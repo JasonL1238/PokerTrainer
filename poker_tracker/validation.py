@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from poker_tracker.cards import CardParseError, parse_cards
+
 
 RANKS = "23456789TJQKA"
 SUITS = "cdhs"
@@ -13,28 +15,15 @@ class CardValidationError(ValueError):
 
 def normalize_cards(value: str, *, expected_counts: Iterable[int] | None = None) -> str:
     """Normalize card text like `AhQs` or `Ah Qs` into `Ah Qs`."""
-    text = value.strip()
-    if not text:
-        return ""
-
-    compact = text.replace(",", " ").replace("-", " ").replace("/", " ")
-    tokens = compact.split()
-    if len(tokens) == 1 and len(tokens[0]) > 2:
-        token = tokens[0]
-        if len(token) % 2 != 0:
-            raise CardValidationError(f"Invalid card string: {value}")
-        tokens = [token[index : index + 2] for index in range(0, len(token), 2)]
-
-    normalized = [_normalize_card(token) for token in tokens]
-    if len(set(normalized)) != len(normalized):
-        raise CardValidationError("Duplicate cards are not allowed.")
-
-    allowed_counts = set(expected_counts or [])
-    if allowed_counts and len(normalized) not in allowed_counts:
-        expected = ", ".join(str(count) for count in sorted(allowed_counts))
-        raise CardValidationError(f"Expected {expected} cards, got {len(normalized)}.")
-
-    return " ".join(normalized)
+    try:
+        cards = parse_cards(value)
+        allowed_counts = set(expected_counts or [])
+        if allowed_counts and len(cards) not in allowed_counts:
+            expected = ", ".join(str(count) for count in sorted(allowed_counts))
+            raise CardValidationError(f"Expected {expected} cards, got {len(cards)}.")
+        return " ".join(str(card) for card in cards)
+    except CardParseError as exc:
+        raise CardValidationError(str(exc)) from exc
 
 
 def validate_tags(tags: list[str], allowed_tags: set[str]) -> list[str]:

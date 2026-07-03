@@ -22,6 +22,8 @@ ActionType = Literal[
 ]
 ReviewStatus = Literal["unreviewed", "reviewed", "needs_correction"]
 SourceType = Literal["manual", "cv_import", "corrected_cv"]
+ReviewType = Literal["hand", "session"]
+SafetyMode = Literal["post_session_only"]
 
 HAND_TAGS = {
     "MISSED_VALUE",
@@ -135,4 +137,36 @@ class HandReview(BaseModel):
     study_lesson: str
     next_review_question: str = ""
     notes: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class LLMProviderConfig(BaseModel):
+    provider_name: str = "mock"
+    model_name: str = "mock-local"
+    has_api_key: bool = False
+
+
+class CoachingRequest(BaseModel):
+    prompt: str
+    review_type: ReviewType
+    provider_name: str = "mock"
+    model_name: str = "mock-local"
+    hand_id: int | None = None
+    session_id: int | None = None
+    safety_mode: SafetyMode = "post_session_only"
+
+
+class CoachingResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None = None
+    provider_name: str
+    model_name: str
+    raw_prompt: str
+    raw_response: str
+    review_type: ReviewType
+    safety_mode: SafetyMode = "post_session_only"
+    hand_id: int | None = None
+    session_id: int | None = None
+    parsed_sections: dict[str, str] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)

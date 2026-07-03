@@ -6,11 +6,11 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from poker_tracker.models import Action, Hand, HandPlayer, HandReview, Session
+from poker_tracker.models import Action, CoachingResponse, Hand, HandPlayer, HandReview, Session
 
 
 DEFAULT_DB_PATH = "poker_tracker.db"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class PokerDatabase:
@@ -105,10 +105,28 @@ class PokerDatabase:
                 FOREIGN KEY (hand_id) REFERENCES hands(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS coaching_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_name TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                raw_prompt TEXT NOT NULL,
+                raw_response TEXT NOT NULL,
+                review_type TEXT NOT NULL,
+                safety_mode TEXT NOT NULL DEFAULT 'post_session_only',
+                hand_id INTEGER,
+                session_id INTEGER,
+                parsed_sections TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (hand_id) REFERENCES hands(id) ON DELETE CASCADE,
+                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_hands_session_id ON hands(session_id);
             CREATE INDEX IF NOT EXISTS idx_hand_players_hand_id ON hand_players(hand_id);
             CREATE INDEX IF NOT EXISTS idx_actions_hand_id ON actions(hand_id);
             CREATE INDEX IF NOT EXISTS idx_reviews_hand_id ON hand_reviews(hand_id);
+            CREATE INDEX IF NOT EXISTS idx_coaching_reviews_hand_id ON coaching_reviews(hand_id);
+            CREATE INDEX IF NOT EXISTS idx_coaching_reviews_session_id ON coaching_reviews(session_id);
             """
         )
         self._ensure_column("hands", "game_type", "TEXT NOT NULL DEFAULT ''")
@@ -124,6 +142,8 @@ class PokerDatabase:
             "hand_reviews", "next_review_question", "TEXT NOT NULL DEFAULT ''"
         )
         self._ensure_column("hand_reviews", "notes", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("coaching_reviews", "safety_mode", "TEXT NOT NULL DEFAULT 'post_session_only'")
+        self._ensure_column("coaching_reviews", "parsed_sections", "TEXT NOT NULL DEFAULT '{}'")
         self._connection.execute(
             """
             INSERT INTO schema_metadata (key, value)
@@ -393,6 +413,54 @@ class PokerDatabase:
         ).fetchall()
         return [_review_from_row(row) for row in rows]
 
+    def create_coaching_response(self, response: CoachingResponse) -> CoachingResponse:
+        payload = response.model_dump()
+        cursor = self._connection.execute(
+            """
+            INSERT INTO coaching_reviews (
+                provider_name, model_name, raw_prompt, raw_response, review_type,
+                safety_mode, hand_id, session_id, parsed_sections, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                payload["provider_name"],
+                payload["model_name"],
+                payload["raw_prompt"],
+                payload["raw_response"],
+                payload["review_type"],
+                payload["safety_mode"],
+                payload["hand_id"],
+                payload["session_id"],
+                _serialize_json(payload["parsed_sections"]),
+                _serialize_datetime(payload["created_at"]),
+            ),
+        )
+        self._connection.commit()
+        return response.model_copy(update={"id": cursor.lastrowid})
+
+    def fetch_coaching_reviews_by_hand(self, hand_id: int) -> list[CoachingResponse]:
+        rows = self._connection.execute(
+            """
+            SELECT * FROM coaching_reviews
+            WHERE hand_id = ? AND review_type = 'hand'
+            ORDER BY created_at DESC, id DESC
+            """,
+            (hand_id,),
+        ).fetchall()
+        return [_coaching_response_from_row(row) for row in rows]
+
+    def fetch_coaching_reviews_by_session(self, session_id: int) -> list[CoachingResponse]:
+        rows = self._connection.execute(
+            """
+            SELECT * FROM coaching_reviews
+            WHERE session_id = ? AND review_type = 'session'
+            ORDER BY created_at DESC, id DESC
+            """,
+            (session_id,),
+        ).fetchall()
+        return [_coaching_response_from_row(row) for row in rows]
+
     def schema_version(self) -> int:
         row = self._connection.execute(
             "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
@@ -454,6 +522,13 @@ def _review_from_row(row: sqlite3.Row) -> HandReview:
     return HandReview(**data)
 
 
+def _coaching_response_from_row(row: sqlite3.Row) -> CoachingResponse:
+    data = _row_dict(row)
+    data["created_at"] = _parse_datetime(data["created_at"])
+    data["parsed_sections"] = _parse_json_dict(data.get("parsed_sections", "{}"))
+    return CoachingResponse(**data)
+
+
 def _parse_json_list(value: str | None) -> list[str]:
     if not value:
         return []
@@ -461,6 +536,15 @@ def _parse_json_list(value: str | None) -> list[str]:
     if not isinstance(parsed, list):
         return []
     return [str(item) for item in parsed]
+
+
+def _parse_json_dict(value: str | None) -> dict[str, str]:
+    if not value:
+        return {}
+    parsed = json.loads(value)
+    if not isinstance(parsed, dict):
+        return {}
+    return {str(key): str(item) for key, item in parsed.items()}
 
 
 # TODO: Add separate repository modules for CV/OCR-derived hand imports later.

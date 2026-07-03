@@ -7,11 +7,23 @@ import streamlit as st
 from pydantic import ValidationError
 
 from poker_tracker.analytics import compute_session_stats
+from poker_tracker.coaching_prompts import build_hand_review_prompt, build_session_review_prompt
 from poker_tracker.db import DEFAULT_DB_PATH, PokerDatabase
+from poker_tracker.equity import PlaceholderEquityCalculator
+from poker_tracker.ev import bluff_ev, call_ev
 from poker_tracker.hand_history import format_hand_history
 from poker_tracker.import_export import export_hand, export_session, import_session
+from poker_tracker.llm_providers import (
+    LLMProviderError,
+    build_coaching_response,
+    get_provider_from_env,
+    provider_config_from_env,
+)
 from poker_tracker.models import Action, HAND_TAGS, Hand, HandPlayer, Session
+from poker_tracker.pot_odds import break_even_bluff_frequency, format_percentage, required_equity_to_call
+from poker_tracker.ranges import RANGE_LABELS, estimate_villain_range_label
 from poker_tracker.review import generate_mock_review
+from poker_tracker.safety import validate_post_session_prompt
 from poker_tracker.seed_data import create_sample_data
 
 
@@ -19,6 +31,7 @@ STREETS = ["preflop", "flop", "turn", "river", "showdown"]
 ACTION_TYPES = ["fold", "check", "call", "bet", "raise", "all-in", "post_blind", "show", "win"]
 POSITIONS = ["", "UTG", "UTG+1", "LJ", "HJ", "CO", "BTN", "SB", "BB"]
 REVIEW_STATUSES = ["unreviewed", "reviewed", "needs_correction"]
+COACHING_MODES = ["Theory + Exploit", "Theory Only", "Exploit Only", "Leak Finder"]
 
 
 @st.cache_resource
@@ -48,8 +61,8 @@ def main() -> None:
         st.info("Create or load a session to start reviewing completed hands.")
         return
 
-    dashboard_tab, entry_tab, hands_tab, transfer_tab = st.tabs(
-        ["Dashboard", "Enter Hand", "Review Hands", "Import / Export"]
+    dashboard_tab, entry_tab, hands_tab, math_tab, coach_tab, transfer_tab = st.tabs(
+        ["Dashboard", "Enter Hand", "Review Hands", "Math Review", "Coach Review", "Import / Export"]
     )
     with dashboard_tab:
         show_session_dashboard(db, selected_session)
@@ -57,6 +70,10 @@ def main() -> None:
         create_hand_form(db, selected_session.id)
     with hands_tab:
         show_saved_hands(db, selected_session)
+    with math_tab:
+        show_math_review(db, selected_session)
+    with coach_tab:
+        show_coach_review(db, selected_session)
     with transfer_tab:
         show_import_export(db, selected_session)
 
@@ -421,6 +438,333 @@ def show_import_export(db: PokerDatabase, session: Session) -> None:
         imported = import_session(db, payload)
         st.success(f"Imported session: {imported.name}")
         st.rerun()
+
+
+def show_math_review(db: PokerDatabase, session: Session) -> None:
+    if session.id is None:
+        return
+    hands = db.fetch_hands_by_session(session.id)
+    if not hands:
+        st.info("Save or load hands before using Math Review.")
+        return
+
+    labels = {
+        hand.id: f"Hand #{hand.hand_number}: {hand.hero_cards or 'unknown'} ({hand.hero_bb_won or 0:g} BB)"
+        for hand in hands
+        if hand.id is not None
+    }
+    selected_hand_id = st.selectbox(
+        "Select hand",
+        options=list(labels.keys()),
+        format_func=lambda hand_id: labels[hand_id],
+    )
+    hand = next(item for item in hands if item.id == selected_hand_id)
+    actions = db.fetch_actions_by_hand(hand.id)
+    players = db.fetch_players_by_hand(hand.id)
+
+    st.code(format_hand_history(session, hand, actions, players), language="text")
+
+    default_range = estimate_villain_range_label(hand.tags, hand.notes)
+    range_options = sorted(RANGE_LABELS)
+    range_label = st.selectbox(
+        "Villain range label",
+        options=range_options,
+        index=range_options.index(default_range),
+    )
+
+    first, second = st.columns(2)
+    with first:
+        pot_before_call = st.number_input("Pot before call", min_value=0.0, step=1.0)
+        call_amount = st.number_input("Call amount", min_value=0.0, step=1.0)
+        use_placeholder_equity = st.checkbox("Use placeholder equity estimate", value=True)
+    with second:
+        pot_size = st.number_input("Pot size for bet/bluff", min_value=0.0, step=1.0)
+        bet_size = st.number_input("Bet size", min_value=0.0, step=1.0)
+        fold_frequency_pct = st.slider("Estimated fold frequency", 0, 100, 40)
+
+    math_facts: dict[str, float | str] = {}
+    equity_result = None
+    errors: list[str] = []
+
+    if call_amount > 0 and pot_before_call > 0:
+        try:
+            required = required_equity_to_call(call_amount, pot_before_call)
+            math_facts["required_equity_to_call"] = required
+            st.write(f"Required equity to call: {format_percentage(required)}")
+        except ValueError as exc:
+            errors.append(str(exc))
+
+    if bet_size > 0 and pot_size > 0:
+        try:
+            bluff_frequency = break_even_bluff_frequency(bet_size, pot_size)
+            math_facts["break_even_bluff_frequency"] = bluff_frequency
+            st.write(f"Break-even bluff frequency: {format_percentage(bluff_frequency)}")
+        except ValueError as exc:
+            errors.append(str(exc))
+
+    if use_placeholder_equity and hand.hero_cards:
+        try:
+            equity_result = PlaceholderEquityCalculator().calculate_equity(
+                hand.hero_cards,
+                hand.board_cards,
+                range_label,
+            )
+            math_facts["placeholder_equity"] = equity_result.equity or "unavailable"
+            st.write(
+                f"Placeholder equity: {format_percentage(equity_result.equity or 0)} "
+                f"(confidence {format_percentage(equity_result.confidence)})"
+            )
+            st.caption(equity_result.notes)
+        except ValueError as exc:
+            errors.append(str(exc))
+
+    if equity_result is not None and equity_result.equity is not None and call_amount > 0 and pot_before_call > 0:
+        ev_value = call_ev(equity_result.equity, pot_before_call, call_amount)
+        math_facts["call_ev"] = round(ev_value, 3)
+        st.write(f"Approximate call EV: {ev_value:.2f}")
+
+    fold_frequency = fold_frequency_pct / 100
+    if bet_size > 0 and pot_size > 0:
+        bluff_value = bluff_ev(fold_frequency, pot_size, bet_size)
+        math_facts["bluff_ev"] = round(bluff_value, 3)
+        st.write(f"Approximate bluff EV at {fold_frequency_pct}% folds: {bluff_value:.2f}")
+
+    for error in errors:
+        st.error(error)
+
+    prompt = build_hand_review_prompt(
+        session,
+        hand,
+        actions,
+        players,
+        pot_odds_facts=math_facts,
+        equity_result=equity_result,
+        villain_range_label=range_label,
+    )
+
+    if st.button("Generate math-aware mock review"):
+        review = generate_mock_review(
+            hand,
+            actions,
+            players,
+            math_facts=math_facts,
+            equity_result=equity_result,
+            villain_range_label=range_label,
+        )
+        db.create_hand_review(review)
+        db.update_hand_status(hand.id, "reviewed")
+        st.success("Math-aware mock review saved.")
+        st.rerun()
+
+    with st.expander("Structured future-LLM prompt"):
+        st.code(prompt, language="text")
+
+
+def show_coach_review(db: PokerDatabase, session: Session) -> None:
+    if session.id is None:
+        return
+    st.subheader("Post-Session Coach Review")
+    st.caption("Provider reviews are for completed hands/sessions only.")
+
+    hands = db.fetch_hands_by_session(session.id)
+    if not hands:
+        st.info("Save or load hands before generating coach reviews.")
+        return
+
+    config = provider_config_from_env()
+    provider_choice = st.selectbox("Provider", ["Mock", "Cloud"])
+    if provider_choice == "Cloud" and not config.has_api_key:
+        st.warning("Cloud provider selected but no OPENAI_API_KEY is configured. Falling back to Mock.")
+    provider = get_provider_from_env("cloud" if provider_choice == "Cloud" else "mock")
+    st.write({"Active provider": provider.provider_name, "Model": provider.model_name})
+
+    coaching_mode = st.selectbox("Coaching mode", COACHING_MODES)
+    review_scope = st.radio("Review scope", ["Hand", "Session"], horizontal=True)
+
+    if review_scope == "Hand":
+        show_hand_coach_review(db, session, hands, provider, coaching_mode)
+    else:
+        show_session_coach_review(db, session, hands, provider, coaching_mode)
+
+
+def show_hand_coach_review(
+    db: PokerDatabase,
+    session: Session,
+    hands: list[Hand],
+    provider,
+    coaching_mode: str,
+) -> None:
+    labels = {
+        hand.id: f"Hand #{hand.hand_number}: {hand.hero_cards or 'unknown'} ({hand.hero_bb_won or 0:g} BB)"
+        for hand in hands
+        if hand.id is not None
+    }
+    selected_hand_id = st.selectbox(
+        "Select hand",
+        options=list(labels.keys()),
+        format_func=lambda hand_id: labels[hand_id],
+        key="coach_hand_select",
+    )
+    hand = next(item for item in hands if item.id == selected_hand_id)
+    actions = db.fetch_actions_by_hand(hand.id)
+    players = db.fetch_players_by_hand(hand.id)
+    history = format_hand_history(session, hand, actions, players)
+    st.code(history, language="text")
+
+    range_label = st.selectbox(
+        "Villain range label",
+        options=sorted(RANGE_LABELS),
+        index=sorted(RANGE_LABELS).index(estimate_villain_range_label(hand.tags, hand.notes)),
+        key="coach_range_label",
+    )
+    pot_before_call = st.number_input("Optional pot before call", min_value=0.0, step=1.0)
+    call_amount = st.number_input("Optional call amount", min_value=0.0, step=1.0)
+    math_facts = _optional_prompt_math_facts(pot_before_call, call_amount)
+
+    prompt = build_hand_review_prompt(
+        session,
+        hand,
+        actions,
+        players,
+        pot_odds_facts=math_facts,
+        villain_range_label=range_label,
+        coaching_mode=coaching_mode,
+    )
+    show_prompt_safety(prompt)
+    with st.expander("Exact prompt sent to provider"):
+        st.code(prompt, language="text")
+
+    if st.button("Generate and save post-session hand review"):
+        try:
+            raw_response = provider.generate_hand_review(prompt)
+            saved = db.create_coaching_response(
+                build_coaching_response(
+                    provider=provider,
+                    prompt=prompt,
+                    raw_response=raw_response,
+                    review_type="hand",
+                    hand_id=hand.id,
+                    session_id=session.id,
+                )
+            )
+            db.update_hand_status(hand.id, "reviewed")
+            st.success(f"Saved provider review #{saved.id}.")
+            st.rerun()
+        except (LLMProviderError, ValueError) as exc:
+            st.error(f"Could not generate review: {exc}")
+
+    show_saved_provider_reviews(db.fetch_coaching_reviews_by_hand(hand.id))
+
+
+def show_session_coach_review(
+    db: PokerDatabase,
+    session: Session,
+    hands: list[Hand],
+    provider,
+    coaching_mode: str,
+) -> None:
+    stats = compute_session_stats(db, session.id)
+    selected_hands = select_session_review_hands(hands)
+    histories = [
+        format_hand_history(
+            session,
+            hand,
+            db.fetch_actions_by_hand(hand.id),
+            db.fetch_players_by_hand(hand.id),
+        )
+        for hand in selected_hands
+        if hand.id is not None
+    ]
+    st.write(
+        {
+            "Selected hands": [hand.hand_number for hand in selected_hands],
+            "Tag counts": stats.hands_by_tag,
+            "Review statuses": stats.hands_by_review_status,
+        }
+    )
+    prompt = build_session_review_prompt(
+        session,
+        stats,
+        histories,
+        coaching_mode=coaching_mode,
+    )
+    show_prompt_safety(prompt)
+    with st.expander("Exact prompt sent to provider"):
+        st.code(prompt, language="text")
+
+    if st.button("Generate and save post-session session review"):
+        try:
+            raw_response = provider.generate_session_review(prompt)
+            saved = db.create_coaching_response(
+                build_coaching_response(
+                    provider=provider,
+                    prompt=prompt,
+                    raw_response=raw_response,
+                    review_type="session",
+                    session_id=session.id,
+                )
+            )
+            st.success(f"Saved provider session review #{saved.id}.")
+            st.rerun()
+        except (LLMProviderError, ValueError) as exc:
+            st.error(f"Could not generate session review: {exc}")
+
+    show_saved_provider_reviews(db.fetch_coaching_reviews_by_session(session.id))
+
+
+def select_session_review_hands(hands: list[Hand]) -> list[Hand]:
+    """Pick relevant completed hands for a session-level provider prompt."""
+    selected: list[Hand] = []
+    losing = sorted(
+        [hand for hand in hands if hand.hero_bb_won is not None and hand.hero_bb_won < 0],
+        key=lambda hand: hand.hero_bb_won or 0,
+    )[:3]
+    winning = sorted(
+        [hand for hand in hands if hand.hero_bb_won is not None and hand.hero_bb_won > 0],
+        key=lambda hand: hand.hero_bb_won or 0,
+        reverse=True,
+    )[:2]
+    tagged = [
+        hand
+        for hand in hands
+        if set(hand.tags) & {"MISSED_VALUE", "RIVER_DECISION", "MULTIWAY", "BIG_POT"}
+    ]
+    unreviewed = [hand for hand in hands if hand.review_status == "unreviewed"][:3]
+    for hand in [*losing, *winning, *tagged, *unreviewed]:
+        if hand.id is not None and hand.id not in {item.id for item in selected}:
+            selected.append(hand)
+    return selected[:8]
+
+
+def show_saved_provider_reviews(reviews) -> None:
+    st.markdown("##### Saved Provider Reviews")
+    if not reviews:
+        st.caption("No provider reviews saved yet.")
+        return
+    for review in reviews:
+        with st.expander(
+            f"{review.created_at.isoformat()} - {review.provider_name}/{review.model_name}"
+        ):
+            st.write({"Review type": review.review_type, "Safety mode": review.safety_mode})
+            st.write(review.parsed_sections or {})
+            st.code(review.raw_response, language="text")
+
+
+def show_prompt_safety(prompt: str) -> None:
+    result = validate_post_session_prompt(prompt)
+    if result.is_safe:
+        st.success("Prompt safety check passed: post-session review only.")
+    else:
+        st.error("Prompt safety check failed: " + "; ".join(result.errors))
+
+
+def _optional_prompt_math_facts(
+    pot_before_call: float,
+    call_amount: float,
+) -> dict[str, float | str]:
+    if pot_before_call <= 0 or call_amount <= 0:
+        return {}
+    return {"required_equity_to_call": required_equity_to_call(call_amount, pot_before_call)}
 
 
 def _hand_summary_rows(hands: list[Hand]) -> list[dict]:

@@ -1,4 +1,6 @@
 from poker_tracker.models import Action, Hand, HandPlayer
+from poker_tracker.equity import PlaceholderEquityCalculator
+from poker_tracker.pot_odds import required_equity_to_call
 from poker_tracker.review import generate_mock_review
 
 
@@ -38,11 +40,26 @@ def test_generate_mock_review_uses_tags_actions_and_result() -> None:
         HandPlayer(hand_id=1, player_name="Villain", position="BB", starting_stack=190),
     ]
 
-    review = generate_mock_review(hand, actions, players)
+    equity = PlaceholderEquityCalculator().calculate_equity(
+        hand.hero_cards,
+        hand.board_cards,
+        "loose",
+    )
+    review = generate_mock_review(
+        hand,
+        actions,
+        players,
+        math_facts={"required_equity_to_call": required_equity_to_call(25, 75)},
+        equity_result=equity,
+        villain_range_label="loose",
+    )
 
     assert review.hand_id == 1
     assert "Hand #7" in review.hand_summary
     assert "MISSED_VALUE" in review.hand_summary
     assert "thin value" in review.theory_coach
+    assert "25.0%" in review.theory_coach
+    assert "placeholder" in review.ev_math_notes
+    assert "Villain range label: loose" in review.exploit_coach
     assert "Aggressive actions" in review.ev_math_notes
-    assert "worse hands" in review.next_review_question
+    assert "required calling equity" in review.next_review_question
