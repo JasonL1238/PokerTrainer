@@ -11,6 +11,9 @@ from poker_tracker.hand_history import format_hand_history
 from poker_tracker.llm_providers import MockLLMProvider, get_provider_from_env
 from poker_tracker.pot_odds import break_even_bluff_frequency, required_equity_to_call
 from poker_tracker.safety import validate_post_session_prompt
+from poker_tracker.frame_extraction import extract_frames_for_video
+from poker_tracker.roi_profiles import create_starter_clubwpt_profile
+from poker_tracker.video_storage import save_video_file
 
 __all__ = [
     "Action",
@@ -20,6 +23,8 @@ __all__ = [
     "compute_session_stats",
     "EquityResult",
     "format_hand_history",
+    "extract_frames_for_video",
+    "create_starter_clubwpt_profile",
     "Hand",
     "HandPlayer",
     "HandReview",
@@ -33,6 +38,7 @@ __all__ = [
     "get_provider_from_env",
     "required_equity_to_call",
     "Session",
+    "save_video_file",
     "generate_mock_review",
     "validate_post_session_prompt",
 ]

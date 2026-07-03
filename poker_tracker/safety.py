@@ -11,10 +11,13 @@ REQUIRED_SAFETY_PHRASES = [
 ]
 
 DANGEROUS_INSTRUCTIONS = [
+    "real-time",
+    "live advice",
     "capture live table",
     "live table capture",
     "poker-client overlay",
     "current-hand recommendation",
+    "current hand recommendation",
     "hotkey",
 ]
 
@@ -47,8 +50,11 @@ def ensure_post_session_prompt(prompt: str) -> None:
 
 
 def _phrase_is_prohibited(prompt: str, phrase: str) -> bool:
+    found = False
     for sentence in prompt.replace("\n", " ").split("."):
         if phrase in sentence:
+            found = True
             before_phrase = sentence.split(phrase, 1)[0]
-            return "do not" in before_phrase or "never" in before_phrase or "no " in before_phrase
-    return True
+            if not ("do not" in before_phrase or "never" in before_phrase or "no " in before_phrase):
+                return False
+    return found

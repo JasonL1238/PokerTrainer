@@ -184,4 +184,7 @@ def test_validation_catches_bad_cards_and_action_types() -> None:
         Hand(session_id=1, hand_number=1, board_cards="Qd Qd 2c")
 
     with pytest.raises(ValidationError):
+        Hand(session_id=1, hand_number=1, hero_cards="Ah Qs", board_cards="Ah 7d 2c")
+
+    with pytest.raises(ValidationError):
         Action(hand_id=1, street="preflop", player_name="Hero", action_type="punt")

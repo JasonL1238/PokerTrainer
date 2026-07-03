@@ -50,31 +50,49 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
     """Import a previously exported session into the current database."""
     session_data = dict(payload["session"])
     session_data.pop("id", None)
-    session = db.create_session(Session(**session_data))
+    session_model = Session(**session_data)
+    validated_hands: list[
+        tuple[Hand, list[HandPlayer], list[Action], list[HandReview]]
+    ] = []
 
     for hand_payload in payload.get("hands", []):
         hand_data = dict(hand_payload["hand"])
         hand_data.pop("id", None)
-        hand_data["session_id"] = session.id
-        saved_hand = db.create_hand(Hand(**hand_data))
+        hand_data["session_id"] = 0
+        hand = Hand(**hand_data)
 
+        players: list[HandPlayer] = []
         for player_data in hand_payload.get("players", []):
             imported = dict(player_data)
             imported.pop("id", None)
-            imported["hand_id"] = saved_hand.id
-            db.create_hand_player(HandPlayer(**imported))
+            imported["hand_id"] = 0
+            players.append(HandPlayer(**imported))
 
+        actions: list[Action] = []
         for action_data in hand_payload.get("actions", []):
             imported = dict(action_data)
             imported.pop("id", None)
-            imported["hand_id"] = saved_hand.id
-            db.create_action(Action(**imported))
+            imported["hand_id"] = 0
+            actions.append(Action(**imported))
 
+        reviews: list[HandReview] = []
         for review_data in hand_payload.get("reviews", []):
             imported = dict(review_data)
             imported.pop("id", None)
-            imported["hand_id"] = saved_hand.id
-            db.create_hand_review(HandReview(**imported))
+            imported["hand_id"] = 0
+            reviews.append(HandReview(**imported))
+
+        validated_hands.append((hand, players, actions, reviews))
+
+    session = db.create_session(session_model)
+    for hand, players, actions, reviews in validated_hands:
+        saved_hand = db.create_hand(hand.model_copy(update={"session_id": session.id}))
+        for player in players:
+            db.create_hand_player(player.model_copy(update={"hand_id": saved_hand.id}))
+        for action in actions:
+            db.create_action(action.model_copy(update={"hand_id": saved_hand.id}))
+        for review in reviews:
+            db.create_hand_review(review.model_copy(update={"hand_id": saved_hand.id}))
 
     return session
 

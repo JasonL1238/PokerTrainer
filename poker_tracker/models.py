@@ -3,8 +3,9 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from poker_tracker.cards import CardParseError, parse_visible_cards
 from poker_tracker.validation import normalize_cards, validate_tags
 
 
@@ -24,6 +25,21 @@ ReviewStatus = Literal["unreviewed", "reviewed", "needs_correction"]
 SourceType = Literal["manual", "cv_import", "corrected_cv"]
 ReviewType = Literal["hand", "session"]
 SafetyMode = Literal["post_session_only"]
+JobStatus = Literal["queued", "running", "completed", "failed"]
+JobType = Literal["frame_extraction"]
+ROIType = Literal[
+    "hero_card",
+    "board_card",
+    "pot",
+    "player_stack",
+    "player_bet",
+    "player_name",
+    "dealer_button",
+    "active_indicator",
+    "action_button",
+    "table_area",
+    "unknown",
+]
 
 HAND_TAGS = {
     "MISSED_VALUE",
@@ -88,6 +104,15 @@ class Hand(BaseModel):
     @classmethod
     def validate_hand_tags(cls, value: list[str]) -> list[str]:
         return validate_tags(value, HAND_TAGS)
+
+    @model_validator(mode="after")
+    def validate_visible_card_uniqueness(self) -> "Hand":
+        if self.hero_cards and self.board_cards:
+            try:
+                parse_visible_cards(self.hero_cards, self.board_cards)
+            except CardParseError as exc:
+                raise ValueError(str(exc)) from exc
+        return self
 
 
 class HandPlayer(BaseModel):
@@ -170,3 +195,94 @@ class CoachingResponse(BaseModel):
     session_id: int | None = None
     parsed_sections: dict[str, str] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class VideoRecord(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None = None
+    session_id: int | None = None
+    original_filename: str
+    stored_path: str
+    file_size_bytes: int = Field(ge=0)
+    duration_seconds: float | None = Field(default=None, ge=0)
+    fps: float | None = Field(default=None, ge=0)
+    width: int | None = Field(default=None, ge=0)
+    height: int | None = Field(default=None, ge=0)
+    frame_count: int | None = Field(default=None, ge=0)
+    uploaded_at: datetime = Field(default_factory=utc_now)
+    notes: str = ""
+
+
+class ProcessingJob(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None = None
+    job_type: JobType
+    status: JobStatus = "queued"
+    video_id: int
+    progress_percent: float = Field(default=0, ge=0, le=100)
+    message: str = ""
+    error_message: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class ExtractedFrame(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None = None
+    video_id: int
+    job_id: int
+    timestamp_seconds: float = Field(ge=0)
+    frame_index: int = Field(ge=0)
+    image_path: str
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class ROIProfile(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None = None
+    name: str = Field(min_length=1)
+    description: str = ""
+    platform: str = "ClubWPT Gold"
+    table_layout: str = ""
+    video_width: int | None = Field(default=None, ge=1)
+    video_height: int | None = Field(default=None, ge=1)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    is_active: bool = False
+
+
+class ROIRegion(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None = None
+    profile_id: int
+    roi_key: str = Field(min_length=1)
+    roi_type: ROIType = "unknown"
+    label: str = ""
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    seat_index: int | None = Field(default=None, ge=1, le=10)
+    card_index: int | None = Field(default=None, ge=1, le=5)
+    notes: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class ROICropResult(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    roi_key: str
+    roi_type: ROIType
+    source_frame_id: int | None = None
+    source_timestamp_seconds: float | None = Field(default=None, ge=0)
+    source_image_path: str
+    crop_path: str
+    crop_width: int = Field(ge=0)
+    crop_height: int = Field(ge=0)

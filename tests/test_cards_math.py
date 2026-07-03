@@ -27,6 +27,8 @@ def test_valid_card_parsing_and_normalization() -> None:
     assert normalize_card_list(hero) == ["Ah", "Qs"]
     assert compact_cards(hero) == "AhQs"
     assert spaced_cards(hero) == "Ah Qs"
+    assert normalize_card_list(parse_hero_cards(["td", "9C"])) == ["Td", "9c"]
+    assert normalize_card_list(parse_board_cards("Ah,Kd/Qs-Jc Td")) == ["Ah", "Kd", "Qs", "Jc", "Td"]
 
 
 def test_invalid_card_parsing() -> None:
@@ -34,6 +36,8 @@ def test_invalid_card_parsing() -> None:
         parse_card("Ax")
     with pytest.raises(CardParseError):
         parse_hero_cards("Ah")
+    with pytest.raises(CardParseError):
+        parse_board_cards("AhKdQ")
 
 
 def test_duplicate_card_detection() -> None:
@@ -61,9 +65,13 @@ def test_pot_odds_edge_cases() -> None:
     with pytest.raises(ValueError):
         required_equity_to_call(0, 100)
     with pytest.raises(ValueError):
+        required_equity_to_call(10, -1)
+    with pytest.raises(ValueError):
         break_even_bluff_frequency(10, 0)
     with pytest.raises(ValueError):
         format_percentage(1.2)
+    assert format_percentage(0) == "0.0%"
+    assert format_percentage(1) == "100.0%"
 
 
 def test_ev_helpers() -> None:
@@ -76,4 +84,10 @@ def test_ev_edge_cases() -> None:
     with pytest.raises(ValueError):
         call_ev(1.2, 100, 10)
     with pytest.raises(ValueError):
+        call_ev(0.5, 0, 10)
+    with pytest.raises(ValueError):
         bluff_ev(0.5, -1, 10)
+    with pytest.raises(ValueError):
+        semi_bluff_ev(-0.1, 0.2, 100, 10)
+    with pytest.raises(ValueError):
+        semi_bluff_ev(0.1, 1.1, 100, 10)

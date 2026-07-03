@@ -11,20 +11,36 @@ from poker_tracker.coaching_prompts import build_hand_review_prompt, build_sessi
 from poker_tracker.db import DEFAULT_DB_PATH, PokerDatabase
 from poker_tracker.equity import PlaceholderEquityCalculator
 from poker_tracker.ev import bluff_ev, call_ev
+from poker_tracker.frame_extraction import (
+    delete_extracted_frames,
+    extract_frames_for_video,
+    select_representative_frames,
+)
 from poker_tracker.hand_history import format_hand_history
 from poker_tracker.import_export import export_hand, export_session, import_session
+from poker_tracker.image_utils import image_dimensions, save_roi_crop_preview
 from poker_tracker.llm_providers import (
     LLMProviderError,
     build_coaching_response,
     get_provider_from_env,
     provider_config_from_env,
 )
-from poker_tracker.models import Action, HAND_TAGS, Hand, HandPlayer, Session
+from poker_tracker.models import Action, HAND_TAGS, Hand, HandPlayer, ROIProfile, ROIRegion, Session, VideoRecord
 from poker_tracker.pot_odds import break_even_bluff_frequency, format_percentage, required_equity_to_call
 from poker_tracker.ranges import RANGE_LABELS, estimate_villain_range_label
 from poker_tracker.review import generate_mock_review
+from poker_tracker.roi import ROI_TYPES, validate_roi_bounds
+from poker_tracker.roi_profiles import (
+    create_starter_clubwpt_profile,
+    duplicate_roi_profile,
+    export_roi_profile,
+    generate_roi_crop_previews,
+    import_roi_profile,
+)
 from poker_tracker.safety import validate_post_session_prompt
 from poker_tracker.seed_data import create_sample_data
+from poker_tracker.video_metadata import extract_video_metadata
+from poker_tracker.video_storage import ensure_data_directories, save_video_file, validate_video_extension
 
 
 STREETS = ["preflop", "flop", "turn", "river", "showdown"]
@@ -61,8 +77,17 @@ def main() -> None:
         st.info("Create or load a session to start reviewing completed hands.")
         return
 
-    dashboard_tab, entry_tab, hands_tab, math_tab, coach_tab, transfer_tab = st.tabs(
-        ["Dashboard", "Enter Hand", "Review Hands", "Math Review", "Coach Review", "Import / Export"]
+    dashboard_tab, entry_tab, hands_tab, math_tab, coach_tab, video_tab, roi_tab, transfer_tab = st.tabs(
+        [
+            "Dashboard",
+            "Enter Hand",
+            "Review Hands",
+            "Math Review",
+            "Coach Review",
+            "Video Processing",
+            "ROI Calibration",
+            "Import / Export",
+        ]
     )
     with dashboard_tab:
         show_session_dashboard(db, selected_session)
@@ -74,6 +99,10 @@ def main() -> None:
         show_math_review(db, selected_session)
     with coach_tab:
         show_coach_review(db, selected_session)
+    with video_tab:
+        show_video_processing(db, selected_session)
+    with roi_tab:
+        show_roi_calibration(db)
     with transfer_tab:
         show_import_export(db, selected_session)
 
@@ -765,6 +794,553 @@ def _optional_prompt_math_facts(
     if pot_before_call <= 0 or call_amount <= 0:
         return {}
     return {"required_equity_to_call": required_equity_to_call(call_amount, pot_before_call)}
+
+
+def show_video_processing(db: PokerDatabase, session: Session) -> None:
+    st.subheader("Completed Session Video Processing")
+    st.caption("Upload completed session videos only. This does not capture or analyze live tables.")
+    ensure_data_directories()
+
+    uploaded = st.file_uploader("Upload completed session video", type=["mp4", "mov", "mkv", "avi"])
+    link_to_session = st.checkbox("Link upload to selected session", value=True)
+    video_notes = st.text_area("Video notes", height=80)
+    if uploaded is not None and st.button("Save uploaded video"):
+        try:
+            validate_video_extension(uploaded.name)
+            uploaded.seek(0)
+            stored_path = save_video_file(uploaded, uploaded.name)
+            metadata = extract_video_metadata(stored_path)
+            saved_video = db.create_video(
+                VideoRecord(
+                    session_id=session.id if link_to_session else None,
+                    original_filename=uploaded.name,
+                    stored_path=str(stored_path),
+                    file_size_bytes=stored_path.stat().st_size,
+                    duration_seconds=metadata.duration_seconds,
+                    fps=metadata.fps,
+                    width=metadata.width,
+                    height=metadata.height,
+                    frame_count=metadata.frame_count,
+                    notes=video_notes.strip(),
+                )
+            )
+            if metadata.error:
+                st.warning(metadata.error)
+            st.success(f"Saved video #{saved_video.id}.")
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+    st.markdown("#### Stored Videos")
+    all_videos = db.fetch_videos()
+    if not all_videos:
+        st.info("No videos stored yet.")
+        return
+
+    labels = {
+        video.id: f"Video #{video.id}: {video.original_filename} ({_format_bytes(video.file_size_bytes)})"
+        for video in all_videos
+        if video.id is not None
+    }
+    selected_video_id = st.selectbox(
+        "Select stored video",
+        options=list(labels.keys()),
+        format_func=lambda video_id: labels[video_id],
+    )
+    video = db.fetch_video(selected_video_id)
+    if video is None:
+        st.error("Selected video no longer exists.")
+        return
+    show_video_metadata(video)
+    show_video_jobs_and_frames(db, video)
+
+
+def show_video_metadata(video: VideoRecord) -> None:
+    st.write(
+        {
+            "Original filename": video.original_filename,
+            "Stored path": video.stored_path,
+            "Size": _format_bytes(video.file_size_bytes),
+            "Duration": _format_optional_seconds(video.duration_seconds),
+            "FPS": video.fps,
+            "Resolution": _format_resolution(video.width, video.height),
+            "Frame count": video.frame_count,
+            "Uploaded": video.uploaded_at.isoformat(),
+            "Notes": video.notes,
+        }
+    )
+
+
+def show_video_jobs_and_frames(db: PokerDatabase, video: VideoRecord) -> None:
+    if video.id is None:
+        return
+
+    st.markdown("#### Frame Extraction")
+    settings_left, settings_right = st.columns(2)
+    with settings_left:
+        frames_per_second = st.number_input(
+            "Frames per second",
+            min_value=0.1,
+            value=2.0,
+            step=0.5,
+            key=f"extract_fps_{video.id}",
+        )
+        start_time = st.number_input(
+            "Start time seconds",
+            min_value=0.0,
+            value=0.0,
+            step=0.5,
+            key=f"extract_start_{video.id}",
+        )
+    with settings_right:
+        max_frames = st.number_input(
+            "Max frames",
+            min_value=1,
+            value=20,
+            step=1,
+            key=f"extract_max_{video.id}",
+        )
+        end_time = st.number_input(
+            "End time seconds (0 = no limit)",
+            min_value=0.0,
+            value=0.0,
+            step=0.5,
+            key=f"extract_end_{video.id}",
+        )
+
+    if st.button("Extract frames", key=f"extract_button_{video.id}"):
+        try:
+            summary = extract_frames_for_video(
+                db,
+                video.id,
+                frames_per_second=float(frames_per_second),
+                max_frames=int(max_frames),
+                start_time_seconds=float(start_time),
+                end_time_seconds=float(end_time) if end_time > 0 else None,
+            )
+            st.success(f"Extracted {summary.frames_extracted} frames to {summary.output_dir}.")
+            if summary.errors:
+                st.warning("; ".join(summary.errors))
+            st.rerun()
+        except (ValueError, RuntimeError) as exc:
+            st.error(f"Frame extraction failed: {exc}")
+
+    jobs = db.fetch_jobs_by_video(video.id)
+    if jobs:
+        st.markdown("##### Jobs")
+        st.dataframe(
+            [
+                {
+                    "ID": job.id,
+                    "Type": job.job_type,
+                    "Status": job.status,
+                    "Progress": job.progress_percent,
+                    "Message": job.message,
+                    "Error": job.error_message,
+                    "Created": job.created_at.isoformat(),
+                }
+                for job in jobs
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    frames = db.fetch_frames_by_video(video.id)
+    st.write({"Extracted frame count": len(frames)})
+    confirm_delete = st.checkbox(
+        "Confirm delete extracted frames for this video",
+        key=f"delete_frames_confirm_{video.id}",
+    )
+    if st.button("Delete extracted frames", key=f"delete_frames_{video.id}", disabled=not confirm_delete):
+        deleted = delete_extracted_frames(db, video.id)
+        st.success(f"Deleted {deleted} extracted frame records/files.")
+        st.rerun()
+    show_frame_preview(frames)
+
+
+def show_frame_preview(frames) -> None:
+    if not frames:
+        st.caption("No frames extracted yet.")
+        return
+    st.markdown("##### Frame Preview")
+    representative = select_representative_frames(frames, limit=12)
+    columns = st.columns(4)
+    for index, frame in enumerate(representative):
+        with columns[index % 4]:
+            st.image(frame.image_path, caption=f"{frame.timestamp_seconds:.2f}s")
+
+    frame_labels = {
+        frame.id: f"{frame.timestamp_seconds:.2f}s - {frame.image_path}"
+        for frame in frames
+        if frame.id is not None
+    }
+    selected_frame_id = st.selectbox(
+        "Select full frame",
+        options=list(frame_labels.keys()),
+        format_func=lambda frame_id: frame_labels[frame_id],
+    )
+    selected = next(frame for frame in frames if frame.id == selected_frame_id)
+    st.write({"Timestamp": selected.timestamp_seconds, "Path": selected.image_path})
+    st.image(selected.image_path)
+
+
+def show_roi_calibration(db: PokerDatabase) -> None:
+    st.subheader("ROI Calibration")
+    st.caption(
+        "Manual calibration for completed-session extracted frames only. "
+        "No card detection, OCR, live capture, or action reconstruction is performed."
+    )
+    ensure_data_directories()
+    # TODO: Add interactive rectangle drawing later if a stable dependency is worth it.
+
+    videos = db.fetch_videos()
+    if not videos:
+        st.info("Upload a completed session video and extract frames before calibrating ROIs.")
+        return
+
+    video_labels = {
+        video.id: f"Video #{video.id}: {video.original_filename} ({_format_resolution(video.width, video.height)})"
+        for video in videos
+        if video.id is not None
+    }
+    selected_video_id = st.selectbox(
+        "Select video for calibration",
+        options=list(video_labels.keys()),
+        format_func=lambda video_id: video_labels[video_id],
+        key="roi_video_select",
+    )
+    video = db.fetch_video(selected_video_id)
+    if video is None or video.id is None:
+        st.error("Selected video no longer exists.")
+        return
+
+    frames = db.fetch_frames_by_video(video.id)
+    if not frames:
+        st.info("Extract frames for this video before ROI calibration.")
+        return
+
+    frame_labels = {
+        frame.id: f"{frame.timestamp_seconds:.2f}s - frame {frame.frame_index}"
+        for frame in frames
+        if frame.id is not None
+    }
+    selected_frame_id = st.selectbox(
+        "Select calibration frame",
+        options=list(frame_labels.keys()),
+        format_func=lambda frame_id: frame_labels[frame_id],
+        key="roi_frame_select",
+    )
+    frame = next(item for item in frames if item.id == selected_frame_id)
+    st.image(frame.image_path, caption=f"Calibration frame at {frame.timestamp_seconds:.2f}s")
+    try:
+        frame_width, frame_height = image_dimensions(frame.image_path)
+        st.write({"Frame width": frame_width, "Frame height": frame_height, "Frame path": frame.image_path})
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+
+    show_roi_profile_tools(db, video, frame_width, frame_height)
+    profiles = db.fetch_roi_profiles()
+    if not profiles:
+        st.info("Create a profile or starter preset to begin adding regions.")
+        return
+
+    profile_labels = {
+        profile.id: f"{'* ' if profile.is_active else ''}Profile #{profile.id}: {profile.name}"
+        for profile in profiles
+        if profile.id is not None
+    }
+    selected_profile_id = st.selectbox(
+        "Select ROI profile",
+        options=list(profile_labels.keys()),
+        format_func=lambda profile_id: profile_labels[profile_id],
+        key="roi_profile_select",
+    )
+    profile = db.fetch_roi_profile(selected_profile_id)
+    if profile is None or profile.id is None:
+        st.error("Selected profile no longer exists.")
+        return
+
+    st.write(
+        {
+            "Platform": profile.platform,
+            "Layout": profile.table_layout,
+            "Profile dimensions": _format_resolution(profile.video_width, profile.video_height),
+            "Active": profile.is_active,
+        }
+    )
+    if st.button("Mark selected profile active", key=f"roi_active_{profile.id}"):
+        db.mark_roi_profile_active(profile.id)
+        st.rerun()
+    if st.button("Duplicate selected profile", key=f"roi_duplicate_{profile.id}"):
+        duplicate_roi_profile(db, profile.id)
+        st.success("Duplicated ROI profile.")
+        st.rerun()
+
+    show_roi_import_export(db, profile)
+    show_add_roi_region_form(db, profile, frame_width, frame_height)
+    show_roi_regions(db, profile, frame, frame_width, frame_height)
+
+
+def show_roi_profile_tools(
+    db: PokerDatabase,
+    video: VideoRecord,
+    frame_width: int,
+    frame_height: int,
+) -> None:
+    st.markdown("#### Profiles")
+    left, right = st.columns(2)
+    with left.form("create_roi_profile"):
+        name = st.text_input("New profile name", value="ClubWPT Gold custom")
+        description = st.text_area("Description", height=70)
+        platform = st.text_input("Platform", value="ClubWPT Gold")
+        table_layout = st.text_input("Table layout", value="9-max")
+        use_frame_dims = st.checkbox("Use selected frame dimensions", value=True)
+        submitted = st.form_submit_button("Create empty profile")
+    if submitted:
+        profile = ROIProfile(
+            name=name.strip(),
+            description=description.strip(),
+            platform=platform.strip() or "ClubWPT Gold",
+            table_layout=table_layout.strip(),
+            video_width=frame_width if use_frame_dims else video.width,
+            video_height=frame_height if use_frame_dims else video.height,
+        )
+        db.create_roi_profile(profile)
+        st.success("ROI profile created.")
+        st.rerun()
+
+    with right:
+        st.markdown("##### Starter preset")
+        st.caption("Creates editable placeholder regions for common ClubWPT Gold table elements.")
+        seats = st.number_input("Seats", min_value=6, max_value=9, value=9, step=1, key="roi_preset_seats")
+        if st.button("Create ClubWPT Gold starter preset"):
+            create_starter_clubwpt_profile(
+                db,
+                video_width=frame_width,
+                video_height=frame_height,
+                max_seats=int(seats),
+            )
+            st.success("Starter ROI profile created.")
+            st.rerun()
+
+
+def show_roi_import_export(db: PokerDatabase, profile: ROIProfile) -> None:
+    if profile.id is None:
+        return
+    st.markdown("#### Import / Export ROI Profile")
+    st.download_button(
+        "Export selected ROI profile JSON",
+        data=json.dumps(export_roi_profile(db, profile.id), indent=2),
+        file_name=f"roi_profile_{profile.id}.json",
+        mime="application/json",
+        key=f"roi_export_{profile.id}",
+    )
+    uploaded = st.file_uploader("Import ROI profile JSON", type=["json"], key="roi_import_upload")
+    if uploaded is not None and st.button("Import ROI profile"):
+        try:
+            payload = json.loads(uploaded.getvalue().decode("utf-8"))
+            imported = import_roi_profile(db, payload)
+            st.success(f"Imported ROI profile: {imported.name}")
+            st.rerun()
+        except (ValueError, ValidationError, KeyError, json.JSONDecodeError) as exc:
+            st.error(f"Could not import ROI profile: {exc}")
+
+
+def show_add_roi_region_form(
+    db: PokerDatabase,
+    profile: ROIProfile,
+    frame_width: int,
+    frame_height: int,
+) -> None:
+    if profile.id is None:
+        return
+    st.markdown("#### Add ROI Region")
+    with st.form("add_roi_region", clear_on_submit=True):
+        left, right = st.columns(2)
+        with left:
+            roi_key = st.text_input("ROI key", placeholder="hero_card_1")
+            roi_type = st.selectbox("ROI type", ROI_TYPES, index=ROI_TYPES.index("unknown"))
+            label = st.text_input("Label", placeholder="Hero card 1")
+            notes = st.text_area("Notes", height=70)
+        with right:
+            x = st.number_input("X", min_value=0, value=0, step=1)
+            y = st.number_input("Y", min_value=0, value=0, step=1)
+            width = st.number_input("Width", min_value=1, value=40, step=1)
+            height = st.number_input("Height", min_value=1, value=40, step=1)
+            seat_index = st.number_input("Seat index (0 = none)", min_value=0, max_value=10, value=0, step=1)
+            card_index = st.number_input("Card index (0 = none)", min_value=0, max_value=5, value=0, step=1)
+        submitted = st.form_submit_button("Add region")
+    if submitted:
+        try:
+            region = ROIRegion(
+                profile_id=profile.id,
+                roi_key=roi_key.strip(),
+                roi_type=roi_type,
+                label=label.strip(),
+                x=int(x),
+                y=int(y),
+                width=int(width),
+                height=int(height),
+                seat_index=int(seat_index) or None,
+                card_index=int(card_index) or None,
+                notes=notes.strip(),
+            )
+            validate_roi_bounds(region, image_width=frame_width, image_height=frame_height)
+            db.create_roi_region(region)
+            st.success("ROI region added.")
+            st.rerun()
+        except (ValueError, ValidationError) as exc:
+            st.error(f"Could not add ROI region: {exc}")
+
+
+def show_roi_regions(
+    db: PokerDatabase,
+    profile: ROIProfile,
+    frame,
+    frame_width: int,
+    frame_height: int,
+) -> None:
+    if profile.id is None:
+        return
+    regions = db.fetch_roi_regions_by_profile(profile.id)
+    st.markdown("#### Regions")
+    if not regions:
+        st.caption("No ROI regions saved for this profile yet.")
+        return
+
+    st.dataframe(
+        [
+            {
+                "Key": region.roi_key,
+                "Type": region.roi_type,
+                "Label": region.label,
+                "X": region.x,
+                "Y": region.y,
+                "W": region.width,
+                "H": region.height,
+                "Seat": region.seat_index,
+                "Card": region.card_index,
+            }
+            for region in regions
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    if st.button("Generate all crop previews", key=f"roi_generate_all_{profile.id}_{frame.id}"):
+        try:
+            results = generate_roi_crop_previews(db, profile.id, frame.id)
+            st.success(f"Generated {len(results)} crop previews.")
+        except ValueError as exc:
+            st.error(str(exc))
+
+    for region in regions:
+        if region.id is None:
+            continue
+        with st.expander(f"{region.roi_key} [{region.roi_type}]"):
+            show_edit_roi_region_form(db, region, frame, frame_width, frame_height)
+
+
+def show_edit_roi_region_form(
+    db: PokerDatabase,
+    region: ROIRegion,
+    frame,
+    frame_width: int,
+    frame_height: int,
+) -> None:
+    with st.form(f"edit_roi_region_{region.id}"):
+        left, right = st.columns(2)
+        with left:
+            roi_key = st.text_input("ROI key", value=region.roi_key)
+            roi_type = st.selectbox(
+                "ROI type",
+                ROI_TYPES,
+                index=ROI_TYPES.index(region.roi_type) if region.roi_type in ROI_TYPES else ROI_TYPES.index("unknown"),
+            )
+            label = st.text_input("Label", value=region.label)
+            notes = st.text_area("Notes", value=region.notes, height=70)
+        with right:
+            x = st.number_input("X", min_value=0, value=region.x, step=1)
+            y = st.number_input("Y", min_value=0, value=region.y, step=1)
+            width = st.number_input("Width", min_value=1, value=region.width, step=1)
+            height = st.number_input("Height", min_value=1, value=region.height, step=1)
+            seat_value = region.seat_index or 0
+            card_value = region.card_index or 0
+            seat_index = st.number_input("Seat index (0 = none)", min_value=0, max_value=10, value=seat_value, step=1)
+            card_index = st.number_input("Card index (0 = none)", min_value=0, max_value=5, value=card_value, step=1)
+        update, preview, delete = st.columns(3)
+        submitted_update = update.form_submit_button("Update")
+        submitted_preview = preview.form_submit_button("Preview crop")
+        submitted_delete = delete.form_submit_button("Delete")
+
+    updated = ROIRegion(
+        id=region.id,
+        profile_id=region.profile_id,
+        roi_key=roi_key.strip(),
+        roi_type=roi_type,
+        label=label.strip(),
+        x=int(x),
+        y=int(y),
+        width=int(width),
+        height=int(height),
+        seat_index=int(seat_index) or None,
+        card_index=int(card_index) or None,
+        notes=notes.strip(),
+        created_at=region.created_at,
+    )
+    if submitted_update:
+        try:
+            validate_roi_bounds(updated, image_width=frame_width, image_height=frame_height)
+            db.update_roi_region(updated)
+            st.success("ROI region updated.")
+            st.rerun()
+        except (ValueError, ValidationError) as exc:
+            st.error(f"Could not update ROI region: {exc}")
+    if submitted_preview:
+        try:
+            result = save_roi_crop_preview(frame, updated)
+            st.write(
+                {
+                    "Crop": result.crop_path,
+                    "Size": f"{result.crop_width}x{result.crop_height}",
+                    "Source timestamp": result.source_timestamp_seconds,
+                }
+            )
+            st.image(result.crop_path)
+        except ValueError as exc:
+            st.error(f"Could not preview ROI crop: {exc}")
+    confirm_delete = st.checkbox(
+        f"Confirm delete {region.roi_key}",
+        key=f"confirm_delete_roi_{region.id}",
+    )
+    if submitted_delete:
+        if not confirm_delete:
+            st.warning("Check the delete confirmation box first.")
+            return
+        db.delete_roi_region(region.id)
+        st.success("ROI region deleted.")
+        st.rerun()
+
+
+def _format_bytes(size: int) -> str:
+    units = ["B", "KB", "MB", "GB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{size} B"
+
+
+def _format_optional_seconds(value: float | None) -> str:
+    return "unknown" if value is None else f"{value:.2f}s"
+
+
+def _format_resolution(width: int | None, height: int | None) -> str:
+    if width is None or height is None:
+        return "unknown"
+    return f"{width}x{height}"
 
 
 def _hand_summary_rows(hands: list[Hand]) -> list[dict]:

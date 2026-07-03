@@ -52,6 +52,8 @@ The current app includes:
 - Sample session data
 - JSON export for one hand or a full session
 - JSON import for a full session
+- Completed-session video upload, metadata tracking, frame extraction, and frame preview
+- ROI calibration profiles and crop previews for extracted post-session frames
 
 ## Math Review
 
@@ -86,6 +88,51 @@ streamlit run app.py
 
 If the cloud provider is selected without an API key, the app falls back to the mock provider. API keys are read from the environment and are not stored in SQLite.
 
+## Video Processing
+
+This workflow is strictly for completed post-session videos. It does not capture live tables, detect cards, run OCR, reconstruct actions, or provide real-time advice.
+
+Run the app and open the `Video Processing` tab:
+
+- Upload a completed session video: `.mp4`, `.mov`, `.mkv`, or `.avi`.
+- Optionally link it to the selected session.
+- Save the upload to local disk.
+- Review metadata such as size, duration, FPS, resolution, and frame count.
+- Choose frame extraction settings.
+- Extract frames for preview and future ROI/CV work.
+- Preview representative frames and inspect individual frame paths.
+- Delete extracted frames with the confirmation checkbox.
+
+Local storage:
+
+```text
+data/
+  videos/   uploaded videos
+  frames/   extracted preview frames
+  exports/  future local exports
+  roi_previews/  ROI crop previews
+```
+
+Video files and frames are stored on disk, not inside SQLite. SQLite stores metadata, paths, jobs, and extracted-frame records. The `data/` contents are ignored by git.
+
+## ROI Calibration
+
+ROI calibration is strictly for completed session videos after frames have already been extracted. It does not detect cards, run OCR, reconstruct actions, or analyze a live table.
+
+Run the app and open the `ROI Calibration` tab:
+
+- Select a stored video.
+- Select an extracted frame.
+- Create an empty ROI profile or a ClubWPT Gold starter preset.
+- Add ROI regions with manual `x`, `y`, `width`, and `height` coordinates.
+- Use ROI types such as `hero_card`, `board_card`, `pot`, `player_stack`, `player_bet`, `player_name`, `dealer_button`, `active_indicator`, `action_button`, and `table_area`.
+- Edit or delete saved regions from the selected profile.
+- Generate crop previews for one region or all regions in the profile.
+- Mark a profile as active when it matches the table layout you want to use later.
+- Export/import ROI profiles as JSON from the same tab.
+
+ROI previews are saved under `data/roi_previews/`. SQLite stores only profile metadata, ROI coordinates, and file paths.
+
 ## Sample Data
 
 Run the app and click `Load sample data` in the sidebar.
@@ -105,4 +152,4 @@ In the app, open the `Import / Export` tab:
 
 Individual hands can be exported from the `Review Hands` tab.
 
-Future milestones can add CV, OCR, equity calculators, solver integration, video processing, RAG, and real LLM review generation as separate modules.
+Future milestones can add card detection, OCR, action reconstruction, solver integration, and RAG as separate modules.
