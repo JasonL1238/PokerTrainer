@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Poker Box Labeler</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #111827; color: #e5e7eb; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; }
+    .layout { display: grid; grid-template-columns: 250px minmax(0, 1fr); min-height: 100vh; }
+    aside { padding: 18px; border-right: 1px solid #374151; background: #172033; }
+    main { padding: 18px; min-width: 0; }
+    h1 { font-size: 20px; margin: 0 0 16px; }
+    h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: #9ca3af; margin: 22px 0 8px; }
+    .class-list { display: grid; gap: 6px; }
+    button { color: inherit; background: #263449; border: 1px solid #475569; border-radius: 5px; padding: 8px 10px; cursor: pointer; text-align: left; }
+    button:hover, button.active { background: #334766; border-color: #93c5fd; }
+    .class-button { display: flex; align-items: center; gap: 8px; }
+    .swatch { width: 12px; height: 12px; border-radius: 2px; flex: 0 0 auto; }
+    .key { margin-left: auto; color: #94a3b8; font-size: 12px; }
+    .progress { line-height: 1.7; color: #cbd5e1; font-variant-numeric: tabular-nums; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+    .toolbar button { text-align: center; }
+    .toolbar .primary { border-color: #60a5fa; background: #1d4ed8; }
+    #status { color: #93c5fd; margin-left: auto; }
+    .stage { height: calc(100vh - 84px); min-height: 320px; overflow: hidden; display: grid; place-items: center; background: #0b1020; border: 1px solid #374151; padding: 12px; }
+    #canvas-frame { display: block; position: relative; flex: 0 0 auto; line-height: 0; }
+    #canvas { display: block; width: 100%; height: 100%; background: #111827; cursor: crosshair; }
+    [hidden] { display: none !important; }
+    .empty { display: grid; place-items: center; min-height: 55vh; color: #94a3b8; }
+    .hint { color: #94a3b8; font-size: 12px; line-height: 1.5; }
+    @media (max-width: 720px) { .layout { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #374151; } .class-list { grid-template-columns: repeat(2, minmax(0, 1fr)); } #status { width: 100%; margin-left: 0; } .stage { height: calc(100vh - 360px); } }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside>
+    <h1>Poker Box Labeler</h1>
+    <div class="hint">Choose a class, then drag boxes on the image. Select an existing box and choose a class to relabel it.</div>
+    <h2>Classes</h2>
+    <div id="class-list" class="class-list">
+      {% for class_name in classes %}
+      <button class="class-button" data-class="{{ class_name }}" type="button">
+        <span class="swatch" style="background: {{ colors[class_name] }}"></span>
+        <span>{{ class_name }}</span><span class="key">{{ loop.index }}</span>
+      </button>
+      {% endfor %}
+    </div>
+    <h2>Progress</h2>
+    <div id="progress" class="progress">Loading...</div>
+    <h2>Shortcuts</h2>
+    <div class="hint">Enter save + next<br>K mark clean<br>X exclude duplicate<br>S skip without saving<br>Left/Right seek<br>D delete, Z undo</div>
+  </aside>
+  <main>
+    <div class="toolbar">
+      <button id="prev" type="button">Previous</button>
+      <button id="next" type="button">Next undecided</button>
+      <button id="save" class="primary" type="button">Save + next</button>
+      <button id="clean" type="button">Mark clean</button>
+      <button id="duplicate" type="button">Exclude duplicate</button>
+      <span id="status">No image loaded</span>
+    </div>
+    <div id="stage" class="stage"><div class="empty">Put images in labeling_poker/data/images, then reload.</div><div id="canvas-frame" hidden><canvas id="canvas"></canvas></div></div>
+  </main>
+</div>
+<script>window.LABELER_CONFIG = {{ {"classes": classes, "colors": colors}|tojson }};</script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
