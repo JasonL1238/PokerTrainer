@@ -10,9 +10,20 @@
 
   function cloneBoxes() { return state.boxes.map((box) => ({ ...box })); }
   function remember() { state.history.push(cloneBoxes()); if (state.history.length > 40) state.history.shift(); }
+  function canonicalCardLabel(label) {
+    if (label === undefined || label === null) return undefined;
+    let text = String(label).trim();
+    if (!text || text.toLowerCase() === "joker") return undefined;
+    if (text.slice(0, 2) === "10") text = "T" + text.slice(2);
+    if (text.length === 2) text = text[0].toUpperCase() + text[1].toLowerCase();
+    return text.length === 2 && config.cardRanks.includes(text[0]) && config.cardSuits.includes(text[1]) ? text : undefined;
+  }
   function normalize(box) {
     const x1 = Math.min(box.x1, box.x2), y1 = Math.min(box.y1, box.y2);
-    return { ...box, x1, y1, x2: Math.max(box.x1, box.x2), y2: Math.max(box.y1, box.y2) };
+    const out = { ...box, x1, y1, x2: Math.max(box.x1, box.x2), y2: Math.max(box.y1, box.y2) };
+    const canonical = out.class === config.cardLabelClass ? canonicalCardLabel(out.label) : undefined;
+    if (canonical) out.label = canonical; else delete out.label;
+    return out;
   }
   function clampPoint(point) { return { x: Math.max(0, Math.min(canvas.width, point.x)), y: Math.max(0, Math.min(canvas.height, point.y)) }; }
   function pointerToImage(event) {
@@ -51,6 +62,39 @@
       const box = normalize({ x1: state.pointer.start.x, y1: state.pointer.start.y, x2: state.pointer.current.x, y2: state.pointer.current.y });
       ctx.strokeStyle = config.colors[state.activeClass]; ctx.setLineDash([6, 4]); ctx.strokeRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1); ctx.setLineDash([]);
     }
+    refreshCardPicker();
+  }
+  function selectedCardBox() {
+    const box = state.selected >= 0 ? state.boxes[state.selected] : null;
+    return box && box.class === config.cardLabelClass ? box : null;
+  }
+  function refreshCardPicker() {
+    const picker = $("card-picker");
+    if (!picker) return;
+    const box = selectedCardBox();
+    picker.dataset.disabled = box ? "false" : "true";
+    const label = box && box.label ? box.label : "";
+    const rank = label.slice(0, 1), suit = label.slice(1, 2);
+    $("card-current").innerHTML = box
+      ? (label ? `Card: <b>${label}</b>` : "Pick a rank and suit")
+      : "Select a face_card box";
+    document.querySelectorAll(".rank-button").forEach((b) => b.classList.toggle("active", !!box && b.dataset.rank === rank));
+    document.querySelectorAll(".suit-button").forEach((b) => b.classList.toggle("active", !!box && b.dataset.suit === suit));
+  }
+  function setCardPart(kind, value) {
+    const box = selectedCardBox();
+    if (!box) return;
+    remember();
+    let rank = box.label ? box.label.slice(0, 1) : "";
+    let suit = box.label ? box.label.slice(1, 2) : "";
+    if (kind === "rank") rank = value; else suit = value;
+    if (rank && suit) box.label = rank + suit; else delete box.label;
+    draw();
+  }
+  function clearCardLabel() {
+    const box = selectedCardBox();
+    if (!box || !box.label) return;
+    remember(); delete box.label; draw();
   }
   function setActiveClass(name, relabelSelected) {
     state.activeClass = name;
@@ -121,6 +165,9 @@
   });
   canvas.addEventListener("pointerup", (event) => { if (!state.pointer) return; const p = state.pointer; if (p.mode === "draw") { const point = pointerToImage(event), box = normalize({ class: state.activeClass, x1: p.start.x, y1: p.start.y, x2: point.x, y2: point.y }); if (box.x2 - box.x1 >= 2 && box.y2 - box.y1 >= 2) { remember(); state.boxes.push(box); state.selected = state.boxes.length - 1; } } state.pointer = null; draw(); });
   document.querySelectorAll(".class-button").forEach((button) => button.addEventListener("click", () => setActiveClass(button.dataset.class, state.selected >= 0)));
+  document.querySelectorAll(".rank-button").forEach((button) => button.addEventListener("click", () => setCardPart("rank", button.dataset.rank)));
+  document.querySelectorAll(".suit-button").forEach((button) => button.addEventListener("click", () => setCardPart("suit", button.dataset.suit)));
+  $("card-clear").addEventListener("click", clearCardLabel);
   $("prev").addEventListener("click", () => seek("prev")); $("next").addEventListener("click", loadNext); $("save").addEventListener("click", () => save("labeled", true)); $("clean").addEventListener("click", () => save("clean", true)); $("duplicate").addEventListener("click", () => save("duplicate", true));
   document.addEventListener("keydown", (event) => {
     if (event.target.matches("input, textarea, select")) return;

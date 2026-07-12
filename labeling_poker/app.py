@@ -7,12 +7,17 @@ from pathlib import Path
 from flask import Flask, jsonify, render_template, request, send_file
 
 from .config import (
+    CARD_LABEL_CLASS,
+    CARD_RANKS,
+    CARD_SUIT_SYMBOLS,
+    CARD_SUITS,
     CLASSES,
     CLASS_COLORS,
     DEFAULT_DB_PATH,
     DEFAULT_IMAGES_DIR,
     DEFAULT_PRIORITY_DIR,
     EXISTING_DATASET_IMAGES_DIR,
+    normalize_card_label,
 )
 from .db import (
     connect,
@@ -57,7 +62,15 @@ def create_app(db_path: Path | str = DEFAULT_DB_PATH, images_dir: Path | str = D
     @app.get("/")
     def index():
         refresh()
-        return render_template("index.html", classes=CLASSES, colors=CLASS_COLORS)
+        return render_template(
+            "index.html",
+            classes=CLASSES,
+            colors=CLASS_COLORS,
+            card_label_class=CARD_LABEL_CLASS,
+            card_ranks=CARD_RANKS,
+            card_suits=CARD_SUITS,
+            card_suit_symbols=CARD_SUIT_SYMBOLS,
+        )
 
     @app.get("/image/<file_id>")
     def image(file_id: str):
@@ -120,7 +133,11 @@ def create_app(db_path: Path | str = DEFAULT_DB_PATH, images_dir: Path | str = D
                     return jsonify({"error": "invalid box"}), 400
                 if class_name not in CLASSES or values[2] <= values[0] or values[3] <= values[1]:
                     return jsonify({"error": "invalid class or box geometry"}), 400
-                clean_boxes.append({"class": class_name, "label": box.get("label"), **dict(zip(("x1", "y1", "x2", "y2"), values))})
+                try:
+                    label = normalize_card_label(class_name, box.get("label"))
+                except ValueError as exc:
+                    return jsonify({"error": str(exc)}), 400
+                clean_boxes.append({"class": class_name, "label": label, **dict(zip(("x1", "y1", "x2", "y2"), values))})
             if status_value in {"clean", "duplicate"} and clean_boxes:
                 return jsonify({"error": "clean or duplicate images cannot have boxes"}), 400
             save_annotations(connection, file_id, status_value, clean_boxes)

@@ -6,8 +6,7 @@ names:
   0: face_card
   1: card_back
   2: dealer_button
-  3: stack_text
-  4: bet_text
-  5: pot_text
-  6: player_name_text
-  7: active_turn_indicator
+  3: pot_text
+  4: stack_text
+  5: action_pill
+  6: active_turn_indicator

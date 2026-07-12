@@ -20,6 +20,18 @@
     .swatch { width: 12px; height: 12px; border-radius: 2px; flex: 0 0 auto; }
     .key { margin-left: auto; color: #94a3b8; font-size: 12px; }
     .progress { line-height: 1.7; color: #cbd5e1; font-variant-numeric: tabular-nums; }
+    .card-picker[data-disabled="true"] { opacity: .45; pointer-events: none; }
+    .card-current { font-size: 13px; color: #cbd5e1; margin-bottom: 8px; min-height: 18px; font-variant-numeric: tabular-nums; }
+    .card-current b { color: #fde68a; font-size: 15px; }
+    .pick-grid { display: grid; gap: 4px; margin-bottom: 6px; }
+    .rank-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+    .suit-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .pick-button { text-align: center; padding: 6px 0; font-weight: 600; }
+    .pick-button.active { background: #334766; border-color: #fbbf24; color: #fde68a; }
+    .suit-button { font-size: 16px; line-height: 1; }
+    .suit-s, .suit-c { color: #e5e7eb; }
+    .suit-h, .suit-d { color: #f87171; }
+    .card-clear { width: 100%; text-align: center; font-size: 12px; margin-top: 2px; }
     .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
     .toolbar button { text-align: center; }
     .toolbar .primary { border-color: #60a5fa; background: #1d4ed8; }
@@ -47,6 +59,21 @@
       </button>
       {% endfor %}
     </div>
+    <h2>Card (rank + suit)</h2>
+    <div id="card-picker" class="card-picker" data-disabled="true">
+      <div id="card-current" class="card-current">Select a face_card box</div>
+      <div id="rank-list" class="pick-grid rank-grid">
+        {% for rank in card_ranks %}
+        <button class="pick-button rank-button" data-rank="{{ rank }}" type="button">{{ rank }}</button>
+        {% endfor %}
+      </div>
+      <div id="suit-list" class="pick-grid suit-grid">
+        {% for suit in card_suits %}
+        <button class="pick-button suit-button suit-{{ suit }}" data-suit="{{ suit }}" type="button">{{ card_suit_symbols[suit] }}</button>
+        {% endfor %}
+      </div>
+      <button id="card-clear" class="card-clear" type="button">Clear card label</button>
+    </div>
     <h2>Progress</h2>
     <div id="progress" class="progress">Loading...</div>
     <h2>Shortcuts</h2>
@@ -64,7 +91,7 @@
     <div id="stage" class="stage"><div class="empty">Put images in labeling_poker/data/images, then reload.</div><div id="canvas-frame" hidden><canvas id="canvas"></canvas></div></div>
   </main>
 </div>
-<script>window.LABELER_CONFIG = {{ {"classes": classes, "colors": colors}|tojson }};</script>
+<script>window.LABELER_CONFIG = {{ {"classes": classes, "colors": colors, "cardLabelClass": card_label_class, "cardRanks": card_ranks, "cardSuits": card_suits, "cardSuitSymbols": card_suit_symbols}|tojson }};</script>
 <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>

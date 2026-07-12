@@ -3,6 +3,22 @@ __pycache__/
 .venv/
 *.pyc
 poker_tracker.db
+
+# Tool caches / local config
+.mpl_config/
+.yolo_config/
+
+# Labeling tool local data (labels DB + captured images)
+labeling_poker/data/
+
+# CV research data & artifacts (code lives in cv_lab/scripts and cv_lab/notes)
+cv_lab/crops/
+cv_lab/datasets/
+cv_lab/frames/
+cv_lab/hand01/
+cv_lab/harvest/
+cv_lab/models/
+cv_lab/results/
 data/*
 !data/.gitkeep
 !data/videos/
