@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from poker_tracker.analytics import compute_session_stats
 from poker_tracker.coaching_prompts import build_hand_review_prompt, build_session_review_prompt
 from poker_tracker.db import DEFAULT_DB_PATH, PokerDatabase
-from poker_tracker.equity import PlaceholderEquityCalculator
+from poker_tracker.equity import get_equity_calculator
 from poker_tracker.ev import bluff_ev, call_ev
 from poker_tracker.frame_extraction import (
     delete_extracted_frames,
@@ -505,7 +505,7 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
     with first:
         pot_before_call = st.number_input("Pot before call", min_value=0.0, step=1.0)
         call_amount = st.number_input("Call amount", min_value=0.0, step=1.0)
-        use_placeholder_equity = st.checkbox("Use placeholder equity estimate", value=True)
+        compute_equity = st.checkbox("Compute Hero equity vs range", value=True)
     with second:
         pot_size = st.number_input("Pot size for bet/bluff", min_value=0.0, step=1.0)
         bet_size = st.number_input("Bet size", min_value=0.0, step=1.0)
@@ -531,18 +531,21 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
         except ValueError as exc:
             errors.append(str(exc))
 
-    if use_placeholder_equity and hand.hero_cards:
+    if compute_equity and hand.hero_cards:
         try:
-            equity_result = PlaceholderEquityCalculator().calculate_equity(
+            equity_result = get_equity_calculator().calculate_equity(
                 hand.hero_cards,
                 hand.board_cards,
                 range_label,
             )
-            math_facts["placeholder_equity"] = equity_result.equity or "unavailable"
-            st.write(
-                f"Placeholder equity: {format_percentage(equity_result.equity or 0)} "
-                f"(confidence {format_percentage(equity_result.confidence)})"
-            )
+            math_facts["equity"] = equity_result.equity or "unavailable"
+            if equity_result.equity is None:
+                st.write(f"Equity vs {range_label}: unavailable ({equity_result.method})")
+            else:
+                st.write(
+                    f"Equity vs {range_label}: {format_percentage(equity_result.equity)} "
+                    f"({equity_result.method}, confidence {format_percentage(equity_result.confidence)})"
+                )
             st.caption(equity_result.notes)
         except ValueError as exc:
             errors.append(str(exc))
