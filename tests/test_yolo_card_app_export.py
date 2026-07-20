@@ -69,27 +69,46 @@ def test_timeline_to_session_payload_exports_only_valid_complete_hands() -> None
 
 
 def test_timeline_to_session_payload_skips_validation_warning_hands() -> None:
+    # A mid-hand board regression (board vanishes then comes back) is a real
+    # sequence problem and must keep blocking export. (A transient state-level
+    # duplicate that the hand's final voted cards resolve no longer warns.)
     timeline = {
         "states": [
             {
                 "time_s": 1.0,
                 "image": "a.jpg",
-                "hero_cards": ["AS", "AS"],
+                "hero_cards": ["AS", "10H"],
                 "board_cards": ["QD", "7S", "2C"],
                 "other_cards": [],
                 "missing": None,
-            }
+            },
+            {
+                "time_s": 2.0,
+                "image": "b.jpg",
+                "hero_cards": ["AS", "10H"],
+                "board_cards": [],
+                "other_cards": [],
+                "missing": None,
+            },
+            {
+                "time_s": 3.0,
+                "image": "c.jpg",
+                "hero_cards": ["AS", "10H"],
+                "board_cards": ["QD", "7S", "2C"],
+                "other_cards": [],
+                "missing": None,
+            },
         ],
         "hands": [
             {
                 "hand_number": 1,
                 "t_start": 1.0,
-                "t_end": 1.0,
+                "t_end": 3.0,
                 "hero": ["AS", "10H"],
                 "board": ["QD", "7S", "2C"],
                 "complete_cards": True,
                 "warnings": [],
-                "source_images": ["a.jpg"],
+                "source_images": ["a.jpg", "b.jpg", "c.jpg"],
             }
         ],
     }

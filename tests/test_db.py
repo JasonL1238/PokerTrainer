@@ -188,3 +188,85 @@ def test_validation_catches_bad_cards_and_action_types() -> None:
 
     with pytest.raises(ValidationError):
         Action(hand_id=1, street="preflop", player_name="Hero", action_type="punt")
+
+
+def test_transaction_commits_grouped_writes() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Test session"))
+
+    with db.transaction():
+        hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+        db.create_hand_player(HandPlayer(hand_id=hand.id, player_name="Hero", is_hero=True))
+        db.create_action(
+            Action(hand_id=hand.id, street="preflop", player_name="Hero", action_type="call")
+        )
+
+    assert len(db.fetch_hands_by_session(session.id)) == 1
+    assert len(db.fetch_players_by_hand(hand.id)) == 1
+    assert len(db.fetch_actions_by_hand(hand.id)) == 1
+
+    db.close()
+
+
+def test_transaction_rolls_back_all_writes_on_error() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Test session"))
+
+    with pytest.raises(RuntimeError):
+        with db.transaction():
+            hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+            db.create_action(
+                Action(hand_id=hand.id, street="preflop", player_name="Hero", action_type="call")
+            )
+            raise RuntimeError("boom")
+
+    # The hand and action from the failed transaction must not be persisted.
+    assert db.fetch_hands_by_session(session.id) == []
+
+    db.close()
+
+
+def test_nested_transactions_defer_to_outermost() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Test session"))
+
+    with pytest.raises(RuntimeError):
+        with db.transaction():
+            with db.transaction():
+                db.create_hand(Hand(session_id=session.id, hand_number=1))
+            raise RuntimeError("outer failure after inner success")
+
+    assert db.fetch_hands_by_session(session.id) == []
+
+    db.close()
+
+
+def test_delete_session_cascades_hands_and_actions() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Test session"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+    db.create_action(
+        Action(hand_id=hand.id, street="preflop", player_name="Hero", action_type="win")
+    )
+
+    db.delete_session(session.id)
+
+    assert db.fetch_session(session.id) is None
+    assert db.fetch_hands_by_session(session.id) == []
+    assert db.fetch_actions_by_hand(hand.id) == []
+
+    db.close()
+
+
+def test_init_db_refuses_newer_schema_version() -> None:
+    db = make_db()
+    db._execute(
+        "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
+        (str(SCHEMA_VERSION + 1),),
+    )
+    db._commit()
+
+    with pytest.raises(RuntimeError, match="newer"):
+        db.init_db()
+
+    db.close()

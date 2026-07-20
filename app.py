@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import date
+from pathlib import Path
 
 import streamlit as st
 from pydantic import ValidationError
@@ -23,11 +25,25 @@ from poker_tracker.llm_providers import (
     LLMProviderError,
     build_coaching_response,
     get_provider_from_env,
-    provider_config_from_env,
 )
 from poker_tracker.models import Action, HAND_TAGS, Hand, HandPlayer, ROIProfile, ROIRegion, Session, VideoRecord
-from poker_tracker.pot_odds import break_even_bluff_frequency, format_percentage, required_equity_to_call
+from poker_tracker.pot_odds import (
+    break_even_bluff_frequency,
+    format_percentage,
+    minimum_defense_frequency,
+    required_equity_to_call,
+)
+from poker_tracker.icm import icm_equities, icm_risk_premium
+from poker_tracker.preflop_ranges import available_ranges
 from poker_tracker.ranges import RANGE_LABELS, estimate_villain_range_label
+from poker_tracker.study_math import (
+    REALIZATION_FACTOR_GUIDE,
+    bluff_to_value_ratio,
+    optimal_bluff_fraction,
+    outs_to_equity_exact,
+    outs_to_equity_rule,
+    realized_equity,
+)
 from poker_tracker.review import generate_mock_review
 from poker_tracker.roi import ROI_TYPES, validate_roi_bounds
 from poker_tracker.roi_profiles import (
@@ -38,6 +54,7 @@ from poker_tracker.roi_profiles import (
     import_roi_profile,
 )
 from poker_tracker.safety import validate_post_session_prompt
+from poker_tracker.ui_theme import brand_header, inject_theme
 from poker_tracker.seed_data import create_sample_data
 from poker_tracker.video_metadata import extract_video_metadata
 from poker_tracker.video_storage import ensure_data_directories, save_video_file, validate_video_extension
@@ -48,6 +65,7 @@ ACTION_TYPES = ["fold", "check", "call", "bet", "raise", "all-in", "post_blind",
 POSITIONS = ["", "UTG", "UTG+1", "LJ", "HJ", "CO", "BTN", "SB", "BB"]
 REVIEW_STATUSES = ["unreviewed", "reviewed", "needs_correction"]
 COACHING_MODES = ["Theory + Exploit", "Theory Only", "Exploit Only", "Leak Finder"]
+MAX_IMPORT_BYTES = 10 * 1024 * 1024  # sane ceiling for JSON imports; videos have their own path
 
 
 @st.cache_resource
@@ -57,10 +75,37 @@ def get_database() -> PokerDatabase:
     return db
 
 
+@st.cache_data(show_spinner=False)
+def _cached_equity(hero_cards: str, board_cards: str, range_label: str):
+    """Cache equity results: exact enumeration/MC is CPU-heavy and pure."""
+    return get_equity_calculator().calculate_equity(hero_cards, board_cards, range_label)
+
+
+@st.cache_data(show_spinner=False)
+def _cached_multiway_equity(hero_cards: str, board_cards: str, villain_ranges: tuple[str, ...]):
+    calculator = get_equity_calculator()
+    if not hasattr(calculator, "calculate_equity_multiway"):
+        return None  # placeholder engine (eval7 missing) has no multiway support
+    return calculator.calculate_equity_multiway(hero_cards, board_cards, list(villain_ranges))
+
+
+def flash(message: str, icon: str = "✅") -> None:
+    """Queue a confirmation that survives the st.rerun() after a state change."""
+    st.session_state["_flash"] = (message, icon)
+
+
+def show_flash() -> None:
+    queued = st.session_state.pop("_flash", None)
+    if queued:
+        message, icon = queued
+        st.toast(message, icon=icon)
+
+
 def main() -> None:
-    st.set_page_config(page_title="Poker Trainer", layout="wide")
-    st.title("Manual Post-Session Review")
-    st.caption("Completed-hand study only. No real-time assistance, capture, overlays, or hotkeys.")
+    st.set_page_config(page_title="PokerTrainer", page_icon="♠", layout="wide")
+    inject_theme()
+    brand_header()
+    show_flash()
 
     db = get_database()
 
@@ -68,9 +113,12 @@ def main() -> None:
         st.header("Session")
         create_session_form(db)
         if st.button("Load sample data"):
-            create_sample_data(db)
-            st.success("Sample session loaded.")
-            st.rerun()
+            if any(session.name == "Sample post-session review" for session in db.fetch_sessions()):
+                st.warning("Sample data is already loaded.")
+            else:
+                create_sample_data(db)
+                flash("Sample session loaded.")
+                st.rerun()
         selected_session = select_session(db)
 
     if selected_session is None:
@@ -129,7 +177,7 @@ def create_session_form(db: PokerDatabase) -> None:
                 notes=notes.strip(),
             )
         )
-        st.success("Session created.")
+        flash("Session created.")
         st.rerun()
 
 
@@ -158,29 +206,76 @@ def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
     if session.id is None:
         return
     stats = compute_session_stats(db, session.id)
-    st.subheader(f"{session.name} - basic/manual stats")
+    st.subheader(session.name)
+    st.caption(f"{session.date_played} · {session.stakes or 'stakes not set'} · {session.platform or 'platform not set'}")
+
     first, second, third, fourth = st.columns(4)
     first.metric("Hands", stats.hand_count)
     second.metric("Hero result", f"{stats.total_hero_bb:g} BB")
-    third.metric("Average / hand", f"{stats.average_hero_bb:g} BB")
+    winrate_help = (
+        f"{stats.average_hero_bb:+.2f} BB/hand over {stats.hands_with_result} hands with recorded results"
+    )
+    if stats.bb_per_100_ci is not None:
+        ci_low, ci_high = stats.bb_per_100_ci
+        winrate_help += (
+            f". 95% CI: {ci_low:+.0f} to {ci_high:+.0f} bb/100 — small samples say little about a true winrate."
+        )
+    third.metric("Winrate", f"{stats.bb_per_100:+.0f} bb/100", help=winrate_help)
     fourth.metric("Reviewed", stats.hands_by_review_status.get("reviewed", 0))
 
-    st.write(
-        {
-            "Unreviewed": stats.hands_by_review_status.get("unreviewed", 0),
-            "Needs correction": stats.hands_by_review_status.get("needs_correction", 0),
-            "Aggressive actions": stats.aggression_count,
-            "Passive actions": stats.passive_count,
-        }
-    )
-    st.markdown("##### Biggest Winning Hands")
-    st.dataframe(_hand_summary_rows(stats.biggest_winning_hands), hide_index=True)
-    st.markdown("##### Biggest Losing Hands")
-    st.dataframe(_hand_summary_rows(stats.biggest_losing_hands), hide_index=True)
-    st.markdown("##### Tag Counts")
-    st.write(stats.hands_by_tag or {})
-    st.markdown("##### Action Counts")
-    st.write(stats.action_counts_by_type or {})
+    fifth, sixth, seventh, eighth = st.columns(4)
+    fifth.metric("Unreviewed", stats.hands_by_review_status.get("unreviewed", 0))
+    sixth.metric("Needs correction", stats.hands_by_review_status.get("needs_correction", 0))
+    seventh.metric("Aggressive actions", stats.aggression_count)
+    eighth.metric("Passive actions", stats.passive_count)
+
+    if stats.hand_count == 0:
+        st.info("No hands recorded yet. Add hands in the Enter Hand tab to see session stats.")
+        return
+
+    winning_col, losing_col = st.columns(2)
+    with winning_col:
+        st.markdown("##### Biggest Winning Hands")
+        st.dataframe(_hand_summary_rows(stats.biggest_winning_hands), hide_index=True, width="stretch")
+    with losing_col:
+        st.markdown("##### Biggest Losing Hands")
+        st.dataframe(_hand_summary_rows(stats.biggest_losing_hands), hide_index=True, width="stretch")
+
+    tags_col, actions_col = st.columns(2)
+    with tags_col:
+        st.markdown("##### Tag Counts")
+        if stats.hands_by_tag:
+            st.dataframe(
+                [{"Tag": tag, "Hands": count} for tag, count in sorted(stats.hands_by_tag.items(), key=lambda item: -item[1])],
+                hide_index=True,
+                width="stretch",
+            )
+        else:
+            st.caption("No tags applied yet.")
+    with actions_col:
+        st.markdown("##### Action Counts")
+        if stats.action_counts_by_type:
+            st.dataframe(
+                [{"Action": action, "Count": count} for action, count in sorted(stats.action_counts_by_type.items(), key=lambda item: -item[1])],
+                hide_index=True,
+                width="stretch",
+            )
+        else:
+            st.caption("No street actions recorded yet.")
+
+    with st.expander("Danger zone: delete this session"):
+        st.warning(
+            f"Deleting **{session.name}** removes all {stats.hand_count} hands, actions, and "
+            "reviews in it. Uploaded videos are kept but unlinked. This cannot be undone."
+        )
+        confirm = st.checkbox(
+            "I understand this permanently deletes the session and its hands.",
+            key=f"confirm_delete_session_{session.id}",
+        )
+        if st.button("Delete session", disabled=not confirm, key=f"delete_session_{session.id}"):
+            db.delete_session(session.id)
+            flash(f"Session '{session.name}' deleted.", icon="🗑️")
+            st.rerun()
 
 
 def create_hand_form(db: PokerDatabase, session_id: int | None) -> None:
@@ -188,21 +283,26 @@ def create_hand_form(db: PokerDatabase, session_id: int | None) -> None:
         st.error("Select a saved session before adding hands.")
         return
 
-    with st.form("create_hand", clear_on_submit=True):
+    existing_hands = db.fetch_hands_by_session(session_id)
+    next_hand_number = max((hand.hand_number for hand in existing_hands), default=0) + 1
+
+    # clear_on_submit=False so a validation error does not wipe the user's work;
+    # the form and editors are reset explicitly after a successful save.
+    with st.form("create_hand", clear_on_submit=False):
         st.markdown("#### Hand Setup")
         setup_left, setup_right = st.columns(2)
         with setup_left:
-            hand_number = st.number_input("Hand number", min_value=1, step=1)
+            hand_number = st.number_input("Hand number", min_value=1, step=1, value=next_hand_number)
             game_type = st.text_input("Game type", value="No-limit Hold'em")
             blinds_antes = st.text_input("Blinds / antes", placeholder="1/2 NL, 0.25 ante")
             table_size = st.number_input("Table size", min_value=2, max_value=10, value=6, step=1)
-            effective_stack = st.number_input("Effective stack", min_value=0.0, step=1.0)
+            effective_stack = st.number_input("Effective stack (BB)", min_value=0.0, step=1.0)
             source_type = st.selectbox("Source", ["manual", "cv_import", "corrected_cv"])
         with setup_right:
             hero_position = st.selectbox("Hero position", POSITIONS, index=6)
             hero_cards = st.text_input("Hero cards", placeholder="Ah Qs")
             board_cards = st.text_input("Board cards", placeholder="Qd 7s 2c 9h 3s")
-            pot_size = st.number_input("Final pot size", min_value=0.0, step=1.0)
+            pot_size = st.number_input("Final pot size (BB)", min_value=0.0, step=1.0)
             hero_bb_won = st.number_input("Final result in BB", step=0.5)
             result = st.text_input("Result text", placeholder="Hero wins")
             review_status = st.selectbox("Review status", REVIEW_STATUSES)
@@ -218,33 +318,43 @@ def create_hand_form(db: PokerDatabase, session_id: int | None) -> None:
         submitted = st.form_submit_button("Save hand")
 
     if submitted:
+        if any(hand.hand_number == int(hand_number) for hand in existing_hands):
+            st.error(f"Hand #{int(hand_number)} already exists in this session. Pick a different number.")
+            return
         try:
-            saved_hand = db.create_hand(
-                Hand(
-                    session_id=session_id,
-                    hand_number=int(hand_number),
-                    game_type=game_type.strip(),
-                    blinds_antes=blinds_antes.strip(),
-                    table_size=int(table_size),
-                    effective_stack=float(effective_stack),
-                    hero_position=hero_position,
-                    hero_cards=hero_cards,
-                    board_cards=board_cards,
-                    pot_size=float(pot_size),
-                    result=result.strip(),
-                    hero_bb_won=float(hero_bb_won),
-                    review_status=review_status,
-                    source_type=source_type,
-                    tags=tags,
-                    notes=notes.strip(),
+            # One transaction: a validation error in any player/action row rolls
+            # back the whole hand instead of persisting a partial save.
+            with db.transaction():
+                saved_hand = db.create_hand(
+                    Hand(
+                        session_id=session_id,
+                        hand_number=int(hand_number),
+                        game_type=game_type.strip(),
+                        blinds_antes=blinds_antes.strip(),
+                        table_size=int(table_size),
+                        effective_stack=float(effective_stack),
+                        hero_position=hero_position,
+                        hero_cards=hero_cards,
+                        board_cards=board_cards,
+                        pot_size=float(pot_size),
+                        result=result.strip(),
+                        hero_bb_won=float(hero_bb_won),
+                        review_status=review_status,
+                        source_type=source_type,
+                        tags=tags,
+                        notes=notes.strip(),
+                    )
                 )
-            )
-            save_player_rows(db, saved_hand.id, player_rows)
-            save_action_rows(db, saved_hand.id, action_rows)
+                save_player_rows(db, saved_hand.id, player_rows)
+                save_action_rows(db, saved_hand.id, action_rows)
         except (ValidationError, ValueError) as exc:
             st.error(f"Could not save hand: {exc}")
             return
-        st.success("Hand saved.")
+        # Reset the data editors explicitly: clear_on_submit does not cover them,
+        # and stale rows would leak into the next hand.
+        for editor_key in ["players_editor", *(f"{street}_actions_editor" for street in STREETS)]:
+            st.session_state.pop(editor_key, None)
+        flash(f"Hand #{int(hand_number)} saved.")
         st.rerun()
 
 
@@ -257,10 +367,10 @@ def collect_player_inputs() -> list[dict]:
         ],
         num_rows="dynamic",
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
         column_config={
             "Position": st.column_config.SelectboxColumn("Position", options=POSITIONS),
-            "Starting stack": st.column_config.NumberColumn("Starting stack", min_value=0),
+            "Starting stack": st.column_config.NumberColumn("Starting stack (BB)", min_value=0),
             "Hero?": st.column_config.CheckboxColumn("Hero?"),
         },
         key="players_editor",
@@ -285,14 +395,14 @@ def collect_action_inputs() -> list[dict]:
                 _default_action_rows(street),
                 num_rows="dynamic",
                 hide_index=True,
-                use_container_width=True,
+                width="stretch",
                 column_config={
                     "Player": st.column_config.TextColumn("Player"),
                     "Position": st.column_config.SelectboxColumn("Position", options=POSITIONS),
                     "Action": st.column_config.SelectboxColumn("Action", options=ACTION_TYPES),
-                    "Amount": st.column_config.NumberColumn("Amount", min_value=0),
-                    "Pot before": st.column_config.NumberColumn("Pot before", min_value=0),
-                    "Stack before": st.column_config.NumberColumn("Stack before", min_value=0),
+                    "Amount": st.column_config.NumberColumn("Amount (BB)", min_value=0),
+                    "Pot before": st.column_config.NumberColumn("Pot before (BB)", min_value=0),
+                    "Stack before": st.column_config.NumberColumn("Stack before (BB)", min_value=0),
                     "Notes": st.column_config.TextColumn("Notes"),
                 },
                 key=f"{street}_actions_editor",
@@ -342,14 +452,33 @@ def show_saved_hands(db: PokerDatabase, session: Session) -> None:
         st.info("No hands saved for this session yet.")
         return
 
-    for hand in hands:
+    filter_col, page_col = st.columns([3, 1])
+    with filter_col:
+        status_filter = st.multiselect(
+            "Filter by review status", REVIEW_STATUSES, default=[], placeholder="All statuses"
+        )
+    if status_filter:
+        hands = [hand for hand in hands if hand.review_status in status_filter]
+    if not hands:
+        st.caption("No hands match the selected filters.")
+        return
+
+    # Paginate so large sessions do not render (and query) every hand each rerun.
+    page_size = 10
+    total_pages = (len(hands) + page_size - 1) // page_size
+    with page_col:
+        page = st.number_input("Page", min_value=1, max_value=total_pages, value=1, step=1)
+    start = (int(page) - 1) * page_size
+    st.caption(f"Showing hands {start + 1}–{min(start + page_size, len(hands))} of {len(hands)}")
+
+    for hand in hands[start : start + page_size]:
         if hand.id is None:
             continue
         players = db.fetch_players_by_hand(hand.id)
         actions = db.fetch_actions_by_hand(hand.id)
         with st.expander(
             f"Hand #{hand.hand_number}: {hand.hero_cards or 'unknown cards'} "
-            f"{hand.hero_bb_won or 0:g} BB [{hand.review_status}]"
+            f"{hand.hero_bb_won or 0:+g} BB [{hand.review_status}]"
         ):
             st.code(format_hand_history(session, hand, actions, players), language="text")
 
@@ -369,7 +498,7 @@ def show_saved_hands(db: PokerDatabase, session: Session) -> None:
                 review = generate_mock_review(hand, actions, players)
                 db.create_hand_review(review)
                 db.update_hand_status(hand.id, "reviewed")
-                st.success("Mock review saved.")
+                flash("Mock review saved.")
                 st.rerun()
 
             for review in db.fetch_reviews_by_hand(hand.id):
@@ -423,11 +552,14 @@ def show_action_editor(db: PokerDatabase, actions: list[Action]) -> None:
             action_type = cols[3].selectbox(
                 "Action", ACTION_TYPES, index=ACTION_TYPES.index(action.action_type)
             )
-            amount = cols[4].number_input("Amount", min_value=0.0, value=action.amount or 0.0)
+            amount = cols[4].number_input("Amount (BB)", min_value=0.0, value=action.amount)
             action_index = cols[5].number_input(
                 "Order", min_value=1, value=action.action_index or 1, step=1
             )
             notes = cols[6].text_input("Notes", value=action.notes)
+            pot_col, stack_col = st.columns(2)
+            pot_before = pot_col.number_input("Pot before (BB)", min_value=0.0, value=action.pot_before)
+            stack_before = stack_col.number_input("Stack before (BB)", min_value=0.0, value=action.stack_before)
             update, delete = st.columns(2)
             submitted_update = update.form_submit_button("Update action")
             submitted_delete = delete.form_submit_button("Delete action")
@@ -443,6 +575,8 @@ def show_action_editor(db: PokerDatabase, actions: list[Action]) -> None:
                     position=position,
                     action_type=action_type,
                     amount=amount,
+                    pot_before=pot_before,
+                    stack_before=stack_before,
                     notes=notes,
                 )
             )
@@ -463,9 +597,21 @@ def show_import_export(db: PokerDatabase, session: Session) -> None:
     )
     uploaded = st.file_uploader("Import session JSON", type=["json"])
     if uploaded is not None and st.button("Import uploaded session"):
-        payload = json.loads(uploaded.getvalue().decode("utf-8"))
-        imported = import_session(db, payload)
-        st.success(f"Imported session: {imported.name}")
+        raw = uploaded.getvalue()
+        if len(raw) > MAX_IMPORT_BYTES:
+            st.error(f"Import file is too large ({len(raw) / 1_048_576:.0f} MB). Limit is 10 MB.")
+            return
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            st.error(f"That file is not valid JSON: {exc}")
+            return
+        try:
+            imported = import_session(db, payload)
+        except (ValidationError, KeyError, ValueError) as exc:
+            st.error(f"Import failed — the file does not match the expected session format. {exc}")
+            return
+        flash(f"Imported session: {imported.name}")
         st.rerun()
 
 
@@ -500,69 +646,148 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
         options=range_options,
         index=range_options.index(default_range),
     )
+    baseline_options = {"(none)": None} | {
+        f"{chart.position} {chart.scenario.replace('_', ' ')} — {chart.description}": chart
+        for chart in available_ranges()
+    }
+    baseline_choice = st.selectbox(
+        "Positional baseline (optional, overrides the label)",
+        options=list(baseline_options.keys()),
+        help="100bb 9-max study charts — a defensible starting point, not solver output.",
+    )
+    custom_range = st.text_input(
+        "Custom villain range (optional, overrides both)",
+        placeholder="e.g. 22+,ATs+,KQo or KK",
+        help="Standard range notation. Leave empty to use the label or baseline.",
+    )
+    baseline_chart = baseline_options[baseline_choice]
+    range_display = range_label
+    if baseline_chart is not None:
+        range_label = baseline_chart.notation
+        range_display = f"{baseline_chart.position} {baseline_chart.scenario.replace('_', ' ')}"
+    if custom_range.strip():
+        range_label = custom_range.strip()
+        range_display = "custom range"
 
     first, second = st.columns(2)
     with first:
-        pot_before_call = st.number_input("Pot before call", min_value=0.0, step=1.0)
-        call_amount = st.number_input("Call amount", min_value=0.0, step=1.0)
+        pot_before_call = st.number_input("Pot before call (BB)", min_value=0.0, step=1.0)
+        call_amount = st.number_input("Call amount (BB)", min_value=0.0, step=1.0)
         compute_equity = st.checkbox("Compute Hero equity vs range", value=True)
     with second:
-        pot_size = st.number_input("Pot size for bet/bluff", min_value=0.0, step=1.0)
-        bet_size = st.number_input("Bet size", min_value=0.0, step=1.0)
+        pot_size = st.number_input("Pot size for bet/bluff (BB)", min_value=0.0, step=1.0)
+        bet_size = st.number_input("Bet size (BB)", min_value=0.0, step=1.0)
         fold_frequency_pct = st.slider("Estimated fold frequency", 0, 100, 40)
 
     math_facts: dict[str, float | str] = {}
     equity_result = None
     errors: list[str] = []
+    call_metrics: list[tuple[str, str, str | None]] = []
+    bet_metrics: list[tuple[str, str, str | None]] = []
 
     if call_amount > 0 and pot_before_call > 0:
         try:
             required = required_equity_to_call(call_amount, pot_before_call)
             math_facts["required_equity_to_call"] = required
-            st.write(f"Required equity to call: {format_percentage(required)}")
+            call_metrics.append(("Required equity to call", format_percentage(required), None))
         except ValueError as exc:
             errors.append(str(exc))
 
     if bet_size > 0 and pot_size > 0:
         try:
             bluff_frequency = break_even_bluff_frequency(bet_size, pot_size)
+            mdf = minimum_defense_frequency(bet_size, pot_size)
+            bluff_fraction = optimal_bluff_fraction(bet_size, pot_size)
+            bluffs_per_value = bluff_to_value_ratio(bet_size, pot_size)
             math_facts["break_even_bluff_frequency"] = bluff_frequency
-            st.write(f"Break-even bluff frequency: {format_percentage(bluff_frequency)}")
+            math_facts["minimum_defense_frequency"] = mdf
+            math_facts["optimal_river_bluff_fraction"] = round(bluff_fraction, 4)
+            bet_metrics.append(("Break-even bluff freq", format_percentage(bluff_frequency), None))
+            bet_metrics.append(("Min defense freq (MDF)", format_percentage(mdf), None))
+            bet_metrics.append(
+                (
+                    "River bluff fraction",
+                    format_percentage(bluff_fraction),
+                    f"Optimal share of a polarized river betting range that is bluffs "
+                    f"({bluffs_per_value:.2f} bluffs per value bet). Earlier streets support more bluffs.",
+                )
+            )
         except ValueError as exc:
             errors.append(str(exc))
 
     if compute_equity and hand.hero_cards:
         try:
-            equity_result = get_equity_calculator().calculate_equity(
-                hand.hero_cards,
-                hand.board_cards,
-                range_label,
-            )
+            with st.spinner("Computing Hero equity vs range..."):
+                equity_result = _cached_equity(hand.hero_cards, hand.board_cards, range_label)
             math_facts["equity"] = equity_result.equity or "unavailable"
             if equity_result.equity is None:
-                st.write(f"Equity vs {range_label}: unavailable ({equity_result.method})")
+                call_metrics.append((f"Equity vs {range_display}", "unavailable", equity_result.method))
             else:
-                st.write(
-                    f"Equity vs {range_label}: {format_percentage(equity_result.equity)} "
-                    f"({equity_result.method}, confidence {format_percentage(equity_result.confidence)})"
+                equity_help = (
+                    f"{equity_result.method}, confidence {format_percentage(equity_result.confidence)}"
                 )
-            st.caption(equity_result.notes)
+                if equity_result.std_error:
+                    ci_low, ci_high = (
+                        max(0.0, equity_result.equity - 1.96 * equity_result.std_error),
+                        min(1.0, equity_result.equity + 1.96 * equity_result.std_error),
+                    )
+                    equity_help += (
+                        f". Monte-Carlo 95% CI: {format_percentage(ci_low)}–{format_percentage(ci_high)}"
+                    )
+                call_metrics.append(
+                    (
+                        f"Equity vs {range_display}",
+                        format_percentage(equity_result.equity),
+                        equity_help,
+                    )
+                )
         except ValueError as exc:
             errors.append(str(exc))
 
     if equity_result is not None and equity_result.equity is not None and call_amount > 0 and pot_before_call > 0:
         ev_value = call_ev(equity_result.equity, pot_before_call, call_amount)
         math_facts["call_ev"] = round(ev_value, 3)
-        st.write(f"Approximate call EV: {ev_value:.2f}")
+        call_metrics.append(("Call EV (approx)", f"{ev_value:+.2f}", "assumes no future betting"))
 
     fold_frequency = fold_frequency_pct / 100
     if bet_size > 0 and pot_size > 0:
         bluff_value = bluff_ev(fold_frequency, pot_size, bet_size)
         math_facts["bluff_ev"] = round(bluff_value, 3)
-        st.write(f"Approximate bluff EV at {fold_frequency_pct}% folds: {bluff_value:.2f}")
+        bet_metrics.append(
+            ("Bluff EV (approx)", f"{bluff_value:+.2f}", f"at {fold_frequency_pct}% folds, zero equity when called")
+        )
+
+    if call_metrics or bet_metrics:
+        st.markdown("##### Calling Math")
+        if call_metrics:
+            for column, (metric_label, value, help_text) in zip(st.columns(max(len(call_metrics), 3)), call_metrics):
+                column.metric(metric_label, value, help=help_text)
+        else:
+            st.caption("Enter a pot and call amount to see calling math.")
+        st.markdown("##### Betting Math")
+        if bet_metrics:
+            for column, (metric_label, value, help_text) in zip(st.columns(max(len(bet_metrics), 3)), bet_metrics):
+                column.metric(metric_label, value, help=help_text)
+        else:
+            st.caption("Enter a pot and bet size to see betting math.")
+    if equity_result is not None:
+        st.caption(equity_result.notes)
 
     for error in errors:
         st.error(error)
+
+    st.markdown("##### Study Tools")
+    realization_tab, multiway_tab, outs_tab, icm_tab = st.tabs(
+        ["Equity Realization", "Multiway Equity", "Outs & Draws", "Tournament ICM"]
+    )
+    with realization_tab:
+        show_equity_realization_tool(equity_result)
+    with multiway_tab:
+        show_multiway_equity_tool(hand, range_label, range_display)
+    with outs_tab:
+        show_outs_tool()
+    with icm_tab:
+        show_icm_tool()
 
     prompt = build_hand_review_prompt(
         session,
@@ -585,11 +810,147 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
         )
         db.create_hand_review(review)
         db.update_hand_status(hand.id, "reviewed")
-        st.success("Math-aware mock review saved.")
+        flash("Math-aware mock review saved.")
         st.rerun()
 
     with st.expander("Structured future-LLM prompt"):
         st.code(prompt, language="text")
+
+
+def show_equity_realization_tool(equity_result) -> None:
+    st.caption(
+        "Raw equity assumes every hand reaches showdown. Out of position or with a capped "
+        "range, Hero realizes less of it. Factors are study heuristics, not solver output."
+    )
+    if equity_result is None or equity_result.equity is None:
+        st.info("Compute Hero equity vs a range above to estimate realized equity.")
+        return
+    scenario = st.selectbox(
+        "Realization scenario",
+        options=list(REALIZATION_FACTOR_GUIDE.keys()),
+        format_func=lambda key: key.replace("_", " "),
+    )
+    factor = REALIZATION_FACTOR_GUIDE[scenario]
+    realized = realized_equity(equity_result.equity, factor)
+    raw_col, factor_col, realized_col = st.columns(3)
+    raw_col.metric("Raw equity", format_percentage(equity_result.equity))
+    factor_col.metric("Realization factor", f"{factor:.2f}×")
+    realized_col.metric("Realized equity (est.)", format_percentage(realized))
+
+
+def show_multiway_equity_tool(hand: Hand, range_label: str, range_display: str) -> None:
+    st.caption(
+        "Pot-share equity vs two or more ranges. Villain 1 uses the range selected above; "
+        "add at least one more villain. Multiway pots need stronger hands to continue."
+    )
+    if not hand.hero_cards:
+        st.info("This hand has no Hero cards recorded.")
+        return
+    second = st.text_input(
+        "Villain 2 range", value="standard", help="A range label or standard notation."
+    )
+    third = st.text_input("Villain 3 range (optional)", value="")
+    villain_ranges = [range_label, second.strip(), *( [third.strip()] if third.strip() else [] )]
+    if not second.strip():
+        st.info("Enter a Villain 2 range to compute multiway equity.")
+        return
+    try:
+        with st.spinner("Computing multiway pot share..."):
+            result = _cached_multiway_equity(hand.hero_cards, hand.board_cards, tuple(villain_ranges))
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    if result is None:
+        st.warning("Multiway equity needs the eval7 engine (not available).")
+        return
+    if result.equity is None:
+        st.warning(f"Could not compute: {result.notes}")
+        return
+    share_col, fair_col = st.columns(2)
+    help_text = result.notes
+    if result.std_error:
+        low, high = (
+            max(0.0, result.equity - 1.96 * result.std_error),
+            min(1.0, result.equity + 1.96 * result.std_error),
+        )
+        help_text += f" 95% CI: {format_percentage(low)}–{format_percentage(high)}."
+    share_col.metric(f"Hero pot share ({len(villain_ranges) + 1}-way)", format_percentage(result.equity), help=help_text)
+    fair_col.metric(
+        "Fair share",
+        format_percentage(1 / (len(villain_ranges) + 1)),
+        help="An equal split of the pot. Above this, Hero is profiting from the multiway pot.",
+    )
+    st.caption(f"Villain 1: {range_display} · ranges: {result.villain_range_label}")
+
+
+def show_outs_tool() -> None:
+    st.caption("Draw equity from counted outs — the rule of 2 and 4 next to the exact odds.")
+    outs = st.number_input("Outs", min_value=0, max_value=20, value=9, step=1)
+    street = st.radio(
+        "Cards to come",
+        options=["Flop → river (2 cards)", "Turn → river (1 card)"],
+        horizontal=True,
+    )
+    streets_to_come = 2 if street.startswith("Flop") else 1
+    unseen = 47 if streets_to_come == 2 else 46
+    if outs == 0:
+        st.info("Count Hero's outs to estimate draw equity.")
+        return
+    rule = outs_to_equity_rule(int(outs), streets_to_come)
+    exact = outs_to_equity_exact(int(outs), unseen, streets_to_come)
+    rule_col, exact_col = st.columns(2)
+    rule_col.metric("Rule of 2 and 4", format_percentage(min(rule, 1.0)))
+    exact_col.metric(
+        "Exact",
+        format_percentage(exact),
+        help=f"{outs} outs among {unseen} unseen cards, {streets_to_come} card(s) to come.",
+    )
+
+
+def show_icm_tool() -> None:
+    st.caption(
+        "Malmuth-Harville ICM: converts tournament chip stacks into prize equity. "
+        "Chips lost hurt more than chips won help — the risk premium quantifies that."
+    )
+    stacks_text = st.text_input("Stacks (comma-separated chips)", value="5000, 3000, 2000")
+    payouts_text = st.text_input("Payouts (comma-separated, best first)", value="50, 30, 20")
+    try:
+        stacks = [float(part) for part in stacks_text.split(",") if part.strip()]
+        payouts = [float(part) for part in payouts_text.split(",") if part.strip()]
+        equities = icm_equities(stacks, payouts)
+    except ValueError as exc:
+        st.error(f"Could not compute ICM: {exc}")
+        return
+    st.dataframe(
+        [
+            {
+                "Player": index + 1,
+                "Stack": f"{stack:g}",
+                "Chip share": format_percentage(stack / sum(stacks)),
+                "ICM equity": f"{equity:.2f}",
+                "Prize share": format_percentage(equity / sum(payouts)),
+            }
+            for index, (stack, equity) in enumerate(zip(stacks, equities))
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+    hero_col, risk_col = st.columns(2)
+    hero_seat = hero_col.number_input("Hero player #", min_value=1, max_value=len(stacks), value=1, step=1)
+    max_risk = stacks[int(hero_seat) - 1]
+    risk_amount = risk_col.number_input(
+        "Chips at risk", min_value=0.0, max_value=float(max_risk), value=min(1000.0, max_risk / 2), step=100.0
+    )
+    if risk_amount > 0 and risk_amount < max_risk:
+        premium = icm_risk_premium(stacks, payouts, int(hero_seat) - 1, risk_amount)
+        st.metric(
+            "ICM cost of losing those chips",
+            f"{premium:.2f}",
+            help=(
+                "Prize equity lost if Hero loses this many chips. Compare against the prize "
+                "equity gained by winning the same pot — the gap is the ICM risk premium."
+            ),
+        )
 
 
 def show_coach_review(db: PokerDatabase, session: Session) -> None:
@@ -603,11 +964,17 @@ def show_coach_review(db: PokerDatabase, session: Session) -> None:
         st.info("Save or load hands before generating coach reviews.")
         return
 
-    config = provider_config_from_env()
-    provider_choice = st.selectbox("Provider", ["Mock", "Cloud"])
-    if provider_choice == "Cloud" and not config.has_api_key:
-        st.warning("Cloud provider selected but no OPENAI_API_KEY is configured. Falling back to Mock.")
-    provider = get_provider_from_env("cloud" if provider_choice == "Cloud" else "mock")
+    provider_choice = st.selectbox("Provider", ["Mock", "Claude (Anthropic)", "Cloud (OpenAI)"])
+    provider_key = {
+        "Mock": "mock",
+        "Claude (Anthropic)": "anthropic",
+        "Cloud (OpenAI)": "cloud",
+    }[provider_choice]
+    provider = get_provider_from_env(provider_key)
+    # get_provider_from_env falls back to Mock when the selected provider's key is absent.
+    if provider_key in {"anthropic", "cloud"} and provider.provider_name == "mock":
+        key_name = "ANTHROPIC_API_KEY" if provider_key == "anthropic" else "OPENAI_API_KEY"
+        st.warning(f"{provider_choice} selected but no {key_name} is configured. Falling back to Mock.")
     st.write({"Active provider": provider.provider_name, "Model": provider.model_name})
 
     coaching_mode = st.selectbox("Coaching mode", COACHING_MODES)
@@ -668,7 +1035,8 @@ def show_hand_coach_review(
 
     if st.button("Generate and save post-session hand review"):
         try:
-            raw_response = provider.generate_hand_review(prompt)
+            with st.spinner("Generating hand review..."):
+                raw_response = provider.generate_hand_review(prompt)
             saved = db.create_coaching_response(
                 build_coaching_response(
                     provider=provider,
@@ -680,7 +1048,7 @@ def show_hand_coach_review(
                 )
             )
             db.update_hand_status(hand.id, "reviewed")
-            st.success(f"Saved provider review #{saved.id}.")
+            flash(f"Saved provider review #{saved.id}.")
             st.rerun()
         except (LLMProviderError, ValueError) as exc:
             st.error(f"Could not generate review: {exc}")
@@ -707,12 +1075,8 @@ def show_session_coach_review(
         for hand in selected_hands
         if hand.id is not None
     ]
-    st.write(
-        {
-            "Selected hands": [hand.hand_number for hand in selected_hands],
-            "Tag counts": stats.hands_by_tag,
-            "Review statuses": stats.hands_by_review_status,
-        }
+    st.caption(
+        f"Selected hands: {', '.join(f'#{hand.hand_number}' for hand in selected_hands) or 'none'}"
     )
     prompt = build_session_review_prompt(
         session,
@@ -726,7 +1090,8 @@ def show_session_coach_review(
 
     if st.button("Generate and save post-session session review"):
         try:
-            raw_response = provider.generate_session_review(prompt)
+            with st.spinner("Generating session review..."):
+                raw_response = provider.generate_session_review(prompt)
             saved = db.create_coaching_response(
                 build_coaching_response(
                     provider=provider,
@@ -736,7 +1101,7 @@ def show_session_coach_review(
                     session_id=session.id,
                 )
             )
-            st.success(f"Saved provider session review #{saved.id}.")
+            flash(f"Saved provider session review #{saved.id}.")
             st.rerun()
         except (LLMProviderError, ValueError) as exc:
             st.error(f"Could not generate session review: {exc}")
@@ -829,15 +1194,24 @@ def show_video_processing(db: PokerDatabase, session: Session) -> None:
             )
             if metadata.error:
                 st.warning(metadata.error)
-            st.success(f"Saved video #{saved_video.id}.")
+            flash(f"Saved video #{saved_video.id}.")
             st.rerun()
         except ValueError as exc:
             st.error(str(exc))
 
     st.markdown("#### Stored Videos")
-    all_videos = db.fetch_videos()
+    filter_to_session = st.checkbox(
+        f"Show only videos linked to this session (#{session.id})",
+        value=False,
+        key="video_filter_session",
+        disabled=session.id is None,
+    )
+    all_videos = db.fetch_videos(session.id if (filter_to_session and session.id is not None) else None)
     if not all_videos:
-        st.info("No videos stored yet.")
+        if filter_to_session:
+            st.info("No videos are linked to the selected session yet.")
+        else:
+            st.info("No videos stored yet.")
         return
 
     labels = {
@@ -913,17 +1287,23 @@ def show_video_jobs_and_frames(db: PokerDatabase, video: VideoRecord) -> None:
 
     if st.button("Extract frames", key=f"extract_button_{video.id}"):
         try:
-            summary = extract_frames_for_video(
-                db,
-                video.id,
-                frames_per_second=float(frames_per_second),
-                max_frames=int(max_frames),
-                start_time_seconds=float(start_time),
-                end_time_seconds=float(end_time) if end_time > 0 else None,
-            )
-            st.success(f"Extracted {summary.frames_extracted} frames to {summary.output_dir}.")
+            with st.spinner("Extracting frames — this can take a while for long videos..."):
+                summary = extract_frames_for_video(
+                    db,
+                    video.id,
+                    frames_per_second=float(frames_per_second),
+                    max_frames=int(max_frames),
+                    start_time_seconds=float(start_time),
+                    end_time_seconds=float(end_time) if end_time > 0 else None,
+                )
             if summary.errors:
-                st.warning("; ".join(summary.errors))
+                flash(
+                    f"Extracted {summary.frames_extracted} frames with "
+                    f"{len(summary.errors)} warnings: {'; '.join(summary.errors)}",
+                    icon="⚠️",
+                )
+            else:
+                flash(f"Extracted {summary.frames_extracted} frames to {summary.output_dir}.")
             st.rerun()
         except (ValueError, RuntimeError) as exc:
             st.error(f"Frame extraction failed: {exc}")
@@ -945,20 +1325,44 @@ def show_video_jobs_and_frames(db: PokerDatabase, video: VideoRecord) -> None:
                 for job in jobs
             ],
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
 
     frames = db.fetch_frames_by_video(video.id)
-    st.write({"Extracted frame count": len(frames)})
+    st.caption(f"Extracted frames: {len(frames)}")
     confirm_delete = st.checkbox(
         "Confirm delete extracted frames for this video",
         key=f"delete_frames_confirm_{video.id}",
     )
     if st.button("Delete extracted frames", key=f"delete_frames_{video.id}", disabled=not confirm_delete):
         deleted = delete_extracted_frames(db, video.id)
-        st.success(f"Deleted {deleted} extracted frame records/files.")
+        flash(f"Deleted {deleted} extracted frame records/files.")
         st.rerun()
     show_frame_preview(frames)
+
+    with st.expander("Danger zone: delete this video"):
+        st.warning(
+            "Removes the stored video file, all extracted frames, and job history. "
+            "Hands and sessions are unaffected. This cannot be undone."
+        )
+        confirm_video = st.checkbox(
+            "I understand this permanently deletes the video and its files.",
+            key=f"confirm_delete_video_{video.id}",
+        )
+        if st.button("Delete video", key=f"delete_video_{video.id}", disabled=not confirm_video):
+            delete_extracted_frames(db, video.id)  # frame files first; rows would cascade anyway
+            db.delete_video(video.id)
+            Path(video.stored_path).unlink(missing_ok=True)
+            flash(f"Deleted video {video.original_filename}.", icon="🗑️")
+            st.rerun()
+
+
+def _safe_image(path: str, caption: str | None = None) -> None:
+    """Render an image, degrading gracefully if the file was moved or deleted."""
+    if Path(path).is_file():
+        st.image(path, caption=caption)
+    else:
+        st.warning(f"Image file missing: {path}")
 
 
 def show_frame_preview(frames) -> None:
@@ -970,7 +1374,7 @@ def show_frame_preview(frames) -> None:
     columns = st.columns(4)
     for index, frame in enumerate(representative):
         with columns[index % 4]:
-            st.image(frame.image_path, caption=f"{frame.timestamp_seconds:.2f}s")
+            _safe_image(frame.image_path, caption=f"{frame.timestamp_seconds:.2f}s")
 
     frame_labels = {
         frame.id: f"{frame.timestamp_seconds:.2f}s - {frame.image_path}"
@@ -983,8 +1387,8 @@ def show_frame_preview(frames) -> None:
         format_func=lambda frame_id: frame_labels[frame_id],
     )
     selected = next(frame for frame in frames if frame.id == selected_frame_id)
-    st.write({"Timestamp": selected.timestamp_seconds, "Path": selected.image_path})
-    st.image(selected.image_path)
+    st.caption(f"{selected.timestamp_seconds:.2f}s · {selected.image_path}")
+    _safe_image(selected.image_path)
 
 
 def show_roi_calibration(db: PokerDatabase) -> None:
@@ -1034,7 +1438,7 @@ def show_roi_calibration(db: PokerDatabase) -> None:
         key="roi_frame_select",
     )
     frame = next(item for item in frames if item.id == selected_frame_id)
-    st.image(frame.image_path, caption=f"Calibration frame at {frame.timestamp_seconds:.2f}s")
+    _safe_image(frame.image_path, caption=f"Calibration frame at {frame.timestamp_seconds:.2f}s")
     try:
         frame_width, frame_height = image_dimensions(frame.image_path)
         st.write({"Frame width": frame_width, "Frame height": frame_height, "Frame path": frame.image_path})
@@ -1077,8 +1481,20 @@ def show_roi_calibration(db: PokerDatabase) -> None:
         st.rerun()
     if st.button("Duplicate selected profile", key=f"roi_duplicate_{profile.id}"):
         duplicate_roi_profile(db, profile.id)
-        st.success("Duplicated ROI profile.")
+        flash("Duplicated ROI profile.")
         st.rerun()
+    with st.expander("Danger zone: delete this profile"):
+        st.warning(
+            f"Deleting **{profile.name}** removes all its calibrated regions. This cannot be undone."
+        )
+        confirm_profile = st.checkbox(
+            "I understand this permanently deletes the profile and its regions.",
+            key=f"confirm_delete_profile_{profile.id}",
+        )
+        if st.button("Delete profile", key=f"roi_delete_{profile.id}", disabled=not confirm_profile):
+            db.delete_roi_profile(profile.id)
+            flash(f"Deleted ROI profile '{profile.name}'.", icon="🗑️")
+            st.rerun()
 
     show_roi_import_export(db, profile)
     show_add_roi_region_form(db, profile, frame_width, frame_height)
@@ -1110,7 +1526,7 @@ def show_roi_profile_tools(
             video_height=frame_height if use_frame_dims else video.height,
         )
         db.create_roi_profile(profile)
-        st.success("ROI profile created.")
+        flash("ROI profile created.")
         st.rerun()
 
     with right:
@@ -1124,7 +1540,7 @@ def show_roi_profile_tools(
                 video_height=frame_height,
                 max_seats=int(seats),
             )
-            st.success("Starter ROI profile created.")
+            flash("Starter ROI profile created.")
             st.rerun()
 
 
@@ -1141,11 +1557,17 @@ def show_roi_import_export(db: PokerDatabase, profile: ROIProfile) -> None:
     )
     uploaded = st.file_uploader("Import ROI profile JSON", type=["json"], key="roi_import_upload")
     if uploaded is not None and st.button("Import ROI profile"):
+        raw = uploaded.getvalue()
+        if len(raw) > MAX_IMPORT_BYTES:
+            st.error(f"Import file is too large ({len(raw) / 1_048_576:.0f} MB). Limit is 10 MB.")
+            return
         try:
-            payload = json.loads(uploaded.getvalue().decode("utf-8"))
+            payload = json.loads(raw.decode("utf-8"))
             imported = import_roi_profile(db, payload)
-            st.success(f"Imported ROI profile: {imported.name}")
+            flash(f"Imported ROI profile: {imported.name}")
             st.rerun()
+        except sqlite3.IntegrityError:
+            st.error("Could not import ROI profile: it contains duplicate ROI keys.")
         except (ValueError, ValidationError, KeyError, json.JSONDecodeError) as exc:
             st.error(f"Could not import ROI profile: {exc}")
 
@@ -1191,8 +1613,10 @@ def show_add_roi_region_form(
             )
             validate_roi_bounds(region, image_width=frame_width, image_height=frame_height)
             db.create_roi_region(region)
-            st.success("ROI region added.")
+            flash("ROI region added.")
             st.rerun()
+        except sqlite3.IntegrityError:
+            st.error(f"An ROI region with the key '{roi_key.strip()}' already exists in this profile.")
         except (ValueError, ValidationError) as exc:
             st.error(f"Could not add ROI region: {exc}")
 
@@ -1228,7 +1652,7 @@ def show_roi_regions(
             for region in regions
         ],
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
 
     if st.button("Generate all crop previews", key=f"roi_generate_all_{profile.id}_{frame.id}"):
@@ -1277,32 +1701,39 @@ def show_edit_roi_region_form(
         submitted_preview = preview.form_submit_button("Preview crop")
         submitted_delete = delete.form_submit_button("Delete")
 
-    updated = ROIRegion(
-        id=region.id,
-        profile_id=region.profile_id,
-        roi_key=roi_key.strip(),
-        roi_type=roi_type,
-        label=label.strip(),
-        x=int(x),
-        y=int(y),
-        width=int(width),
-        height=int(height),
-        seat_index=int(seat_index) or None,
-        card_index=int(card_index) or None,
-        notes=notes.strip(),
-        created_at=region.created_at,
-    )
+    def build_updated_region() -> ROIRegion:
+        # Constructed lazily inside each submit branch: an invalid field (e.g. an
+        # empty ROI key) must surface as a form error, not a raw traceback.
+        return ROIRegion(
+            id=region.id,
+            profile_id=region.profile_id,
+            roi_key=roi_key.strip(),
+            roi_type=roi_type,
+            label=label.strip(),
+            x=int(x),
+            y=int(y),
+            width=int(width),
+            height=int(height),
+            seat_index=int(seat_index) or None,
+            card_index=int(card_index) or None,
+            notes=notes.strip(),
+            created_at=region.created_at,
+        )
+
     if submitted_update:
         try:
+            updated = build_updated_region()
             validate_roi_bounds(updated, image_width=frame_width, image_height=frame_height)
             db.update_roi_region(updated)
-            st.success("ROI region updated.")
+            flash("ROI region updated.")
             st.rerun()
+        except sqlite3.IntegrityError:
+            st.error(f"An ROI region with the key '{roi_key.strip()}' already exists in this profile.")
         except (ValueError, ValidationError) as exc:
             st.error(f"Could not update ROI region: {exc}")
     if submitted_preview:
         try:
-            result = save_roi_crop_preview(frame, updated)
+            result = save_roi_crop_preview(frame, build_updated_region())
             st.write(
                 {
                     "Crop": result.crop_path,
@@ -1311,7 +1742,7 @@ def show_edit_roi_region_form(
                 }
             )
             st.image(result.crop_path)
-        except ValueError as exc:
+        except (ValueError, ValidationError) as exc:
             st.error(f"Could not preview ROI crop: {exc}")
     confirm_delete = st.checkbox(
         f"Confirm delete {region.roi_key}",
@@ -1322,7 +1753,7 @@ def show_edit_roi_region_form(
             st.warning("Check the delete confirmation box first.")
             return
         db.delete_roi_region(region.id)
-        st.success("ROI region deleted.")
+        flash("ROI region deleted.")
         st.rerun()
 
 

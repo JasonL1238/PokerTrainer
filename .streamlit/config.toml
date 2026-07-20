@@ -1,0 +1,14 @@
+[theme]
+base = "dark"
+# Flat, professional dark navy — GTO-tool style without heavy gradients.
+primaryColor = "#7C5CFA"
+backgroundColor = "#0E1220"
+secondaryBackgroundColor = "#161C2E"
+textColor = "#E8EAF2"
+font = "sans serif"
+
+[server]
+maxUploadSize = 2048
+
+[browser]
+gatherUsageStats = false

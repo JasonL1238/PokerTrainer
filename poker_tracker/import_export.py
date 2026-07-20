@@ -48,6 +48,11 @@ def export_session_json(db: PokerDatabase, session_id: int, path: str | Path) ->
 
 def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
     """Import a previously exported session into the current database."""
+    version = payload.get("export_version", EXPORT_VERSION)
+    if version != EXPORT_VERSION:
+        raise ValueError(
+            f"Unsupported export_version {version}; this app understands version {EXPORT_VERSION}."
+        )
     session_data = dict(payload["session"])
     session_data.pop("id", None)
     session_model = Session(**session_data)

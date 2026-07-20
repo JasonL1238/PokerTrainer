@@ -100,6 +100,11 @@ def export_roi_profile(db: PokerDatabase, profile_id: int) -> dict[str, Any]:
 
 def import_roi_profile(db: PokerDatabase, payload: dict[str, Any]) -> ROIProfile:
     """Import an ROI profile from JSON, creating new profile and region IDs."""
+    version = payload.get("export_version", ROI_EXPORT_VERSION)
+    if version != ROI_EXPORT_VERSION:
+        raise ValueError(
+            f"Unsupported export_version {version}; this app understands version {ROI_EXPORT_VERSION}."
+        )
     profile_data = dict(payload["profile"])
     profile_data.pop("id", None)
     profile_data["is_active"] = False
