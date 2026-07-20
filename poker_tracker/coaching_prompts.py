@@ -5,6 +5,7 @@ from poker_tracker.equity import EquityResult
 from poker_tracker.hand_history import format_hand_history
 from poker_tracker.models import Action, Hand, HandPlayer, Session
 from poker_tracker.pot_odds import format_percentage
+from poker_tracker.preflop_ranges import range_percent, resolve_preflop_range
 from poker_tracker.ranges import get_range_description, normalize_range_label
 
 
@@ -46,12 +47,18 @@ def build_hand_review_prompt(
     equity_result: EquityResult | None = None,
     villain_range_label: str | None = None,
     coaching_mode: str = "Theory + Exploit",
+    hero_position: str | None = None,
+    hero_range_scenario: str = "RFI",
 ) -> str:
     """Build a structured prompt for a future LLM hand review without calling one."""
     range_label = normalize_range_label(villain_range_label)
     range_description = get_range_description(range_label)
     facts = _format_math_facts(pot_odds_facts or {})
     equity = _format_equity(equity_result)
+    hero_range_block = _format_hero_range(
+        hero_position if hero_position is not None else hand.hero_position,
+        hero_range_scenario,
+    )
     sections = "\n".join(f"- {section}" for section in REQUIRED_REVIEW_SECTIONS)
 
     return f"""Post-session safety:
@@ -67,7 +74,7 @@ Hand history:
 Hand tags: {", ".join(hand.tags) if hand.tags else "none"}
 Result: {hand.hero_bb_won if hand.hero_bb_won is not None else "unknown"} BB
 Villain range label: {range_description.label}
-Villain range description: {range_description.description}
+Villain range description: {range_description.description}{hero_range_block}
 Pot odds / math facts:
 {facts}
 Equity result:
@@ -110,6 +117,28 @@ Hand histories:
 Return exactly these sections:
 {sections}
 """
+
+
+def _format_hero_range(hero_position: str | None, scenario: str) -> str:
+    """Return a hero preflop-range block, or "" if no chart resolves.
+
+    The block is a positional study baseline (not solver output), consistent
+    with the anti-hallucination framing of the rest of the prompt. Returns an
+    empty string when the position/scenario has no defined chart so the block
+    is omitted gracefully rather than emitting an empty section.
+    """
+    chart = resolve_preflop_range(hero_position, scenario)
+    if chart is None:
+        return ""
+    percent = format_percentage(range_percent(chart.notation))
+    return (
+        f"\nHero preflop range (study baseline, not solver output):\n"
+        f"- position: {chart.position}\n"
+        f"- scenario: {chart.scenario}\n"
+        f"- notation: {chart.notation}\n"
+        f"- percent of hands: {percent}\n"
+        f"- description: {chart.description}"
+    )
 
 
 def _format_math_facts(facts: dict[str, float | str]) -> str:

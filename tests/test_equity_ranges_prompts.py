@@ -11,6 +11,7 @@ from poker_tracker.equity import PlaceholderEquityCalculator
 from poker_tracker.hand_history import format_hand_history
 from poker_tracker.models import Action, Hand, HandPlayer, Session
 from poker_tracker.pot_odds import required_equity_to_call
+from poker_tracker.preflop_ranges import get_preflop_range
 from poker_tracker.ranges import estimate_villain_range_label, get_range_description
 
 
@@ -57,6 +58,54 @@ def test_hand_prompt_contains_required_sections_and_safety() -> None:
     assert "placeholder" in prompt
     for section in REQUIRED_REVIEW_SECTIONS:
         assert section in prompt
+
+
+def test_hand_prompt_includes_hero_range_for_valid_position() -> None:
+    session, hand, actions, players = _sample_hand()  # hero_position == "BTN"
+    prompt = build_hand_review_prompt(
+        session, hand, actions, players, villain_range_label="standard"
+    )
+
+    btn_rfi = get_preflop_range("BTN", "rfi")
+    assert "Hero preflop range" in prompt
+    assert "study baseline" in prompt
+    assert "position: BTN" in prompt
+    assert btn_rfi.notation in prompt
+    assert "percent of hands:" in prompt
+    # Existing villain behavior remains intact.
+    assert "Villain range label:" in prompt
+
+
+def test_hand_prompt_hero_position_alias_and_override() -> None:
+    session, hand, actions, players = _sample_hand()
+    hand.hero_position = "button"  # alias should normalize to BTN
+    prompt = build_hand_review_prompt(session, hand, actions, players)
+    assert "position: BTN" in prompt
+
+    # Explicit override wins over hand.hero_position.
+    override = build_hand_review_prompt(
+        session, hand, actions, players, hero_position="CO"
+    )
+    assert "position: CO" in override
+    assert get_preflop_range("CO", "rfi").notation in override
+
+
+def test_hand_prompt_omits_hero_range_for_unknown_position() -> None:
+    session, hand, actions, players = _sample_hand()
+    for bad in ("", "STRADDLE"):
+        hand.hero_position = bad
+        prompt = build_hand_review_prompt(session, hand, actions, players)
+        assert "Hero preflop range" not in prompt
+        # Rest of the prompt still builds correctly.
+        assert POST_SESSION_SAFETY in prompt
+        for section in REQUIRED_REVIEW_SECTIONS:
+            assert section in prompt
+
+    # BB has no RFI chart, so the default scenario must omit the block too.
+    hand.hero_position = "BB"
+    assert "Hero preflop range" not in build_hand_review_prompt(
+        session, hand, actions, players
+    )
 
 
 def test_session_prompt_contains_required_sections_and_safety() -> None:

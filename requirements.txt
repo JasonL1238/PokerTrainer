@@ -5,3 +5,4 @@ pytest>=8.2
 opencv-python-headless>=4.8
 Cython>=3.0  # build dependency for eval7 (no prebuilt wheel on some Python versions)
 eval7>=0.1.10  # hand evaluator + range parser powering the equity engine
+anthropic>=0.40  # official Anthropic SDK for the Claude coaching provider

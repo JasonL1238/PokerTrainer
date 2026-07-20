@@ -11,6 +11,14 @@ from poker_tracker.safety import ensure_post_session_prompt
 
 
 DEFAULT_MODEL = "gpt-4o-mini"
+ANTHROPIC_DEFAULT_MODEL = "claude-opus-4-8"
+
+# Shared coach system prompt reused by every cloud provider (OpenAI + Anthropic)
+# so the post-session safety framing is identical regardless of backend.
+COACH_SYSTEM_PROMPT = (
+    "You are a post-session poker study coach. Never provide "
+    "real-time poker assistance or invent unavailable math."
+)
 
 
 class LLMProviderError(RuntimeError):
@@ -90,10 +98,7 @@ class CloudLLMProvider:
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You are a post-session poker study coach. Never provide "
-                        "real-time poker assistance or invent unavailable math."
-                    ),
+                    "content": COACH_SYSTEM_PROMPT,
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -120,25 +125,97 @@ class CloudLLMProvider:
             raise LLMProviderError("Cloud LLM response did not contain message content.") from exc
 
 
+class AnthropicLLMProvider:
+    """Anthropic Claude provider using the official `anthropic` Python SDK.
+
+    API keys are read from the environment and are never stored in prompts or DB
+    rows. The `anthropic` import is intentionally lazy (done inside `_complete`)
+    so this module imports cleanly even when the SDK is not installed.
+    """
+
+    provider_name = "anthropic"
+
+    def __init__(self, api_key: str, model_name: str = ANTHROPIC_DEFAULT_MODEL) -> None:
+        self.api_key = api_key
+        self.model_name = model_name
+
+    def generate_hand_review(self, prompt: str) -> str:
+        ensure_post_session_prompt(prompt)
+        return self._complete(prompt)
+
+    def generate_session_review(self, prompt: str) -> str:
+        ensure_post_session_prompt(prompt)
+        return self._complete(prompt)
+
+    def _complete(self, prompt: str) -> str:
+        try:
+            import anthropic
+        except ImportError as exc:  # SDK not installed in this environment
+            raise LLMProviderError(
+                "The 'anthropic' package is required for AnthropicLLMProvider. "
+                "Install it with: pip install anthropic"
+            ) from exc
+
+        client = anthropic.Anthropic(api_key=self.api_key)
+        try:
+            with client.messages.stream(
+                model=self.model_name,
+                max_tokens=4096,
+                system=COACH_SYSTEM_PROMPT,
+                thinking={"type": "adaptive"},
+                messages=[{"role": "user", "content": prompt}],
+            ) as stream:
+                message = stream.get_final_message()
+        except (anthropic.APIConnectionError, anthropic.APIError) as exc:
+            raise LLMProviderError(f"Anthropic request failed: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - surface any SDK error uniformly
+            raise LLMProviderError(f"Anthropic request failed: {exc}") from exc
+
+        text = "".join(
+            block.text for block in message.content if getattr(block, "type", None) == "text"
+        ).strip()
+        if not text:
+            raise LLMProviderError("Anthropic response did not contain any text content.")
+        return text
+
+
 def provider_config_from_env() -> LLMProviderConfig:
     """Read provider config from environment without exposing secrets."""
     provider_name = os.getenv("POKER_TRACKER_LLM_PROVIDER", "mock").strip().lower() or "mock"
-    model_name = os.getenv("POKER_TRACKER_LLM_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    has_key = bool(os.getenv("OPENAI_API_KEY"))
-    if provider_name in {"openai", "cloud"} and has_key:
+    requested_model = os.getenv("POKER_TRACKER_LLM_MODEL", "").strip()
+    model_name = requested_model or DEFAULT_MODEL
+    has_openai_key = bool(os.getenv("OPENAI_API_KEY"))
+    has_anthropic_key = bool(os.getenv("ANTHROPIC_API_KEY"))
+    if provider_name in {"anthropic", "claude"} and has_anthropic_key:
+        return LLMProviderConfig(
+            provider_name="anthropic",
+            model_name=requested_model or ANTHROPIC_DEFAULT_MODEL,
+            has_api_key=True,
+        )
+    if provider_name in {"anthropic", "claude"}:
+        return LLMProviderConfig(provider_name="mock", model_name="mock-local", has_api_key=False)
+    if provider_name in {"openai", "cloud"} and has_openai_key:
         return LLMProviderConfig(provider_name="cloud", model_name=model_name, has_api_key=True)
     if provider_name in {"openai", "cloud"}:
         return LLMProviderConfig(provider_name="mock", model_name="mock-local", has_api_key=False)
-    return LLMProviderConfig(provider_name="mock", model_name="mock-local", has_api_key=has_key)
+    return LLMProviderConfig(provider_name="mock", model_name="mock-local", has_api_key=has_openai_key)
 
 
 def get_provider_from_env(preferred_provider: str | None = None) -> LLMProvider:
     """Return a configured provider, falling back to mock when cloud config is missing."""
     requested = (preferred_provider or os.getenv("POKER_TRACKER_LLM_PROVIDER", "mock")).lower()
+    requested_model = os.getenv("POKER_TRACKER_LLM_MODEL", "").strip()
+    if requested in {"anthropic", "claude"}:
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+        if anthropic_key:
+            return AnthropicLLMProvider(
+                api_key=anthropic_key,
+                model_name=requested_model or ANTHROPIC_DEFAULT_MODEL,
+            )
+        return MockLLMProvider()
     api_key = os.getenv("OPENAI_API_KEY")
-    model_name = os.getenv("POKER_TRACKER_LLM_MODEL", DEFAULT_MODEL)
     if requested in {"openai", "cloud"} and api_key:
-        return CloudLLMProvider(api_key=api_key, model_name=model_name)
+        return CloudLLMProvider(api_key=api_key, model_name=requested_model or DEFAULT_MODEL)
     return MockLLMProvider()
 
 
