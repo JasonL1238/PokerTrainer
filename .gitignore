@@ -19,6 +19,16 @@ cv_lab/hand01/
 cv_lab/harvest/
 cv_lab/models/
 cv_lab/results/
+cv_lab/runs/
+cv_lab/logs/
+runs/
+
+# Training/run logs and downloaded model weights (regenerable / re-downloadable)
+*.log
+*.pt
+
+# Auto-generated labeling priority list (regenerate from labels.sqlite3)
+labeling_poker/priority/
 data/*
 !data/.gitkeep
 !data/videos/
