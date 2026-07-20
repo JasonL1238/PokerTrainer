@@ -27,6 +27,12 @@ def format_hand_history(
         f"Game: {hand.game_type or 'Unknown'} {hand.blinds_antes}".strip(),
         f"Hero: {hand.hero_position or 'Unknown'}, {hand.hero_cards or 'unknown cards'}",
         f"Board: {hand.board_cards or 'none'}",
+    ]
+    if hand.pot_size is not None:
+        lines.append(f"Final pot: {hand.pot_size:g}")
+    if hand.result:
+        lines.append(f"Outcome: {hand.result}")
+    lines += [
         f"Result: {_format_bb_result(hand.hero_bb_won)}",
         f"Tags: {', '.join(hand.tags) if hand.tags else 'none'}",
     ]

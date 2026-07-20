@@ -140,6 +140,10 @@ def test_yolo_reconstruction_to_coaching_prompt_seam(tmp_path) -> None:
     # --- (c) Prompt preserves the post-session safety text. ---
     assert POST_SESSION_SAFETY in prompt
 
+    # --- (c2) Reconstructed pot and winner reach the coach. ---
+    assert "Final pot: 42.5" in prompt
+    assert "Outcome: Hero wins" in prompt
+
     # --- (d) Since actions flowed through, the prompt's hand history reflects them. ---
     assert "Preflop:" in prompt
     assert "Flop:" in prompt
