@@ -106,3 +106,46 @@ def test_pad_expands_crop_within_bounds():
     rd.frame_from_models(img, 0.0, rows, classifier=clf, pad=0.5)
     # box is 20x20, pad 0.5 each side -> +10 each side -> 40x40, still in bounds
     assert clf.seen_shapes[0][:2] == (40, 40)
+
+
+# --------------------------------------------------------------------------- #
+# Hero-seat cross-check: hero zone must agree with the seat-0 convention
+# --------------------------------------------------------------------------- #
+def _fixture_frame(card_centers):
+    """One frame with face_cards centered at the given normalized (cx, cy)."""
+    w = h = 1000
+    dets = []
+    for i, (cx, cy) in enumerate(card_centers):
+        x, y = cx * w, cy * h
+        dets.append({"cls": "face_card", "conf": 0.9, "attr": ["As", "Kd"][i % 2],
+                     "xyxy": [x - 20, y - 40, x + 20, y + 40]})
+    return rd.frames_from_fixture(
+        [{"image": "f0", "time_s": 0.0, "width": w, "height": h, "detections": dets}]
+    )[0]
+
+
+def test_hero_zone_on_seat0_anchor_no_mismatch():
+    # Cards where hero hole cards actually render: bottom-center, nearest
+    # seat 0's card anchor.
+    view = rd.assign_regions(_fixture_frame([(0.49, 0.80), (0.53, 0.80)]))
+    assert view["hero"] == ["As", "Kd"]
+    assert view["hero_seat_mismatch"] is False
+
+
+def test_hero_zone_near_other_seat_flags_mismatch():
+    # Still inside the hero zone (cx 0.40-0.58, cy >= 0.64) but nearer seat 1's
+    # card anchor (0.194, 0.623) than seat 0's (0.500, 0.860): the layout has
+    # drifted, so the seat-0 hero convention is flagged.
+    view = rd.assign_regions(_fixture_frame([(0.405, 0.65), (0.41, 0.66)]))
+    assert view["hero_seat_mismatch"] is True
+
+
+def test_single_flapped_card_does_not_flag_mismatch():
+    # Majority vote: one on-anchor card + one off-anchor card -> no warning.
+    view = rd.assign_regions(_fixture_frame([(0.50, 0.82), (0.405, 0.65)]))
+    assert view["hero_seat_mismatch"] is False
+
+
+def test_no_hero_cards_no_mismatch():
+    view = rd.assign_regions(_fixture_frame([]))
+    assert view["hero_seat_mismatch"] is False

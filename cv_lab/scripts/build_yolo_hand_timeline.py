@@ -65,6 +65,7 @@ def _frame_state(frame: rd.Frame) -> dict[str, Any]:
         "pills": pills,
         "dealer_seat": view["dealer_seat"],
         "active_seat": view["active_seat"],
+        "hero_seat_mismatch": view.get("hero_seat_mismatch", False),
         "missing": None,
     }
 
@@ -626,6 +627,11 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         warnings.append("duplicate_visible_cards")
     if final_pot is not None and not reconciled:
         warnings.append("pot_not_reconciled")
+    if any(s.get("hero_seat_mismatch") for s in hand):
+        # The hero zone's cards sat nearer another seat's card anchor: the
+        # "hero = seat 0" convention is suspect, so is_hero / hero_position /
+        # hero_bb_won attribution below can't be trusted for this layout.
+        warnings.append("hero_seat_mismatch")
 
     return {
         "hand_number": hand_number,

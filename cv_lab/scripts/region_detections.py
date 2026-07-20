@@ -206,6 +206,10 @@ def assign_regions(frame: Frame) -> dict[str, Any]:
     board_dets: list[tuple[float, Detection]] = []
     pot_candidates: list[Detection] = []
     seats: dict[int, dict[str, Any]] = {}
+    # Nearest card-anchor seat for each card in the STRICT hero zone ("other"-zone
+    # strays like villain showdown reveals don't vote). The spine's hero identity
+    # is the convention hero zone == seat 0; these votes cross-check it.
+    hero_zone_seat_votes: list[int] = []
 
     def seat(i: int) -> dict[str, Any]:
         return seats.setdefault(
@@ -224,6 +228,8 @@ def assign_regions(frame: Frame) -> dict[str, Any]:
                 board_dets.append((cx, det))
             else:  # hero (or a stray "other" -> treat as hero-side card)
                 hero_dets.append((cx, det))
+                if zone == "hero":
+                    hero_zone_seat_votes.append(_nearest_seat(cx, cy, "card_back"))
         elif det.cls == "pot_text":
             pot_candidates.append(det)
         elif det.cls in _SEATED_CLASSES:
@@ -262,6 +268,13 @@ def assign_regions(frame: Frame) -> dict[str, Any]:
     dealer_seat = next((i for i, info in seats.items() if info["dealer"]), None)
     active_seat = next((i for i, info in seats.items() if info["turn"]), None)
 
+    # Hero-seat cross-check: if most hero-zone cards sit nearer another seat's
+    # card anchor than seat 0's, the layout/anchors have drifted and every
+    # downstream "hero = seat 0" attribution (is_hero, hero_position, hero net)
+    # is suspect. Majority vote so one flapped assignment doesn't warn.
+    off_seat = sum(1 for v in hero_zone_seat_votes if v != 0)
+    hero_seat_mismatch = off_seat * 2 > len(hero_zone_seat_votes)
+
     return {
         "hero": hero_cards,
         "board": board_cards,
@@ -269,6 +282,7 @@ def assign_regions(frame: Frame) -> dict[str, Any]:
         "seats": seats,
         "dealer_seat": dealer_seat,
         "active_seat": active_seat,
+        "hero_seat_mismatch": hero_seat_mismatch,
     }
 
 

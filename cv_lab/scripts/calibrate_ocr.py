@@ -51,6 +51,13 @@ NUMBER_TRUTH: dict[int, str] = {
 BET_EVAL: dict[int, str] = {262: "9", 1533: "1", 2956: "1", 3922: "3", 4854: "1", 6172: "1"}
 # pot crops carry the POT: prefix + BB suffix -> source of the affix-letter templates.
 _POT_IDS = {39, 1338, 2547, 3672, 4635, 5806}
+# Bet crops also carry the chip-stack icon next to the amount. Its white suit
+# highlight survives binarize_text at HUD scale and classifies as a confident '0',
+# joining the digit run ("12" -> run [chip,1,2] -> gap-inferred decimal -> 0.12).
+# Harvest it as affix template 'c' so it breaks the run like the POT:/BB letters.
+# Only the chip GLYPH is taken from these crops; their values stay held out of the
+# digit templates (BET_EVAL remains a fair number-reading eval).
+_CHIP_IDS = set(BET_EVAL)
 
 # annotation_id -> transcribed pill word.
 PILL_TRUTH: dict[int, str] = {
@@ -109,6 +116,27 @@ def build_templates(db: Path, imgdir: Path) -> TemplateOCR:
             digit_acc.setdefault("P", []).append(_norm(tall[0].mask, DIGIT_SIZE))
             digit_acc.setdefault("T", []).append(_norm(tall[2].mask, DIGIT_SIZE))
 
+    # Chip-icon affix from bet crops: expected tall layout is value digits + BB +
+    # one chip at either end. The chip is the only glyph wider than tall (the suit
+    # highlight sits on a squat stack); digits and B are all taller than wide.
+    for aid in _CHIP_IDS:
+        crop = _load_crop(con, imgdir, aid)
+        truth = BET_EVAL.get(aid, "")
+        if crop is None or not truth:
+            continue
+        comps = segment_glyphs(binarize_text(crop))
+        max_h = max((c.h for c in comps), default=0)
+        tall = sorted((c for c in comps if c.h >= 0.55 * max_h), key=lambda g: g.x)
+        want = len(truth.replace(".", ""))
+        if len(tall) != want + 3:  # value + B + B + chip
+            print(f"  ! chip id{aid}: tall={len(tall)} != {want}+3, skipped")
+            continue
+        chip = max((tall[0], tall[-1]), key=lambda g: g.w / max(g.h, 1))
+        if chip.w <= chip.h:
+            print(f"  ! chip id{aid}: no wide end glyph ({chip.w}x{chip.h}), skipped")
+            continue
+        digit_acc.setdefault("c", []).append(_norm(chip.mask, DIGIT_SIZE))
+
     digits: dict[str, np.ndarray] = {}
     for ch, vecs in digit_acc.items():
         m = np.mean(vecs, axis=0)
@@ -146,22 +174,30 @@ def build_templates(db: Path, imgdir: Path) -> TemplateOCR:
 def evaluate(bank: TemplateOCR, db: Path, imgdir: Path) -> None:
     con = sqlite3.connect(str(db))
     ok = 0
+    attempted = 0
     combined = {**NUMBER_TRUTH, **BET_EVAL}
     print("\n== number read-back (train pot/stack + held-out bet) ==")
     for aid, value in combined.items():
         crop = _load_crop(con, imgdir, aid)
+        if crop is None:
+            print(f"       id{aid:<5} truth={value:<8} crop missing on disk, skipped")
+            continue
         val, raw = bank.read_number(crop)
         got = ("%g" % val) if val is not None else "None"
         hit = got == ("%g" % float(value))
         ok += hit
+        attempted += 1
         tag = "bet*" if aid in BET_EVAL else "    "
         print(f"  {tag} id{aid:<5} truth={value:<8} got={got:<8} raw='{raw}' {'OK' if hit else 'XX'}")
-    print(f"numbers: {ok}/{len(combined)}  (* = held-out)")
+    print(f"numbers: {ok}/{attempted}  (* = held-out, {len(combined) - attempted} skipped)")
 
     okp = 0
     print("\n== pill read-back ==")
     for aid, word in PILL_TRUTH.items():
         crop = _load_crop(con, imgdir, aid)
+        if crop is None:
+            print(f"  id{aid:<5} truth={word:<7} crop missing on disk, skipped")
+            continue
         got, sc = bank.read_word(crop)
         hit = got == word
         okp += hit

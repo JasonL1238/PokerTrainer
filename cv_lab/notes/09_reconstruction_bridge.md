@@ -66,9 +66,20 @@ All 10 timeline hands (7 complete + 3 partially observed) export through
 ## Known gaps
 - 2 partially-observed hands (recording start/end) + 1 hand under-sampled by
   the labeled-frame gap export as `needs_correction` drafts — by design.
-- OCR misreads like "12"→0.12 (chip-icon glyph joining the digit run) still
-  occur in bet_text; the spine routes around them (stack deltas + debounce),
-  but `read_number` could be tightened.
+- ~~OCR misreads like "12"→0.12 (chip-icon glyph joining the digit run)~~
+  FIXED: the chip icon's white suit highlight was classifying as a confident
+  '0' and joining every bet digit run (339/3014 v00 reads); with 3-glyph runs
+  the chip gap is indistinguishable from the decimal gap, so the fix is a
+  chip affix template ('c', harvested by calibrate_ocr.py from the labeled
+  bet crops) that breaks the run like the POT:/BB letters. Also fixed 7
+  frames of pot_text reading 0.0 (chip alone winning the run). All 33
+  chip-decimal misreads now read correctly; eval still 0 err/hand.
+  Remaining transients (chip ANIMATIONS flying over text, e.g. t=354) read
+  wrong for 1-2 frames and are absorbed by the spine's debounce, as before.
+- Hero attribution is the convention hero zone == seat 0; assign_regions now
+  cross-checks it (hero-zone cards must sit nearest seat 0's card anchor,
+  majority vote) and flags `hero_seat_mismatch` into hand warnings when a
+  re-learned layout breaks the convention.
 - Anchors/zones are v00-layout-specific; other table layouts need re-learning
   (same k-means, `SEAT_ANCHORS_BY_CLASS` docstring).
 

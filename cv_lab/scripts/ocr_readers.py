@@ -137,8 +137,9 @@ class TemplateOCR:
 
     # ---- glyph classification ----
     def classify_digit(self, glyph: np.ndarray) -> tuple[str, float]:
-        """Nearest template over digits AND affix letters (B/P/T). Returning a letter
-        lets read_number reject POT:/BB glyphs instead of misreading B as 8."""
+        """Nearest template over digits AND affix glyphs (B/P/T letters, 'c' chip
+        icon). Returning a non-digit lets read_number reject POT:/BB/chip glyphs
+        instead of misreading B as 8 or the chip's suit highlight as 0."""
         vec = _norm(glyph, DIGIT_SIZE)
         best, bs = "", -1.0
         for ch, tpl in self.digits.items():
