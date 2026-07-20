@@ -100,6 +100,9 @@ def _tokenize_cards(value: str) -> list[str]:
     if not text:
         return []
     cleaned = text.replace(",", " ").replace("-", " ").replace("/", " ")
+    # Accept the common "10" spelling for tens ("10h" -> "Th"). "10" can only
+    # ever appear as a ten rank, so a plain substring replace is safe.
+    cleaned = cleaned.replace("10", "T")
     tokens = cleaned.split()
     if len(tokens) == 1 and len(tokens[0]) > 2:
         compact = tokens[0]

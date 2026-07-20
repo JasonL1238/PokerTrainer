@@ -45,6 +45,9 @@ class EquityResult(BaseModel):
     method: str
     confidence: float = Field(ge=0, le=1)
     notes: str
+    # Monte-Carlo sampling error (one standard error of the equity estimate);
+    # None for exact enumeration and unavailable results.
+    std_error: float | None = Field(default=None, ge=0)
 
 
 class EquityCalculator(Protocol):
@@ -137,8 +140,7 @@ class Eval7EquityCalculator:
         hero = parse_hero_cards(hero_cards)
         board = parse_board_cards(board_cards)
         parse_visible_cards(hero_cards, board_cards)  # reject hero/board card overlap
-        label = normalize_range_label(villain_range)
-        notation = range_notation(label)
+        label, notation = _resolve_range(villain_range)
 
         if notation is None:
             return self._result(
@@ -173,10 +175,10 @@ class Eval7EquityCalculator:
 
         if len(board) >= 3:
             equity = self._exact(hero, board, combos)
-            method, confidence = "enumeration", EXACT_CONFIDENCE
+            method, confidence, std_error = "enumeration", EXACT_CONFIDENCE, None
             notes = f"Exact enumeration vs a {len(combos)}-combo {label} range."
         else:
-            equity = self._monte_carlo(hero, board, combos)
+            equity, std_error = self._monte_carlo(hero, board, combos)
             method, confidence = "monte_carlo", MONTE_CARLO_CONFIDENCE
             notes = (
                 f"Seeded Monte-Carlo ({self.iterations:,} iterations) vs a "
@@ -184,7 +186,85 @@ class Eval7EquityCalculator:
             )
 
         return self._result(
-            hero, board, label, equity=round(equity, 4), method=method, confidence=confidence, notes=notes
+            hero,
+            board,
+            label,
+            equity=round(equity, 4),
+            method=method,
+            confidence=confidence,
+            notes=notes,
+            std_error=std_error,
+        )
+
+    def calculate_equity_multiway(
+        self,
+        hero_cards: str,
+        board_cards: str,
+        villain_ranges: list[str],
+    ) -> EquityResult:
+        """Hero pot-share equity vs two or more villain ranges.
+
+        Uses a seeded Monte-Carlo (villain combos sampled with rejection so no
+        card is dealt twice); each showdown awards Hero their split-adjusted
+        share of the pot. Reported equity is expected pot share, the multiway
+        analogue of heads-up hot/cold equity.
+        """
+        if len(villain_ranges) < 2:
+            raise ValueError("calculate_equity_multiway needs at least two villain ranges.")
+        hero = parse_hero_cards(hero_cards)
+        board = parse_board_cards(board_cards)
+        parse_visible_cards(hero_cards, board_cards)
+
+        labels: list[str] = []
+        notations: list[str] = []
+        for villain_range in villain_ranges:
+            label, notation = _resolve_range(villain_range)
+            if notation is None:
+                return self._result(
+                    hero,
+                    board,
+                    " | ".join([*labels, label]),
+                    equity=None,
+                    method="range_unavailable",
+                    confidence=0.0,
+                    notes=f"No range definition for villain range {label!r}.",
+                )
+            labels.append(label)
+            notations.append(notation)
+
+        dead = {str(card) for card in hero} | {str(card) for card in board}
+        villain_combos = []
+        for notation in notations:
+            combos = [
+                (hand, weight)
+                for hand, weight in eval7.HandRange(notation).hands
+                if str(hand[0]) not in dead and str(hand[1]) not in dead
+            ]
+            if not combos:
+                return self._result(
+                    hero,
+                    board,
+                    " | ".join(labels),
+                    equity=None,
+                    method="no_valid_combos",
+                    confidence=0.0,
+                    notes="A villain range is fully blocked by Hero/board cards.",
+                )
+            villain_combos.append(combos)
+
+        equity, std_error = self._monte_carlo_multiway(hero, board, villain_combos)
+        return self._result(
+            hero,
+            board,
+            " | ".join(labels),
+            equity=round(equity, 4),
+            method="monte_carlo_multiway",
+            confidence=MONTE_CARLO_CONFIDENCE,
+            notes=(
+                f"Seeded Monte-Carlo ({self.iterations:,} iterations) pot-share equity vs "
+                f"{len(villain_combos)} villain ranges."
+            ),
+            std_error=std_error,
         )
 
     def _exact(self, hero: list[Card], board: list[Card], combos: list) -> float:
@@ -208,14 +288,16 @@ class Eval7EquityCalculator:
                 total += weight
         return (wins + ties / 2) / total
 
-    def _monte_carlo(self, hero: list[Card], board: list[Card], combos: list) -> float:
+    def _monte_carlo(
+        self, hero: list[Card], board: list[Card], combos: list
+    ) -> tuple[float, float]:
         rng = random.Random(self.seed)
         hero_e = [eval7.Card(str(card)) for card in hero]
         board_e = [eval7.Card(str(card)) for card in board]
         full = [eval7.Card(f"{rank}{suit}") for rank in "23456789TJQKA" for suit in "cdhs"]
         dead = {str(card) for card in hero + board}
         need = 5 - len(board_e)
-        wins = ties = total = 0.0
+        stats = _RunningEquity()
         for _ in range(self.iterations):
             hand, weight = combos[rng.randrange(len(combos))]
             villain = list(hand)
@@ -225,11 +307,59 @@ class Eval7EquityCalculator:
             hero_score = eval7.evaluate(hero_e + board_e + completion)
             villain_score = eval7.evaluate(villain + board_e + completion)
             if hero_score > villain_score:
-                wins += weight
+                share = 1.0
             elif hero_score == villain_score:
-                ties += weight
-            total += weight
-        return (wins + ties / 2) / total
+                share = 0.5
+            else:
+                share = 0.0
+            stats.add(share, weight)
+        return stats.mean(), stats.standard_error()
+
+    def _monte_carlo_multiway(
+        self, hero: list[Card], board: list[Card], villain_combos: list[list]
+    ) -> tuple[float, float]:
+        rng = random.Random(self.seed)
+        hero_e = [eval7.Card(str(card)) for card in hero]
+        board_e = [eval7.Card(str(card)) for card in board]
+        full = [eval7.Card(f"{rank}{suit}") for rank in "23456789TJQKA" for suit in "cdhs"]
+        dead = {str(card) for card in hero + board}
+        need = 5 - len(board_e)
+        stats = _RunningEquity()
+        iterations = 0
+        while iterations < self.iterations:
+            # Rejection sampling: draw one combo per villain, retry the whole
+            # deal if two villains claim the same card.
+            used = set(dead)
+            villains = []
+            weight = 1.0
+            clash = False
+            for combos in villain_combos:
+                hand, hand_weight = combos[rng.randrange(len(combos))]
+                cards = {str(hand[0]), str(hand[1])}
+                if cards & used:
+                    clash = True
+                    break
+                used |= cards
+                villains.append(list(hand))
+                weight *= hand_weight
+            if clash:
+                continue
+            iterations += 1
+            deck = [card for card in full if str(card) not in used]
+            completion = rng.sample(deck, need)
+            hero_score = eval7.evaluate(hero_e + board_e + completion)
+            villain_scores = [
+                eval7.evaluate(villain + board_e + completion) for villain in villains
+            ]
+            best_villain = max(villain_scores)
+            if hero_score > best_villain:
+                share = 1.0
+            elif hero_score == best_villain:
+                share = 1.0 / (1 + villain_scores.count(best_villain))
+            else:
+                share = 0.0
+            stats.add(share, weight)
+        return stats.mean(), stats.standard_error()
 
     @staticmethod
     def _result(
@@ -241,6 +371,7 @@ class Eval7EquityCalculator:
         method: str,
         confidence: float,
         notes: str,
+        std_error: float | None = None,
     ) -> EquityResult:
         return EquityResult(
             hero_hand=compact_cards(hero),
@@ -250,7 +381,57 @@ class Eval7EquityCalculator:
             method=method,
             confidence=confidence,
             notes=notes,
+            std_error=std_error,
         )
+
+
+class _RunningEquity:
+    """Weighted running mean and standard error for Monte-Carlo pot shares.
+
+    Uses the effective sample size (sum(w))^2 / sum(w^2) so weighted ranges do
+    not overstate the estimate's precision.
+    """
+
+    def __init__(self) -> None:
+        self._sum_w = 0.0
+        self._sum_wx = 0.0
+        self._sum_wx2 = 0.0
+        self._sum_w2 = 0.0
+
+    def add(self, share: float, weight: float) -> None:
+        self._sum_w += weight
+        self._sum_wx += weight * share
+        self._sum_wx2 += weight * share * share
+        self._sum_w2 += weight * weight
+
+    def mean(self) -> float:
+        return self._sum_wx / self._sum_w
+
+    def standard_error(self) -> float:
+        mean = self.mean()
+        variance = max(0.0, self._sum_wx2 / self._sum_w - mean * mean)
+        effective_n = (self._sum_w * self._sum_w) / self._sum_w2
+        return (variance / effective_n) ** 0.5
+
+
+def _resolve_range(villain_range: str) -> tuple[str, str | None]:
+    """Resolve a villain range input to (label, eval7 notation).
+
+    Known labels map to their predefined notation; anything else is accepted as
+    raw eval7 range notation (e.g. "KK" or "22+,ATs+") if it parses, otherwise
+    the notation is None and callers report range_unavailable.
+    """
+    label = normalize_range_label(villain_range)
+    notation = range_notation(label)
+    if notation is None:
+        custom = (villain_range or "").strip()
+        if custom and custom.lower() != "unknown":
+            try:
+                if eval7.HandRange(custom).hands:
+                    return custom, custom
+            except Exception:  # eval7 raises its own RangeStringError on bad syntax
+                pass
+    return label, notation
 
 
 def _combinations(items: list, choose: int):

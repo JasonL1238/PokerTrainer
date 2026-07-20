@@ -18,13 +18,16 @@ def break_even_bluff_frequency(bet_size: float, pot_size: float) -> float:
     return bet_size / (pot_size + bet_size)
 
 
-def value_bet_call_threshold(bet_size: float, pot_size: float) -> float:
-    """Return a simple call-frequency threshold for comparing value/bluff pressure.
+def minimum_defense_frequency(bet_size: float, pot_size: float) -> float:
+    """Return the MDF: how often the defender must continue vs a bet.
 
-    This uses the same risk/reward ratio as a break-even bluff. It is a review aid,
-    not a complete value-betting model.
+    Formula: pot_size / (pot_size + bet_size). This is the complement of the
+    break-even bluff frequency (alpha). Defending less often than the MDF makes
+    any-two-cards bluffs immediately profitable for the bettor.
     """
-    return break_even_bluff_frequency(bet_size, pot_size)
+    _require_positive(bet_size, "bet_size")
+    _require_positive(pot_size, "pot_size")
+    return pot_size / (pot_size + bet_size)
 
 
 def format_percentage(value: float) -> str:

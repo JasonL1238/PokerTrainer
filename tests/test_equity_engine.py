@@ -84,3 +84,83 @@ def test_placeholder_still_available_as_labeled_fallback():
     placeholder = PlaceholderEquityCalculator().calculate_equity("As Ah", "", "premium")
     assert placeholder.method == "placeholder"
     assert placeholder.confidence == pytest.approx(0.2)
+
+
+def test_custom_range_notation_accepted():
+    result = _eq("As Ah", "", "KK")
+    assert result.method == "monte_carlo"
+    assert result.equity is not None
+
+
+def test_invalid_custom_notation_falls_back_to_unavailable():
+    result = _eq("As Ah", "", "not a range !!!")
+    assert result.equity is None
+    assert result.method == "range_unavailable"
+
+
+def test_golden_value_aa_vs_kk():
+    # Textbook: AA vs KK preflop ~= 81.9%. Seeded MC at 100k iters, tight band.
+    result = _eq("As Ah", "", "KK")
+    assert result.equity == pytest.approx(0.819, abs=0.01)
+
+
+def test_golden_value_ak_suited_vs_pair_below():
+    # Classic coin flip: AKs vs 22 preflop ~= 49-50%.
+    result = _eq("Ah Kh", "", "22")
+    assert result.equity == pytest.approx(0.50, abs=0.015)
+
+
+def test_board_plays_ties_split_exactly():
+    # Royal flush on board: every runout is a tie -> equity exactly 0.5.
+    result = _eq("2c 2d", "As Ks Qs Js Ts", "premium")
+    assert result.method == "enumeration"
+    assert result.equity == pytest.approx(0.5)
+
+
+def test_call_ev_consistent_with_required_equity():
+    # Cross-module consistency: at the required calling equity, EV(call) == 0.
+    from poker_tracker.ev import call_ev
+    from poker_tracker.pot_odds import required_equity_to_call
+
+    equity = required_equity_to_call(30, 90)
+    assert call_ev(equity, 90, 30) == pytest.approx(0.0)
+
+
+def test_monte_carlo_reports_standard_error():
+    result = _eq("Ah Kh", "", "standard", iterations=20_000)
+    assert result.method == "monte_carlo"
+    assert result.std_error is not None
+    assert 0 < result.std_error < 0.01
+
+
+def test_enumeration_has_no_standard_error():
+    result = _eq("Ah Kh", "Qh Jh Th", "premium")
+    assert result.method == "enumeration"
+    assert result.std_error is None
+
+
+def test_multiway_equity_pot_share():
+    calc = Eval7EquityCalculator(iterations=20_000)
+    result = calc.calculate_equity_multiway("As Ad", "Ac 7h 2d", ["KK", "QQ"])
+    assert result.method == "monte_carlo_multiway"
+    # Top set vs two dominated pairs should hold nearly the whole pot.
+    assert result.equity == pytest.approx(0.997, abs=0.005)
+    assert result.std_error is not None
+
+
+def test_multiway_equity_is_reproducible_and_below_heads_up():
+    calc = Eval7EquityCalculator(iterations=20_000)
+    heads_up = calc.calculate_equity("Ah Kh", "", "standard").equity
+    first = calc.calculate_equity_multiway("Ah Kh", "", ["standard", "loose"])
+    second = calc.calculate_equity_multiway("Ah Kh", "", ["standard", "loose"])
+    assert first.equity == second.equity  # seeded → deterministic
+    assert first.equity < heads_up  # a second live range always costs pot share
+
+
+def test_multiway_requires_two_ranges_and_honest_unknown():
+    calc = Eval7EquityCalculator(iterations=1_000)
+    with pytest.raises(ValueError):
+        calc.calculate_equity_multiway("Ah Kh", "", ["standard"])
+    result = calc.calculate_equity_multiway("Ah Kh", "", ["standard", "unknown"])
+    assert result.equity is None
+    assert result.method == "range_unavailable"

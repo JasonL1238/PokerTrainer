@@ -32,9 +32,9 @@ RANGES = {
     ),
     "standard": RangeDescription(
         label="standard",
-        description="Reasonable default range for unknown regulars.",
-        examples=["77+", "ATs+", "KJs+", "QJs", "AQo+"],
-        notation="77+,ATs+,KJs+,QJs,AQo+",
+        description="Reasonable default range for unknown regulars (~21% of hands).",
+        examples=["22+", "A2s+", "K9s+", "suited connectors", "ATo+", "KTo+"],
+        notation="22+,A2s+,K9s+,Q9s+,J9s+,T8s+,97s+,87s,76s,65s,ATo+,KTo+,QJo",
     ),
     "loose": RangeDescription(
         label="loose",
