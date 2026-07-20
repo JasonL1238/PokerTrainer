@@ -51,6 +51,12 @@ def _frame_state(frame: rd.Frame) -> dict[str, Any]:
     bets = {i: info.get("bet") for i, info in seats.items() if info.get("bet") is not None}
     pills = {i: info["pill_action"] for i, info in seats.items() if info["pill_action"]}
     board = view["board"]
+    # A pot text of exactly 0 is never real once a hand is in progress (blinds and
+    # antes are posted before the first observed state); it is an OCR dropout on the
+    # pot region. Treat it as unread so it can't anchor initial_pot / final_pot.
+    pot = view["pot"]
+    if pot is not None and pot <= 0.0:
+        pot = None
     return {
         "time_s": frame.time_s,
         "image": frame.image,
@@ -58,7 +64,7 @@ def _frame_state(frame: rd.Frame) -> dict[str, Any]:
         "hero_cards": view["hero"],
         "board_cards": board,
         "other_cards": [],
-        "pot": view["pot"],
+        "pot": pot,
         "dealt_in": dealt_in,
         "stacks": stacks,
         "bets": bets,
@@ -335,12 +341,25 @@ def _settle_index(hand: list[dict[str, Any]]) -> int:
     winner is paid, flipping the result). States after the sweep are next-deal
     noise: the next hand's antes tick every stack down and its blinds post while
     the old hero cards linger."""
+    n = len(hand)
+    # Suffix max of the pot from each index onward: a real settlement is TERMINAL
+    # -- the pot is swept and only the next deal's small blinds follow -- so a
+    # candidate jump is rejected if the pot later grows well beyond its own level.
+    # This stops a mid-hand phantom (a stack OCR blip on a seat that then folds)
+    # from truncating the hand before the real sweep.
+    suffix_max_pot = [0.0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        p = hand[i]["pot"] or 0.0
+        suffix_max_pot[i] = max(p, suffix_max_pot[i + 1])
     pot_so_far: float | None = None
-    best_idx, best_jump = len(hand) - 1, 0.0
+    best_idx, best_jump = n - 1, 0.0
     for idx, (prev, cur) in enumerate(zip(hand, hand[1:]), start=1):
         if prev["pot"] is not None:
             pot_so_far = prev["pot"] if pot_so_far is None else max(pot_so_far, prev["pot"])
         threshold = max(3.0, 0.4 * (pot_so_far or 0.0))
+        cur_pot = cur["pot"] if cur["pot"] is not None else (pot_so_far or 0.0)
+        if suffix_max_pot[idx + 1] > cur_pot + threshold:
+            continue  # pot keeps growing after this -> not the terminal sweep
         for seat, after in cur["stacks"].items():
             before = prev["stacks"].get(seat)
             if before is None:
@@ -625,8 +644,17 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
     # Gains are measured on the SETTLED window only: the next-deal states that
     # trail a hand contain auto top-ups (stack refills to the buy-in) and the
     # next hand's antes/blinds, either of which corrupts a full-series delta.
-    # (Winner is NOT gated on the fold list: a fold pill can be misdetected on a
-    # seat that actually reaches showdown, and a real stack sweep outranks it.)
+    # Phantom-winner guard: a seat whose LAST action is a fold, showing a "gain"
+    # that exceeds the pot it could possibly rake, is a stack OCR blip (a folded
+    # short stack misreading upward), not a sweep -- disqualify it from winning.
+    # Both conditions are required so real winners survive: a transient fold pill
+    # misdetected on a seat that then wins still shows a gain consistent with the
+    # pot (that seat is kept), and an all-in winner who is never marked folded is
+    # never touched however large the side pot.
+    last_action: dict[int, str] = {}
+    for a in actions:
+        last_action[a["seat"]] = a["action_type"]
+    folded_seats = {s for s, act in last_action.items() if act == "fold"}
     contributed = 0.0
     winner_seat, win_gain = None, 0.0
     hero_bb_won = None
@@ -639,18 +667,45 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         if pre_settle:
             contributed += max(series[0] - pre_settle[-1], 0.0)
         gain = series[-1] - low
-        if gain > win_gain + _EPS:
+        phantom = (seat in folded_seats and final_pot is not None
+                   and gain > 1.5 * final_pot + 3.0)
+        if not phantom and gain > win_gain + _EPS:
             win_gain, winner_seat = gain, seat
         if seat == 0:
             hero_bb_won = round(series[-1] - series[0], 2)
     contributed = round(contributed, 2)
 
+    # Did the hero fold? Signals, strongest first: a hero fold pill, a
+    # reconstructed hero fold action, or -- for a blind/checked hero who never
+    # commits chips (no pill sampled) -- the hero's cards mucking away while the
+    # pot is still contested multiway. The last is gated on winner_seat is None
+    # and >=2 villains still holding cards so a hero-WIN sweep (everyone else's
+    # cards clear at once) can never be mistaken for a fold.
+    hero_had_cards = len(hero) == 2
+    hero_pill_fold = any(s["pills"].get(0) == "fold" for s in hand)
+    hero_action_fold = any(a["seat"] == 0 and a["action_type"] == "fold" for a in actions)
+    last = hand[-1]
+    villains_live_at_end = len([s for s in last["dealt_in"] if s != 0]) >= 2
+    hero_mucked = (
+        hero_had_cards and winner_seat is None and villains_live_at_end
+        and len(hand[0]["hero_cards"]) == 2 and len(last["hero_cards"]) != 2
+    )
+    hero_folded = hero_had_cards and (hero_pill_fold or hero_action_fold or hero_mucked)
+
     if winner_seat == 0:
         result = "Hero wins"
     elif winner_seat is not None:
         result = "Villain wins"
+    elif hero_folded:
+        result = "Hero folds"
     else:
         result = ""
+
+    # A hand the hero folded out of, whose villain resolution falls outside the
+    # tracked window (no pot sweep observed), is a COMPLETE record of the hero's
+    # decision -- cards, fold, net loss -- even without an observed winner. The
+    # full-pot reconciliation does not apply: we never see the pot close.
+    hero_fold_only = hero_folded and winner_seat is None
 
     cards = hero + board
     cards_unique = len(cards) == len(set(cards))
@@ -658,12 +713,67 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
     # (stacks are pre-debited), so observed stack contributions reconcile
     # against the pot GROWTH from the first reading, not the whole pot.
     initial_pot = pots[0] if pots else None
-    reconciled = (
-        final_pot is not None and initial_pot is not None
-        and abs(initial_pot + contributed - final_pot) <= max(3.0, 0.25 * final_pot)
-    )
+
+    # Three INDEPENDENT estimates of the final pot, each with a distinct failure
+    # mode, so a wrong one is outvoted rather than trusted:
+    #   text    -- the pot-region OCR; can drop out / freeze stale mid-betting
+    #              (a 52 BB river sweep still displaying "12").
+    #   contrib -- initial pot + chips every seat put in; breaks if a stack
+    #              misreads (one bad seat inflates the sum).
+    #   win     -- chips swept to the winner; OVERCOUNTS by any uncalled bet
+    #              returned (an over-shove's excess is refunded pre-sweep).
+    # Report the estimate in the largest mutually-agreeing cluster, preferring
+    # the pot text on ties (it needs no arithmetic). A hand reconciles when >=2
+    # estimates independently agree -- money conservation the single text read
+    # can't fake. Two stack estimates agreeing against the text means the text
+    # is the misread, so the text is correctly overridden.
+    pot_text = final_pot
+    contrib_pot = round(initial_pot + contributed, 2) if initial_pot is not None else None
+    win_pot = round(win_gain, 2) if (winner_seat is not None and win_gain > _EPS) else None
+    candidates = [(k, v) for k, v in
+                  (("text", pot_text), ("contrib", contrib_pot), ("win", win_pot))
+                  if v is not None]
+
+    def _pot_agree(a: float, b: float) -> bool:
+        return abs(a - b) <= max(3.0, 0.15 * max(a, b))
+
+    pref = {"text": 0, "contrib": 1, "win": 2}  # tie-break order
+    best = None  # (support, -pref, value)
+    for k, v in candidates:
+        support = sum(1 for _, u in candidates if _pot_agree(v, u))
+        key = (support, -pref[k])
+        if best is None or key > best[0]:
+            best = (key, v, k)
+    if best is not None and not hero_fold_only:
+        final_pot = best[1]
+    best_support = best[0][0] if best is not None else 0
+    pot_text_dropped = bool(best is not None and best[2] != "text"
+                            and pot_text is not None and not _pot_agree(final_pot, pot_text))
+
+    if hero_fold_only:
+        reconciled = True  # not applicable: villain resolution unobserved
+    else:
+        reconciled = best_support >= 2
+
+    # Phantom-winner demotion: an UNRECONCILED villain-winner on a hand the hero
+    # folded is not corroborated by the pot or the contributions -- it is a
+    # phantom sweep from a trailing junk frame (the table replaced by the lobby,
+    # or a frozen end-of-recording frame the stack OCR misreads). Reporting it
+    # would assert a winner we cannot stand behind. The reliable, coaching-
+    # relevant fact is the hero fold; drop the unverifiable winner and record the
+    # villain resolution as unobserved. (A reconciled winner is kept: v01#1's
+    # real river sweep still reconciles via the contrib/win consensus.)
+    if hero_folded and winner_seat is not None and not reconciled:
+        winner_seat, win_gain = None, 0.0
+        result = "Hero folds"
+        final_pot = pot_text  # the consensus/derived pot rode on the phantom sweep
+        hero_fold_only = True
+        pot_text_dropped = False
+        reconciled = True
+
     complete_cards = len(hero) == 2 and len(board) in {0, 3, 4, 5} and cards_unique
-    complete = bool(hero) and cards_unique and final_pot is not None and bool(actions) and winner_seat is not None
+    complete = (bool(hero) and cards_unique and final_pot is not None and bool(actions)
+                and (winner_seat is not None or hero_fold_only))
 
     warnings: list[str] = []
     if len(hero) != 2:
@@ -672,7 +782,7 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         warnings.append("invalid_board_count")
     if not cards_unique:
         warnings.append("duplicate_visible_cards")
-    if final_pot is not None and not reconciled:
+    if final_pot is not None and not reconciled and not hero_fold_only:
         warnings.append("pot_not_reconciled")
     if any(s.get("hero_seat_mismatch") for s in hand):
         # The hero zone's cards sat nearer another seat's card anchor: the
@@ -692,9 +802,11 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         "streets": streets,
         "actions": actions,
         "pot": final_pot,
+        "pot_text_dropped": pot_text_dropped,
         "winner_seat": winner_seat,
         "win_gain": round(win_gain, 2),
         "result": result,
+        "hero_folded": hero_folded,
         "hero_bb_won": hero_bb_won,
         "contributed_est": contributed,
         "reconciled": reconciled,
