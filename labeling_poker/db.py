@@ -61,13 +61,21 @@ def sync_files(connection: sqlite3.Connection, images_dir: Path | str) -> list[s
         (path for path in directory.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES),
         key=lambda path: path.name,
     )
+    present_ids: set[str] = set()
     for path in paths:
         file_id = path.stem
+        present_ids.add(file_id)
         relative_path = path.relative_to(directory).as_posix()
         connection.execute(
             "INSERT INTO files(id, path) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET path=excluded.path",
             (file_id, relative_path),
         )
+    # Drop undecided rows whose image file disappeared so Browse doesn't land on 404s.
+    for row in connection.execute("SELECT id FROM files").fetchall():
+        if row["id"] in present_ids:
+            continue
+        if get_status(connection, row["id"]) == "undecided":
+            connection.execute("DELETE FROM files WHERE id = ?", (row["id"],))
     connection.commit()
     return [path.stem for path in paths]
 
@@ -111,28 +119,148 @@ def save_annotations(connection: sqlite3.Connection, file_id: str, status_value:
         )
 
 
-def next_undecided(connection: sqlite3.Connection, priority_ids: Iterable[str] = ()) -> str | None:
+STATUS_FILTERS = {"all", "undecided", "labeled", "clean", "duplicate"}
+
+
+def _ordered_ids(connection: sqlite3.Connection, priority_ids: Iterable[str] = ()) -> list[str]:
+    """Return file IDs with the optional priority list first, without duplicates."""
     ids = file_ids(connection)
-    undecided = {row["id"] for row in connection.execute("SELECT id FROM files WHERE id NOT IN (SELECT file_id FROM status)")}
+    known = set(ids)
+    priority = []
+    seen = set()
     for file_id in priority_ids:
-        if file_id in undecided:
-            return file_id
-    return next((file_id for file_id in ids if file_id in undecided), None)
+        if file_id in known and file_id not in seen:
+            priority.append(file_id)
+            seen.add(file_id)
+    return priority + [file_id for file_id in ids if file_id not in seen]
 
 
-def seek(connection: sqlite3.Connection, current_id: str | None, direction: str) -> str | None:
-    ids = file_ids(connection)
+def _matching_ids(
+    connection: sqlite3.Connection,
+    status_filter: str,
+    priority_ids: Iterable[str] = (),
+    *,
+    priority_only: bool = False,
+    order_by_updated_at: bool = False,
+) -> list[str]:
+    """Return IDs matching a status, optionally scoped and ordered by label time."""
+    ids = _ordered_ids(connection, priority_ids)
+    if priority_only:
+        priority_set = set(priority_ids)
+        ids = [file_id for file_id in ids if file_id in priority_set]
+    if status_filter == "all":
+        return ids
+
+    status_by_id = {
+        row["file_id"]: (row["status"], row["updated_at"])
+        for row in connection.execute("SELECT file_id, status, updated_at FROM status")
+    }
+    matches = [file_id for file_id in ids if status_by_id.get(file_id, ("undecided", ""))[0] == status_filter]
+    if order_by_updated_at:
+        # ISO-8601 timestamps sort chronologically as text. Use the file ID as a
+        # deterministic tie-breaker for labels saved in the same clock tick.
+        matches.sort(key=lambda file_id: (status_by_id[file_id][1], file_id))
+    return matches
+
+
+def next_matching(
+    connection: sqlite3.Connection,
+    status_filter: str = "undecided",
+    priority_ids: Iterable[str] = (),
+    current_id: str | None = None,
+    *,
+    priority_only: bool = False,
+    order_by_updated_at: bool = False,
+    start_with_latest: bool = False,
+    wrap_next: bool = False,
+) -> str | None:
+    """Find the first or next file that matches a saved-label status.
+
+    Keeping the current ID in the ordering even after it is re-saved with a new
+    status lets the UI advance naturally after, for example, changing a labeled
+    image to clean.
+    """
+    if status_filter not in STATUS_FILTERS:
+        raise ValueError(f"unknown status filter {status_filter!r}")
+    ids = _matching_ids(
+        connection,
+        status_filter,
+        priority_ids,
+        priority_only=priority_only,
+        order_by_updated_at=order_by_updated_at,
+    )
+    if current_id is None:
+        return ids[-1] if start_with_latest and ids else (ids[0] if ids else None)
+    return seek(
+        connection,
+        current_id,
+        "next",
+        status_filter,
+        priority_ids,
+        priority_only=priority_only,
+        order_by_updated_at=order_by_updated_at,
+        wrap_next=wrap_next,
+    )
+
+
+def next_undecided(connection: sqlite3.Connection, priority_ids: Iterable[str] = ()) -> str | None:
+    return next_matching(connection, "undecided", priority_ids)
+
+
+def seek(
+    connection: sqlite3.Connection,
+    current_id: str | None,
+    direction: str,
+    status_filter: str = "all",
+    priority_ids: Iterable[str] = (),
+    *,
+    priority_only: bool = False,
+    order_by_updated_at: bool = False,
+    wrap_next: bool = False,
+) -> str | None:
+    """Move through files in either direction, limited to one status when asked."""
+    if direction not in {"prev", "next"}:
+        raise ValueError("direction must be prev or next")
+    if status_filter not in STATUS_FILTERS:
+        raise ValueError(f"unknown status filter {status_filter!r}")
+    ids = _matching_ids(
+        connection,
+        status_filter,
+        priority_ids,
+        priority_only=priority_only,
+        order_by_updated_at=order_by_updated_at,
+    )
     if not ids:
         return None
     if current_id not in ids:
         return ids[0] if direction == "next" else ids[-1]
     index = ids.index(current_id) + (1 if direction == "next" else -1)
-    return ids[index] if 0 <= index < len(ids) else None
+    if 0 <= index < len(ids):
+        return ids[index]
+    if direction == "next" and wrap_next:
+        return ids[0]
+    return None
 
 
 def progress(connection: sqlite3.Connection) -> dict[str, int]:
     total = connection.execute("SELECT COUNT(*) FROM files").fetchone()[0]
     counts = {row["status"]: row["count"] for row in connection.execute("SELECT status, COUNT(*) AS count FROM status GROUP BY status")}
+    labeled = counts.get("labeled", 0)
+    clean = counts.get("clean", 0)
+    duplicate = counts.get("duplicate", 0)
+    return {"total": total, "labeled": labeled, "clean": clean, "duplicate": duplicate, "undecided": total - labeled - clean - duplicate}
+
+
+def queue_progress(connection: sqlite3.Connection, priority_ids: list[str]) -> dict[str, int]:
+    total = len(priority_ids)
+    if total == 0:
+        return {"total": 0, "labeled": 0, "clean": 0, "duplicate": 0, "undecided": 0}
+    placeholders = ",".join("?" * total)
+    rows = connection.execute(
+        f"SELECT status, COUNT(*) AS count FROM status WHERE file_id IN ({placeholders}) GROUP BY status",
+        priority_ids,
+    )
+    counts = {row["status"]: row["count"] for row in rows}
     labeled = counts.get("labeled", 0)
     clean = counts.get("clean", 0)
     duplicate = counts.get("duplicate", 0)

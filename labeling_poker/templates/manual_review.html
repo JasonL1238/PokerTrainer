@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Manual Review · Poker Labeler</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #111827; color: #e5e7eb; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 1680px; margin: 0 auto; padding: 22px; }
+    h1 { margin: 0; font-size: 24px; }
+    .subtle { color: #94a3b8; font-size: 14px; margin: 6px 0 18px; }
+    .top, .filters, .pager { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .top { justify-content: space-between; }
+    a { color: inherit; text-decoration: none; }
+    .button, .filter { border: 1px solid #475569; background: #263449; border-radius: 6px; padding: 8px 10px; font-size: 14px; }
+    .filter.active { background: #1d4ed8; border-color: #60a5fa; }
+    .count { color: #cbd5e1; font-variant-numeric: tabular-nums; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; margin-top: 18px; }
+    .card { overflow: hidden; border: 1px solid #374151; background: #172033; border-radius: 8px; }
+    canvas { display: block; width: 100%; background: #0b1020; aspect-ratio: 16 / 9; }
+    .details { padding: 10px; }
+    .id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; }
+    .meta { display: flex; flex-wrap: wrap; gap: 6px; margin: 7px 0 10px; color: #cbd5e1; font-size: 12px; }
+    .tag { padding: 2px 6px; border: 1px solid #475569; border-radius: 999px; }
+    .tag.pending { color: #fde68a; border-color: #a16207; }
+    .tag.labeled { color: #86efac; border-color: #15803d; }
+    .tag.clean { color: #93c5fd; border-color: #2563eb; }
+    .tag.duplicate { color: #fca5a5; border-color: #b91c1c; }
+    .empty { color: #94a3b8; margin: 40px 0; text-align: center; }
+    .pager { justify-content: center; margin: 24px 0 8px; }
+    .pager [aria-disabled="true"] { opacity: .4; pointer-events: none; }
+    @media (max-width: 600px) { main { padding: 14px; } .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="top">
+    <div>
+      <h1>Manual review</h1>
+      <div class="subtle">Two-model outputs stay pending until you save them. Saved items are shown newest first.</div>
+    </div>
+    <a class="button" href="{{ url_for('index', queue='two_model_validation') }}">Open labeler</a>
+  </div>
+  <nav class="filters" aria-label="Review filter">
+    <a class="filter {% if selected_view == 'pending' %}active{% endif %}" href="{{ url_for('manual_review', view='pending') }}">Pending {{ counts.pending }}</a>
+    <a class="filter {% if selected_view == 'labeled' %}active{% endif %}" href="{{ url_for('manual_review', view='labeled') }}">Labeled {{ counts.labeled }}</a>
+    <a class="filter {% if selected_view == 'labeled_sus' %}active{% endif %}" href="{{ url_for('manual_review', view='labeled_sus') }}">Labeled sus {{ counts.labeled_sus }}</a>
+    <a class="filter {% if selected_view == 'unlabeled_sus' %}active{% endif %}" href="{{ url_for('manual_review', view='unlabeled_sus') }}">Unlabeled sus {{ counts.unlabeled_sus }}</a>
+    <a class="filter {% if selected_view == 'clean' %}active{% endif %}" href="{{ url_for('manual_review', view='clean') }}">Clean {{ counts.clean }}</a>
+    <a class="filter {% if selected_view == 'duplicate' %}active{% endif %}" href="{{ url_for('manual_review', view='duplicate') }}">Duplicates {{ counts.duplicate }}</a>
+    <a class="filter {% if selected_view == 'all' %}active{% endif %}" href="{{ url_for('manual_review', view='all') }}">All saved + pending</a>
+  </nav>
+  <div class="count">{{ total }} items · page {{ page }}</div>
+  {% if items %}
+  <section class="grid">
+    {% for item in items %}
+    <article class="card">
+      <canvas class="review-canvas" data-image="{{ url_for('image', file_id=item.id) }}" data-boxes='{{ item.boxes|tojson }}'></canvas>
+      <div class="details">
+        <div class="id">{{ item.id }}</div>
+        <div class="meta">
+          <span class="tag {% if item.kind in ['Two-model prediction', 'Unlabeled sus'] %}pending{% else %}{{ item.kind }}{% endif %}">{{ item.kind }}</span>
+          <span class="tag">{{ item.boxes|length }} boxes</span>
+          {% if item.sus_reasons %}<span class="tag">{{ item.sus_reasons|join('; ') }}</span>{% endif %}
+          {% if item.updated_at %}<span>{{ item.updated_at }}</span>{% endif %}
+        </div>
+        <a class="button" href="{{ url_for('index', id=item.id, queue='two_model_validation', view='labeled_sus' if selected_view == 'labeled_sus' else ('unlabeled_sus' if selected_view == 'unlabeled_sus' else ('labeled' if item.kind == 'labeled' else 'undecided'))) }}">Open in labeler</a>
+      </div>
+    </article>
+    {% endfor %}
+  </section>
+  {% else %}
+  <div class="empty">No items in this view.</div>
+  {% endif %}
+  <nav class="pager" aria-label="Pagination">
+    <a class="button" aria-disabled="{{ 'false' if has_prev else 'true' }}" href="{{ url_for('manual_review', view=selected_view, page=page - 1) }}">Previous</a>
+    <a class="button" aria-disabled="{{ 'false' if has_next else 'true' }}" href="{{ url_for('manual_review', view=selected_view, page=page + 1) }}">Next</a>
+  </nav>
+</main>
+<script>
+  const colors = {{ colors|tojson }};
+  document.querySelectorAll(".review-canvas").forEach((canvas) => {
+    const boxes = JSON.parse(canvas.dataset.boxes || "[]"), image = new Image(), ctx = canvas.getContext("2d");
+    image.onload = () => {
+      canvas.width = image.naturalWidth; canvas.height = image.naturalHeight;
+      ctx.drawImage(image, 0, 0);
+      const line = Math.max(2, Math.round(image.naturalWidth / 350));
+      boxes.forEach((box) => {
+        const color = colors[box.class] || "#ffffff";
+        ctx.strokeStyle = color; ctx.lineWidth = line; ctx.strokeRect(box.x1, box.y1, box.x2 - box.x1, box.y2 - box.y1);
+        const label = box.label ? `${box.class} (${box.label})` : box.class;
+        ctx.font = `bold ${Math.max(12, Math.round(image.naturalWidth / 55))}px system-ui`;
+        const width = ctx.measureText(label).width + line * 4;
+        ctx.fillStyle = "rgba(11,16,32,.86)"; ctx.fillRect(box.x1, Math.max(0, box.y1 - 22), width, 22);
+        ctx.fillStyle = color; ctx.fillText(label, box.x1 + line * 2, Math.max(16, box.y1 - 6));
+      });
+    };
+    image.src = canvas.dataset.image;
+  });
+</script>
+</body>
+</html>

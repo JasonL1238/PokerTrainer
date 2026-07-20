@@ -7,6 +7,7 @@ DEFAULT_DB_PATH = ROOT / "data" / "labels.sqlite3"
 DEFAULT_PRIORITY_DIR = ROOT / "priority"
 EXISTING_DATASET_IMAGES_DIR = ROOT.parent / "cv_lab" / "datasets" / "yolo_cards_autolabel_v1" / "images"
 DEFAULT_MODEL_PATH = ROOT.parent / "cv_lab" / "models" / "best (4).pt"
+DEFAULT_REGION_MODEL_PATH = ROOT.parent / "cv_lab" / "models" / "region_spine_v1.pt"
 YOLOV12_VENDOR_CANDIDATES = [
     ROOT.parent / "cv-backend" / "vendor" / "yolov12",
     ROOT.parent.parent / "YoloCardDetectTest" / "cv-backend" / "vendor" / "yolov12",
@@ -14,8 +15,11 @@ YOLOV12_VENDOR_CANDIDATES = [
 
 # Keep class order stable: numeric IDs in exported YOLO labels follow this list.
 # Lean reconstruction schema: every class feeds hand reconstruction directly.
-# bet_text (redundant with stack deltas) and player_name_text (irrelevant to
-# single-hand reconstruction) were dropped before labeling started.
+# player_name_text (irrelevant to single-hand reconstruction) stays dropped.
+# bet_text was appended LAST (ID 7) after labeling began so existing IDs 0-6 stay
+# fixed: for hands where recording started mid-street there is no start-of-street
+# stack baseline, so the chips a player has committed this street can't be recovered
+# from stack deltas; the bet_text amount supplies that baseline directly.
 CLASSES = [
     "face_card",
     "card_back",
@@ -24,6 +28,7 @@ CLASSES = [
     "stack_text",
     "action_pill",
     "active_turn_indicator",
+    "bet_text",
 ]
 CLASS_COLORS = {
     "face_card": "#36cfc9",
@@ -33,6 +38,7 @@ CLASS_COLORS = {
     "stack_text": "#73d13d",
     "action_pill": "#9254de",
     "active_turn_indicator": "#f759ab",
+    "bet_text": "#ff7a45",
 }
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 

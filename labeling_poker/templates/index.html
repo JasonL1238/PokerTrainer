@@ -16,6 +16,7 @@
     .class-list { display: grid; gap: 6px; }
     button { color: inherit; background: #263449; border: 1px solid #475569; border-radius: 5px; padding: 8px 10px; cursor: pointer; text-align: left; }
     button:hover, button.active { background: #334766; border-color: #93c5fd; }
+    select { color: inherit; background: #263449; border: 1px solid #475569; border-radius: 5px; padding: 8px 10px; }
     .class-button { display: flex; align-items: center; gap: 8px; }
     .swatch { width: 12px; height: 12px; border-radius: 2px; flex: 0 0 auto; }
     .key { margin-left: auto; color: #94a3b8; font-size: 12px; }
@@ -32,9 +33,18 @@
     .suit-s, .suit-c { color: #e5e7eb; }
     .suit-h, .suit-d { color: #f87171; }
     .card-clear { width: 100%; text-align: center; font-size: 12px; margin-top: 2px; }
+    .face-card-list { display: flex; flex-wrap: wrap; gap: 6px; }
+    .face-chip { text-align: center; min-width: 44px; font-weight: 700; font-size: 15px; font-variant-numeric: tabular-nums; }
+    .face-chip.missing { border-color: #fbbf24; color: #fde68a; background: #78350f; }
+    .face-chip.active { border-color: #93c5fd; }
+    .face-missing { color: #fde68a; }
+    .face-card-empty { color: #94a3b8; font-size: 12px; }
     .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
     .toolbar button { text-align: center; }
     .toolbar .primary { border-color: #60a5fa; background: #1d4ed8; }
+    #sus-done { border-color: #34d399; background: #065f46; }
+    .carry-toggle { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #cbd5e1; cursor: pointer; }
+    .browse-control { display: flex; align-items: center; gap: 6px; color: #cbd5e1; font-size: 12px; }
     #status { color: #93c5fd; margin-left: auto; }
     .stage { height: calc(100vh - 84px); min-height: 320px; overflow: hidden; display: grid; place-items: center; background: #0b1020; border: 1px solid #374151; padding: 12px; }
     #canvas-frame { display: block; position: relative; flex: 0 0 auto; line-height: 0; }
@@ -74,18 +84,36 @@
       </div>
       <button id="card-clear" class="card-clear" type="button">Clear card label</button>
     </div>
+    <h2>Face cards on frame</h2>
+    <div id="face-card-list" class="face-card-list"><div class="face-card-empty">No face cards on this frame</div></div>
     <h2>Progress</h2>
     <div id="progress" class="progress">Loading...</div>
+    <div id="queue-progress" class="progress" hidden></div>
     <h2>Shortcuts</h2>
-    <div class="hint">Enter save + next<br>K mark clean<br>X exclude duplicate<br>S skip without saving<br>Left/Right seek<br>D delete, Z undo</div>
+    <div class="hint">Enter save + next<br>K mark clean<br>X exclude duplicate<br>S skip without saving<br>Left/Right seek<br>D or Backspace delete box, Z undo<br>Shift+C clear all boxes<br><br>Labels carry to the next fresh frame (toggle "Carry labels"); tweak them or Shift+C to wipe.<br><br>With a face_card selected: type rank (A K Q J T 9-2) + suit (s h d c), e.g. K then D &rarr; Kd. Backspace deletes, Esc deselects.</div>
   </aside>
   <main>
     <div class="toolbar">
+      <label class="browse-control">Browse
+        <select id="view-filter" aria-label="Images to browse">
+          <option value="undecided">New / undecided</option>
+          <option value="labeled">Labeled</option>
+          <option value="labeled_sus">Labeled sus (card labels)</option>
+          <option value="unlabeled_sus">Unlabeled sus (auto-label)</option>
+          <option value="clean">Clean</option>
+          <option value="duplicate">Excluded duplicates</option>
+          <option value="all">All images</option>
+        </select>
+      </label>
       <button id="prev" type="button">Previous</button>
       <button id="next" type="button">Next undecided</button>
       <button id="save" class="primary" type="button">Save + next</button>
       <button id="clean" type="button">Mark clean</button>
       <button id="duplicate" type="button">Exclude duplicate</button>
+      <button id="clear" type="button">Clear all</button>
+      <button id="sus-done" type="button" hidden>Done — sus cards look good</button>
+      <label class="carry-toggle"><input id="carry-toggle" type="checkbox" checked> Carry labels</label>
+      <a href="/manual-review?view=pending" style="color: inherit; text-decoration: none;"><button type="button">Gallery</button></a>
       <span id="status">No image loaded</span>
     </div>
     <div id="stage" class="stage"><div class="empty">Put images in labeling_poker/data/images, then reload.</div><div id="canvas-frame" hidden><canvas id="canvas"></canvas></div></div>

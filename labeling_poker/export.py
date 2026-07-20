@@ -52,13 +52,32 @@ def yolo_line(box: dict, width: int, height: int) -> str:
     return f"{class_id} {(x1 + x2) / 2 / width:.8f} {(y1 + y2) / 2 / height:.8f} {(x2 - x1) / width:.8f} {(y2 - y1) / height:.8f}"
 
 
-def write_dataset(db_path: Path | str, images_dir: Path | str, output_dir: Path | str) -> dict[str, int]:
+def write_dataset(
+    db_path: Path | str,
+    images_dir: Path | str,
+    output_dir: Path | str,
+    *,
+    exclude_card_only: bool = False,
+) -> dict[str, int]:
     images_dir, output_dir = Path(images_dir), Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     with connect(db_path) as connection:
         sync_files(connection, images_dir)
         rows = connection.execute("SELECT id, path FROM files ORDER BY id").fetchall()
-        included = [row["id"] for row in rows if get_status(connection, row["id"]) in {"labeled", "clean"}]
+        included = []
+        for row in rows:
+            file_id = row["id"]
+            status_value = get_status(connection, file_id)
+            if status_value not in {"labeled", "clean"}:
+                continue
+            # A card-only frame is valid classifier data, but is unsafe detector
+            # data whenever the table also contains unboxed region classes. Keep
+            # clean negatives; otherwise require at least one non-card region.
+            if exclude_card_only and status_value == "labeled":
+                annotations = get_annotations(connection, file_id)
+                if annotations and not any(box["class"] != "face_card" for box in annotations):
+                    continue
+            included.append(file_id)
         splits = split_ids(included)
         row_by_id = {row["id"]: row for row in rows}
         for split, split_ids_value in splits.items():
@@ -87,10 +106,14 @@ def main() -> None:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     parser.add_argument("--images", type=Path, default=DEFAULT_IMAGES_DIR)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--exclude-card-only",
+        action="store_true",
+        help="exclude labeled frames containing only face_card boxes; useful for Model 1 only",
+    )
     args = parser.parse_args()
-    print(write_dataset(args.db, args.images, args.out))
+    print(write_dataset(args.db, args.images, args.out, exclude_card_only=args.exclude_card_only))
 
 
 if __name__ == "__main__":
     main()
-
