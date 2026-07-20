@@ -133,6 +133,9 @@ def main() -> None:
     parser.add_argument("--device", default="")
     parser.add_argument("--out", default=str(REPO_ROOT / "cv_lab" / "results" / "two_model_timeline.json"))
     parser.add_argument("--dump-detections", default="", help="optional: write raw per-frame detections here")
+    parser.add_argument("--dump-frames", default="",
+                        help="optional: write fixture-compatible frames (region_detections.load_frames) "
+                             "so the spine can be re-run on cached detections without GPU inference")
     parser.add_argument("--yolov12-vendor", default=str(DEFAULT_YOLOV12_VENDOR))
     args = parser.parse_args()
 
@@ -183,6 +186,16 @@ def main() -> None:
     if args.dump_detections:
         Path(args.dump_detections).write_text(json.dumps(raw_dump, indent=2), encoding="utf-8")
         print(f"raw detections -> {args.dump_detections}")
+    if args.dump_frames:
+        fixture = [{
+            "image": f.image, "time_s": f.time_s, "width": f.width, "height": f.height,
+            "video_frame": f.video_frame,
+            "detections": [{"cls": d.cls, "conf": round(d.conf, 4),
+                            "xyxy": [round(v, 2) for v in d.xyxy], "attr": d.attr}
+                           for d in f.detections],
+        } for f in frames]
+        Path(args.dump_frames).write_text(json.dumps(fixture), encoding="utf-8")
+        print(f"fixture frames -> {args.dump_frames}")
 
 
 if __name__ == "__main__":

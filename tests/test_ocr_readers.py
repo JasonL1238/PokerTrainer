@@ -108,3 +108,31 @@ def test_genuine_decimal_still_reads(digit_templates, chip_template) -> None:
     bank = TemplateOCR({**digit_templates, "c": chip_template}, {})
     val, raw = bank.read_number(_render(draw))
     assert (val, raw) == (0.5, "0.50")
+
+
+def test_sub_baseline_speck_is_not_a_decimal(digit_templates) -> None:
+    """A stray speck below the digit baseline (cursor fleck, sub-baseline noise)
+    shares the value's x-range but sits well under it. It must NOT be read as a
+    decimal point -- this is the regression that turned an integer "211" into 2.11
+    (verified on real HUD crops: a w4xh6 speck ~30px below the digits)."""
+    def draw(im: np.ndarray) -> None:
+        cv2.putText(im, "211", (60, 30), FONT, 0.8, WHITE, THICK)
+        cv2.circle(im, (78, 44), 2, WHITE, -1)  # speck well below the baseline
+
+    bank = TemplateOCR(dict(digit_templates), {})
+    val, raw = bank.read_number(_render(draw))
+    assert (val, raw) == (211.0, "211")
+
+
+def test_decimal_splits_at_dot_not_last_two(digit_templates) -> None:
+    """When a trailing fractional glyph drops out of the run, the split must follow
+    the dot's real x-position, not blindly take the last two digits: "127.8" (a
+    dropped trailing 0) must read 127.8, never 12.78."""
+    def draw(im: np.ndarray) -> None:
+        cv2.putText(im, "127", (40, 30), FONT, 0.8, WHITE, THICK)
+        cv2.circle(im, (98, 28), 2, WHITE, -1)  # dot on the baseline after "127"
+        cv2.putText(im, "8", (104, 30), FONT, 0.8, WHITE, THICK)
+
+    bank = TemplateOCR(dict(digit_templates), {})
+    val, raw = bank.read_number(_render(draw))
+    assert (val, raw) == (127.8, "127.8")

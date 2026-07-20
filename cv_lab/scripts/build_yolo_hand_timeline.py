@@ -296,21 +296,60 @@ def _mode(values: list[Any]) -> Any:
     return Counter(values).most_common(1)[0][0] if values else None
 
 
+def _trim_trailing_next_deal(hand: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop trailing states that already belong to the NEXT deal.
+
+    Segmentation cuts a hand only when the hero's hole cards change to a new pair,
+    so an interstitial frame between hands -- button already advanced, pot reset to
+    the blinds, hero not yet re-dealt -- trails the current hand and corrupts its
+    final pot, hero net, and reconciliation (e.g. a 240 BB pot 'ending' at 1.5).
+    The button only moves between hands, so a trailing state whose dealer differs
+    from the hand's modal dealer, or whose pot has collapsed far below the hand's
+    peak, while the hero holds no cards, is next-deal noise."""
+    if len(hand) <= 1:
+        return hand
+    modal_dealer = _mode([s["dealer_seat"] for s in hand])
+    max_pot = max((s["pot"] for s in hand if s["pot"] is not None), default=None)
+    end = len(hand)
+    while end > 1:
+        s = hand[end - 1]
+        dealer_moved = (modal_dealer is not None and s["dealer_seat"] is not None
+                        and s["dealer_seat"] != modal_dealer)
+        pot_collapsed = (max_pot is not None and max_pot > 6.0 and s["pot"] is not None
+                         and s["pot"] < 0.3 * max_pot)
+        no_hero = len(s["hero_cards"]) != 2
+        if no_hero and (dealer_moved or pot_collapsed):
+            end -= 1
+        else:
+            break
+    return hand[:end]
+
+
 def _settle_index(hand: list[dict[str, Any]]) -> int:
-    """Index of the state where the pot is swept to the winner (a single-transition
-    stack jump of at least ~half the pot), or the last index if never seen.
-    States after it are settlement/next-deal noise: the next hand's antes tick
-    every stack down and its blinds post while the old hero cards linger."""
+    """Index of the state where the pot is swept to the winner, or the last index
+    if never seen. The sweep is the single LARGEST qualifying stack jump in the
+    hand -- during play stacks only fall (chips go in), so any increase is a pot
+    award and the real sweep dwarfs any pre-sweep noise bump. Picking the first
+    jump above a low threshold is wrong when a spurious sub-pot bump on a folded
+    seat precedes the true sweep by a frame (it truncates the window before the
+    winner is paid, flipping the result). States after the sweep are next-deal
+    noise: the next hand's antes tick every stack down and its blinds post while
+    the old hero cards linger."""
     pot_so_far: float | None = None
+    best_idx, best_jump = len(hand) - 1, 0.0
     for idx, (prev, cur) in enumerate(zip(hand, hand[1:]), start=1):
         if prev["pot"] is not None:
             pot_so_far = prev["pot"] if pot_so_far is None else max(pot_so_far, prev["pot"])
         threshold = max(3.0, 0.4 * (pot_so_far or 0.0))
         for seat, after in cur["stacks"].items():
             before = prev["stacks"].get(seat)
-            if before is not None and after - before >= threshold:
-                return idx
-    return len(hand) - 1
+            if before is None:
+                continue
+            jump = after - before
+            # >= so that, on a tie, the later (true post-sweep) frame wins.
+            if jump >= threshold and jump >= best_jump:
+                best_idx, best_jump = idx, jump
+    return best_idx
 
 
 def _reconstruct_actions(
@@ -522,6 +561,9 @@ def _vote_board(hand: list[dict[str, Any]]) -> list[str]:
 
 
 def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
+    # Shed any next-deal interstitial frames that segmentation left on the tail
+    # before anything measures pot / stacks / winner from them.
+    hand = _trim_trailing_next_deal(hand)
     # Numeric debounce is PER HAND: bets/stacks/pot must never carry an accepted
     # value across a hand boundary (the next hand's first readings are fresh).
     _debounce_series(hand, "stacks")
@@ -580,11 +622,16 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
     # winner + hero result from stack recovery. Contributions are measured
     # against the last PRE-settlement stack, not the minimum: an over-shove's
     # uncalled portion is returned before the sweep and never enters the pot.
+    # Gains are measured on the SETTLED window only: the next-deal states that
+    # trail a hand contain auto top-ups (stack refills to the buy-in) and the
+    # next hand's antes/blinds, either of which corrupts a full-series delta.
+    # (Winner is NOT gated on the fold list: a fold pill can be misdetected on a
+    # seat that actually reaches showdown, and a real stack sweep outranks it.)
     contributed = 0.0
     winner_seat, win_gain = None, 0.0
     hero_bb_won = None
     for seat in players:
-        series = _stack_series(hand, seat)
+        series = _stack_series(settled_states, seat) or _stack_series(hand, seat)
         if not series:
             continue
         low = min(series)

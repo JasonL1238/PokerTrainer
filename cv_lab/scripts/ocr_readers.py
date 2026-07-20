@@ -206,18 +206,36 @@ class TemplateOCR:
         digits = "".join(ch for _, ch, _ in run)
         gx = [(g.x, g.x + g.w) for g, _, _ in run]
         x0, x1 = gx[0][0], gx[-1][1]
-        # Detect the decimal two ways (ClubWPT fractions are always 2 places, so a
-        # detected decimal -> split the last two digits):
-        #  1. a short dot glyph sitting strictly between value digits, or
+        # The digit run's own vertical band. A real decimal point sits ON this
+        # baseline, so a valid dot glyph must vertically overlap the run -- specks
+        # elsewhere in the crop (cursor dots, chip flecks, sub-baseline noise) can
+        # share the value's x-range while sitting well above or below it, and those
+        # are NOT decimals. Ignoring y is what turned "211"->2.11 and "200"->2.0.
+        run_y0 = min(g.y for g, _, _ in run)
+        run_y1 = max(g.y + g.h for g, _, _ in run)
+        # Detect the decimal two ways (ClubWPT fractions are always 2 places):
+        #  1. a short dot glyph between value digits AND on their baseline, or
         #  2. a scale-invariant gap: the inter-digit space at the decimal is markedly
         #     wider than the others (the faint dot blob often falls below the speck
         #     floor in the smaller stack font, but its gap always survives).
-        has_dot = any(x0 < (d.x + d.w / 2.0) < x1 for d in dots)
-        if not has_dot and len(digits) >= 3:
+        dot_centers = [d.x + d.w / 2.0 for d in dots
+                       if x0 < (d.x + d.w / 2.0) < x1
+                       and d.y < run_y1 and d.y + d.h > run_y0]
+        split_at: int | None = None  # index of the first fractional digit in `digits`
+        if dot_centers:
+            # Split at the dot's real position, not blindly at the last two digits:
+            # a dropped trailing glyph ("127.80" read as digits "1278") otherwise
+            # becomes 12.78 instead of 127.8.
+            dot_x = min(dot_centers)
+            split_at = sum(1 for gx0, gx1 in gx if (gx0 + gx1) / 2.0 < dot_x)
+        elif len(digits) >= 3:
             gaps = [gx[i + 1][0] - gx[i][1] for i in range(len(gx) - 1)]
             if gaps and max(gaps) >= 5 and max(gaps) >= 1.7 * float(np.median(gaps)):
-                has_dot = True
-        raw = f"{digits[:-2]}.{digits[-2:]}" if (has_dot and len(digits) > 2) else digits
+                split_at = len(digits) - 2
+        if split_at is not None and 0 < split_at < len(digits):
+            raw = f"{digits[:split_at]}.{digits[split_at:]}"
+        else:
+            raw = digits
         try:
             return float(raw), raw
         except ValueError:
