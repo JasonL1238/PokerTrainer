@@ -52,6 +52,12 @@ def _resolve_vendor_path(vendor_path: str) -> str:
 def _load_yolo_class(vendor_path: str):
     os.environ.setdefault("YOLO_CONFIG_DIR", str(REPO_ROOT / ".yolo_config"))
     os.environ.setdefault("MPLCONFIGDIR", str(REPO_ROOT / ".mpl_config"))
+    # numpy>=2 removed several legacy aliases the vendored ultralytics fork still
+    # uses (e.g. np.trapz -> np.trapezoid). Shim them so the fork runs under
+    # numpy 2 without editing the vendored tree or pinning the whole env down.
+    import numpy as _np
+    if not hasattr(_np, "trapz"):
+        _np.trapz = _np.trapezoid  # type: ignore[attr-defined]
     if vendor_path:
         sys.path.insert(0, vendor_path)
     from ultralytics import YOLO

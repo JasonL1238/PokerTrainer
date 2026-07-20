@@ -86,14 +86,20 @@ def _state_warnings(state: dict[str, Any], hand: dict[str, Any]) -> list[dict[st
     visible = hero + board
     duplicates = sorted({card for card in visible if isinstance(card, str) and card and visible.count(card) > 1})
     if duplicates:
-        warnings.append(_warn(
-            "duplicate_visible_cards",
-            "duplicate cards appear across hero and board",
-            duplicates=duplicates,
-            hero=hero,
-            board=board,
-            **_card_warning_context(state, hand),
-        ))
+        # A transient per-state misread that the hand's final (voted) hero+board
+        # already resolved is noise, not a data problem: suppress when the hand
+        # summary exists and carries no duplicate among these cards.
+        summary = _cards(hand.get("hero") or []) + _cards(hand.get("board") or [])
+        resolved = bool(summary) and all(summary.count(c) <= 1 for c in duplicates)
+        if not resolved:
+            warnings.append(_warn(
+                "duplicate_visible_cards",
+                "duplicate cards appear across hero and board",
+                duplicates=duplicates,
+                hero=hero,
+                board=board,
+                **_card_warning_context(state, hand),
+            ))
 
     for field, cards in (("hero_cards", hero), ("board_cards", board), ("other_cards", other)):
         warnings.extend(_validate_cards_are_strings(cards, field, state, hand))
@@ -142,10 +148,20 @@ def _hand_sequence_warnings(hand: dict[str, Any], hand_states: list[dict[str, An
     previous_order: int | None = None
     previous_board: list[str] = []
 
-    for state in hand_states:
+    # The pot sweep at the end of every hand clears the board: an empty board
+    # that never comes back within the hand is settlement, not a regression.
+    last_nonempty = -1
+    for idx, state in enumerate(hand_states):
+        if _cards(state.get("board_cards", [])):
+            last_nonempty = idx
+
+    for idx, state in enumerate(hand_states):
         board = _cards(state.get("board_cards", []))
         count = len(board)
         context = _card_warning_context(state, hand)
+
+        if count == 0 and idx > last_nonempty:
+            break  # terminal sweep: nothing after this is street data
 
         if previous_count is not None and count < previous_count:
             warnings.append(_warn(

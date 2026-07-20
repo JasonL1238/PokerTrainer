@@ -34,10 +34,9 @@ from cv_lab.scripts.build_yolo_card_timeline import _zone_for_box
 
 CLASS_SET = set(CLASSES)
 
-# Coarse per-seat centroids for the current 8-max ClubWPT view, in normalized
-# (cx, cy) coords. Seat 0 is the hero (bottom-center). This is the STUB seat model;
-# the real anchored per-seat model (green-coin landmark_anchor) plugs into
-# assign_regions() later without changing the spine.
+# Coarse per-seat avatar centroids for the current 8-max ClubWPT view, in
+# normalized (cx, cy) coords. Seat 0 is the hero (bottom-center). Used as the
+# fallback for classes without a learned anchor table below.
 SEAT_CENTROIDS: dict[int, tuple[float, float]] = {
     0: (0.50, 0.86),
     1: (0.16, 0.80),
@@ -49,18 +48,45 @@ SEAT_CENTROIDS: dict[int, tuple[float, float]] = {
     7: (0.84, 0.80),
 }
 
-# Clockwise seat ring starting at the hero seat. Action moves along this ring
-# (dealer -> SB -> BB -> ...), used to assign positions in the spine.
-SEAT_RING: list[int] = [0, 7, 6, 5, 4, 3, 2, 1]
+# Learned per-CLASS seat anchors (k-means over the human-labeled boxes in
+# labels.sqlite3, v00 frames, normalized by true image dims). Each HUD element
+# renders at its own per-seat position -- card backs sit above/inside of the
+# avatar, bet texts toward the table center -- so nearest-avatar assignment
+# flaps between adjacent seats; nearest-class-anchor does not. Regenerate by
+# re-running the k-means when the table layout changes.
+SEAT_ANCHORS_BY_CLASS: dict[str, dict[int, tuple[float, float]]] = {
+    "card_back": {0: (0.500, 0.860), 1: (0.194, 0.623), 2: (0.117, 0.368), 3: (0.174, 0.164),
+                  4: (0.480, 0.125), 5: (0.810, 0.164), 6: (0.868, 0.369), 7: (0.791, 0.618)},
+    "stack_text": {0: (0.528, 0.809), 1: (0.180, 0.717), 2: (0.106, 0.458), 3: (0.162, 0.255),
+                   4: (0.470, 0.195), 5: (0.833, 0.257), 6: (0.889, 0.461), 7: (0.815, 0.714)},
+    "action_pill": {0: (0.521, 0.842), 1: (0.182, 0.754), 2: (0.109, 0.499), 3: (0.165, 0.291),
+                    4: (0.468, 0.234), 5: (0.826, 0.296), 6: (0.881, 0.501), 7: (0.807, 0.750)},
+    "dealer_button": {0: (0.424, 0.640), 1: (0.308, 0.680), 2: (0.154, 0.539), 3: (0.289, 0.245),
+                      4: (0.584, 0.263), 5: (0.725, 0.227), 6: (0.787, 0.511), 7: (0.676, 0.671)},
+    "active_turn_indicator": {0: (0.447, 0.788), 1: (0.259, 0.689), 2: (0.183, 0.437), 3: (0.239, 0.233),
+                              4: (0.546, 0.177), 5: (0.752, 0.239), 6: (0.804, 0.445), 7: (0.733, 0.691)},
+    "bet_text": {0: (0.467, 0.579), 1: (0.311, 0.591), 2: (0.256, 0.441), 3: (0.313, 0.313),
+                 4: (0.491, 0.312), 5: (0.659, 0.314), 6: (0.714, 0.438), 7: (0.661, 0.581)},
+}
+
+# Seat ring in action order starting at the hero seat: on the ClubWPT layout the
+# action moves hero (bottom-center) -> bottom-left -> up the left side -> across
+# the top -> down the right side, i.e. ascending seat index (dealer -> SB=dealer+1
+# -> BB=dealer+2 ... verified against live blind posts). Used for positions.
+SEAT_RING: list[int] = [0, 1, 2, 3, 4, 5, 6, 7]
 
 # Detections whose zone is a table seat (as opposed to the shared board/pot).
 _SEATED_CLASSES = {
     "card_back",
     "stack_text",
+    "bet_text",
     "action_pill",
     "dealer_button",
     "active_turn_indicator",
 }
+
+# Classes whose attr is a numeric amount readable by the template OCR.
+_AMOUNT_CLASSES = {"pot_text", "stack_text", "bet_text"}
 
 
 @dataclass
@@ -137,8 +163,15 @@ def read_pill_action(det: Detection, *, dealt_in: bool) -> str | None:
     text = str(det.attr).strip().lower()
     if text in _PILL_ALIASES:
         return _PILL_ALIASES[text]
+    # Colour fallback emitted by the OCR reader when the pill word is unreadable:
+    # gray = check/fold (resolved by whether the seat still holds cards), green =
+    # call/bet (call is the safe default), orange = raise.
     if text in {"gray", "grey", "neutral"}:
         return "check" if dealt_in else "fold"
+    if text == "green":
+        return "call"
+    if text == "orange":
+        return "raise"
     return None
 
 
@@ -150,10 +183,11 @@ def _center(det: Detection, frame: Frame) -> tuple[float, float]:
     return ((x0 + x1) / 2.0 / frame.width, (y0 + y1) / 2.0 / frame.height)
 
 
-def _nearest_seat(cx: float, cy: float) -> int:
+def _nearest_seat(cx: float, cy: float, cls: str = "") -> int:
+    anchors = SEAT_ANCHORS_BY_CLASS.get(cls, SEAT_CENTROIDS)
     return min(
-        SEAT_CENTROIDS,
-        key=lambda s: (cx - SEAT_CENTROIDS[s][0]) ** 2 + (cy - SEAT_CENTROIDS[s][1]) ** 2,
+        anchors,
+        key=lambda s: (cx - anchors[s][0]) ** 2 + (cy - anchors[s][1]) ** 2,
     )
 
 
@@ -175,7 +209,8 @@ def assign_regions(frame: Frame) -> dict[str, Any]:
 
     def seat(i: int) -> dict[str, Any]:
         return seats.setdefault(
-            i, {"card_back": False, "stack": None, "pill_action": None, "dealer": False, "turn": False}
+            i, {"card_back": False, "stack": None, "bet": None, "pill_action": None,
+                "dealer": False, "turn": False}
         )
 
     for det in frame.detections:
@@ -192,11 +227,13 @@ def assign_regions(frame: Frame) -> dict[str, Any]:
         elif det.cls == "pot_text":
             pot_candidates.append(det)
         elif det.cls in _SEATED_CLASSES:
-            i = _nearest_seat(cx, cy)
+            i = _nearest_seat(cx, cy, det.cls)
             if det.cls == "card_back":
                 seat(i)["card_back"] = True
             elif det.cls == "stack_text":
                 seat(i)["stack"] = read_amount(det)
+            elif det.cls == "bet_text":
+                seat(i)["bet"] = read_amount(det)
             elif det.cls == "action_pill":
                 seat(i)["_pill_det"] = det  # resolved after dealt-in is known
             elif det.cls == "dealer_button":
@@ -306,3 +343,86 @@ def frame_from_yolo_rows(
             )
         )
     return Frame(image=image, time_s=time_s, width=width, height=height, detections=dets, video_frame=video_frame)
+
+
+def _pad_crop_xyxy(image, x0: float, y0: float, x1: float, y1: float, pad: float):
+    """Crop [x0,y0,x1,y1] (pixels) expanded by ``pad`` each side, clamped to image.
+
+    Returns the sub-array, or None if degenerate/out of bounds. Uses plain array
+    slicing so region_detections stays importable without cv2/numpy on the
+    fixture path.
+    """
+    if image is None:
+        return None
+    h, w = image.shape[:2]
+    bw, bh = x1 - x0, y1 - y0
+    x0 -= bw * pad
+    x1 += bw * pad
+    y0 -= bh * pad
+    y1 += bh * pad
+    xi0, yi0 = max(int(round(x0)), 0), max(int(round(y0)), 0)
+    xi1, yi1 = min(int(round(x1)), w), min(int(round(y1)), h)
+    if xi1 <= xi0 or yi1 <= yi0:
+        return None
+    return image[yi0:yi1, xi0:xi1]
+
+
+def frame_from_models(
+    image,
+    time_s: float,
+    rows: Iterable[dict[str, Any]],
+    *,
+    classifier,
+    image_name: str = "",
+    pad: float = 0.12,
+    video_frame: int = 0,
+    ocr: bool = True,
+) -> Frame:
+    """Build a Frame from Model 1's region detections + Model 2's card classifier.
+
+    This is the Design-A wiring: the region detector (Model 1) only *localizes*
+    ``face_card`` boxes -- it does not name them. For each ``face_card`` box we
+    crop the region out of ``image`` and hand it to ``classifier`` (Model 2,
+    duck-typed: any object with ``classify(bgr_crop) -> (label, conf)``) to get
+    the rank+suit, which becomes the detection's ``attr``. Amount classes
+    (pot_text / stack_text / bet_text) and action_pill are read by the
+    deterministic template OCR (ocr_readers); pass ``ocr=False`` to skip it
+    (attrs then stay whatever the row provides, as on the fixture path).
+
+    ``rows`` are Model 1 detection dicts with keys: class, confidence|conf,
+    x1, y1, x2, y2. ``image`` is an HxWx3 BGR array (Model 1's input frame);
+    width/height are taken from it.
+    """
+    h, w = (int(image.shape[0]), int(image.shape[1])) if image is not None else (0, 0)
+    ocr_readers = None
+    if ocr and image is not None:
+        # Lazy import keeps the fixture path importable without cv2/numpy.
+        from cv_lab.scripts import ocr_readers as _ocr
+
+        ocr_readers = _ocr
+    dets: list[Detection] = []
+    for row in rows:
+        cls = str(row.get("class", "")).strip()
+        if cls not in CLASS_SET:
+            continue
+        xyxy = (float(row["x1"]), float(row["y1"]), float(row["x2"]), float(row["y2"]))
+        attr = row.get("attr")
+        if cls == "face_card" and classifier is not None:
+            crop = _pad_crop_xyxy(image, *xyxy, pad)
+            if crop is not None and getattr(crop, "size", 1) > 0:
+                label, _conf = classifier.classify(crop)
+                attr = label
+        elif ocr_readers is not None and attr is None and cls in _AMOUNT_CLASSES:
+            attr = ocr_readers.read_amount_from_image(image, xyxy)
+        elif ocr_readers is not None and attr is None and cls == "action_pill":
+            attr = ocr_readers.read_pill_attr(image, xyxy)
+        dets.append(
+            Detection(
+                cls=cls,
+                conf=float(row.get("confidence", row.get("conf", 0.0)) or 0.0),
+                xyxy=xyxy,
+                attr=attr,
+            )
+        )
+    return Frame(image=image_name, time_s=time_s, width=w, height=h,
+                 detections=dets, video_frame=video_frame)

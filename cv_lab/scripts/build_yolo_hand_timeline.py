@@ -48,6 +48,7 @@ def _frame_state(frame: rd.Frame) -> dict[str, Any]:
     seats = view["seats"]
     dealt_in = sorted(i for i, info in seats.items() if info["card_back"])
     stacks = {i: info["stack"] for i, info in seats.items() if info["stack"] is not None}
+    bets = {i: info.get("bet") for i, info in seats.items() if info.get("bet") is not None}
     pills = {i: info["pill_action"] for i, info in seats.items() if info["pill_action"]}
     board = view["board"]
     return {
@@ -60,6 +61,7 @@ def _frame_state(frame: rd.Frame) -> dict[str, Any]:
         "pot": view["pot"],
         "dealt_in": dealt_in,
         "stacks": stacks,
+        "bets": bets,
         "pills": pills,
         "dealer_seat": view["dealer_seat"],
         "active_seat": view["active_seat"],
@@ -73,6 +75,7 @@ def _signature(state: dict[str, Any]) -> tuple:
         tuple(state["board_cards"]),
         tuple(state["dealt_in"]),
         tuple(sorted(state["stacks"].items())),
+        tuple(sorted(state["bets"].items())),
         tuple(sorted(state["pills"].items())),
         state["pot"],
         state["dealer_seat"],
@@ -80,15 +83,53 @@ def _signature(state: dict[str, Any]) -> tuple:
     )
 
 
+def _debounce_cards(raw: list[dict[str, Any]], key: str) -> None:
+    """Debounce card-list fields (hero_cards / board_cards) in place over the raw
+    per-frame states. A NON-EMPTY reading that differs from the accepted one must
+    be confirmed by the next non-empty reading, else it is replaced by the carried
+    value -- or dropped entirely when there is nothing to carry. An empty reading
+    RESETS the carry: cards leaving the table (sweep / new deal) must not leak the
+    previous hand's cards into the next one."""
+    accepted: tuple | None = None
+    for idx, state in enumerate(raw):
+        cards = tuple(state[key])
+        if not cards:
+            accepted = None
+            continue
+        if accepted is not None and cards == accepted:
+            continue
+        confirmed = True
+        for nxt in raw[idx + 1:]:
+            nxt_cards = tuple(nxt[key])
+            if nxt_cards:
+                # confirmed when the next reading repeats the candidate OR
+                # extends it (boards only grow: a one-state turn immediately
+                # followed by the river that contains it is real)
+                confirmed = (nxt_cards == cards
+                             or nxt_cards[: len(cards)] == cards)
+                break
+        if confirmed:
+            accepted = cards
+        else:
+            state[key] = list(accepted) if accepted is not None else []
+
+
 def build_states(frames: list[rd.Frame]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Return (distinct states, events). States collapse consecutive identical frames."""
+    """Return (distinct states, events). Raw per-frame states are debounced first
+    (cards, pot, stacks, bets -- single-frame OCR/classifier blips are rejected
+    unless the next reading confirms them), then collapsed to distinct states."""
+    raw = [_frame_state(f) for f in frames]
+    _debounce_cards(raw, "hero_cards")
+    _debounce_cards(raw, "board_cards")
+    for state in raw:
+        state["stage"] = _stage(len(state["board_cards"]))
+
     states: list[dict[str, Any]] = []
     events: list[dict[str, Any]] = []
     last_sig: tuple | None = None
     prev: dict[str, Any] | None = None
 
-    for frame in frames:
-        state = _frame_state(frame)
+    for state in raw:
         sig = _signature(state)
         if sig == last_sig:
             continue
@@ -125,27 +166,101 @@ def build_states(frames: list[rd.Frame]) -> tuple[list[dict[str, Any]], list[dic
 # Pass 2: segment into hands (hero-cards change is the boundary)
 # --------------------------------------------------------------------------- #
 def _segment(states: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """A new hand starts when the hero's hole cards change AND there is table
+    evidence of a fresh deal: the board reset, the pot dropped (back to the
+    blinds+antes), the dealer button moved, or a long recording gap. A hero-card
+    change alone -- with a board still showing, or mid-preflop with the same pot
+    and button -- is read noise (suit misreads, showdown reveals landing in the
+    hero card zone), never a real boundary."""
     hands: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
     current_hero: list[str] = []
+    anchor: dict[str, Any] | None = None  # last state showing the current hero's cards
     for state in states:
         hero = state["hero_cards"]
         boundary = False
         if current:
-            prev = current[-1]
-            hero_changed = len(hero) == 2 and hero != current_hero
-            board_reset = bool(prev["board_cards"]) and not state["board_cards"]
-            large_gap = state["time_s"] - prev["time_s"] > 30
-            boundary = hero_changed and (board_reset or bool(prev["board_cards"]) or large_gap)
+            ref = anchor or current[-1]
+            hero_changed = len(hero) == 2 and bool(current_hero) and hero != current_hero
+            if hero_changed and not state["board_cards"]:
+                # Compare against the anchor, not the immediately preceding state:
+                # the table often passes through a swept interstitial state (no
+                # cards, pot cleared) that would otherwise hide the reset.
+                board_reset = bool(ref["board_cards"])
+                pot_dropped = (state["pot"] is not None and ref["pot"] is not None
+                               and state["pot"] < ref["pot"] - _EPS)
+                dealer_moved = (state["dealer_seat"] is not None
+                                and ref["dealer_seat"] is not None
+                                and state["dealer_seat"] != ref["dealer_seat"])
+                large_gap = state["time_s"] - ref["time_s"] > 30
+                boundary = board_reset or pot_dropped or dealer_moved or large_gap
         if boundary:
             hands.append(current)
-            current, current_hero = [], []
+            current, current_hero, anchor = [], [], None
         current.append(state)
         if len(hero) == 2 and not current_hero:
             current_hero = hero
+        if hero == current_hero and current_hero:
+            anchor = state
     if current:
         hands.append(current)
     return hands
+
+
+# --------------------------------------------------------------------------- #
+# Temporal cleanup: OCR jitter debounce (a value must survive two consecutive
+# states to be believed; otherwise the previous accepted value carries forward)
+# --------------------------------------------------------------------------- #
+def _debounce_series(hand: list[dict[str, Any]], key: str) -> None:
+    """Debounce per-seat numeric dicts (stacks / bets) in place over ONE hand's
+    states, with revert-only rejection: a reading B is a blip only in an
+    A -> B -> A pattern (the next reading reverts to the previous accepted
+    value). Directional sequences (A -> B -> C) are kept -- a call followed
+    immediately by the winner's pot award must not be eaten."""
+    accepted: dict[int, float] = {}
+    for idx, state in enumerate(hand):
+        cur = state[key]
+        for seat in list(cur):
+            val = cur[seat]
+            prev_val = accepted.get(seat)
+            if prev_val is None or abs(val - prev_val) <= _EPS:
+                accepted[seat] = val
+                continue
+            nxt_val = None
+            for nxt in hand[idx + 1:]:
+                if seat in nxt[key]:
+                    nxt_val = nxt[key][seat]
+                    break
+            if nxt_val is not None and abs(nxt_val - prev_val) <= _EPS:
+                cur[seat] = prev_val  # A -> B -> A: B was an OCR blip
+            else:
+                accepted[seat] = val
+    # done in place
+
+
+def _debounce_pot(hand: list[dict[str, Any]]) -> None:
+    """Debounce ONE hand's pot series in place: revert-only blip rejection plus
+    a floor -- a mid-hand pot can never fall below the antes already in it."""
+    accepted: float | None = None
+    for idx, state in enumerate(hand):
+        pot = state["pot"]
+        if pot is None:
+            continue
+        if accepted is not None and pot < 1.0 <= accepted:
+            state["pot"] = accepted
+            continue
+        if accepted is None or abs(pot - accepted) <= _EPS:
+            accepted = pot
+            continue
+        nxt_val = None
+        for nxt in hand[idx + 1:]:
+            if nxt["pot"] is not None:
+                nxt_val = nxt["pot"]
+                break
+        if nxt_val is not None and abs(nxt_val - accepted) <= _EPS:
+            state["pot"] = accepted  # A -> B -> A blip
+        else:
+            accepted = pot
 
 
 # --------------------------------------------------------------------------- #
@@ -180,56 +295,194 @@ def _mode(values: list[Any]) -> Any:
     return Counter(values).most_common(1)[0][0] if values else None
 
 
+def _settle_index(hand: list[dict[str, Any]]) -> int:
+    """Index of the state where the pot is swept to the winner (a single-transition
+    stack jump of at least ~half the pot), or the last index if never seen.
+    States after it are settlement/next-deal noise: the next hand's antes tick
+    every stack down and its blinds post while the old hero cards linger."""
+    pot_so_far: float | None = None
+    for idx, (prev, cur) in enumerate(zip(hand, hand[1:]), start=1):
+        if prev["pot"] is not None:
+            pot_so_far = prev["pot"] if pot_so_far is None else max(pot_so_far, prev["pot"])
+        threshold = max(3.0, 0.4 * (pot_so_far or 0.0))
+        for seat, after in cur["stacks"].items():
+            before = prev["stacks"].get(seat)
+            if before is not None and after - before >= threshold:
+                return idx
+    return len(hand) - 1
+
+
 def _reconstruct_actions(
     hand: list[dict[str, Any]], positions: dict[int, str], player_name: dict[int, str]
 ) -> list[dict[str, Any]]:
-    """Derive ordered actions from state-to-state deltas: folds from card_back
-    disappearing, bet/raise/call sizes from stack decreases (reconciled against the
-    pot delta), checks from a check pill with no stack change."""
+    """Derive ordered actions from state-to-state deltas.
+
+    Sources, in order of trust:
+      folds   <- fold pills (the ONLY signal for the hero, whose grayed cards keep
+                 a card_back on screen) plus card_back disappearance, latched so a
+                 later pill misread cannot un-fold a seat;
+      amounts <- bet_text deltas (per-street contributions rendered on the felt),
+                 falling back to debounced stack decreases;
+      checks  <- a fresh check pill with no money delta (readable stacks NOT
+                 required -- pill evidence stands on its own).
+
+    Every action is attributed to the PREVIOUS state's street: chips go in (and
+    seats fold) before the next board card appears, so on the transition where a
+    street closes, the new state already shows the next street's board.
+    """
     actions: list[dict[str, Any]] = []
     street_index: dict[str, int] = {}
-    street_has_bet: dict[str, bool] = {}
+    # Preflop starts True: the blinds are a live bet, so limps are calls and
+    # preflop folds are always legitimate.
+    street_has_bet: dict[str, bool] = {"preflop": True}
+    folded: set[int] = set()
+    acted: dict[str, set[int]] = {}          # street -> seats seen acting
+    street_raised: dict[str, bool] = {}      # street -> saw raise/bet/all-in
 
-    for prev, cur in zip(hand, hand[1:]):
-        street = _street_for_count(len(cur["board_cards"]), cur["stage"])
+    def emit(street, seat, atype, amount, pot_before, stack_before):
+        street_index[street] = street_index.get(street, 0) + 1
+        if atype in {"bet", "raise", "all-in"}:
+            street_has_bet[street] = True
+            street_raised[street] = True
+        acted.setdefault(street, set()).add(seat)
+        actions.append(_action(street, street_index[street], seat, positions, player_name,
+                               atype, amount, pot_before, stack_before))
+
+    # ---- pre-observed actions standing in the hand's FIRST state ----
+    # A hand often enters view mid-preflop: pills and bet_texts already on the
+    # table are completed actions we never saw happen. Bets at or below the big
+    # blind with no pill are blind posts, not actions. (This table renders
+    # amounts in BB units, so the big blind is 1.0.)
+    first = hand[0]
+    if not first["board_cards"]:
+        for seat in sorted(set(first["pills"]) | set(first["bets"])):
+            pill = first["pills"].get(seat)
+            bet = first["bets"].get(seat)
+            if pill == "fold":
+                folded.add(seat)
+                emit("preflop", seat, "fold", None, None, first["stacks"].get(seat))
+            elif pill in {"raise", "bet", "call"}:
+                emit("preflop", seat, pill if pill != "bet" else "raise",
+                     bet, None, first["stacks"].get(seat))
+            elif pill == "check":
+                emit("preflop", seat, "check", None, None, first["stacks"].get(seat))
+            elif pill is None and bet is not None and bet > 1.0 + _EPS:
+                emit("preflop", seat, "call", bet, None, first["stacks"].get(seat))
+
+    settle = _settle_index(hand)
+    for prev, cur in zip(hand[: settle + 1], hand[1: settle + 1]):
+        street = _street_for_count(len(prev["board_cards"]), prev["stage"])
         if street not in _STREET_BY_COUNT.values():
             continue
         pot_before = prev["pot"]
 
-        # folds first (card_back disappeared)
-        for seat in sorted(set(prev["dealt_in"]) - set(cur["dealt_in"])):
-            street_index[street] = street_index.get(street, 0) + 1
-            actions.append(_action(street, street_index[street], seat, positions, player_name,
-                                    "fold", None, pot_before, prev["stacks"].get(seat)))
-
-        # stack-decrease actions (bet / raise / call / all-in)
-        for seat in sorted(cur["stacks"]):
-            before = prev["stacks"].get(seat)
-            after = cur["stacks"][seat]
-            if before is None or after is None or after >= before - _EPS:
+        # ---- money actions (bet_text delta, corroborated by the stack) ----
+        money_seats: dict[int, tuple[float, float | None]] = {}  # seat -> (amount, stack_before)
+        for seat in sorted(set(cur["bets"]) | set(cur["stacks"])):
+            if seat in folded or seat not in positions:
                 continue
-            amount = round(before - after, 2)
+            before = prev["stacks"].get(seat)
+            after = cur["stacks"].get(seat)
+            stack_dropped = before is not None and after is not None and after < before - _EPS
+            stack_flat = before is not None and after is not None and abs(after - before) <= _EPS
+            amount = None
+            if stack_dropped:
+                # the debounced stack delta is the most reliable size
+                amount = round(before - after, 2)
+            elif not stack_flat:
+                # stack unreadable this transition: fall back to the bet_text
+                # delta. (A bet_text rising while the stack is provably unchanged
+                # is rendering lag of an action already emitted from the stack.)
+                cur_bet = cur["bets"].get(seat)
+                prev_bet = prev["bets"].get(seat)
+                same_street = len(prev["board_cards"]) == len(cur["board_cards"])
+                if cur_bet is not None and cur_bet >= 0.5 - _EPS:
+                    base = prev_bet if (same_street and prev_bet is not None) else 0.0
+                    if cur_bet > base + _EPS:
+                        amount = round(cur_bet - base, 2)
+            if amount is not None and amount >= 0.5 - _EPS:
+                money_seats[seat] = (amount, before)
+
+        for seat, (amount, stack_before) in sorted(money_seats.items()):
             pill = cur["pills"].get(seat)
-            if after <= _EPS:
+            after = cur["stacks"].get(seat)
+            if after is not None and after <= _EPS:
                 atype = "all-in"
             elif pill in {"raise", "bet", "call"}:
                 atype = pill
             else:
                 atype = "call" if street_has_bet.get(street) else "bet"
-            if atype in {"bet", "raise", "all-in"}:
-                street_has_bet[street] = True
-            street_index[street] = street_index.get(street, 0) + 1
-            actions.append(_action(street, street_index[street], seat, positions, player_name,
-                                    atype, amount, pot_before, before))
+            emit(street, seat, atype, amount, pot_before, stack_before)
 
-        # explicit checks (check pill, no stack change)
-        for seat, pill in cur["pills"].items():
-            if pill == "check" and prev["pills"].get(seat) != "check":
-                before, after = prev["stacks"].get(seat), cur["stacks"].get(seat)
-                if before is not None and after is not None and abs(before - after) <= _EPS:
-                    street_index[street] = street_index.get(street, 0) + 1
-                    actions.append(_action(street, street_index[street], seat, positions,
-                                            player_name, "check", None, pot_before, before))
+        # ---- folds: card_back disappeared OR a fresh fold pill (hero: pill only) ----
+        # A fold is only possible facing a bet; "folds" detected on a street where
+        # nobody has bet are showdown reveals/sweeps, not actions.
+        gone = set(prev["dealt_in"]) - set(cur["dealt_in"])
+        pill_folds = {seat for seat, pill in cur["pills"].items()
+                      if pill == "fold" and prev["pills"].get(seat) != "fold"}
+        for seat in sorted((gone | pill_folds) - folded):
+            if seat in money_seats or seat not in positions:
+                continue  # money and a fold can't both happen; unknown seats are noise
+            if not street_has_bet.get(street):
+                continue
+            if seat in gone and seat not in pill_folds:
+                if len(gone) >= 2:
+                    continue  # multi-seat sweep after the pot is awarded
+                before = prev["stacks"].get(seat)
+                if before is not None and before <= _EPS:
+                    continue  # an all-in player's cards flip over; they can't fold
+            folded.add(seat)
+            emit(street, seat, "fold", None, pot_before, prev["stacks"].get(seat))
+
+        # ---- checks: fresh check pill, no money this transition ----
+        # A fresh check pill arriving together WITH a new board card belongs to
+        # the new street (its first check), unlike money, which closes streets.
+        check_street = street
+        if len(cur["board_cards"]) > len(prev["board_cards"]):
+            check_street = _street_for_count(len(cur["board_cards"]), cur["stage"])
+        for seat, pill in sorted(cur["pills"].items()):
+            if pill != "check" or prev["pills"].get(seat) == "check":
+                continue
+            if seat in money_seats or seat in folded or seat not in positions:
+                continue
+            emit(check_street, seat, "check", None, pot_before, prev["stacks"].get(seat))
+
+    # ---- synthesized closing checks ----
+    # 2s sampling and instant street closes hide some checks: a street that ended
+    # with no bet was checked through by every live seat, and a preflop with no
+    # raise gives the big blind a free check. Emit the checks we know happened
+    # but never saw.
+    streets_seen = {_STREET_BY_COUNT[n] for n in
+                    {len(s["board_cards"]) for s in hand} if n in _STREET_BY_COUNT}
+    folded_at: dict[int, str] = {a["seat"]: a["street"] for a in actions
+                                 if a["action_type"] == "fold"}
+    order = [s for s in ("preflop", "flop", "turn", "river") if s in streets_seen]
+    all_in_at: dict[int, int] = {a["seat"]: order.index(a["street"]) for a in actions
+                                 if a["action_type"] == "all-in" and a["street"] in order}
+    for si, street in enumerate(order):
+        live = [p for p in positions
+                if p not in folded_at or order.index(folded_at[p]) > si]
+        # seats already all-in on an earlier street cannot act; with fewer than
+        # two actionable seats there is no betting round to check through
+        actionable = [p for p in live if all_in_at.get(p, 99) >= si]
+        if len(actionable) < 2:
+            continue
+        for seat in sorted(actionable):
+            if seat in acted.get(street, set()):
+                continue
+            if not street_has_bet.get(street):
+                # on the last street, only a showdown (>=2 seats never folded)
+                # proves the unseen players actually got to check
+                if street != order[-1] or len(actionable) >= 2:
+                    emit(street, seat, "check", None, None, None)
+            elif street == "preflop" and positions.get(seat) == "BB" \
+                    and not street_raised.get("preflop"):
+                emit(street, seat, "check", None, None, None)
+
+    # Emission interleaves sources (transitions, cur-street checks, synthesis),
+    # so impose global street order; within a street the emit order stands.
+    street_rank = {s: k for k, s in enumerate(("preflop", "flop", "turn", "river"))}
+    actions.sort(key=lambda a: street_rank.get(a["street"], 9))
     return actions
 
 
@@ -238,7 +491,9 @@ def _action(street, index, seat, positions, player_name, atype, amount, pot_befo
         "street": street,
         "action_index": index,
         "seat": seat,
-        "player_name": player_name[seat],
+        # A pill can be assigned (by the coarse stub seat model) to a seat that was
+        # never seen dealt in; fall back to a synthetic name rather than crashing.
+        "player_name": player_name.get(seat, "Hero" if seat == 0 else f"Seat{seat}"),
         "position": positions.get(seat, ""),
         "action_type": atype,
         "amount": amount,
@@ -247,13 +502,47 @@ def _action(street, index, seat, positions, player_name, atype, amount, pot_befo
     }
 
 
+def _vote_board(hand: list[dict[str, Any]]) -> list[str]:
+    """Majority-vote the final board: among observed board tuples, take the longest
+    one that either repeats (>=2 states) or extends a repeating shorter tuple as a
+    prefix. A single-frame misread tuple loses to the stable reading."""
+    from collections import Counter
+
+    counts = Counter(tuple(s["board_cards"]) for s in hand if s["board_cards"])
+    if not counts:
+        return []
+    stable = [t for t, n in counts.items() if n >= 2]
+    stable.sort(key=lambda t: (len(t), counts[t]))
+    best = stable[-1] if stable else ()
+    for t, n in counts.items():
+        if n == 1 and len(t) > len(best) and tuple(t[: len(best)]) == tuple(best):
+            best = t  # a once-seen river that extends the stable turn is real
+    return list(best) if best else _best_board(hand)
+
+
 def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
-    hero_candidates = [s["hero_cards"] for s in hand if len(s["hero_cards"]) == 2]
-    hero = hero_candidates[0] if hero_candidates else []
-    board = _best_board(hand)
+    # Numeric debounce is PER HAND: bets/stacks/pot must never carry an accepted
+    # value across a hand boundary (the next hand's first readings are fresh).
+    _debounce_series(hand, "stacks")
+    _debounce_series(hand, "bets")
+    _debounce_pot(hand)
+    hero = _mode([tuple(s["hero_cards"]) for s in hand if len(s["hero_cards"]) == 2])
+    hero = list(hero) if hero else []
+    board = _vote_board(hand)
     dealer_seat = _mode([s["dealer_seat"] for s in hand])
 
-    players = sorted({seat for s in hand for seat in s["dealt_in"]})
+    # A seat is a player with two states of card_back evidence, or with any
+    # evidence in the hand's opening states (instant folders show exactly one
+    # frame of cards). A single mid-hand misdetection must not conjure a
+    # phantom player.
+    from collections import Counter
+
+    dealt_counts = Counter(seat for s in hand for seat in s["dealt_in"])
+    opening = {seat for s in hand[:2] for seat in s["dealt_in"]}
+    players = sorted(seat for seat, n in dealt_counts.items()
+                     if n >= 2 or seat in opening)
+    if not players:
+        players = sorted(dealt_counts)
     positions = _positions(players, dealer_seat)
     player_name = {seat: ("Hero" if seat == 0 else f"Seat{seat}") for seat in players}
 
@@ -270,9 +559,13 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
 
     actions = _reconstruct_actions(hand, positions, player_name)
 
-    # per-street end pot (last stable pot at each board count) + final pot
+    # per-street end pot (last stable pot at each board count) + final pot.
+    # Only states up to the settlement (pot swept to the winner) count: after it
+    # the display is already showing the next deal's antes/blinds.
+    settle = _settle_index(hand)
+    settled_states = hand[: settle + 1]
     street_pot: dict[str, float] = {}
-    for s in hand:
+    for s in settled_states:
         street = _STREET_BY_COUNT.get(len(s["board_cards"]))
         if street and s["pot"] is not None:
             street_pot[street] = s["pot"]
@@ -280,10 +573,12 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
     for street in streets:
         if street["street"] in street_pot:
             street["pot"] = street_pot[street["street"]]
-    pots = [s["pot"] for s in hand if s["pot"] is not None]
+    pots = [s["pot"] for s in settled_states if s["pot"] is not None]
     final_pot = pots[-1] if pots else None
 
-    # winner + hero result from stack recovery
+    # winner + hero result from stack recovery. Contributions are measured
+    # against the last PRE-settlement stack, not the minimum: an over-shove's
+    # uncalled portion is returned before the sweep and never enters the pot.
     contributed = 0.0
     winner_seat, win_gain = None, 0.0
     hero_bb_won = None
@@ -292,7 +587,9 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         if not series:
             continue
         low = min(series)
-        contributed += max(series[0] - low, 0.0)
+        pre_settle = [s["stacks"][seat] for s in settled_states[:-1] if seat in s["stacks"]]
+        if pre_settle:
+            contributed += max(series[0] - pre_settle[-1], 0.0)
         gain = series[-1] - low
         if gain > win_gain + _EPS:
             win_gain, winner_seat = gain, seat
@@ -309,9 +606,13 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
 
     cards = hero + board
     cards_unique = len(cards) == len(set(cards))
+    # Blinds + antes are already in the pot before the first observed state
+    # (stacks are pre-debited), so observed stack contributions reconcile
+    # against the pot GROWTH from the first reading, not the whole pot.
+    initial_pot = pots[0] if pots else None
     reconciled = (
-        final_pot is not None and contributed > 0
-        and abs(contributed - final_pot) <= max(3.0, 0.25 * final_pot)
+        final_pot is not None and initial_pot is not None
+        and abs(initial_pot + contributed - final_pot) <= max(3.0, 0.25 * final_pot)
     )
     complete_cards = len(hero) == 2 and len(board) in {0, 3, 4, 5} and cards_unique
     complete = bool(hero) and cards_unique and final_pot is not None and bool(actions) and winner_seat is not None
@@ -362,9 +663,10 @@ def build_hand_timeline(frames: list[rd.Frame]) -> dict[str, Any]:
             "source": "yolo_region_detections",
             "classes": rd.CLASSES,
             "notes": [
-                "Offline completed-session reconstruction from 7-class region detections.",
-                "Seat zones are coarse geometry; the anchored seat model plugs in later.",
-                "Attribute reads (rank/suit, amounts, pill colour) are pluggable stubs.",
+                "Offline completed-session reconstruction from 8-class region detections.",
+                "Seats assigned via per-class anchors learned from the labeled boxes.",
+                "Attribute reads: Model 2 rank/suit + deterministic template OCR "
+                "(amounts, pill words); fixtures may pass attrs through directly.",
             ],
         },
         "summary": {
