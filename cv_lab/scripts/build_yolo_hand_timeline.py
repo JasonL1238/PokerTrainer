@@ -64,6 +64,8 @@ def _frame_state(frame: rd.Frame) -> dict[str, Any]:
         "hero_cards": view["hero"],
         "board_cards": board,
         "other_cards": [],
+        "villain_cards": view.get("villain_cards", {}),
+        "hero_dim": view.get("hero_dim", False),
         "pot": pot,
         "dealt_in": dealt_in,
         "stacks": stacks,
@@ -80,6 +82,8 @@ def _signature(state: dict[str, Any]) -> tuple:
     return (
         tuple(state["hero_cards"]),
         tuple(state["board_cards"]),
+        tuple(sorted((seat, tuple(cards)) for seat, cards in state["villain_cards"].items())),
+        state["hero_dim"],
         tuple(state["dealt_in"]),
         tuple(sorted(state["stacks"].items())),
         tuple(sorted(state["bets"].items())),
@@ -121,6 +125,22 @@ def _debounce_cards(raw: list[dict[str, Any]], key: str) -> None:
             state[key] = list(accepted) if accepted is not None else []
 
 
+def _debounce_bool_confirm(raw: list[dict[str, Any]], key: str) -> None:
+    """A True reading must be confirmed by the VERY NEXT reading also being
+    True, else it's a single-frame blip (e.g. a card-flip/bet animation
+    transiently darkening the hero-card crop) and is rejected. A real greyed-
+    out fold holds for many consecutive samples, so this costs it nothing;
+    a one-off dip loses its only reading. Mirrors _debounce_cards' confirm
+    rule but for a plain boolean rather than a card list."""
+    n = len(raw)
+    accepted = [False] * n
+    for i, state in enumerate(raw):
+        if state[key] and i + 1 < n and raw[i + 1][key]:
+            accepted[i] = True
+    for i, state in enumerate(raw):
+        state[key] = accepted[i]
+
+
 def build_states(frames: list[rd.Frame]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return (distinct states, events). Raw per-frame states are debounced first
     (cards, pot, stacks, bets -- single-frame OCR/classifier blips are rejected
@@ -128,6 +148,7 @@ def build_states(frames: list[rd.Frame]) -> tuple[list[dict[str, Any]], list[dic
     raw = [_frame_state(f) for f in frames]
     _debounce_cards(raw, "hero_cards")
     _debounce_cards(raw, "board_cards")
+    _debounce_bool_confirm(raw, "hero_dim")
     for state in raw:
         state["stage"] = _stage(len(state["board_cards"]))
 
@@ -608,6 +629,23 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
     positions = _positions(players, dealer_seat)
     player_name = {seat: ("Hero" if seat == 0 else f"Seat{seat}") for seat in players}
 
+    # Villain showdown reveals: a non-hero seat's cards flip face-up only when
+    # the client actually shows them (all-in showdown, or a voluntary show), so
+    # this is empty for the vast majority of hands. Mode over every state's
+    # reading (like hero/board) rather than trusting a single frame.
+    shown_cards: dict[int, list[str]] = {}
+    known_cards = set(hero) | set(board)
+    for seat in players:
+        if seat == 0:
+            continue
+        votes = [tuple(s["villain_cards"].get(seat, [])) for s in hand]
+        votes = [v for v in votes if len(v) == 2]
+        best = _mode(votes)
+        # A reveal sharing a card with hero/board is a misread (board/hero
+        # card bleeding across zones), not a real villain reveal -- drop it.
+        if best and not (set(best) & known_cards):
+            shown_cards[seat] = list(best)
+
     player_rows = []
     for seat in players:
         series = _stack_series(hand, seat)
@@ -617,6 +655,7 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
             "player_name": player_name[seat],
             "starting_stack": series[0] if series else None,
             "is_hero": seat == 0,
+            "shown_cards": shown_cards.get(seat),
         })
 
     actions = _reconstruct_actions(hand, positions, player_name)
@@ -676,21 +715,28 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
     contributed = round(contributed, 2)
 
     # Did the hero fold? Signals, strongest first: a hero fold pill, a
-    # reconstructed hero fold action, or -- for a blind/checked hero who never
-    # commits chips (no pill sampled) -- the hero's cards mucking away while the
-    # pot is still contested multiway. The last is gated on winner_seat is None
-    # and >=2 villains still holding cards so a hero-WIN sweep (everyone else's
-    # cards clear at once) can never be mistaken for a fold.
+    # reconstructed hero fold action, the hero's own cards rendered greyed-out
+    # (the client's persistent in-place fold indicator -- unlike the pill,
+    # which flashes for under a second, this holds for the rest of the hand,
+    # so it survives sparse sampling that would otherwise miss the pill), or
+    # -- for a blind/checked hero who never commits chips (no pill sampled) --
+    # the hero's cards mucking away while the pot is still contested multiway.
+    # The last is gated on winner_seat is None and >=2 villains still holding
+    # cards so a hero-WIN sweep (everyone else's cards clear at once) can
+    # never be mistaken for a fold.
     hero_had_cards = len(hero) == 2
     hero_pill_fold = any(s["pills"].get(0) == "fold" for s in hand)
     hero_action_fold = any(a["seat"] == 0 and a["action_type"] == "fold" for a in actions)
+    hero_dim_fold = any(s["hero_dim"] for s in hand)
     last = hand[-1]
     villains_live_at_end = len([s for s in last["dealt_in"] if s != 0]) >= 2
     hero_mucked = (
         hero_had_cards and winner_seat is None and villains_live_at_end
         and len(hand[0]["hero_cards"]) == 2 and len(last["hero_cards"]) != 2
     )
-    hero_folded = hero_had_cards and (hero_pill_fold or hero_action_fold or hero_mucked)
+    hero_folded = hero_had_cards and (
+        hero_pill_fold or hero_action_fold or hero_dim_fold or hero_mucked
+    )
 
     if winner_seat == 0:
         result = "Hero wins"

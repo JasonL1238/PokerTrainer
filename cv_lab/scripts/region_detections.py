@@ -88,6 +88,12 @@ _SEATED_CLASSES = {
 # Classes whose attr is a numeric amount readable by the template OCR.
 _AMOUNT_CLASSES = {"pot_text", "stack_text", "bet_text"}
 
+# Mean grayscale crop value below which hero's own hole cards read as the
+# client's greyed-out "folded" rendering rather than the lit/active one.
+# Calibrated against real frames (ClubWPT session, v05#32): live cards ~172,
+# folded cards ~50 -- a wide gap, so this sits with margin on both sides.
+_HERO_DIM_BRIGHTNESS_THRESHOLD = 100.0
+
 
 @dataclass
 class Detection:
@@ -97,12 +103,21 @@ class Detection:
     - pot_text / stack_text: the numeric value (float or numeric string)
     - action_pill: the action or colour ("raise"/"call"/"bet"/"check"/"gray"/None)
     - card_back / dealer_button / active_turn_indicator: unused (None)
+
+    ``brightness`` (face_card only): mean grayscale value of the card crop,
+    0-255. The client renders a folded seat's own hole cards greyed-out in
+    place rather than removing them, so this is a second, more durable fold
+    signal than the action_pill (which flashes "FOLD" for under a second --
+    easy to miss at a few-second sampling rate -- while the greyed cards stay
+    that way for the rest of the hand). None when not computed (fixture/test
+    paths that never had pixel access).
     """
 
     cls: str
     conf: float
     xyxy: tuple[float, float, float, float]
     attr: Any = None
+    brightness: float | None = None
 
 
 @dataclass
@@ -197,6 +212,10 @@ def assign_regions(frame: Frame) -> dict[str, Any]:
     Returns a normalized table view:
         {
           "hero": [card,...], "board": [card,...],
+          "villain_cards": { seat_index: [card,...] },  # non-hero face_card boxes,
+              # i.e. cards a villain flipped face-up (showdown reveal) -- only
+              # present in the rare frames where the client actually shows them.
+          "hero_dim": bool,  # hero's own cards are rendered greyed-out (folded)
           "pot": float | None,
           "seats": { seat_index: {"card_back","stack","pill_action","dealer","turn"} },
           "dealer_seat": int | None, "active_seat": int | None,
@@ -204,6 +223,10 @@ def assign_regions(frame: Frame) -> dict[str, Any]:
     """
     hero_dets: list[tuple[float, Detection]] = []
     board_dets: list[tuple[float, Detection]] = []
+    # face_card boxes outside the hero/board zones -- a villain's cards flipped
+    # face-up at showdown -- keyed by nearest seat (same anchors as card_back,
+    # so a seat's revealed cards line up with where its card_back sat).
+    villain_dets: dict[int, list[tuple[float, Detection]]] = {}
     pot_candidates: list[Detection] = []
     seats: dict[int, dict[str, Any]] = {}
     # Nearest card-anchor seat for each card in the STRICT hero zone ("other"-zone
@@ -226,10 +249,12 @@ def assign_regions(frame: Frame) -> dict[str, Any]:
             zone = _zone_for_box(cx, cy)
             if zone == "board":
                 board_dets.append((cx, det))
-            else:  # hero (or a stray "other" -> treat as hero-side card)
+            elif zone == "hero":
                 hero_dets.append((cx, det))
-                if zone == "hero":
-                    hero_zone_seat_votes.append(_nearest_seat(cx, cy, "card_back"))
+                hero_zone_seat_votes.append(_nearest_seat(cx, cy, "card_back"))
+            else:
+                i = _nearest_seat(cx, cy, "card_back")
+                villain_dets.setdefault(i, []).append((cx, det))
         elif det.cls == "pot_text":
             pot_candidates.append(det)
         elif det.cls in _SEATED_CLASSES:
@@ -249,6 +274,21 @@ def assign_regions(frame: Frame) -> dict[str, Any]:
 
     hero_cards = [c for c in (read_card_label(d) for _, d in sorted(hero_dets)) if c][:2]
     board_cards = [c for c in (read_card_label(d) for _, d in sorted(board_dets)) if c][:5]
+
+    # Hero fold, second signal: the client greys out hero's own hole cards in
+    # place on fold rather than removing them (mean crop brightness ~50/255,
+    # vs. ~170+ while still live) -- and unlike the "FOLD" action_pill, which
+    # flashes for well under a second, the greyed-out cards stay that way for
+    # the rest of the hand, so a sparse sampling rate can still catch it.
+    hero_brightness_vals = [d.brightness for _, d in hero_dets if d.brightness is not None]
+    hero_dim = bool(hero_brightness_vals) and (
+        sum(hero_brightness_vals) / len(hero_brightness_vals) < _HERO_DIM_BRIGHTNESS_THRESHOLD
+    )
+    villain_cards: dict[int, list[str]] = {}
+    for seat_i, dets in villain_dets.items():
+        cards = [c for c in (read_card_label(d) for _, d in sorted(dets)) if c][:2]
+        if cards:
+            villain_cards[seat_i] = cards
 
     # Hero seat is dealt in when hero hole cards are visible.
     if hero_cards:
@@ -278,6 +318,8 @@ def assign_regions(frame: Frame) -> dict[str, Any]:
     return {
         "hero": hero_cards,
         "board": board_cards,
+        "villain_cards": villain_cards,
+        "hero_dim": hero_dim,
         "pot": pot,
         "seats": seats,
         "dealer_seat": dealer_seat,
@@ -299,6 +341,7 @@ def frames_from_fixture(data: Iterable[dict[str, Any]]) -> list[Frame]:
                 conf=float(d.get("conf", 1.0)),
                 xyxy=tuple(float(v) for v in d["xyxy"]),  # type: ignore[arg-type]
                 attr=d.get("attr"),
+                brightness=d.get("brightness"),
             )
             for d in row.get("detections", [])
         ]
@@ -421,11 +464,20 @@ def frame_from_models(
             continue
         xyxy = (float(row["x1"]), float(row["y1"]), float(row["x2"]), float(row["y2"]))
         attr = row.get("attr")
+        brightness = None
         if cls == "face_card" and classifier is not None:
             crop = _pad_crop_xyxy(image, *xyxy, pad)
             if crop is not None and getattr(crop, "size", 1) > 0:
                 label, _conf = classifier.classify(crop)
                 attr = label
+            # Brightness is read off the TIGHT (unpadded) box -- the folded/
+            # active grey-vs-white contrast is on the card face itself, and
+            # padding pulls in felt background that would dilute it.
+            tight = _pad_crop_xyxy(image, *xyxy, 0.0)
+            if tight is not None and getattr(tight, "size", 1) > 0:
+                import cv2
+
+                brightness = float(cv2.cvtColor(tight, cv2.COLOR_BGR2GRAY).mean())
         elif ocr_readers is not None and attr is None and cls in _AMOUNT_CLASSES:
             attr = ocr_readers.read_amount_from_image(image, xyxy)
         elif ocr_readers is not None and attr is None and cls == "action_pill":
@@ -436,6 +488,7 @@ def frame_from_models(
                 conf=float(row.get("confidence", row.get("conf", 0.0)) or 0.0),
                 xyxy=xyxy,
                 attr=attr,
+                brightness=brightness,
             )
         )
     return Frame(image=image_name, time_s=time_s, width=w, height=h,

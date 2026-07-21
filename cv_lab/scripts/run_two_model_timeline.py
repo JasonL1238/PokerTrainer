@@ -43,7 +43,8 @@ def _time_from_name(name: str, fallback: float) -> float:
 def _frame_to_dict(frame: rd.Frame) -> dict:
     d = asdict(frame)
     d["detections"] = [
-        {"cls": det.cls, "conf": det.conf, "xyxy": list(det.xyxy), "attr": det.attr}
+        {"cls": det.cls, "conf": det.conf, "xyxy": list(det.xyxy), "attr": det.attr,
+         "brightness": det.brightness}
         for det in frame.detections
     ]
     return d
