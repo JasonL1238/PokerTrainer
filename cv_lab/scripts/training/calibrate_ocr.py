@@ -28,7 +28,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 from labeling_poker.config import DEFAULT_DB_PATH, EXISTING_DATASET_IMAGES_DIR  # noqa: E402
-from cv_lab.scripts.reading.ocr_readers import (  # noqa: E402
+from cv_lab.scripts.pipeline.ocr_readers import (  # noqa: E402
     DEFAULT_TEMPLATE_PATH,
     DIGIT_SIZE,
     WORD_SIZE,

@@ -17,7 +17,7 @@ import av
 import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-from cv_lab.scripts.detect.evaluate_yolo_cards import (  # noqa: E402
+from cv_lab.scripts.pipeline.evaluate_yolo_cards import (  # noqa: E402
     DEFAULT_YOLOV12_VENDOR,
     REPO_ROOT,
     _draw_text,

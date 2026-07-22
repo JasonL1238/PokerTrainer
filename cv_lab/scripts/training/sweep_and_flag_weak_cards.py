@@ -27,8 +27,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cv_lab.scripts.detect.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
-from cv_lab.scripts.detect.card_classifier import CardClassifier, DEFAULT_CLS_WEIGHTS  # noqa: E402
+from cv_lab.scripts.pipeline.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
+from cv_lab.scripts.pipeline.card_classifier import CardClassifier, DEFAULT_CLS_WEIGHTS  # noqa: E402
 from cv_lab.scripts.pipeline.run_two_model_pipeline import DEFAULT_DETECTOR, _detect_regions  # noqa: E402
 
 DEFAULT_IMAGES_DIR = REPO_ROOT / "cv_lab" / "datasets" / "yolo_cards_autolabel_v1" / "images"

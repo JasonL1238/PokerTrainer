@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirna
 import numpy as np
 import av
 
-import cv_lab.scripts.reading.read_table
+import cv_lab.scripts.pipeline.read_table
 
 VIDEO = "/Users/jasonli/Documents/GitHub/PokerTrainer/data/videos/clubwpt_session_01.mov"
 MODELS = "/Users/jasonli/Documents/GitHub/PokerTrainer/cv_lab/models"

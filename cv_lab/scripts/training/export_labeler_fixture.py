@@ -43,7 +43,7 @@ def _read_attr(cls: str, label, crop, bank) -> object:
         return label
     if bank is None or crop is None or crop.size == 0:
         return None
-    from cv_lab.scripts.reading.ocr_readers import pill_color
+    from cv_lab.scripts.pipeline.ocr_readers import pill_color
 
     if cls in _AMOUNT_CLASSES:
         val, _ = bank.read_number(crop)
@@ -57,7 +57,7 @@ def _read_attr(cls: str, label, crop, bank) -> object:
 def build_fixture(db_path: Path, images_dir: Path, video_prefix: str, ocr: bool = True) -> list[dict]:
     import cv2
 
-    from cv_lab.scripts.reading.ocr_readers import TemplateOCR
+    from cv_lab.scripts.pipeline.ocr_readers import TemplateOCR
 
     bank = TemplateOCR.load() if ocr else None
     con = sqlite3.connect(db_path)

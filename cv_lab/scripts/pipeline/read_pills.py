@@ -23,7 +23,7 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.
 import numpy as np
 import cv2
 
-from cv_lab.scripts.reading.landmark_anchor import REF_SEAT_COINS
+from cv_lab.scripts.pipeline.landmark_anchor import REF_SEAT_COINS
 
 # pill box relative to a seat coin (reference-normalized full-frame coords).
 PILL_DX0, PILL_DX1 = -0.020, 0.078

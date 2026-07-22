@@ -13,14 +13,14 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.
 
 import cv2
 
-from cv_lab.scripts.reading.classify_screen import classify
-from cv_lab.scripts.reading.read_pot import load_bank, read_pot
-from cv_lab.scripts.reading.read_cards import load_templates, read_board
-from cv_lab.scripts.reading.read_seats import read_seats
-from cv_lab.scripts.reading.read_pills import read_pills, load_word_bank
-from cv_lab.scripts.reading.read_markers import active_seat, dealer_seat
-from cv_lab.scripts.reading.read_hero import read_hero
-from cv_lab.scripts.reading.landmark_anchor import CANON_ROIS
+from cv_lab.scripts.pipeline.classify_screen import classify
+from cv_lab.scripts.pipeline.read_pot import load_bank, read_pot
+from cv_lab.scripts.pipeline.read_cards import load_templates, read_board
+from cv_lab.scripts.pipeline.read_seats import read_seats
+from cv_lab.scripts.pipeline.read_pills import read_pills, load_word_bank
+from cv_lab.scripts.pipeline.read_markers import active_seat, dealer_seat
+from cv_lab.scripts.pipeline.read_hero import read_hero
+from cv_lab.scripts.pipeline.landmark_anchor import CANON_ROIS
 
 _DIGITS = None
 _CARDS = None

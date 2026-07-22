@@ -23,7 +23,7 @@ from threading import Lock
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-from cv_lab.scripts.detect.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
+from cv_lab.scripts.pipeline.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 # Promoted stable weights; falls back to the raw run dir if not yet promoted.

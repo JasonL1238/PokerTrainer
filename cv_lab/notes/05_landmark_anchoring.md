@@ -5,7 +5,7 @@ Make ROIs tolerant to the user's stated constraint: screen recordings vary at th
 (sometimes more/less non-WPT screen content is captured), so the table sits at a different
 offset/scale per recording. The hardcoded fractional ROIs from Findings 04 would break. Solution:
 locate the table by ON-SCREEN LANDMARKS, derive all ROIs relative to it.
-Module: `cv_lab/scripts/reading/landmark_anchor.py`. No ground truth used.
+Module: `cv_lab/scripts/pipeline/landmark_anchor.py`. No ground truth used.
 
 ## The key color finding
 Sampled pixel colors across the UI: the ENTIRE ClubWPT interface is dark and COOL (hue ~110,

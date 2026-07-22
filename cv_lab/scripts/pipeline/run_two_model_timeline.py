@@ -27,8 +27,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from cv_lab.scripts.detect.two_model_infer import TwoModelPipeline  # noqa: E402
-from cv_lab.scripts.detect import region_detections as rd  # noqa: E402
+from cv_lab.scripts.pipeline.two_model_infer import TwoModelPipeline  # noqa: E402
+from cv_lab.scripts.pipeline import region_detections as rd  # noqa: E402
 from cv_lab.scripts.pipeline import build_yolo_hand_timeline as bt  # noqa: E402
 
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".bmp")

@@ -7,9 +7,9 @@ board and hero share one set of rank/suit templates.
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 import cv2
-from cv_lab.scripts.reading.landmark_anchor import anchor
-import cv_lab.scripts.reading.read_cards as rc
-import cv_lab.scripts.reading.read_hero as rh
+from cv_lab.scripts.pipeline.landmark_anchor import anchor
+import cv_lab.scripts.pipeline.read_cards as rc
+import cv_lab.scripts.pipeline.read_hero as rh
 
 DF = "/Users/jasonli/Documents/GitHub/PokerTrainer/cv_lab/hand01/decision_frames"
 ST = "/Users/jasonli/Documents/GitHub/PokerTrainer/cv_lab/hand01/spade_test"

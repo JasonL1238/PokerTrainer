@@ -17,7 +17,7 @@ from __future__ import annotations
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))))
 
-from cv_lab.scripts.reading.landmark_anchor import anchor
+from cv_lab.scripts.pipeline.landmark_anchor import anchor
 
 SCALE_LO, SCALE_HI = 0.45, 1.8
 MAX_RESID = 0.02          # median reprojection error < 2% of table width

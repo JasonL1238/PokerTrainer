@@ -28,9 +28,9 @@ import cv2
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from cv_lab.scripts.detect.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
-from cv_lab.scripts.detect.card_classifier import CardClassifier  # noqa: E402
-from cv_lab.scripts.detect import region_detections as rd  # noqa: E402
+from cv_lab.scripts.pipeline.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
+from cv_lab.scripts.pipeline.card_classifier import CardClassifier  # noqa: E402
+from cv_lab.scripts.pipeline import region_detections as rd  # noqa: E402
 from labeling_poker.config import CLASSES  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[3]

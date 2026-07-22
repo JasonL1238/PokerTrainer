@@ -454,7 +454,7 @@ def frame_from_models(
     ocr_readers = None
     if ocr and image is not None:
         # Lazy import keeps the fixture path importable without cv2/numpy.
-        from cv_lab.scripts.reading import ocr_readers as _ocr
+        from cv_lab.scripts.pipeline import ocr_readers as _ocr
 
         ocr_readers = _ocr
     dets: list[Detection] = []

@@ -24,8 +24,8 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.
 import numpy as np
 import cv2
 
-from cv_lab.scripts.reading.landmark_anchor import REF_SEAT_COINS
-from cv_lab.scripts.reading.read_cards import (_match, RANK_SIZE, SUIT_SIZE, _tight)
+from cv_lab.scripts.pipeline.landmark_anchor import REF_SEAT_COINS
+from cv_lab.scripts.pipeline.read_cards import (_match, RANK_SIZE, SUIT_SIZE, _tight)
 
 HERO_SEAT = 7  # bottom-center seat coin (Mochi / hero)
 # hero-card ROI relative to the hero seat coin (reference-normalized full-frame).

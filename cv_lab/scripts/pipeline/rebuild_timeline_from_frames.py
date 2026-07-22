@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
-from cv_lab.scripts.detect import region_detections as rd  # noqa: E402
+from cv_lab.scripts.pipeline import region_detections as rd  # noqa: E402
 from cv_lab.scripts.pipeline.build_yolo_hand_timeline import build_hand_timeline  # noqa: E402
 
 

@@ -31,7 +31,7 @@ from cv_lab.scripts.pipeline.build_yolo_card_timeline import (
     _stage,
     _street_events,
 )
-from cv_lab.scripts.detect import region_detections as rd
+from cv_lab.scripts.pipeline import region_detections as rd
 
 DEFAULT_OUT = "cv_lab/results/yolo_hand_timeline.json"
 

@@ -34,9 +34,9 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
-from cv_lab.scripts.detect.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
-from cv_lab.scripts.detect.card_classifier import CardClassifier, DEFAULT_CLS_WEIGHTS  # noqa: E402
-import cv_lab.scripts.detect.region_detections as rd  # noqa: E402
+from cv_lab.scripts.pipeline.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
+from cv_lab.scripts.pipeline.card_classifier import CardClassifier, DEFAULT_CLS_WEIGHTS  # noqa: E402
+import cv_lab.scripts.pipeline.region_detections as rd  # noqa: E402
 from cv_lab.scripts.pipeline.build_yolo_hand_timeline import build_hand_timeline  # noqa: E402
 
 DEFAULT_DETECTOR = REPO_ROOT / "cv_lab" / "models" / "region_spine_v1.pt"

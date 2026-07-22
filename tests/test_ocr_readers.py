@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 import pytest
 
-from cv_lab.scripts.reading.ocr_readers import (
+from cv_lab.scripts.pipeline.ocr_readers import (
     DIGIT_SIZE,
     TemplateOCR,
     _norm,

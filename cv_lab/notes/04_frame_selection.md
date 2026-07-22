@@ -4,7 +4,7 @@
 Replace the manual "pick N timestamps to read" step (Experiment A) with an automatic
 selector that finds the settled decision/state-change frames on its own. Validate it against
 the Experiment-A hand, which serves as a known-good ANSWER KEY (its 12 real events are known).
-Script: `cv_lab/scripts/frames/select_keyframes.py`. No ground truth used.
+Script: `cv_lab/scripts/pipeline/select_keyframes.py`. No ground truth used.
 
 ## v1 (whole-frame motion diff) — FAILED, and the failure is instructive
 Idea: a table is static except during animations, so diff consecutive downscaled gray frames;

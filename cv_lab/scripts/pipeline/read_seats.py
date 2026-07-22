@@ -24,8 +24,8 @@ _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.
 import numpy as np
 import cv2
 
-from cv_lab.scripts.reading.landmark_anchor import REF_SEAT_COINS, REF_POT_COIN
-from cv_lab.scripts.reading.read_pot import glyph_boxes, _norm_glyph, _recognize
+from cv_lab.scripts.pipeline.landmark_anchor import REF_SEAT_COINS, REF_POT_COIN
+from cv_lab.scripts.pipeline.read_pot import glyph_boxes, _norm_glyph, _recognize
 
 # stack number box relative to a seat coin, in reference-normalized full-frame
 # coords: from just right of the coin, extending right, centered on coin height.

@@ -13,9 +13,9 @@ import numpy as np
 import cv2
 import av
 
-from cv_lab.scripts.reading.classify_screen import classify
-import cv_lab.scripts.reading.read_cards as rc
-import cv_lab.scripts.reading.read_hero as rh
+from cv_lab.scripts.pipeline.classify_screen import classify
+import cv_lab.scripts.pipeline.read_cards as rc
+import cv_lab.scripts.pipeline.read_hero as rh
 
 VIDEO = "/Users/jasonli/Documents/GitHub/PokerTrainer/data/videos/clubwpt_session_01.mov"
 OUT = "/Users/jasonli/Documents/GitHub/PokerTrainer/cv_lab/harvest"

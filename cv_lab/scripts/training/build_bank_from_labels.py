@@ -8,8 +8,8 @@ Also folds in the clean hand-01 exemplars via build_card_templates.
 import sys, os, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 import cv2
-import cv_lab.scripts.reading.read_cards as rc
-import cv_lab.scripts.reading.read_hero as rh
+import cv_lab.scripts.pipeline.read_cards as rc
+import cv_lab.scripts.pipeline.read_hero as rh
 
 HARV = "/Users/jasonli/Documents/GitHub/PokerTrainer/cv_lab/harvest"
 

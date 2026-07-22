@@ -41,7 +41,7 @@ import av
 import cv2
 import numpy as np
 
-import cv_lab.scripts.reading.landmark_anchor as la
+import cv_lab.scripts.pipeline.landmark_anchor as la
 
 # normalized (x0, x1, y0, y1) ROIs for ClubWPT Gold, this recording's geometry
 ROIS = {

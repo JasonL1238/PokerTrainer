@@ -16,9 +16,9 @@ import av
 import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-import cv_lab.scripts.reading.read_table
-import cv_lab.scripts.reading.read_cards
-import cv_lab.scripts.reading.read_hero
+import cv_lab.scripts.pipeline.read_table
+import cv_lab.scripts.pipeline.read_cards
+import cv_lab.scripts.pipeline.read_hero
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
