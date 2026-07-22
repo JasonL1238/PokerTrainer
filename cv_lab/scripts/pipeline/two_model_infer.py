@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from cv_lab.scripts.pipeline.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
 from cv_lab.scripts.pipeline.card_classifier import CardClassifier  # noqa: E402
 from cv_lab.scripts.pipeline import region_detections as rd  # noqa: E402
-from labeling_poker.config import CLASSES  # noqa: E402
+from cv_lab.labeling_poker.config import CLASSES  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_REGION_WEIGHTS = REPO_ROOT / "cv_lab" / "models" / "region_spine_v1.pt"

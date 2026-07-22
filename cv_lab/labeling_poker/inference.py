@@ -37,8 +37,8 @@ def _model():
                 vendor = _vendor_path()
                 if str(vendor) not in sys.path:
                     sys.path.insert(0, str(vendor))
-                os.environ.setdefault("YOLO_CONFIG_DIR", str(DEFAULT_MODEL_PATH.parent.parent / ".yolo_config"))
-                os.environ.setdefault("MPLCONFIGDIR", str(DEFAULT_MODEL_PATH.parent.parent / ".mpl_config"))
+                os.environ.setdefault("YOLO_CONFIG_DIR", str(DEFAULT_MODEL_PATH.parent.parent.parent / ".yolo_config"))
+                os.environ.setdefault("MPLCONFIGDIR", str(DEFAULT_MODEL_PATH.parent.parent.parent / ".mpl_config"))
                 from ultralytics import YOLO
 
                 _MODEL = YOLO(str(Path(os.environ.get("POKER_LABELER_MODEL", DEFAULT_MODEL_PATH))))
@@ -53,8 +53,8 @@ def _region_model():
                 vendor = _vendor_path()
                 if str(vendor) not in sys.path:
                     sys.path.insert(0, str(vendor))
-                os.environ.setdefault("YOLO_CONFIG_DIR", str(DEFAULT_MODEL_PATH.parent.parent / ".yolo_config"))
-                os.environ.setdefault("MPLCONFIGDIR", str(DEFAULT_MODEL_PATH.parent.parent / ".mpl_config"))
+                os.environ.setdefault("YOLO_CONFIG_DIR", str(DEFAULT_MODEL_PATH.parent.parent.parent / ".yolo_config"))
+                os.environ.setdefault("MPLCONFIGDIR", str(DEFAULT_MODEL_PATH.parent.parent.parent / ".mpl_config"))
                 from ultralytics import YOLO
 
                 _REGION_MODEL = YOLO(str(Path(os.environ.get("POKER_LABELER_REGION_MODEL", DEFAULT_REGION_MODEL_PATH))))
@@ -124,10 +124,7 @@ def _card_classifier():
     if _CARD_CLASSIFIER is None:
         with _CARD_CLASSIFIER_LOCK:
             if _CARD_CLASSIFIER is None:
-                scripts_dir = Path(__file__).resolve().parent.parent / "cv_lab" / "scripts"
-                if str(scripts_dir) not in sys.path:
-                    sys.path.insert(0, str(scripts_dir))
-                from card_classifier import CardClassifier
+                from cv_lab.scripts.pipeline.card_classifier import CardClassifier
 
                 weights = os.environ.get("POKER_LABELER_CARD_MODEL")
                 _CARD_CLASSIFIER = CardClassifier(weights=weights or None)

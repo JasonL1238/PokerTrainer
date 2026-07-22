@@ -10,7 +10,7 @@ Pipeline position:
     raw detections (per frame) -> assign_regions (seats/zones) + attribute readers
     -> per-frame table state -> [build_yolo_hand_timeline]
 
-The 7 classes and their reconstruction jobs (labeling_poker/config.py, README):
+The 7 classes and their reconstruction jobs (cv_lab/labeling_poker/config.py, README):
     face_card, card_back, dealer_button, pot_text, stack_text, action_pill,
     active_turn_indicator.
 
@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 # Canonical rank+suit normaliser shared with the labeler ("KD"/"10C" -> "Kd"/"Tc").
-from labeling_poker.config import CLASSES, normalize_card_label
+from cv_lab.labeling_poker.config import CLASSES, normalize_card_label
 
 # Reuse the proven card zone split (hero vs board vs other) from the card-only builder.
 from cv_lab.scripts.pipeline.build_yolo_card_timeline import _zone_for_box
@@ -375,7 +375,7 @@ def frame_from_yolo_rows(
     *,
     video_frame: int = 0,
 ) -> Frame:
-    """Adapt one image's YOLO detection rows (labeling_poker.inference.predict_cards
+    """Adapt one image's YOLO detection rows (cv_lab.labeling_poker.inference.predict_cards
     shape: class/label/confidence/x1..y2) into a Frame. Downstream wiring for the
     trained 7-class detector; unlike the old card model, ``class`` is trusted here."""
     dets: list[Detection] = []

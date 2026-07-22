@@ -4,12 +4,12 @@ This is a local Flask + vanilla JavaScript tool for labeling poker table images 
 
 ## Run
 
-Put source images in `labeling_poker/data/images/`. The filename stem is the image ID, so `000123.jpg` is served as `/image/000123`. If that folder is empty, the app automatically uses the existing `cv_lab/datasets/yolo_cards_autolabel_v1/images/` dataset, including its train/val/test subfolders.
+Put source images in `cv_lab/labeling_poker/data/images/`. The filename stem is the image ID, so `000123.jpg` is served as `/image/000123`. If that folder is empty, the app automatically uses the existing `cv_lab/datasets/yolo_cards_autolabel_v1/images/` dataset, including its train/val/test subfolders.
 
 The classes are `face_card`, `card_back`, `dealer_button`, `pot_text`, `stack_text`, `action_pill`, `active_turn_indicator`, and `bet_text`. These are generic visual regions chosen so YOLO detections carry everything hand reconstruction needs: cards define streets and hand boundaries, card backs reveal who is dealt in and who folds, the pot and stacks form the arithmetic reconciliation net (bet sizes come from stack deltas), the dealer button fixes positions, action pills give each seat's last action (color read from the crop; gray check-vs-fold is resolved by card backs disappearing), the turn indicator orders actions within a street, and bet text provides a committed-chip baseline when a recording begins mid-street. Rank/suit and amounts are read later as attributes with card classification or OCR. `player_name_text` was deliberately dropped because names are irrelevant to single-hand reconstruction.
 
 ```bash
-python -m labeling_poker.app --port 5055
+python -m cv_lab.labeling_poker.app --port 5055
 ```
 
 Open <http://127.0.0.1:5055> — it redirects to the one labeling setup:

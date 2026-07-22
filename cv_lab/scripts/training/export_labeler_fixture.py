@@ -1,4 +1,4 @@
-"""Bridge: labeling_poker SQLite boxes -> region_detections Frame fixture JSON.
+"""Bridge: cv_lab.labeling_poker SQLite boxes -> region_detections Frame fixture JSON.
 
 This lets the reconstruction spine (build_yolo_hand_timeline.py) run on your
 hand-labeled ground-truth boxes with NO trained detector and NO OCR:
@@ -26,7 +26,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
-from labeling_poker.config import (  # noqa: E402
+from cv_lab.labeling_poker.config import (  # noqa: E402
     CARD_LABEL_CLASS,
     DEFAULT_DB_PATH,
     EXISTING_DATASET_IMAGES_DIR,

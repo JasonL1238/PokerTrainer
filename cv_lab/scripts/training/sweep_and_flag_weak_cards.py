@@ -32,7 +32,7 @@ from cv_lab.scripts.pipeline.card_classifier import CardClassifier, DEFAULT_CLS_
 from cv_lab.scripts.pipeline.run_two_model_pipeline import DEFAULT_DETECTOR, _detect_regions  # noqa: E402
 
 DEFAULT_IMAGES_DIR = REPO_ROOT / "cv_lab" / "datasets" / "yolo_cards_autolabel_v1" / "images"
-DEFAULT_PRIORITY_DIR = REPO_ROOT / "labeling_poker" / "priority"
+DEFAULT_PRIORITY_DIR = REPO_ROOT / "cv_lab" / "labeling_poker" / "priority"
 DEFAULT_REPORT = REPO_ROOT / "cv_lab" / "results" / "cv_weak_card_flags.json"
 DEFAULT_RENDER_DIR = REPO_ROOT / "cv_lab" / "results" / "annotated_frames"
 
@@ -371,7 +371,7 @@ def main() -> None:
     print(f"images written under: {images_dir}")
     print(f"report: {report_path}")
     print(f"priority queue ({len(merged_ids)} ids): {queue_path}")
-    print(f"\nlabel these first: python -m labeling_poker.app   then open /?queue={args.queue_name}"
+    print(f"\nlabel these first: python -m cv_lab.labeling_poker.app   then open /?queue={args.queue_name}"
           f" or fetch /api/next?queue={args.queue_name}")
 
 

@@ -13,7 +13,7 @@ Output is the Ultralytics classification layout (folder-per-class):
   <out>/train/<label>/*.png
   <out>/val/<label>/*.png
 
-All labels are canonicalized through labeling_poker.config.normalize_card_label,
+All labels are canonicalized through cv_lab.labeling_poker.config.normalize_card_label,
 so the three different naming schemes ("As" / "AS"|"10C" / "10c") converge to the
 same 52 canonical classes ("As", "Kd", "Tc", ...). "joker" is dropped.
 
@@ -35,8 +35,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
-from labeling_poker.config import CARD_RANKS, CARD_SUITS, normalize_card_label  # noqa: E402
-from labeling_poker.db import connect, get_annotations, get_status  # noqa: E402
+from cv_lab.labeling_poker.config import CARD_RANKS, CARD_SUITS, normalize_card_label  # noqa: E402
+from cv_lab.labeling_poker.db import connect, get_annotations, get_status  # noqa: E402
 from cv_lab.scripts.training.build_mixed_card_dataset import _find_image, _parse_names as _parse_names_block  # noqa: E402
 
 # 52 canonical classes, matching normalize_card_label's output form.
@@ -62,7 +62,7 @@ def _parse_names(data_yaml: Path) -> list[str]:
     raise ValueError(f"no names: block or inline list found in {data_yaml}")
 
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
-DEFAULT_SQLITE_DB = REPO_ROOT / "labeling_poker" / "data" / "labels.sqlite3"
+DEFAULT_SQLITE_DB = REPO_ROOT / "cv_lab" / "labeling_poker" / "data" / "labels.sqlite3"
 DEFAULT_SQLITE_IMAGES = REPO_ROOT / "cv_lab" / "datasets" / "yolo_cards_autolabel_v1" / "images"
 DEFAULT_DETECTION_DATASETS = [
     REPO_ROOT / "cv_lab" / "datasets" / "yolo_cards_autolabel_v1",

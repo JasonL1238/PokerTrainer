@@ -5,7 +5,7 @@ into one of the 52 canonical rank+suit labels ("As", "Kd", "Tc", ...). This is t
 attribute reader the two-model pipeline calls after Model 1 (the region detector)
 localizes a ``face_card`` box.
 
-The model is loaded lazily and cached (mirrors labeling_poker.inference), so import
+The model is loaded lazily and cached (mirrors cv_lab.labeling_poker.inference), so import
 is cheap and the weights load on first use.
 
 Usage:

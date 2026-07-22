@@ -28,7 +28,7 @@ import cv2
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_IMAGES_DIR = REPO_ROOT / "cv_lab" / "datasets" / "yolo_cards_autolabel_v1" / "images"
-DEFAULT_PRIORITY_DIR = REPO_ROOT / "labeling_poker" / "priority"
+DEFAULT_PRIORITY_DIR = REPO_ROOT / "cv_lab" / "labeling_poker" / "priority"
 
 
 def _slug(idx: int) -> str:
@@ -107,7 +107,7 @@ def main() -> None:
     print(f"\nstaged {len(all_ids)} new frames ({len(merged)} total in queue)")
     print(f"images written under: {images_dir}")
     print(f"queue: {queue_path}")
-    print(f"\nreview: python -m labeling_poker.app   then open /?queue={args.queue_name}")
+    print(f"\nreview: python -m cv_lab.labeling_poker.app   then open /?queue={args.queue_name}")
 
 
 if __name__ == "__main__":

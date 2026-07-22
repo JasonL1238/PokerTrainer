@@ -9,7 +9,7 @@ poker_tracker.db
 .yolo_config/
 
 # Labeling tool local data (labels DB + captured images)
-labeling_poker/data/
+cv_lab/labeling_poker/data/
 
 # CV research data & artifacts (code lives in cv_lab/scripts and cv_lab/notes)
 cv_lab/crops/
@@ -28,7 +28,7 @@ runs/
 *.pt
 
 # Auto-generated labeling priority list (regenerate from labels.sqlite3)
-labeling_poker/priority/
+cv_lab/labeling_poker/priority/
 data/*
 !data/.gitkeep
 !data/videos/

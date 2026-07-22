@@ -2,11 +2,11 @@ import struct
 
 import pytest
 
-from labeling_poker.app import create_app
-from labeling_poker.config import normalize_card_label
-from labeling_poker.db import connect, get_annotations, get_status, next_matching, progress, save_annotations, seek, sync_files
-from labeling_poker.export import image_size, split_ids, write_dataset
-from labeling_poker.label_audit import (
+from cv_lab.labeling_poker.app import create_app
+from cv_lab.labeling_poker.config import normalize_card_label
+from cv_lab.labeling_poker.db import connect, get_annotations, get_status, next_matching, progress, save_annotations, seek, sync_files
+from cv_lab.labeling_poker.export import image_size, split_ids, write_dataset
+from cv_lab.labeling_poker.label_audit import (
     audit_boxes,
     audit_unlabeled_frames,
     filter_card_label_suspects,
@@ -329,7 +329,7 @@ def test_api_two_model_bootstrap_is_review_only(tmp_path, monkeypatch):
     def fake_predict(_path):
         return [{"class": "face_card", "label": "As", "x1": 1, "y1": 2, "x2": 20, "y2": 30}]
 
-    monkeypatch.setattr("labeling_poker.app.predict_two_model", fake_predict)
+    monkeypatch.setattr("cv_lab.labeling_poker.app.predict_two_model", fake_predict)
     response = client.get("/api/bootstrap/001?source=two_model")
     assert response.status_code == 200
     assert response.get_json()["boxes"][0]["label"] == "As"
@@ -347,7 +347,7 @@ def test_api_uses_cached_two_model_predictions_without_writing_labels(tmp_path, 
     monkeypatch.setenv("POKER_LABELER_TWO_MODEL_CACHE", str(cache))
     client = create_app(db_path, images).test_client()
     client.get("/", follow_redirects=True)
-    monkeypatch.setattr("labeling_poker.app.predict_two_model", lambda _path: pytest.fail("cache was not used"))
+    monkeypatch.setattr("cv_lab.labeling_poker.app.predict_two_model", lambda _path: pytest.fail("cache was not used"))
 
     response = client.get("/api/bootstrap/001?source=two_model")
     assert response.status_code == 200

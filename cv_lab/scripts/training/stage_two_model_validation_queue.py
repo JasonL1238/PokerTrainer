@@ -16,8 +16,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 
-from labeling_poker.config import DEFAULT_DB_PATH, EXISTING_DATASET_IMAGES_DIR
-from labeling_poker.db import connect, get_status, sync_files
+from cv_lab.labeling_poker.config import DEFAULT_DB_PATH, EXISTING_DATASET_IMAGES_DIR
+from cv_lab.labeling_poker.db import connect, get_status, sync_files
 
 def stage_queue(db_path: Path, images_dir: Path, queue_path: Path) -> int:
     images_dir = images_dir.resolve()
@@ -38,7 +38,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     parser.add_argument("--images", type=Path, default=EXISTING_DATASET_IMAGES_DIR)
-    parser.add_argument("--queue", type=Path, default=REPO_ROOT / "labeling_poker" / "priority" / "two_model_validation.txt")
+    parser.add_argument("--queue", type=Path, default=REPO_ROOT / "cv_lab" / "labeling_poker" / "priority" / "two_model_validation.txt")
     args = parser.parse_args()
     print(f"staged {stage_queue(args.db, args.images, args.queue)} undecided frames -> {args.queue}")
 

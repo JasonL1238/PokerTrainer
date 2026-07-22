@@ -5,12 +5,12 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_IMAGES_DIR = ROOT / "data" / "images"
 DEFAULT_DB_PATH = ROOT / "data" / "labels.sqlite3"
 DEFAULT_PRIORITY_DIR = ROOT / "priority"
-EXISTING_DATASET_IMAGES_DIR = ROOT.parent / "cv_lab" / "datasets" / "yolo_cards_autolabel_v1" / "images"
-DEFAULT_MODEL_PATH = ROOT.parent / "cv_lab" / "models" / "best (4).pt"
-DEFAULT_REGION_MODEL_PATH = ROOT.parent / "cv_lab" / "models" / "region_spine_v1.pt"
+EXISTING_DATASET_IMAGES_DIR = ROOT.parent / "datasets" / "yolo_cards_autolabel_v1" / "images"
+DEFAULT_MODEL_PATH = ROOT.parent / "models" / "best (4).pt"
+DEFAULT_REGION_MODEL_PATH = ROOT.parent / "models" / "region_spine_v1.pt"
 YOLOV12_VENDOR_CANDIDATES = [
-    ROOT.parent / "cv-backend" / "vendor" / "yolov12",
-    ROOT.parent.parent / "YoloCardDetectTest" / "cv-backend" / "vendor" / "yolov12",
+    ROOT.parent.parent / "cv-backend" / "vendor" / "yolov12",
+    ROOT.parent.parent.parent / "YoloCardDetectTest" / "cv-backend" / "vendor" / "yolov12",
 ]
 
 # Keep class order stable: numeric IDs in exported YOLO labels follow this list.
