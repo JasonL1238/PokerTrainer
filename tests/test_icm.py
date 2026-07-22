@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from poker_tracker.icm import icm_equities, icm_risk_premium
+from poker_tracker.math.icm import icm_equities, icm_risk_premium
 
 
 def test_heads_up_golden_value() -> None:

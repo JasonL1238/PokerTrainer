@@ -5,8 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from poker_tracker.cards import CardParseError, parse_visible_cards
-from poker_tracker.validation import normalize_cards, validate_tags
+from poker_tracker.math.cards import CardParseError, parse_visible_cards
+from poker_tracker.persistence.validation import normalize_cards, validate_tags
 
 
 Street = Literal["preflop", "flop", "turn", "river", "showdown"]

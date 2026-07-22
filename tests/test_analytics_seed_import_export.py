@@ -3,11 +3,11 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from poker_tracker.analytics import compute_session_stats
-from poker_tracker.db import PokerDatabase
-from poker_tracker.import_export import export_hand, export_session, import_session
-from poker_tracker.models import Action, Hand, Session
-from poker_tracker.seed_data import create_sample_data
+from poker_tracker.math.analytics import compute_session_stats
+from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.persistence.import_export import export_hand, export_session, import_session
+from poker_tracker.persistence.models import Action, Hand, Session
+from poker_tracker.persistence.seed_data import create_sample_data
 
 
 def make_db() -> PokerDatabase:

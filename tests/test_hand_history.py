@@ -1,5 +1,5 @@
-from poker_tracker.hand_history import format_hand_history
-from poker_tracker.models import Action, Hand, HandPlayer, Session
+from poker_tracker.coaching.hand_history import format_hand_history
+from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
 
 
 def test_hand_history_formatting() -> None:

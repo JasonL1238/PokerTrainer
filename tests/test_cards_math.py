@@ -1,6 +1,6 @@
 import pytest
 
-from poker_tracker.cards import (
+from poker_tracker.math.cards import (
     CardParseError,
     compact_cards,
     normalize_card_list,
@@ -10,8 +10,8 @@ from poker_tracker.cards import (
     parse_visible_cards,
     spaced_cards,
 )
-from poker_tracker.ev import bluff_ev, call_ev, semi_bluff_ev
-from poker_tracker.pot_odds import (
+from poker_tracker.math.ev import bluff_ev, call_ev, semi_bluff_ev
+from poker_tracker.math.pot_odds import (
     break_even_bluff_frequency,
     format_percentage,
     minimum_defense_frequency,

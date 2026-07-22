@@ -1,14 +1,14 @@
 import eval7
 import pytest
 
-from poker_tracker.preflop_ranges import (
+from poker_tracker.math.preflop_ranges import (
     POSITIONS,
     SCENARIOS,
     available_ranges,
     get_preflop_range,
     range_percent,
 )
-from poker_tracker.ranges import range_notation
+from poker_tracker.math.ranges import range_notation
 
 
 def test_every_defined_range_parses_in_eval7_with_combos() -> None:

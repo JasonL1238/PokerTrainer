@@ -4,11 +4,11 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from poker_tracker.db import PokerDatabase
-from poker_tracker.image_utils import save_roi_crop_preview
-from poker_tracker.models import ROICropResult, ROIProfile, ROIRegion
-from poker_tracker.roi import common_roi_keys, validate_roi_bounds
-from poker_tracker.video_storage import ROI_PREVIEWS_DIR
+from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.ui.image_utils import save_roi_crop_preview
+from poker_tracker.persistence.models import ROICropResult, ROIProfile, ROIRegion
+from poker_tracker.ui.roi import common_roi_keys, validate_roi_bounds
+from poker_tracker.ui.video_storage import ROI_PREVIEWS_DIR
 
 
 ROI_EXPORT_VERSION = 1

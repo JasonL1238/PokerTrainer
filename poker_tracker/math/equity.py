@@ -5,7 +5,7 @@ from typing import Protocol
 
 from pydantic import BaseModel, Field
 
-from poker_tracker.cards import (
+from poker_tracker.math.cards import (
     Card,
     compact_cards,
     parse_board_cards,
@@ -13,7 +13,7 @@ from poker_tracker.cards import (
     parse_visible_cards,
     spaced_cards,
 )
-from poker_tracker.ranges import (
+from poker_tracker.math.ranges import (
     RangeDescription,
     get_range_description,
     normalize_range_label,

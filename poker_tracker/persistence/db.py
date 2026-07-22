@@ -8,7 +8,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from poker_tracker.models import (
+from poker_tracker.persistence.models import (
     Action,
     CoachingResponse,
     ExtractedFrame,
@@ -21,12 +21,12 @@ from poker_tracker.models import (
     Session,
     VideoRecord,
 )
-from poker_tracker.roi import validate_roi_bounds
+from poker_tracker.ui.roi import validate_roi_bounds
 
 
 # Anchored to the project root so launching from another directory does not
 # silently create a second, empty database.
-DEFAULT_DB_PATH = str(Path(__file__).resolve().parent.parent / "poker_tracker.db")
+DEFAULT_DB_PATH = str(Path(__file__).resolve().parent.parent.parent / "poker_tracker.db")
 SCHEMA_VERSION = 5
 
 

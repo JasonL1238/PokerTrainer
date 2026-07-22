@@ -6,8 +6,8 @@ import urllib.error
 import urllib.request
 from typing import Protocol
 
-from poker_tracker.models import CoachingResponse, LLMProviderConfig
-from poker_tracker.safety import ensure_post_session_prompt
+from poker_tracker.persistence.models import CoachingResponse, LLMProviderConfig
+from poker_tracker.coaching.safety import ensure_post_session_prompt
 
 
 DEFAULT_MODEL = "gpt-4o-mini"

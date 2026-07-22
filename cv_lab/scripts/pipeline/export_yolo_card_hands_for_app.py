@@ -20,9 +20,9 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from poker_tracker.db import PokerDatabase
-from poker_tracker.import_export import EXPORT_VERSION, import_session
-from poker_tracker.models import Action, Hand, HandPlayer, Session
+from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.persistence.import_export import EXPORT_VERSION, import_session
+from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
 
 from cv_lab.scripts.eval.validate_yolo_card_timeline import validate_timeline
 

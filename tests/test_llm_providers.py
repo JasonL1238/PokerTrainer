@@ -1,13 +1,13 @@
 import pytest
 
-from poker_tracker.coaching_prompts import (
+from poker_tracker.coaching.coaching_prompts import (
     build_hand_review_prompt,
     build_session_review_prompt,
 )
-from poker_tracker.analytics import compute_session_stats
-from poker_tracker.db import PokerDatabase
-from poker_tracker.hand_history import format_hand_history
-from poker_tracker.llm_providers import (
+from poker_tracker.math.analytics import compute_session_stats
+from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.coaching.hand_history import format_hand_history
+from poker_tracker.coaching.llm_providers import (
     CloudLLMProvider,
     MockLLMProvider,
     build_coaching_response,
@@ -15,8 +15,8 @@ from poker_tracker.llm_providers import (
     parse_sections,
     provider_config_from_env,
 )
-from poker_tracker.models import Action, Hand, Session
-from poker_tracker.safety import ensure_post_session_prompt, validate_post_session_prompt
+from poker_tracker.persistence.models import Action, Hand, Session
+from poker_tracker.coaching.safety import ensure_post_session_prompt, validate_post_session_prompt
 
 
 def test_mock_provider_hand_review_generation() -> None:

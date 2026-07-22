@@ -5,8 +5,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from poker_tracker.db import PokerDatabase
-from poker_tracker.models import Action, Hand, HandPlayer, HandReview, Session
+from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.persistence.models import Action, Hand, HandPlayer, HandReview, Session
 
 
 EXPORT_VERSION = 1

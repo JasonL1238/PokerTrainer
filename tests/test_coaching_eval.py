@@ -1,10 +1,10 @@
-from poker_tracker.coaching_eval import (
+from poker_tracker.coaching.coaching_eval import (
     UNSAFE_PHRASES,
     CoachingEvalReport,
     run_coaching_eval,
 )
-from poker_tracker.coaching_prompts import REQUIRED_REVIEW_SECTIONS
-from poker_tracker.llm_providers import (
+from poker_tracker.coaching.coaching_prompts import REQUIRED_REVIEW_SECTIONS
+from poker_tracker.coaching.llm_providers import (
     ANTHROPIC_DEFAULT_MODEL,
     AnthropicLLMProvider,
     MockLLMProvider,

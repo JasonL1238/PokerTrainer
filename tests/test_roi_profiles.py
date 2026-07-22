@@ -6,11 +6,11 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
-from poker_tracker.db import PokerDatabase
-from poker_tracker.image_utils import crop_roi_from_image, save_roi_crop_preview
-from poker_tracker.models import ExtractedFrame, ProcessingJob, ROIProfile, ROIRegion, VideoRecord
-from poker_tracker.roi import clip_roi_to_bounds, validate_roi_bounds
-from poker_tracker.roi_profiles import (
+from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.ui.image_utils import crop_roi_from_image, save_roi_crop_preview
+from poker_tracker.persistence.models import ExtractedFrame, ProcessingJob, ROIProfile, ROIRegion, VideoRecord
+from poker_tracker.ui.roi import clip_roi_to_bounds, validate_roi_bounds
+from poker_tracker.ui.roi_profiles import (
     create_starter_clubwpt_profile,
     duplicate_roi_profile,
     export_roi_profile,

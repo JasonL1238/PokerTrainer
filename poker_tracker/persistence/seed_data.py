@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from poker_tracker.db import PokerDatabase
-from poker_tracker.models import Action, Hand, HandPlayer, Session
-from poker_tracker.review import generate_mock_review
+from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
+from poker_tracker.coaching.review import generate_mock_review
 
 
 def create_sample_data(db: PokerDatabase) -> Session:

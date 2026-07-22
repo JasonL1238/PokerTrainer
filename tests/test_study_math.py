@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from poker_tracker.study_math import (
+from poker_tracker.math.study_math import (
     REALIZATION_FACTOR_GUIDE,
     bluff_to_value_ratio,
     mean_confidence_interval,

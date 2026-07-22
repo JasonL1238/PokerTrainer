@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from poker_tracker.analytics import SessionStats
-from poker_tracker.equity import EquityResult
-from poker_tracker.hand_history import format_hand_history
-from poker_tracker.models import Action, Hand, HandPlayer, Session
-from poker_tracker.pot_odds import format_percentage
-from poker_tracker.preflop_ranges import range_percent, resolve_preflop_range
-from poker_tracker.ranges import get_range_description, normalize_range_label
+from poker_tracker.math.analytics import SessionStats
+from poker_tracker.math.equity import EquityResult
+from poker_tracker.coaching.hand_history import format_hand_history
+from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
+from poker_tracker.math.pot_odds import format_percentage
+from poker_tracker.math.preflop_ranges import range_percent, resolve_preflop_range
+from poker_tracker.math.ranges import get_range_description, normalize_range_label
 
 
 REQUIRED_REVIEW_SECTIONS = [

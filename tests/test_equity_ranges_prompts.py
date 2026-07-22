@@ -1,18 +1,18 @@
-from poker_tracker.analytics import compute_session_stats
-from poker_tracker.coaching_prompts import (
+from poker_tracker.math.analytics import compute_session_stats
+from poker_tracker.coaching.coaching_prompts import (
     POST_SESSION_SAFETY,
     REQUIRED_REVIEW_SECTIONS,
     SESSION_REVIEW_SECTIONS,
     build_hand_review_prompt,
     build_session_review_prompt,
 )
-from poker_tracker.db import PokerDatabase
-from poker_tracker.equity import PlaceholderEquityCalculator
-from poker_tracker.hand_history import format_hand_history
-from poker_tracker.models import Action, Hand, HandPlayer, Session
-from poker_tracker.pot_odds import required_equity_to_call
-from poker_tracker.preflop_ranges import get_preflop_range
-from poker_tracker.ranges import estimate_villain_range_label, get_range_description
+from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.math.equity import PlaceholderEquityCalculator
+from poker_tracker.coaching.hand_history import format_hand_history
+from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
+from poker_tracker.math.pot_odds import required_equity_to_call
+from poker_tracker.math.preflop_ranges import get_preflop_range
+from poker_tracker.math.ranges import estimate_villain_range_label, get_range_description
 
 
 def test_equity_abstraction_returns_valid_result() -> None:

@@ -1,7 +1,7 @@
-from poker_tracker.models import Action, Hand, HandPlayer
-from poker_tracker.equity import PlaceholderEquityCalculator
-from poker_tracker.pot_odds import required_equity_to_call
-from poker_tracker.review import generate_mock_review
+from poker_tracker.persistence.models import Action, Hand, HandPlayer
+from poker_tracker.math.equity import PlaceholderEquityCalculator
+from poker_tracker.math.pot_odds import required_equity_to_call
+from poker_tracker.coaching.review import generate_mock_review
 
 
 def test_generate_mock_review_uses_tags_actions_and_result() -> None:

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from poker_tracker.db import PokerDatabase
-from poker_tracker.models import ProcessingJob
+from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.persistence.models import ProcessingJob
 
 
 def create_job(db: PokerDatabase, video_id: int, job_type: str = "frame_extraction") -> ProcessingJob:

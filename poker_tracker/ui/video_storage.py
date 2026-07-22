@@ -9,7 +9,7 @@ from typing import BinaryIO
 
 # Anchored to the project root so the app behaves the same regardless of the
 # working directory it is launched from.
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
 VIDEOS_DIR = DATA_DIR / "videos"
 FRAMES_DIR = DATA_DIR / "frames"

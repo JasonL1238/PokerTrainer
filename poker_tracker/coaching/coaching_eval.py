@@ -26,9 +26,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from poker_tracker.coaching_prompts import REQUIRED_REVIEW_SECTIONS, build_hand_review_prompt
-from poker_tracker.llm_providers import LLMProvider, parse_sections
-from poker_tracker.models import Action, Hand, HandPlayer, Session
+from poker_tracker.coaching.coaching_prompts import REQUIRED_REVIEW_SECTIONS, build_hand_review_prompt
+from poker_tracker.coaching.llm_providers import LLMProvider, parse_sections
+from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
 
 
 # Live-play / real-time-assistance phrasing that must never appear in a

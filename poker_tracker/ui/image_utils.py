@@ -4,9 +4,9 @@ from pathlib import Path
 
 import cv2
 
-from poker_tracker.models import ExtractedFrame, ROICropResult, ROIRegion
-from poker_tracker.roi import clip_roi_to_bounds, safe_roi_key, validate_roi_bounds
-from poker_tracker.video_storage import ROI_PREVIEWS_DIR, ensure_data_directories
+from poker_tracker.persistence.models import ExtractedFrame, ROICropResult, ROIRegion
+from poker_tracker.ui.roi import clip_roi_to_bounds, safe_roi_key, validate_roi_bounds
+from poker_tracker.ui.video_storage import ROI_PREVIEWS_DIR, ensure_data_directories
 
 
 def image_dimensions(image_path: str | Path) -> tuple[int, int]:

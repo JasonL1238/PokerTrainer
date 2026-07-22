@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Iterable
 
-from poker_tracker.cards import CardParseError, parse_cards
+from poker_tracker.math.cards import CardParseError, parse_cards
 
 
 RANKS = "23456789TJQKA"

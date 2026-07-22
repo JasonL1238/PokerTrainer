@@ -8,35 +8,35 @@ from pathlib import Path
 import streamlit as st
 from pydantic import ValidationError
 
-from poker_tracker.analytics import compute_session_stats
-from poker_tracker.coaching_prompts import build_hand_review_prompt, build_session_review_prompt
-from poker_tracker.db import DEFAULT_DB_PATH, PokerDatabase
-from poker_tracker.equity import get_equity_calculator
-from poker_tracker.ev import bluff_ev, call_ev
-from poker_tracker.frame_extraction import (
+from poker_tracker.math.analytics import compute_session_stats
+from poker_tracker.coaching.coaching_prompts import build_hand_review_prompt, build_session_review_prompt
+from poker_tracker.persistence.db import DEFAULT_DB_PATH, PokerDatabase
+from poker_tracker.math.equity import get_equity_calculator
+from poker_tracker.math.ev import bluff_ev, call_ev
+from poker_tracker.ui.frame_extraction import (
     delete_extracted_frames,
     extract_frames_for_video,
     select_representative_frames,
 )
-from poker_tracker.hand_history import format_hand_history
-from poker_tracker.import_export import export_hand, export_session, import_session
-from poker_tracker.image_utils import image_dimensions, save_roi_crop_preview
-from poker_tracker.llm_providers import (
+from poker_tracker.coaching.hand_history import format_hand_history
+from poker_tracker.persistence.import_export import export_hand, export_session, import_session
+from poker_tracker.ui.image_utils import image_dimensions, save_roi_crop_preview
+from poker_tracker.coaching.llm_providers import (
     LLMProviderError,
     build_coaching_response,
     get_provider_from_env,
 )
-from poker_tracker.models import Action, HAND_TAGS, Hand, HandPlayer, ROIProfile, ROIRegion, Session, VideoRecord
-from poker_tracker.pot_odds import (
+from poker_tracker.persistence.models import Action, HAND_TAGS, Hand, HandPlayer, ROIProfile, ROIRegion, Session, VideoRecord
+from poker_tracker.math.pot_odds import (
     break_even_bluff_frequency,
     format_percentage,
     minimum_defense_frequency,
     required_equity_to_call,
 )
-from poker_tracker.icm import icm_equities, icm_risk_premium
-from poker_tracker.preflop_ranges import available_ranges
-from poker_tracker.ranges import RANGE_LABELS, estimate_villain_range_label
-from poker_tracker.study_math import (
+from poker_tracker.math.icm import icm_equities, icm_risk_premium
+from poker_tracker.math.preflop_ranges import available_ranges
+from poker_tracker.math.ranges import RANGE_LABELS, estimate_villain_range_label
+from poker_tracker.math.study_math import (
     REALIZATION_FACTOR_GUIDE,
     bluff_to_value_ratio,
     optimal_bluff_fraction,
@@ -44,20 +44,20 @@ from poker_tracker.study_math import (
     outs_to_equity_rule,
     realized_equity,
 )
-from poker_tracker.review import generate_mock_review
-from poker_tracker.roi import ROI_TYPES, validate_roi_bounds
-from poker_tracker.roi_profiles import (
+from poker_tracker.coaching.review import generate_mock_review
+from poker_tracker.ui.roi import ROI_TYPES, validate_roi_bounds
+from poker_tracker.ui.roi_profiles import (
     create_starter_clubwpt_profile,
     duplicate_roi_profile,
     export_roi_profile,
     generate_roi_crop_previews,
     import_roi_profile,
 )
-from poker_tracker.safety import validate_post_session_prompt
-from poker_tracker.ui_theme import brand_header, inject_theme
-from poker_tracker.seed_data import create_sample_data
-from poker_tracker.video_metadata import extract_video_metadata
-from poker_tracker.video_storage import ensure_data_directories, save_video_file, validate_video_extension
+from poker_tracker.coaching.safety import validate_post_session_prompt
+from poker_tracker.ui.ui_theme import brand_header, inject_theme
+from poker_tracker.persistence.seed_data import create_sample_data
+from poker_tracker.ui.video_metadata import extract_video_metadata
+from poker_tracker.ui.video_storage import ensure_data_directories, save_video_file, validate_video_extension
 
 
 STREETS = ["preflop", "flop", "turn", "river", "showdown"]

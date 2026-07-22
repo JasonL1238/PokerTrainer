@@ -7,7 +7,7 @@ run unconditionally; the import is guarded only to skip cleanly if it is absent.
 """
 import pytest
 
-from poker_tracker.equity import (
+from poker_tracker.math.equity import (
     Eval7EquityCalculator,
     EquityResult,
     PlaceholderEquityCalculator,
@@ -119,8 +119,8 @@ def test_board_plays_ties_split_exactly():
 
 def test_call_ev_consistent_with_required_equity():
     # Cross-module consistency: at the required calling equity, EV(call) == 0.
-    from poker_tracker.ev import call_ev
-    from poker_tracker.pot_odds import required_equity_to_call
+    from poker_tracker.math.ev import call_ev
+    from poker_tracker.math.pot_odds import required_equity_to_call
 
     equity = required_equity_to_call(30, 90)
     assert call_ev(equity, 90, 30) == pytest.approx(0.0)

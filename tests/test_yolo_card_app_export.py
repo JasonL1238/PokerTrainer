@@ -7,8 +7,8 @@ from cv_lab.scripts.pipeline.export_yolo_card_hands_for_app import (
     load_hand_corrections,
     timeline_to_session_payload,
 )
-from poker_tracker.db import PokerDatabase
-from poker_tracker.import_export import import_session
+from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.persistence.import_export import import_session
 
 
 def test_card_to_app_normalizes_detector_labels() -> None:

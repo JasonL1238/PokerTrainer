@@ -1,8 +1,8 @@
 import pytest
 from pydantic import ValidationError
 
-from poker_tracker.db import PokerDatabase, SCHEMA_VERSION
-from poker_tracker.models import Action, Hand, HandPlayer, HandReview, Session
+from poker_tracker.persistence.db import PokerDatabase, SCHEMA_VERSION
+from poker_tracker.persistence.models import Action, Hand, HandPlayer, HandReview, Session
 
 
 def make_db() -> PokerDatabase:

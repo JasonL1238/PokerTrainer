@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from datetime import date
 
-from poker_tracker.equity import EquityResult
-from poker_tracker.models import Action, Hand, HandPlayer, HandReview
-from poker_tracker.hand_history import format_hand_history
-from poker_tracker.pot_odds import format_percentage
-from poker_tracker.ranges import get_range_description, normalize_range_label
+from poker_tracker.math.equity import EquityResult
+from poker_tracker.persistence.models import Action, Hand, HandPlayer, HandReview
+from poker_tracker.coaching.hand_history import format_hand_history
+from poker_tracker.math.pot_odds import format_percentage
+from poker_tracker.math.ranges import get_range_description, normalize_range_label
 
 
 AGGRESSIVE_ACTIONS = {"bet", "raise", "all-in"}

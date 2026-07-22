@@ -3,9 +3,9 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 
-from poker_tracker.db import PokerDatabase
-from poker_tracker.models import Hand
-from poker_tracker.study_math import mean_confidence_interval
+from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.persistence.models import Hand
+from poker_tracker.math.study_math import mean_confidence_interval
 
 
 AGGRESSIVE_ACTIONS = {"bet", "raise", "all-in"}

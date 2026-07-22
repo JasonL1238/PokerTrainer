@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from poker_tracker.models import Action, Hand, HandPlayer, Session
+from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
 
 
 STREET_LABELS = {
