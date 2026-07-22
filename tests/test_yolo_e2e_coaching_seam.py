@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 
-from cv_lab.scripts.export_yolo_card_hands_for_app import export_timeline
+from cv_lab.scripts.pipeline.export_yolo_card_hands_for_app import export_timeline
 from poker_tracker.coaching_prompts import POST_SESSION_SAFETY, build_hand_review_prompt
 from poker_tracker.db import PokerDatabase
 from poker_tracker.import_export import import_session

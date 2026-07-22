@@ -1,6 +1,6 @@
 import json
 
-from cv_lab.scripts.export_yolo_card_hands_for_app import (
+from cv_lab.scripts.pipeline.export_yolo_card_hands_for_app import (
     _card_to_app,
     apply_hand_corrections,
     export_timeline,

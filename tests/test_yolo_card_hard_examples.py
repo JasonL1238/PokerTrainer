@@ -1,7 +1,7 @@
 import csv
 from pathlib import Path
 
-from cv_lab.scripts.mine_yolo_card_hard_examples import mine_hard_examples
+from cv_lab.scripts.labeling.mine_yolo_card_hard_examples import mine_hard_examples
 
 
 def _write_csv(path: Path, fieldnames: list[str], rows: list[dict]) -> None:

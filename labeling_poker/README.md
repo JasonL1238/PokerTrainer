@@ -66,7 +66,7 @@ The queues serve different review loops:
 - `cv_weak_cards` is produced by the combined runtime when Model 2 is low-confidence or hits a known weak rank. It prioritizes frames for card-label correction. In the labeler today, only the `model1_review` queue switches bootstrap source; other queues use the legacy full-frame card detector (`best (4).pt`) for a convenient starting face-card box. That detector is not Model 2.
 - `two_model_validation` is an approval queue created by `stage_two_model_validation_queue.py`. It contains only undecided frames, and each frame receives Model 1's region boxes plus Model 2's card names when opened. Those predictions are never written to SQLite unless the reviewer saves them, so approval or an edit is required before either model can train on them.
 
-The end-to-end completed-session runner is `cv_lab/scripts/run_two_model_pipeline.py`; it runs Model 1 first, invokes Model 2 only for its card boxes, and then sends the results into the reconstruction spine. This is offline post-session analysis only.
+The end-to-end completed-session runner is `cv_lab/scripts/pipeline/run_two_model_pipeline.py`; it runs Model 1 first, invokes Model 2 only for its card boxes, and then sends the results into the reconstruction spine. This is offline post-session analysis only.
 
 ## Card rank + suit
 

@@ -1,4 +1,4 @@
-from cv_lab.scripts.build_yolo_card_timeline import _stage, _summarize_hands, _zone_for_box
+from cv_lab.scripts.pipeline.build_yolo_card_timeline import _stage, _summarize_hands, _zone_for_box
 
 
 def test_zone_for_box_assigns_hero_board_other():

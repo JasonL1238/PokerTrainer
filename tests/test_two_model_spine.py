@@ -16,7 +16,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 sys.path.insert(0, os.path.join(REPO_ROOT, "cv_lab", "scripts"))
 
-import region_detections as rd  # noqa: E402
+import cv_lab.scripts.detect.region_detections as rd  # noqa: E402
 
 
 class StubClassifier:

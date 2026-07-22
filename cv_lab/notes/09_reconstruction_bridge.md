@@ -20,7 +20,7 @@ All 10 timeline hands (7 complete + 3 partially observed) export through
   stitched from the human-labeled boxes + template OCR, cross-checked with pot
   arithmetic (every street's pot delta reconciles against stack deltas), plus
   targeted visual verification. Includes full action lists with amounts.
-- `cv_lab/scripts/eval_hand_reconstruction.py` — counts discrete errors per
+- `cv_lab/scripts/eval/eval_hand_reconstruction.py` — counts discrete errors per
   hand (segmentation, cards, dealer, pot, winner, hero net, per-street
   multiset action alignment with amount tolerances).
 
@@ -85,7 +85,7 @@ All 10 timeline hands (7 complete + 3 partially observed) export through
 
 ## Repro
 ```
-conda run -n poker-cv python cv_lab/scripts/run_two_model_pipeline.py \
+conda run -n poker-cv python cv_lab/scripts/pipeline/run_two_model_pipeline.py \
     --start 0 --end 564 --interval 2 --device mps \
     --out cv_lab/results/two_model_timeline_v00.json
 conda run -n poker-cv python -m cv_lab.scripts.eval_hand_reconstruction \

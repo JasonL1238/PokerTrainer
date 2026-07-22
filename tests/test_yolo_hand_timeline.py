@@ -5,9 +5,9 @@ drive build_yolo_hand_timeline end to end and assert a complete reconstructed ha
 positions, ordered actions with bet sizes from stack deltas, pot, winner, and the
 arithmetic reconciliation. Also confirms the spine output validates cleanly.
 """
-from cv_lab.scripts import region_detections as rd
-from cv_lab.scripts.build_yolo_hand_timeline import build_hand_timeline
-from cv_lab.scripts.validate_yolo_card_timeline import validate_timeline
+from cv_lab.scripts.detect import region_detections as rd
+from cv_lab.scripts.pipeline.build_yolo_hand_timeline import build_hand_timeline
+from cv_lab.scripts.eval.validate_yolo_card_timeline import validate_timeline
 
 W = H = 1000
 
