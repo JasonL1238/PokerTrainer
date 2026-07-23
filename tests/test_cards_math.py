@@ -10,12 +10,21 @@ from poker_tracker.math.cards import (
     parse_visible_cards,
     spaced_cards,
 )
-from poker_tracker.math.ev import bluff_ev, call_ev, semi_bluff_ev
+from poker_tracker.math.ev import (
+    bluff_ev,
+    call_ev,
+    semi_bluff_break_even_fold_frequency,
+    semi_bluff_ev,
+)
 from poker_tracker.math.pot_odds import (
     break_even_bluff_frequency,
     format_percentage,
     minimum_defense_frequency,
+    pot_odds_offered_by_bet,
+    rake_amount,
     required_equity_to_call,
+    required_equity_to_call_after_rake,
+    stack_to_pot_ratio,
 )
 
 
@@ -58,6 +67,8 @@ def test_pot_odds_calculations() -> None:
     assert required_equity_to_call(25, 75) == pytest.approx(0.25)
     assert break_even_bluff_frequency(50, 100) == pytest.approx(1 / 3)
     assert minimum_defense_frequency(50, 100) == pytest.approx(2 / 3)
+    assert pot_odds_offered_by_bet(50, 100) == pytest.approx(0.25)
+    assert stack_to_pot_ratio(200, 50) == pytest.approx(4.0)
     # MDF and the break-even bluff frequency (alpha) are complements.
     assert minimum_defense_frequency(75, 100) + break_even_bluff_frequency(75, 100) == pytest.approx(1.0)
     assert format_percentage(0.3333) == "33.3%"
@@ -87,6 +98,26 @@ def test_ev_helpers() -> None:
     assert semi_bluff_ev(0.4, 0.3, 100, 50) == pytest.approx(46)
     # With zero equity when called, a semi-bluff degenerates to a pure bluff.
     assert semi_bluff_ev(0.5, 0.0, 100, 50) == pytest.approx(bluff_ev(0.5, 100, 50))
+    assert semi_bluff_break_even_fold_frequency(0.0, 100, 50) == pytest.approx(1 / 3)
+    needed = semi_bluff_break_even_fold_frequency(0.2, 100, 50)
+    assert semi_bluff_ev(needed, 0.2, 100, 50) == pytest.approx(0.0)
+
+
+def test_rake_adjusted_call_math_is_internally_consistent() -> None:
+    # Calling 25 into 75 creates a 100 BB pot. Five percent rake raises the
+    # break-even threshold from 25% to 25/95.
+    assert rake_amount(100, 0.05, 10) == pytest.approx(5.0)
+    threshold = required_equity_to_call_after_rake(25, 75, 0.05, 10)
+    assert threshold == pytest.approx(25 / 95)
+    assert call_ev(threshold, 75, 25, rake_rate=0.05, rake_cap=10) == pytest.approx(0.0)
+
+
+def test_rake_cap_and_validation() -> None:
+    assert rake_amount(200, 0.05, 3) == pytest.approx(3.0)
+    with pytest.raises(ValueError):
+        rake_amount(100, 1.01)
+    with pytest.raises(ValueError):
+        rake_amount(100, 0.05, -1)
 
 
 def test_ten_rank_normalization() -> None:

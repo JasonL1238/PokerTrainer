@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from bisect import bisect_left
 from typing import Protocol
 
 from pydantic import BaseModel, Field
@@ -48,6 +49,8 @@ class EquityResult(BaseModel):
     # Monte-Carlo sampling error (one standard error of the equity estimate);
     # None for exact enumeration and unavailable results.
     std_error: float | None = Field(default=None, ge=0)
+    valid_combos: int | None = Field(default=None, ge=0)
+    samples: int | None = Field(default=None, ge=0)
 
 
 class EquityCalculator(Protocol):
@@ -194,6 +197,8 @@ class Eval7EquityCalculator:
             confidence=confidence,
             notes=notes,
             std_error=std_error,
+            valid_combos=len(combos),
+            samples=None if len(board) >= 3 else self.iterations,
         )
 
     def calculate_equity_multiway(
@@ -265,6 +270,8 @@ class Eval7EquityCalculator:
                 f"{len(villain_combos)} villain ranges."
             ),
             std_error=std_error,
+            valid_combos=sum(len(combos) for combos in villain_combos),
+            samples=self.iterations,
         )
 
     def _exact(self, hero: list[Card], board: list[Card], combos: list) -> float:
@@ -298,8 +305,9 @@ class Eval7EquityCalculator:
         dead = {str(card) for card in hero + board}
         need = 5 - len(board_e)
         stats = _RunningEquity()
+        sampler = _WeightedComboSampler(combos)
         for _ in range(self.iterations):
-            hand, weight = combos[rng.randrange(len(combos))]
+            hand = sampler.choose(rng)
             villain = list(hand)
             used = dead | {str(villain[0]), str(villain[1])}
             deck = [card for card in full if str(card) not in used]
@@ -312,7 +320,7 @@ class Eval7EquityCalculator:
                 share = 0.5
             else:
                 share = 0.0
-            stats.add(share, weight)
+            stats.add(share)
         return stats.mean(), stats.standard_error()
 
     def _monte_carlo_multiway(
@@ -325,23 +333,22 @@ class Eval7EquityCalculator:
         dead = {str(card) for card in hero + board}
         need = 5 - len(board_e)
         stats = _RunningEquity()
+        samplers = [_WeightedComboSampler(combos) for combos in villain_combos]
         iterations = 0
         while iterations < self.iterations:
             # Rejection sampling: draw one combo per villain, retry the whole
             # deal if two villains claim the same card.
             used = set(dead)
             villains = []
-            weight = 1.0
             clash = False
-            for combos in villain_combos:
-                hand, hand_weight = combos[rng.randrange(len(combos))]
+            for sampler in samplers:
+                hand = sampler.choose(rng)
                 cards = {str(hand[0]), str(hand[1])}
                 if cards & used:
                     clash = True
                     break
                 used |= cards
                 villains.append(list(hand))
-                weight *= hand_weight
             if clash:
                 continue
             iterations += 1
@@ -358,7 +365,7 @@ class Eval7EquityCalculator:
                 share = 1.0 / (1 + villain_scores.count(best_villain))
             else:
                 share = 0.0
-            stats.add(share, weight)
+            stats.add(share)
         return stats.mean(), stats.standard_error()
 
     @staticmethod
@@ -372,6 +379,8 @@ class Eval7EquityCalculator:
         confidence: float,
         notes: str,
         std_error: float | None = None,
+        valid_combos: int | None = None,
+        samples: int | None = None,
     ) -> EquityResult:
         return EquityResult(
             hero_hand=compact_cards(hero),
@@ -382,15 +391,13 @@ class Eval7EquityCalculator:
             confidence=confidence,
             notes=notes,
             std_error=std_error,
+            valid_combos=valid_combos,
+            samples=samples,
         )
 
 
 class _RunningEquity:
-    """Weighted running mean and standard error for Monte-Carlo pot shares.
-
-    Uses the effective sample size (sum(w))^2 / sum(w^2) so weighted ranges do
-    not overstate the estimate's precision.
-    """
+    """Running mean and standard error for sampled pot shares."""
 
     def __init__(self) -> None:
         self._sum_w = 0.0
@@ -398,11 +405,11 @@ class _RunningEquity:
         self._sum_wx2 = 0.0
         self._sum_w2 = 0.0
 
-    def add(self, share: float, weight: float) -> None:
-        self._sum_w += weight
-        self._sum_wx += weight * share
-        self._sum_wx2 += weight * share * share
-        self._sum_w2 += weight * weight
+    def add(self, share: float) -> None:
+        self._sum_w += 1.0
+        self._sum_wx += share
+        self._sum_wx2 += share * share
+        self._sum_w2 += 1.0
 
     def mean(self) -> float:
         return self._sum_wx / self._sum_w
@@ -412,6 +419,29 @@ class _RunningEquity:
         variance = max(0.0, self._sum_wx2 / self._sum_w - mean * mean)
         effective_n = (self._sum_w * self._sum_w) / self._sum_w2
         return (variance / effective_n) ** 0.5
+
+
+class _WeightedComboSampler:
+    """Sample eval7 combos in proportion to their range weights."""
+
+    def __init__(self, combos: list) -> None:
+        self._hands = []
+        self._cumulative = []
+        total = 0.0
+        for hand, weight in combos:
+            if weight <= 0:
+                continue
+            total += float(weight)
+            self._hands.append(hand)
+            self._cumulative.append(total)
+        if not self._hands:
+            raise ValueError("Range contains no positive-weight combos.")
+        self._total = total
+
+    def choose(self, rng: random.Random):
+        target = rng.random() * self._total
+        index = min(bisect_left(self._cumulative, target), len(self._hands) - 1)
+        return self._hands[index]
 
 
 def _resolve_range(villain_range: str) -> tuple[str, str | None]:

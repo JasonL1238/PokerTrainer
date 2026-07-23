@@ -153,7 +153,8 @@ def test_yolo_reconstruction_to_coaching_prompt_seam(tmp_path) -> None:
     assert "BTN Villain raise 3" in prompt
     assert "SB Hero bet 12" in prompt
     # Players block reflects the reconstructed seats.
-    assert "Hero Hero: SB" in prompt
+    assert "Hero: SB" in prompt
+    assert "Hero Hero" not in prompt
     assert "Villain: BTN" in prompt
 
     db.close()

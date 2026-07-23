@@ -7,6 +7,7 @@ import pytest
 from poker_tracker.math.study_math import (
     REALIZATION_FACTOR_GUIDE,
     bluff_to_value_ratio,
+    geometric_bet_fraction,
     mean_confidence_interval,
     monte_carlo_confidence_interval,
     monte_carlo_standard_error,
@@ -15,6 +16,21 @@ from poker_tracker.math.study_math import (
     outs_to_equity_rule,
     realized_equity,
 )
+
+
+class TestGeometricBetFraction:
+    def test_one_street_equals_spr(self):
+        assert geometric_bet_fraction(1.5, 1) == pytest.approx(1.5)
+
+    def test_three_street_reference_case(self):
+        fraction = geometric_bet_fraction(4.0, 3)
+        assert fraction == pytest.approx((9 ** (1 / 3) - 1) / 2)
+        assert fraction == pytest.approx(0.54004, abs=1e-5)
+
+    @pytest.mark.parametrize("spr,streets", [(-1, 2), (1, 0), (1, 4)])
+    def test_invalid_inputs_raise(self, spr, streets):
+        with pytest.raises(ValueError):
+            geometric_bet_fraction(spr, streets)
 
 
 class TestOutsToEquityRule:

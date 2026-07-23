@@ -26,7 +26,7 @@ SourceType = Literal["manual", "cv_import", "corrected_cv"]
 ReviewType = Literal["hand", "session"]
 SafetyMode = Literal["post_session_only"]
 JobStatus = Literal["queued", "running", "completed", "failed"]
-JobType = Literal["frame_extraction"]
+JobType = Literal["frame_extraction", "cv_reconstruction"]
 ROIType = Literal[
     "hero_card",
     "board_card",
@@ -224,6 +224,8 @@ class ProcessingJob(BaseModel):
     progress_percent: float = Field(default=0, ge=0, le=100)
     message: str = ""
     error_message: str = ""
+    pid: int | None = Field(default=None, ge=1)
+    heartbeat_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
     started_at: datetime | None = None
     completed_at: datetime | None = None

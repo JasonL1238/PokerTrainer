@@ -21,7 +21,10 @@ def test_hand_history_formatting() -> None:
         Action(hand_id=1, street="preflop", action_index=2, player_name="Hero", position="BTN", action_type="call", amount=2.5),
         Action(hand_id=1, street="river", action_index=1, player_name="Hero", position="BTN", action_type="check"),
     ]
-    players = [HandPlayer(hand_id=1, player_name="Hero", position="BTN", is_hero=True)]
+    players = [
+        HandPlayer(hand_id=1, player_name="Hero", position="BTN", is_hero=True),
+        HandPlayer(hand_id=1, player_name="HJ", position="HJ", starting_stack=180),
+    ]
 
     history = format_hand_history(session, hand, actions, players)
 
@@ -32,7 +35,11 @@ def test_hand_history_formatting() -> None:
     assert "Outcome: Hero wins" in history
     assert "Result: +12.5 BB" in history
     assert "Preflop:" in history
-    assert "HJ HJ raise 2.5" in history
+    assert "HJ raise 2.5" in history
+    assert "HJ HJ" not in history
+    assert "Hero Hero" not in history
+    assert "Hero: BTN" in history
+    assert "HJ: stack 180" in history
     assert "Review status: reviewed" in history
 
 

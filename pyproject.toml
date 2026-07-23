@@ -1,3 +1,28 @@
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+files = [
+    "poker_tracker/ui/auth.py",
+    "poker_tracker/ui/components.py",
+    "poker_tracker/ui/navigation.py",
+    "poker_tracker/ui/poker_visuals.py",
+    "poker_tracker/ui/ui_theme.py",
+    "poker_tracker/ui/view_models.py",
+]
+follow_imports = "skip"
+ignore_missing_imports = true
+no_implicit_optional = true
+warn_unused_ignores = true
+exclude = ["cv_lab/"]

@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
-
+from poker_tracker.player_labels import actor_label, labels_match
 
 STREET_LABELS = {
     "preflop": "Preflop",
@@ -70,17 +70,24 @@ def _group_actions(actions: list[Action]) -> dict[str, list[Action]]:
 
 
 def _format_player(player: HandPlayer) -> str:
-    hero_marker = " Hero" if player.is_hero else ""
-    stack = "" if player.starting_stack is None else f", stack {player.starting_stack:g}"
-    notes = "" if not player.notes else f", {player.notes}"
-    return f"{player.player_name}{hero_marker}: {player.position or 'Unknown'}{stack}{notes}"
+    hero_marker = " (Hero)" if player.is_hero and not labels_match(player.player_name, "Hero") else ""
+    name = actor_label(player.player_name, None) or "Unknown player"
+    details: list[str] = []
+    if not labels_match(player.player_name, player.position):
+        details.append(player.position or "Unknown position")
+    if player.starting_stack is not None:
+        details.append(f"stack {player.starting_stack:g}")
+    if player.notes:
+        details.append(player.notes)
+    detail_text = f": {', '.join(details)}" if details else ""
+    return f"{name}{hero_marker}{detail_text}"
 
 
 def _format_action(action: Action) -> str:
-    position = f"{action.position} " if action.position else ""
     amount = "" if action.amount is None else f" {action.amount:g}"
     notes = "" if not action.notes else f" ({action.notes})"
-    return f"{position}{action.player_name} {action.action_type}{amount}{notes}"
+    actor = actor_label(action.player_name, action.position, position_first=True)
+    return f"{actor} {action.action_type}{amount}{notes}"
 
 
 def _format_bb_result(value: float | None) -> str:

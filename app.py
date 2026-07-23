@@ -5,46 +5,94 @@ import sqlite3
 from datetime import date
 from pathlib import Path
 
+import altair as alt
 import streamlit as st
 from pydantic import ValidationError
 
-from poker_tracker.math.analytics import compute_session_stats
-from poker_tracker.coaching.coaching_prompts import build_hand_review_prompt, build_session_review_prompt
-from poker_tracker.persistence.db import DEFAULT_DB_PATH, PokerDatabase
-from poker_tracker.math.equity import get_equity_calculator
-from poker_tracker.math.ev import bluff_ev, call_ev
-from poker_tracker.ui.frame_extraction import (
-    delete_extracted_frames,
-    extract_frames_for_video,
-    select_representative_frames,
+from poker_tracker.coaching.coaching_prompts import (
+    build_hand_review_prompt,
+    build_session_review_prompt,
 )
 from poker_tracker.coaching.hand_history import format_hand_history
-from poker_tracker.persistence.import_export import export_hand, export_session, import_session
-from poker_tracker.ui.image_utils import image_dimensions, save_roi_crop_preview
 from poker_tracker.coaching.llm_providers import (
     LLMProviderError,
     build_coaching_response,
     get_provider_from_env,
 )
-from poker_tracker.persistence.models import Action, HAND_TAGS, Hand, HandPlayer, ROIProfile, ROIRegion, Session, VideoRecord
+from poker_tracker.coaching.review import generate_mock_review
+from poker_tracker.coaching.safety import validate_post_session_prompt
+from poker_tracker.math.analytics import compute_session_stats
+from poker_tracker.math.equity import get_equity_calculator
+from poker_tracker.math.ev import (
+    bluff_ev,
+    call_ev,
+    semi_bluff_break_even_fold_frequency,
+    semi_bluff_ev,
+)
+from poker_tracker.math.icm import icm_equities, icm_risk_premium
 from poker_tracker.math.pot_odds import (
     break_even_bluff_frequency,
     format_percentage,
     minimum_defense_frequency,
+    pot_odds_offered_by_bet,
+    rake_amount,
     required_equity_to_call,
+    required_equity_to_call_after_rake,
+    stack_to_pot_ratio,
 )
-from poker_tracker.math.icm import icm_equities, icm_risk_premium
 from poker_tracker.math.preflop_ranges import available_ranges
-from poker_tracker.math.ranges import RANGE_LABELS, estimate_villain_range_label
+from poker_tracker.math.ranges import RANGE_LABELS, estimate_villain_range_label, range_notation
 from poker_tracker.math.study_math import (
     REALIZATION_FACTOR_GUIDE,
     bluff_to_value_ratio,
+    geometric_bet_fraction,
     optimal_bluff_fraction,
     outs_to_equity_exact,
     outs_to_equity_rule,
     realized_equity,
 )
-from poker_tracker.coaching.review import generate_mock_review
+from poker_tracker.persistence.db import DEFAULT_DB_PATH, PokerDatabase
+from poker_tracker.persistence.import_export import export_hand, export_session, import_session
+from poker_tracker.persistence.models import (
+    HAND_TAGS,
+    Action,
+    Hand,
+    HandPlayer,
+    ROIProfile,
+    ROIRegion,
+    Session,
+    VideoRecord,
+)
+from poker_tracker.persistence.seed_data import create_sample_data
+from poker_tracker.ui.auth import check_password, logout_button
+from poker_tracker.ui.components import (
+    data_callout,
+    empty_state,
+    kpi_card,
+    page_header,
+    product_hero,
+    section_header,
+    section_header_with_meta,
+    trust_badge,
+    workflow_step,
+)
+from poker_tracker.ui.cv_jobs import CVJobAlreadyRunningError, reconcile_stuck_jobs, start_cv_job
+from poker_tracker.ui.frame_extraction import (
+    delete_extracted_frames,
+    extract_frames_for_video,
+    select_representative_frames,
+)
+from poker_tracker.ui.image_utils import image_dimensions, save_roi_crop_preview
+from poker_tracker.ui.navigation import Page, navigate_to, render_navigation
+from poker_tracker.ui.poker_visuals import (
+    equity_meter_html,
+    inject_poker_visual_styles,
+    poker_table_html,
+    range_cells_from_notation,
+    range_matrix_html,
+    render_action_timeline,
+    render_poker_table,
+)
 from poker_tracker.ui.roi import ROI_TYPES, validate_roi_bounds
 from poker_tracker.ui.roi_profiles import (
     create_starter_clubwpt_profile,
@@ -53,12 +101,19 @@ from poker_tracker.ui.roi_profiles import (
     generate_roi_crop_previews,
     import_roi_profile,
 )
-from poker_tracker.coaching.safety import validate_post_session_prompt
 from poker_tracker.ui.ui_theme import brand_header, inject_theme
-from poker_tracker.persistence.seed_data import create_sample_data
 from poker_tracker.ui.video_metadata import extract_video_metadata
-from poker_tracker.ui.video_storage import ensure_data_directories, save_video_file, validate_video_extension
-
+from poker_tracker.ui.video_storage import (
+    ensure_data_directories,
+    save_video_file,
+    validate_video_extension,
+)
+from poker_tracker.ui.view_models import (
+    build_hand_rows,
+    build_job_rows,
+    build_portfolio_summary,
+    build_session_rows,
+)
 
 STREETS = ["preflop", "flop", "turn", "river", "showdown"]
 ACTION_TYPES = ["fold", "check", "call", "bet", "raise", "all-in", "post_blind", "show", "win"]
@@ -89,70 +144,628 @@ def _cached_multiway_equity(hero_cards: str, board_cards: str, villain_ranges: t
     return calculator.calculate_equity_multiway(hero_cards, board_cards, list(villain_ranges))
 
 
-def flash(message: str, icon: str = "✅") -> None:
+def flash(message: str) -> None:
     """Queue a confirmation that survives the st.rerun() after a state change."""
-    st.session_state["_flash"] = (message, icon)
+    st.session_state["_flash"] = message
 
 
 def show_flash() -> None:
     queued = st.session_state.pop("_flash", None)
     if queued:
-        message, icon = queued
-        st.toast(message, icon=icon)
+        st.toast(queued)
 
 
 def main() -> None:
-    st.set_page_config(page_title="PokerTrainer", page_icon="♠", layout="wide")
+    st.set_page_config(page_title="PokerTrainer", layout="wide")
     inject_theme()
-    brand_header()
+    inject_poker_visual_styles()
+    if not check_password():
+        return
     show_flash()
 
     db = get_database()
+    reconciled = reconcile_stuck_jobs(db)
+    if reconciled:
+        st.toast(f"Recovered {len(reconciled)} interrupted processing job(s).")
+    sessions = db.fetch_sessions()
 
     with st.sidebar:
-        st.header("Session")
-        create_session_form(db)
-        if st.button("Load sample data"):
-            if any(session.name == "Sample post-session review" for session in db.fetch_sessions()):
+        brand_header()
+        page = render_navigation()
+        st.divider()
+        trust_badge()
+        selected_session = None
+        if sessions:
+            st.caption("SESSION CONTEXT")
+            selected_session = select_session(db)
+        with st.expander("New session", expanded=not sessions):
+            create_session_form(db)
+        if st.button("Load sample data", width="stretch"):
+            if any(session.name == "Sample post-session review" for session in sessions):
                 st.warning("Sample data is already loaded.")
             else:
                 create_sample_data(db)
                 flash("Sample session loaded.")
                 st.rerun()
-        selected_session = select_session(db)
+        logout_button()
 
-    if selected_session is None:
-        st.info("Create or load a session to start reviewing completed hands.")
+    if page == Page.OVERVIEW:
+        show_product_overview(db)
+    elif page == Page.SESSIONS:
+        show_sessions_workspace(db, selected_session)
+    elif page == Page.HANDS:
+        show_hands_workspace(db)
+    elif page == Page.STUDY:
+        show_study_workspace(db, selected_session)
+    elif page == Page.INSIGHTS:
+        show_insights_workspace(db)
+    elif page == Page.IMPORT:
+        show_import_workspace(db, selected_session)
+    else:
+        show_settings_workspace(db, selected_session)
+
+
+def show_product_overview(db: PokerDatabase) -> None:
+    sessions = db.fetch_sessions()
+    hands_by_session = {
+        session.id: db.fetch_hands_by_session(session.id)
+        for session in sessions
+        if session.id is not None
+    }
+    all_hands = [hand for hands in hands_by_session.values() for hand in hands]
+    summary = build_portfolio_summary(all_hands, len(sessions))
+
+    featured = all_hands[-1] if all_hands else None
+    if featured is not None and featured.id is not None:
+        featured_actions = db.fetch_actions_by_hand(featured.id)
+        featured_players = db.fetch_players_by_hand(featured.id)
+        table_html = poker_table_html(
+            hero_cards=featured.hero_cards,
+            board_cards=featured.board_cards,
+            pot_size=featured.pot_size,
+            players=featured_players,
+            result_bb=featured.hero_bb_won,
+            label=f"Completed hand #{featured.hand_number}",
+        )
+        hand_label = f"HAND #{featured.hand_number}"
+    else:
+        featured_actions = []
+        table_html = poker_table_html(
+            hero_cards="As Kh",
+            board_cards="Qs 7d 2c 9h",
+            pot_size=38.5,
+            players=[],
+            label="Simulated completed-hand workspace",
+            preview=True,
+        )
+        hand_label = "PREVIEW"
+
+    product_hero(
+        "Turn completed hands into sharper decisions.",
+        "Reconstruct sessions, replay decision paths, and study the math in one private poker analysis workspace.",
+        table_html,
+        proof_points=(
+            (str(summary.hand_count), "saved hands"),
+            (f"{summary.review_percent:.0f}%", "reviewed"),
+            (hand_label, "replay surface"),
+        ),
+    )
+
+    with st.container(key="overview_actions"):
+        action_left, action_right, spacer = st.columns([1, 1, 3])
+        if action_left.button("Import completed session", type="primary", width="stretch"):
+            navigate_to(Page.IMPORT)
+            st.rerun()
+        if action_right.button("Open hand library", width="stretch"):
+            navigate_to(Page.HANDS)
+            st.rerun()
+
+    with st.container(key="overview_metrics"):
+        columns = st.columns(4)
+        with columns[0]:
+            kpi_card("Sessions", str(summary.session_count), "Completed sessions on file")
+        with columns[1]:
+            kpi_card("Hands", str(summary.hand_count), "Across every saved session")
+        with columns[2]:
+            kpi_card(
+                "Review coverage",
+                f"{summary.review_percent:.0f}%",
+                f"{summary.reviewed_count} hands completed",
+                tone="positive" if summary.review_percent >= 75 else "default",
+            )
+        with columns[3]:
+            result_tone = (
+                "positive"
+                if summary.net_bb > 0
+                else "negative"
+                if summary.net_bb < 0
+                else "default"
+            )
+            kpi_card(
+                "Recorded result",
+                f"{summary.net_bb:+g} BB",
+                "Recorded hands only",
+                tone=result_tone,
+            )
+
+    if featured_actions:
+        section_header_with_meta(
+            "Latest decision history",
+            "Street-by-street action from the featured completed hand.",
+            f"{len(featured_actions)} ACTIONS",
+        )
+        render_action_timeline(
+            featured_actions,
+            players=featured_players,
+            effective_stack=featured.effective_stack,
+            initial_pot=1.5,
+        )
+
+    section_header_with_meta(
+        "Recent sessions",
+        "Newest completed sessions",
+        f"{len(session_rows := build_session_rows(sessions, hands_by_session))} TOTAL",
+    )
+    if not session_rows:
+        empty_state(
+            "No sessions yet",
+            "Create a session or import a completed-session video to begin your study library.",
+        )
+    else:
+        st.dataframe(
+            [
+                {
+                    "Session": row.name,
+                    "Date": row.date_played,
+                    "Platform": row.platform,
+                    "Stakes": row.stakes,
+                    "Hands": row.hand_count,
+                    "Reviewed": f"{row.reviewed_count}/{row.hand_count}",
+                    "Result": f"{row.net_bb:+g} BB",
+                }
+                for row in session_rows[:8]
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+
+    section_header("Processing", "Recent offline reconstruction activity")
+    job_rows = build_job_rows(db.fetch_recent_jobs(6), db.fetch_videos())
+    if not job_rows:
+        empty_state("No processing jobs", "Uploaded video reconstruction jobs will appear here.")
+    else:
+        st.dataframe(
+            [
+                {
+                    "Video": row.filename,
+                    "Type": row.job_type,
+                    "Status": row.status.replace("_", " ").title(),
+                    "Progress": f"{row.progress_percent:.0f}%",
+                    "Update": row.message,
+                    "Created": row.age_label,
+                }
+                for row in job_rows
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+
+
+def show_sessions_workspace(db: PokerDatabase, session: Session | None) -> None:
+    page_header(
+        "Sessions",
+        "Inspect results, add reconstructed or manual hands, and manage one completed session at a time.",
+    )
+    if session is None:
+        empty_state(
+            "Create your first session",
+            "Use the New session panel in the left rail to get started.",
+        )
+        return
+    summary_tab, add_tab = st.tabs(["Session summary", "Add hand"])
+    with summary_tab:
+        show_session_dashboard(db, session)
+    with add_tab:
+        create_hand_form(db, session.id)
+
+
+def show_hands_workspace(db: PokerDatabase) -> None:
+    page_header(
+        "Hand library",
+        "Find high-impact and unresolved decisions across every completed session.",
+    )
+    sessions = db.fetch_sessions()
+    hands = db.fetch_all_hands()
+    if not hands:
+        empty_state(
+            "No hands to review", "Import a completed session or add a hand manually first."
+        )
         return
 
-    dashboard_tab, entry_tab, hands_tab, math_tab, coach_tab, video_tab, roi_tab, transfer_tab = st.tabs(
+    with st.container(key="hand_filters"):
+        session_filter, status_filter, tag_filter = st.columns(3)
+        session_names = [session.name for session in sessions]
+        selected_sessions = session_filter.multiselect(
+            "Sessions", session_names, placeholder="All sessions"
+        )
+        selected_statuses = status_filter.multiselect(
+            "Review status", REVIEW_STATUSES, placeholder="All statuses"
+        )
+        selected_tags = tag_filter.multiselect("Tags", sorted(HAND_TAGS), placeholder="All tags")
+    session_ids = {
+        session.id
+        for session in sessions
+        if not selected_sessions or session.name in selected_sessions
+    }
+    filtered = [
+        hand
+        for hand in hands
+        if hand.session_id in session_ids
+        and (not selected_statuses or hand.review_status in selected_statuses)
+        and (not selected_tags or set(hand.tags) & set(selected_tags))
+    ]
+    rows = build_hand_rows(sessions, filtered)
+    if not rows:
+        empty_state("No matching hands", "Clear one or more filters to broaden the result set.")
+        return
+    st.caption(f"{len(rows)} hands · results and confidence reflect recorded source data")
+    st.dataframe(
         [
-            "Dashboard",
-            "Enter Hand",
-            "Review Hands",
-            "Math Review",
-            "Coach Review",
-            "Video Processing",
-            "ROI Calibration",
-            "Import / Export",
-        ]
+            {
+                "Session": row.session_name,
+                "Hand": f"#{row.hand_number}",
+                "Hero": row.hero_cards,
+                "Board": row.board_cards,
+                "Position": row.position,
+                "Result": "—" if row.result_bb is None else f"{row.result_bb:+g} BB",
+                "Review": row.review_status.replace("_", " ").title(),
+                "Confidence": row.confidence_label,
+                "Source": row.source_label,
+                "Tags": ", ".join(row.tags) or "—",
+            }
+            for row in rows
+        ],
+        hide_index=True,
+        width="stretch",
     )
-    with dashboard_tab:
-        show_session_dashboard(db, selected_session)
-    with entry_tab:
-        create_hand_form(db, selected_session.id)
-    with hands_tab:
-        show_saved_hands(db, selected_session)
-    with math_tab:
-        show_math_review(db, selected_session)
-    with coach_tab:
-        show_coach_review(db, selected_session)
-    with video_tab:
-        show_video_processing(db, selected_session)
-    with roi_tab:
+    labels = {
+        row.hand_id: f"{row.session_name} · Hand #{row.hand_number} · {row.hero_cards}"
+        for row in rows
+    }
+    open_col, button_col = st.columns([4, 1])
+    hand_id = open_col.selectbox(
+        "Open in Study", list(labels), format_func=lambda value: labels[value]
+    )
+    if button_col.button("Study hand", type="primary", width="stretch"):
+        st.session_state["study_hand_id"] = hand_id
+        navigate_to(Page.STUDY)
+        st.rerun()
+
+
+def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
+    page_header(
+        "Study",
+        "Replay the hand, inspect the evidence, and turn one completed decision into a reusable lesson.",
+    )
+    sessions = db.fetch_sessions()
+    all_hands = db.fetch_all_hands()
+    if not all_hands:
+        empty_state("Nothing queued for study", "Import or add a completed hand first.")
+        return
+    available_ids = {hand.id for hand in all_hands if hand.id is not None}
+    requested = st.session_state.get("study_hand_id")
+    if requested not in available_ids:
+        session_hands = [hand for hand in all_hands if session and hand.session_id == session.id]
+        requested = (session_hands or all_hands)[0].id
+        st.session_state["study_hand_id"] = requested
+    hand = next(item for item in all_hands if item.id == requested)
+    hand_session = next(item for item in sessions if item.id == hand.session_id)
+    ordered = [
+        item for item in all_hands if item.session_id == hand.session_id and item.id is not None
+    ]
+    labels = {
+        item.id: f"#{item.hand_number} · {item.hero_cards or 'Unknown'} · {item.hero_bb_won or 0:+g} BB"
+        for item in ordered
+    }
+
+    actions = db.fetch_actions_by_hand(hand.id)
+    players = db.fetch_players_by_hand(hand.id)
+
+    with st.container(key="study_workspace"):
+        list_col, replay_col, inspector_col = st.columns([0.82, 1.78, 1.15], gap="large")
+        with list_col:
+            with st.container(key="study_hand_list"):
+                st.markdown("#### Session queue")
+                selected = st.selectbox(
+                    "Choose hand",
+                    list(labels),
+                    index=list(labels).index(hand.id),
+                    format_func=lambda value: labels[value],
+                    label_visibility="collapsed",
+                )
+                if selected != hand.id:
+                    st.session_state["study_hand_id"] = selected
+                    st.rerun()
+                data_callout("Session", hand_session.name)
+                st.caption(
+                    f"Played {hand_session.date_played} · {hand_session.stakes or 'Stakes not recorded'}"
+                )
+                st.caption(f"Source · {hand.source_type.replace('_', ' ').title()}")
+                confidence = (
+                    "Not scored"
+                    if hand.confidence_score is None
+                    else f"{100 * hand.confidence_score:.0f}%"
+                )
+                st.caption(f"Reconstruction confidence · {confidence}")
+                status = st.selectbox(
+                    "Review status",
+                    REVIEW_STATUSES,
+                    index=REVIEW_STATUSES.index(hand.review_status),
+                    key=f"study_status_{hand.id}",
+                )
+                if st.button("Save review status", key=f"study_save_{hand.id}", width="stretch"):
+                    db.update_hand_status(hand.id, status)
+                    flash("Review status updated.")
+                    st.rerun()
+
+        with replay_col:
+            section_header_with_meta(
+                f"Hand #{hand.hand_number}",
+                "Completed-hand replay",
+                hand.game_type.upper() if hand.game_type else "NO-LIMIT HOLD'EM",
+            )
+            render_poker_table(
+                hero_cards=hand.hero_cards,
+                board_cards=hand.board_cards,
+                pot_size=hand.pot_size,
+                players=players,
+                result_bb=hand.hero_bb_won,
+                label=f"{hand_session.name} · {hand.hero_position or 'Position not recorded'}",
+            )
+            section_header_with_meta(
+                "Decision history",
+                "Saved actions grouped by street.",
+                f"{len(actions)} ACTIONS",
+            )
+            render_action_timeline(
+                actions,
+                players=players,
+                effective_stack=hand.effective_stack,
+                initial_pot=1.5,
+            )
+            with st.expander("Raw hand history"):
+                st.code(format_hand_history(hand_session, hand, actions, players), language="text")
+
+        with inspector_col:
+            with st.container(key="study_inspector"):
+                st.markdown("#### Analysis inspector")
+                summary_tab, math_tab, coach_tab, notes_tab = st.tabs(
+                    ["Summary", "Math", "Coach", "Notes"]
+                )
+                with summary_tab:
+                    data_callout("Position", hand.hero_position or "Not recorded")
+                    data_callout(
+                        "Effective stack",
+                        "—" if hand.effective_stack is None else f"{hand.effective_stack:g} BB",
+                    )
+                    data_callout(
+                        "Final pot",
+                        "—" if hand.pot_size is None else f"{hand.pot_size:g} BB",
+                    )
+                    st.caption(f"Tags · {', '.join(hand.tags) or 'None'}")
+                    st.caption("All information shown is from a saved, completed hand.")
+                with math_tab:
+                    st.caption("Recorded facts only — no live or current-hand recommendations.")
+                    calls = [
+                        action
+                        for action in actions
+                        if action.action_type == "call" and action.amount and action.pot_before
+                    ]
+                    if calls:
+                        decision = calls[-1]
+                        required = required_equity_to_call(decision.amount, decision.pot_before)
+                        st.markdown(
+                            equity_meter_html(required, label="Required equity"),
+                            unsafe_allow_html=True,
+                        )
+                        st.caption(
+                            f"Calling {decision.amount:g} BB into a {decision.pot_before:g} BB pot."
+                        )
+                    else:
+                        empty_state(
+                            "No call math available",
+                            "Record a call amount and pot-before value to calculate required equity.",
+                        )
+                with coach_tab:
+                    reviews = db.fetch_coaching_reviews_by_hand(hand.id)
+                    if reviews:
+                        latest = reviews[0]
+                        st.caption(f"{latest.provider_name} · {latest.model_name} · post-session")
+                        for title, content in latest.parsed_sections.items():
+                            st.markdown(f"**{title.replace('_', ' ').title()}**")
+                            st.write(content)
+                    else:
+                        empty_state(
+                            "No coaching review",
+                            "Generate one from the session coaching tools in Settings.",
+                        )
+                with notes_tab:
+                    st.markdown("##### Hand notes")
+                    st.write(hand.notes or "No notes recorded.")
+                    st.caption("Edit saved hand notes from Sessions · Add hand.")
+
+
+def show_insights_workspace(db: PokerDatabase) -> None:
+    page_header(
+        "Insights",
+        "Evidence-backed patterns from your completed hands—without fabricated solver scores.",
+    )
+    hands = db.fetch_all_hands()
+    if not hands:
+        empty_state(
+            "Not enough evidence", "Insights appear after completed hands are imported or recorded."
+        )
+        return
+    tagged: dict[str, int] = {}
+    statuses: dict[str, int] = {}
+    for hand in hands:
+        statuses[hand.review_status] = statuses.get(hand.review_status, 0) + 1
+        for tag in hand.tags:
+            tagged[tag] = tagged.get(tag, 0) + 1
+    unresolved = [hand for hand in hands if hand.review_status != "reviewed"]
+    biggest = sorted(
+        [hand for hand in unresolved if hand.hero_bb_won is not None],
+        key=lambda hand: abs(hand.hero_bb_won or 0),
+        reverse=True,
+    )[:8]
+    with st.container(key="session_metrics"):
+        metric_cols = st.columns(3)
+        with metric_cols[0]:
+            kpi_card("Evidence base", str(len(hands)), "Completed hands")
+        with metric_cols[1]:
+            kpi_card(
+                "Unresolved",
+                str(len(unresolved)),
+                "Needs review or correction",
+                tone="negative" if unresolved else "positive",
+            )
+        with metric_cols[2]:
+            low_confidence = sum((hand.confidence_score or 1) < 0.6 for hand in hands)
+            kpi_card("Low confidence", str(low_confidence), "Verify source reconstruction")
+    left, right = st.columns(2)
+    with left:
+        section_header("Study themes", "Tag frequency and sample size")
+        if tagged:
+            theme_rows = [
+                {
+                    "theme": tag.replace("_", " ").title(),
+                    "hands": count,
+                }
+                for tag, count in sorted(tagged.items(), key=lambda item: -item[1])
+            ]
+            theme_chart = (
+                alt.Chart(alt.Data(values=theme_rows))
+                .mark_bar(cornerRadiusEnd=2, color="#35D07F", height=13)
+                .encode(
+                    x=alt.X(
+                        "hands:Q", title=None, axis=alt.Axis(grid=False, labels=False, ticks=False)
+                    ),
+                    y=alt.Y("theme:N", title=None, sort="-x", axis=alt.Axis(labelColor="#99A69E")),
+                    tooltip=[
+                        alt.Tooltip("theme:N", title="Theme"),
+                        alt.Tooltip("hands:Q", title="Hands"),
+                    ],
+                )
+                .properties(height=max(130, 30 * len(theme_rows)))
+                .configure_view(strokeOpacity=0)
+                .configure_axis(domain=False)
+            )
+            st.altair_chart(theme_chart, width="stretch")
+        else:
+            empty_state(
+                "No tagged themes", "Apply tags during review to build a useful leak index."
+            )
+    with right:
+        section_header("Review coverage", "Workflow status, not playing skill")
+        coverage_rows = [
+            {
+                "status": status.replace("_", " ").title(),
+                "hands": count,
+                "tone": status,
+            }
+            for status, count in sorted(statuses.items())
+        ]
+        coverage_chart = (
+            alt.Chart(alt.Data(values=coverage_rows))
+            .mark_arc(innerRadius=52, outerRadius=78, stroke="#080B0A", strokeWidth=2)
+            .encode(
+                theta=alt.Theta("hands:Q"),
+                color=alt.Color(
+                    "tone:N",
+                    scale=alt.Scale(
+                        domain=["reviewed", "unreviewed", "needs_correction"],
+                        range=["#35D07F", "#66736B", "#E5A64B"],
+                    ),
+                    legend=None,
+                ),
+                tooltip=[
+                    alt.Tooltip("status:N", title="Status"),
+                    alt.Tooltip("hands:Q", title="Hands"),
+                ],
+            )
+            .properties(height=190)
+            .configure_view(strokeOpacity=0)
+        )
+        st.altair_chart(coverage_chart, width="stretch")
+        st.caption(" · ".join(f"{row['status']} {row['hands']}" for row in coverage_rows))
+    section_header("Largest unresolved decisions", "Ranked by absolute recorded BB result")
+    if biggest:
+        st.dataframe(
+            [
+                {
+                    "Hand": f"#{hand.hand_number}",
+                    "Result": f"{hand.hero_bb_won:+g} BB",
+                    "Position": hand.hero_position or "—",
+                    "Status": hand.review_status.replace("_", " ").title(),
+                    "Tags": ", ".join(hand.tags) or "—",
+                }
+                for hand in biggest
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+    else:
+        empty_state(
+            "No unresolved recorded results",
+            "Review coverage is clear for hands with recorded BB outcomes.",
+        )
+
+
+def show_import_workspace(db: PokerDatabase, session: Session | None) -> None:
+    page_header(
+        "Import a completed session",
+        "Upload, validate, reconstruct, and review—never capture or advise on a live table.",
+    )
+    if session is None:
+        empty_state(
+            "Create a session first",
+            "Use New session in the left rail, then return here to attach a video.",
+        )
+        return
+    show_video_processing(db, session)
+
+
+def show_settings_workspace(db: PokerDatabase, session: Session | None) -> None:
+    page_header("Settings", "Calibration, portability, and advanced post-session tooling.")
+    calibration_tab, data_tab, math_tab, coach_tab = st.tabs(
+        ["ROI calibration", "Data transfer", "Math tools", "Coaching"]
+    )
+    with calibration_tab:
         show_roi_calibration(db)
-    with transfer_tab:
-        show_import_export(db, selected_session)
+    with data_tab:
+        if session is None:
+            empty_state(
+                "No session selected",
+                "Create or select a session before importing or exporting JSON.",
+            )
+        else:
+            show_import_export(db, session)
+    with math_tab:
+        if session is None:
+            empty_state(
+                "No session selected", "Select a session to use its saved hands in math review."
+            )
+        else:
+            with st.container(key="math_workspace"):
+                show_math_review(db, session)
+    with coach_tab:
+        if session is None:
+            empty_state(
+                "No session selected",
+                "Select a completed session before generating coaching review.",
+            )
+        else:
+            show_coach_review(db, session)
 
 
 def create_session_form(db: PokerDatabase) -> None:
@@ -207,27 +820,60 @@ def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
         return
     stats = compute_session_stats(db, session.id)
     st.subheader(session.name)
-    st.caption(f"{session.date_played} · {session.stakes or 'stakes not set'} · {session.platform or 'platform not set'}")
-
-    first, second, third, fourth = st.columns(4)
-    first.metric("Hands", stats.hand_count)
-    second.metric("Hero result", f"{stats.total_hero_bb:g} BB")
-    winrate_help = (
-        f"{stats.average_hero_bb:+.2f} BB/hand over {stats.hands_with_result} hands with recorded results"
+    st.caption(
+        f"{session.date_played} · {session.stakes or 'stakes not set'} · {session.platform or 'platform not set'}"
     )
+
+    winrate_help = f"{stats.average_hero_bb:+.2f} BB/hand over {stats.hands_with_result} hands with recorded results"
     if stats.bb_per_100_ci is not None:
         ci_low, ci_high = stats.bb_per_100_ci
-        winrate_help += (
-            f". 95% CI: {ci_low:+.0f} to {ci_high:+.0f} bb/100 — small samples say little about a true winrate."
-        )
-    third.metric("Winrate", f"{stats.bb_per_100:+.0f} bb/100", help=winrate_help)
-    fourth.metric("Reviewed", stats.hands_by_review_status.get("reviewed", 0))
+        winrate_help += f". 95% CI: {ci_low:+.0f} to {ci_high:+.0f} bb/100 — small samples say little about a true winrate."
+    with st.container(key="session_metrics"):
+        first, second, third, fourth = st.columns(4)
+        with first:
+            kpi_card("Hands", str(stats.hand_count), "Completed hands in session")
+        with second:
+            result_tone = (
+                "positive"
+                if stats.total_hero_bb > 0
+                else "negative"
+                if stats.total_hero_bb < 0
+                else "default"
+            )
+            kpi_card(
+                "Hero result",
+                f"{stats.total_hero_bb:+g} BB",
+                "Recorded results only",
+                tone=result_tone,
+            )
+        with third:
+            kpi_card("Winrate", f"{stats.bb_per_100:+.0f} bb/100", winrate_help)
+        with fourth:
+            kpi_card(
+                "Reviewed",
+                str(stats.hands_by_review_status.get("reviewed", 0)),
+                "Completed review workflow",
+                tone="positive",
+            )
 
-    fifth, sixth, seventh, eighth = st.columns(4)
-    fifth.metric("Unreviewed", stats.hands_by_review_status.get("unreviewed", 0))
-    sixth.metric("Needs correction", stats.hands_by_review_status.get("needs_correction", 0))
-    seventh.metric("Aggressive actions", stats.aggression_count)
-    eighth.metric("Passive actions", stats.passive_count)
+        fifth, sixth, seventh, eighth = st.columns(4)
+        with fifth:
+            kpi_card(
+                "Unreviewed",
+                str(stats.hands_by_review_status.get("unreviewed", 0)),
+                "Still in the study queue",
+            )
+        with sixth:
+            kpi_card(
+                "Needs correction",
+                str(stats.hands_by_review_status.get("needs_correction", 0)),
+                "Verify recorded evidence",
+                tone="warning",
+            )
+        with seventh:
+            kpi_card("Aggressive actions", str(stats.aggression_count), "Bet, raise, or all-in")
+        with eighth:
+            kpi_card("Passive actions", str(stats.passive_count), "Check or call")
 
     if stats.hand_count == 0:
         st.info("No hands recorded yet. Add hands in the Enter Hand tab to see session stats.")
@@ -236,17 +882,24 @@ def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
     winning_col, losing_col = st.columns(2)
     with winning_col:
         st.markdown("##### Biggest Winning Hands")
-        st.dataframe(_hand_summary_rows(stats.biggest_winning_hands), hide_index=True, width="stretch")
+        st.dataframe(
+            _hand_summary_rows(stats.biggest_winning_hands), hide_index=True, width="stretch"
+        )
     with losing_col:
         st.markdown("##### Biggest Losing Hands")
-        st.dataframe(_hand_summary_rows(stats.biggest_losing_hands), hide_index=True, width="stretch")
+        st.dataframe(
+            _hand_summary_rows(stats.biggest_losing_hands), hide_index=True, width="stretch"
+        )
 
     tags_col, actions_col = st.columns(2)
     with tags_col:
         st.markdown("##### Tag Counts")
         if stats.hands_by_tag:
             st.dataframe(
-                [{"Tag": tag, "Hands": count} for tag, count in sorted(stats.hands_by_tag.items(), key=lambda item: -item[1])],
+                [
+                    {"Tag": tag, "Hands": count}
+                    for tag, count in sorted(stats.hands_by_tag.items(), key=lambda item: -item[1])
+                ],
                 hide_index=True,
                 width="stretch",
             )
@@ -256,7 +909,12 @@ def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
         st.markdown("##### Action Counts")
         if stats.action_counts_by_type:
             st.dataframe(
-                [{"Action": action, "Count": count} for action, count in sorted(stats.action_counts_by_type.items(), key=lambda item: -item[1])],
+                [
+                    {"Action": action, "Count": count}
+                    for action, count in sorted(
+                        stats.action_counts_by_type.items(), key=lambda item: -item[1]
+                    )
+                ],
                 hide_index=True,
                 width="stretch",
             )
@@ -274,7 +932,7 @@ def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
         )
         if st.button("Delete session", disabled=not confirm, key=f"delete_session_{session.id}"):
             db.delete_session(session.id)
-            flash(f"Session '{session.name}' deleted.", icon="🗑️")
+            flash(f"Session '{session.name}' deleted.")
             st.rerun()
 
 
@@ -292,7 +950,9 @@ def create_hand_form(db: PokerDatabase, session_id: int | None) -> None:
         st.markdown("#### Hand Setup")
         setup_left, setup_right = st.columns(2)
         with setup_left:
-            hand_number = st.number_input("Hand number", min_value=1, step=1, value=next_hand_number)
+            hand_number = st.number_input(
+                "Hand number", min_value=1, step=1, value=next_hand_number
+            )
             game_type = st.text_input("Game type", value="No-limit Hold'em")
             blinds_antes = st.text_input("Blinds / antes", placeholder="1/2 NL, 0.25 ante")
             table_size = st.number_input("Table size", min_value=2, max_value=10, value=6, step=1)
@@ -319,7 +979,9 @@ def create_hand_form(db: PokerDatabase, session_id: int | None) -> None:
 
     if submitted:
         if any(hand.hand_number == int(hand_number) for hand in existing_hands):
-            st.error(f"Hand #{int(hand_number)} already exists in this session. Pick a different number.")
+            st.error(
+                f"Hand #{int(hand_number)} already exists in this session. Pick a different number."
+            )
             return
         try:
             # One transaction: a validation error in any player/action row rolls
@@ -361,7 +1023,13 @@ def create_hand_form(db: PokerDatabase, session_id: int | None) -> None:
 def collect_player_inputs() -> list[dict]:
     edited_rows = st.data_editor(
         [
-            {"Player": "Hero", "Position": "BTN", "Starting stack": 0.0, "Hero?": True, "Notes": ""},
+            {
+                "Player": "Hero",
+                "Position": "BTN",
+                "Starting stack": 0.0,
+                "Hero?": True,
+                "Notes": "",
+            },
             {"Player": "", "Position": "", "Starting stack": 0.0, "Hero?": False, "Notes": ""},
             {"Player": "", "Position": "", "Starting stack": 0.0, "Hero?": False, "Notes": ""},
         ],
@@ -558,8 +1226,12 @@ def show_action_editor(db: PokerDatabase, actions: list[Action]) -> None:
             )
             notes = cols[6].text_input("Notes", value=action.notes)
             pot_col, stack_col = st.columns(2)
-            pot_before = pot_col.number_input("Pot before (BB)", min_value=0.0, value=action.pot_before)
-            stack_before = stack_col.number_input("Stack before (BB)", min_value=0.0, value=action.stack_before)
+            pot_before = pot_col.number_input(
+                "Pot before (BB)", min_value=0.0, value=action.pot_before
+            )
+            stack_before = stack_col.number_input(
+                "Stack before (BB)", min_value=0.0, value=action.stack_before
+            )
             update, delete = st.columns(2)
             submitted_update = update.form_submit_button("Update action")
             submitted_delete = delete.form_submit_button("Delete action")
@@ -628,7 +1300,8 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
         for hand in hands
         if hand.id is not None
     }
-    selected_hand_id = st.selectbox(
+    hand_col, range_col, baseline_col = st.columns([1.1, 0.75, 1.4])
+    selected_hand_id = hand_col.selectbox(
         "Select hand",
         options=list(labels.keys()),
         format_func=lambda hand_id: labels[hand_id],
@@ -637,11 +1310,12 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
     actions = db.fetch_actions_by_hand(hand.id)
     players = db.fetch_players_by_hand(hand.id)
 
-    st.code(format_hand_history(session, hand, actions, players), language="text")
+    with st.expander("Completed-hand history", expanded=False):
+        st.code(format_hand_history(session, hand, actions, players), language="text")
 
     default_range = estimate_villain_range_label(hand.tags, hand.notes)
     range_options = sorted(RANGE_LABELS)
-    range_label = st.selectbox(
+    range_label = range_col.selectbox(
         "Villain range label",
         options=range_options,
         index=range_options.index(default_range),
@@ -650,7 +1324,7 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
         f"{chart.position} {chart.scenario.replace('_', ' ')} — {chart.description}": chart
         for chart in available_ranges()
     }
-    baseline_choice = st.selectbox(
+    baseline_choice = baseline_col.selectbox(
         "Positional baseline (optional, overrides the label)",
         options=list(baseline_options.keys()),
         help="100bb 9-max study charts — a defensible starting point, not solver output.",
@@ -669,27 +1343,110 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
         range_label = custom_range.strip()
         range_display = "custom range"
 
-    first, second = st.columns(2)
-    with first:
-        pot_before_call = st.number_input("Pot before call (BB)", min_value=0.0, step=1.0)
-        call_amount = st.number_input("Call amount (BB)", min_value=0.0, step=1.0)
-        compute_equity = st.checkbox("Compute Hero equity vs range", value=True)
-    with second:
-        pot_size = st.number_input("Pot size for bet/bluff (BB)", min_value=0.0, step=1.0)
-        bet_size = st.number_input("Bet size (BB)", min_value=0.0, step=1.0)
-        fold_frequency_pct = st.slider("Estimated fold frequency", 0, 100, 40)
+    matrix_notation = (
+        range_label
+        if baseline_chart is not None or custom_range.strip()
+        else range_notation(range_label)
+    )
+    if matrix_notation:
+        try:
+            with st.expander("Range matrix", expanded=False):
+                st.caption(f"{range_display.title()} · study range, not solver output")
+                st.markdown(
+                    range_matrix_html(
+                        range_cells_from_notation(matrix_notation),
+                        label=f"{range_display} preflop range",
+                    ),
+                    unsafe_allow_html=True,
+                )
+        except (KeyError, ValueError) as exc:
+            st.warning(f"Range matrix unavailable: {exc}")
+
+    with st.container(key="math_primary_inputs"):
+        call_pot_col, call_col, bet_pot_col, bet_col = st.columns(4)
+        pot_before_call = call_pot_col.number_input(
+            "Pot facing Hero (BB)",
+            min_value=0.0,
+            step=0.5,
+            help="Pot after Villain's bet and before Hero calls.",
+        )
+        call_amount = call_col.number_input("Call amount (BB)", min_value=0.0, step=0.5)
+        pot_size = bet_pot_col.number_input(
+            "Pot before Hero bets (BB)", min_value=0.0, step=0.5
+        )
+        bet_size = bet_col.number_input("Hero bet (BB)", min_value=0.0, step=0.5)
+
+    with st.container(key="math_secondary_inputs"):
+        fold_col, called_equity_col, stack_col, streets_col = st.columns(4)
+        fold_frequency_pct = fold_col.slider("Villain folds", 0, 100, 40)
+        equity_when_called_pct = called_equity_col.slider(
+            "Equity when called",
+            0,
+            100,
+            30,
+            help="Equity versus Villain's continuing range, not their full starting range.",
+        )
+        effective_stack = stack_col.number_input(
+            "Effective stack behind (BB)",
+            min_value=0.0,
+            value=float(hand.effective_stack or 0.0),
+            step=1.0,
+        )
+        streets_remaining = streets_col.selectbox(
+            "Betting streets left",
+            [1, 2, 3],
+            help="Include the current street.",
+        )
+    compute_equity = st.toggle("Compute blocker-aware equity", value=True)
+
+    with st.expander("Rake and model assumptions", expanded=False):
+        rake_col, cap_col, assumption_col = st.columns([1, 1, 2])
+        rake_pct = rake_col.number_input(
+            "Rake (%)", min_value=0.0, max_value=100.0, value=0.0, step=0.1
+        )
+        rake_cap = cap_col.number_input(
+            "Rake cap (BB)",
+            min_value=0.0,
+            value=0.0,
+            step=0.5,
+            help="Zero means uncapped when rake is nonzero.",
+        )
+        assumption_col.caption(
+            "Heads-up, one-street EV unless stated otherwise. Use zero rake when "
+            "no-flop-no-drop or another room rule means no rake is taken."
+        )
 
     math_facts: dict[str, float | str] = {}
     equity_result = None
     errors: list[str] = []
     call_metrics: list[tuple[str, str, str | None]] = []
     bet_metrics: list[tuple[str, str, str | None]] = []
+    rake_rate = rake_pct / 100
+    modeled_rake_cap = None if rake_cap == 0 else rake_cap
 
     if call_amount > 0 and pot_before_call > 0:
         try:
             required = required_equity_to_call(call_amount, pot_before_call)
+            adjusted_required = required_equity_to_call_after_rake(
+                call_amount,
+                pot_before_call,
+                rake_rate,
+                modeled_rake_cap,
+            )
+            gross_final_pot = pot_before_call + call_amount
+            modeled_rake = rake_amount(gross_final_pot, rake_rate, modeled_rake_cap)
             math_facts["required_equity_to_call"] = required
-            call_metrics.append(("Required equity to call", format_percentage(required), None))
+            math_facts["rake_adjusted_required_equity"] = adjusted_required
+            call_metrics.extend(
+                [
+                    ("Required equity", format_percentage(required), "No-rake pot odds."),
+                    (
+                        "After-rake threshold",
+                        f"{adjusted_required * 100:.1f}%",
+                        f"Final pot {gross_final_pot:g} BB; modeled rake {modeled_rake:g} BB.",
+                    ),
+                ]
+            )
         except ValueError as exc:
             errors.append(str(exc))
 
@@ -697,13 +1454,27 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
         try:
             bluff_frequency = break_even_bluff_frequency(bet_size, pot_size)
             mdf = minimum_defense_frequency(bet_size, pot_size)
+            offered = pot_odds_offered_by_bet(bet_size, pot_size)
             bluff_fraction = optimal_bluff_fraction(bet_size, pot_size)
             bluffs_per_value = bluff_to_value_ratio(bet_size, pot_size)
             math_facts["break_even_bluff_frequency"] = bluff_frequency
             math_facts["minimum_defense_frequency"] = mdf
+            math_facts["pot_odds_offered"] = offered
             math_facts["optimal_river_bluff_fraction"] = round(bluff_fraction, 4)
-            bet_metrics.append(("Break-even bluff freq", format_percentage(bluff_frequency), None))
-            bet_metrics.append(("Min defense freq (MDF)", format_percentage(mdf), None))
+            bet_metrics.append(("Bet size", f"{bet_size / pot_size * 100:.1f}% pot", None))
+            bet_metrics.append(
+                ("Pot odds offered", format_percentage(offered), "Caller's break-even equity.")
+            )
+            bet_metrics.append(
+                ("Auto-profit folds", format_percentage(bluff_frequency), "Folds needed for a zero-equity bluff.")
+            )
+            bet_metrics.append(
+                (
+                    "MDF baseline",
+                    format_percentage(mdf),
+                    "Heads-up, one-street baseline; not a solver strategy frequency.",
+                )
+            )
             bet_metrics.append(
                 (
                     "River bluff fraction",
@@ -712,6 +1483,21 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
                     f"({bluffs_per_value:.2f} bluffs per value bet). Earlier streets support more bluffs.",
                 )
             )
+            if effective_stack > 0:
+                spr = stack_to_pot_ratio(effective_stack, pot_size)
+                geometric = geometric_bet_fraction(spr, int(streets_remaining))
+                math_facts["spr"] = round(spr, 3)
+                math_facts["geometric_bet_fraction"] = round(geometric, 4)
+                bet_metrics.extend(
+                    [
+                        ("SPR", f"{spr:.2f}", "Effective stack behind divided by current pot."),
+                        (
+                            "Geometric size",
+                            f"{geometric * 100:.1f}% pot",
+                            f"Equal sizing across {streets_remaining} street(s), assuming bet-call each street.",
+                        ),
+                    ]
+                )
         except ValueError as exc:
             errors.append(str(exc))
 
@@ -719,21 +1505,27 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
         try:
             with st.spinner("Computing Hero equity vs range..."):
                 equity_result = _cached_equity(hand.hero_cards, hand.board_cards, range_label)
-            math_facts["equity"] = equity_result.equity or "unavailable"
+            math_facts["equity"] = (
+                equity_result.equity
+                if equity_result.equity is not None
+                else "unavailable"
+            )
             if equity_result.equity is None:
-                call_metrics.append((f"Equity vs {range_display}", "unavailable", equity_result.method))
-            else:
-                equity_help = (
-                    f"{equity_result.method}, confidence {format_percentage(equity_result.confidence)}"
+                call_metrics.append(
+                    (f"Equity vs {range_display}", "unavailable", equity_result.method)
                 )
+            else:
+                equity_help = equity_result.method.replace("_", " ")
+                if equity_result.valid_combos is not None:
+                    equity_help += f", {equity_result.valid_combos} blocker-valid combos"
+                if equity_result.samples is not None:
+                    equity_help += f", {equity_result.samples:,} samples"
                 if equity_result.std_error:
                     ci_low, ci_high = (
                         max(0.0, equity_result.equity - 1.96 * equity_result.std_error),
                         min(1.0, equity_result.equity + 1.96 * equity_result.std_error),
                     )
-                    equity_help += (
-                        f". Monte-Carlo 95% CI: {format_percentage(ci_low)}–{format_percentage(ci_high)}"
-                    )
+                    equity_help += f". Monte-Carlo 95% CI: {format_percentage(ci_low)}–{format_percentage(ci_high)}"
                 call_metrics.append(
                     (
                         f"Equity vs {range_display}",
@@ -744,50 +1536,99 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
         except ValueError as exc:
             errors.append(str(exc))
 
-    if equity_result is not None and equity_result.equity is not None and call_amount > 0 and pot_before_call > 0:
-        ev_value = call_ev(equity_result.equity, pot_before_call, call_amount)
+    if (
+        equity_result is not None
+        and equity_result.equity is not None
+        and call_amount > 0
+        and pot_before_call > 0
+    ):
+        ev_value = call_ev(
+            equity_result.equity,
+            pot_before_call,
+            call_amount,
+            rake_rate=rake_rate,
+            rake_cap=modeled_rake_cap,
+        )
+        adjusted_required = required_equity_to_call_after_rake(
+            call_amount, pot_before_call, rake_rate, modeled_rake_cap
+        )
         math_facts["call_ev"] = round(ev_value, 3)
-        call_metrics.append(("Call EV (approx)", f"{ev_value:+.2f}", "assumes no future betting"))
+        call_metrics.append(
+            (
+                "Equity edge",
+                f"{(equity_result.equity - adjusted_required) * 100:+.1f} pp",
+                "Equity minus the after-rake break-even threshold.",
+            )
+        )
+        call_metrics.append(
+            ("Call EV", f"{ev_value:+.2f} BB", "Incremental EV; assumes no future betting.")
+        )
 
     fold_frequency = fold_frequency_pct / 100
     if bet_size > 0 and pot_size > 0:
         bluff_value = bluff_ev(fold_frequency, pot_size, bet_size)
+        equity_when_called = equity_when_called_pct / 100
+        semi_value = semi_bluff_ev(
+            fold_frequency, equity_when_called, pot_size, bet_size
+        )
+        needed_folds = semi_bluff_break_even_fold_frequency(
+            equity_when_called, pot_size, bet_size
+        )
         math_facts["bluff_ev"] = round(bluff_value, 3)
-        bet_metrics.append(
-            ("Bluff EV (approx)", f"{bluff_value:+.2f}", f"at {fold_frequency_pct}% folds, zero equity when called")
+        math_facts["semi_bluff_ev"] = round(semi_value, 3)
+        bet_metrics.extend(
+            [
+                (
+                    "Pure-bluff EV",
+                    f"{bluff_value:+.2f} BB",
+                    f"At {fold_frequency_pct}% folds, zero equity when called.",
+                ),
+                (
+                    "Semi-bluff EV",
+                    f"{semi_value:+.2f} BB",
+                    f"At {equity_when_called_pct}% equity when called.",
+                ),
+                (
+                    "Folds needed",
+                    format_percentage(needed_folds),
+                    "Break-even semi-bluff fold frequency.",
+                ),
+            ]
         )
 
     if call_metrics or bet_metrics:
         st.markdown("##### Calling Math")
         if call_metrics:
-            for column, (metric_label, value, help_text) in zip(st.columns(max(len(call_metrics), 3)), call_metrics):
-                column.metric(metric_label, value, help=help_text)
+            _render_metric_rows(call_metrics)
         else:
             st.caption("Enter a pot and call amount to see calling math.")
         st.markdown("##### Betting Math")
         if bet_metrics:
-            for column, (metric_label, value, help_text) in zip(st.columns(max(len(bet_metrics), 3)), bet_metrics):
-                column.metric(metric_label, value, help=help_text)
+            _render_metric_rows(bet_metrics)
         else:
             st.caption("Enter a pot and bet size to see betting math.")
     if equity_result is not None:
         st.caption(equity_result.notes)
+    st.caption(
+        "Equilibrium metrics are heads-up, one-street baselines. Full GTO strategy "
+        "requires the exact game tree, positions, ranges, stack depth, rake, and allowed sizes."
+    )
 
     for error in errors:
         st.error(error)
 
-    st.markdown("##### Study Tools")
-    realization_tab, multiway_tab, outs_tab, icm_tab = st.tabs(
-        ["Equity Realization", "Multiway Equity", "Outs & Draws", "Tournament ICM"]
-    )
-    with realization_tab:
-        show_equity_realization_tool(equity_result)
-    with multiway_tab:
-        show_multiway_equity_tool(hand, range_label, range_display)
-    with outs_tab:
-        show_outs_tool()
-    with icm_tab:
-        show_icm_tool()
+    with st.expander("Advanced study models", expanded=False):
+        realization_tab, multiway_tab, outs_tab, icm_tab = st.tabs(
+            ["Realization heuristic", "Multiway equity", "Outs", "Tournament ICM"]
+        )
+        with realization_tab:
+            show_equity_realization_tool(equity_result)
+        with multiway_tab:
+            show_multiway_equity_tool(hand, range_label, range_display)
+        with outs_tab:
+            show_outs_tool()
+        with icm_tab:
+            show_icm_tool()
 
     prompt = build_hand_review_prompt(
         session,
@@ -815,6 +1656,20 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
 
     with st.expander("Structured future-LLM prompt"):
         st.code(prompt, language="text")
+
+
+def _render_metric_rows(
+    metrics: list[tuple[str, str, str | None]],
+    *,
+    per_row: int = 4,
+) -> None:
+    """Render compact metric rows without dropping or compressing values."""
+    for start in range(0, len(metrics), per_row):
+        batch = metrics[start : start + per_row]
+        for column, (label, value, help_text) in zip(
+            st.columns(len(batch)), batch, strict=True
+        ):
+            column.metric(label, value, help=help_text)
 
 
 def show_equity_realization_tool(equity_result) -> None:
@@ -850,13 +1705,15 @@ def show_multiway_equity_tool(hand: Hand, range_label: str, range_display: str) 
         "Villain 2 range", value="standard", help="A range label or standard notation."
     )
     third = st.text_input("Villain 3 range (optional)", value="")
-    villain_ranges = [range_label, second.strip(), *( [third.strip()] if third.strip() else [] )]
+    villain_ranges = [range_label, second.strip(), *([third.strip()] if third.strip() else [])]
     if not second.strip():
         st.info("Enter a Villain 2 range to compute multiway equity.")
         return
     try:
         with st.spinner("Computing multiway pot share..."):
-            result = _cached_multiway_equity(hand.hero_cards, hand.board_cards, tuple(villain_ranges))
+            result = _cached_multiway_equity(
+                hand.hero_cards, hand.board_cards, tuple(villain_ranges)
+            )
     except ValueError as exc:
         st.error(str(exc))
         return
@@ -874,7 +1731,11 @@ def show_multiway_equity_tool(hand: Hand, range_label: str, range_display: str) 
             min(1.0, result.equity + 1.96 * result.std_error),
         )
         help_text += f" 95% CI: {format_percentage(low)}–{format_percentage(high)}."
-    share_col.metric(f"Hero pot share ({len(villain_ranges) + 1}-way)", format_percentage(result.equity), help=help_text)
+    share_col.metric(
+        f"Hero pot share ({len(villain_ranges) + 1}-way)",
+        format_percentage(result.equity),
+        help=help_text,
+    )
     fair_col.metric(
         "Fair share",
         format_percentage(1 / (len(villain_ranges) + 1)),
@@ -930,16 +1791,22 @@ def show_icm_tool() -> None:
                 "ICM equity": f"{equity:.2f}",
                 "Prize share": format_percentage(equity / sum(payouts)),
             }
-            for index, (stack, equity) in enumerate(zip(stacks, equities))
+            for index, (stack, equity) in enumerate(zip(stacks, equities, strict=True))
         ],
         hide_index=True,
         width="stretch",
     )
     hero_col, risk_col = st.columns(2)
-    hero_seat = hero_col.number_input("Hero player #", min_value=1, max_value=len(stacks), value=1, step=1)
+    hero_seat = hero_col.number_input(
+        "Hero player #", min_value=1, max_value=len(stacks), value=1, step=1
+    )
     max_risk = stacks[int(hero_seat) - 1]
     risk_amount = risk_col.number_input(
-        "Chips at risk", min_value=0.0, max_value=float(max_risk), value=min(1000.0, max_risk / 2), step=100.0
+        "Chips at risk",
+        min_value=0.0,
+        max_value=float(max_risk),
+        value=min(1000.0, max_risk / 2),
+        step=100.0,
     )
     if risk_amount > 0 and risk_amount < max_risk:
         premium = icm_risk_premium(stacks, payouts, int(hero_seat) - 1, risk_amount)
@@ -974,7 +1841,9 @@ def show_coach_review(db: PokerDatabase, session: Session) -> None:
     # get_provider_from_env falls back to Mock when the selected provider's key is absent.
     if provider_key in {"anthropic", "cloud"} and provider.provider_name == "mock":
         key_name = "ANTHROPIC_API_KEY" if provider_key == "anthropic" else "OPENAI_API_KEY"
-        st.warning(f"{provider_choice} selected but no {key_name} is configured. Falling back to Mock.")
+        st.warning(
+            f"{provider_choice} selected but no {key_name} is configured. Falling back to Mock."
+        )
     st.write({"Active provider": provider.provider_name, "Model": provider.model_name})
 
     coaching_mode = st.selectbox("Coaching mode", COACHING_MODES)
@@ -1165,8 +2034,13 @@ def _optional_prompt_math_facts(
 
 
 def show_video_processing(db: PokerDatabase, session: Session) -> None:
-    st.subheader("Completed Session Video Processing")
-    st.caption("Upload completed session videos only. This does not capture or analyze live tables.")
+    workflow_step(
+        1,
+        "Upload completed-session video",
+        "Store a finished recording locally for offline reconstruction.",
+        state="active",
+    )
+    st.caption("This workflow never captures or analyzes a live table.")
     ensure_data_directories()
 
     uploaded = st.file_uploader("Upload completed session video", type=["mp4", "mov", "mkv", "avi"])
@@ -1199,14 +2073,20 @@ def show_video_processing(db: PokerDatabase, session: Session) -> None:
         except ValueError as exc:
             st.error(str(exc))
 
-    st.markdown("#### Stored Videos")
+    workflow_step(
+        2,
+        "Validate the source",
+        "Confirm file metadata and choose the recording to reconstruct.",
+    )
     filter_to_session = st.checkbox(
         f"Show only videos linked to this session (#{session.id})",
         value=False,
         key="video_filter_session",
         disabled=session.id is None,
     )
-    all_videos = db.fetch_videos(session.id if (filter_to_session and session.id is not None) else None)
+    all_videos = db.fetch_videos(
+        session.id if (filter_to_session and session.id is not None) else None
+    )
     if not all_videos:
         if filter_to_session:
             st.info("No videos are linked to the selected session yet.")
@@ -1233,24 +2113,99 @@ def show_video_processing(db: PokerDatabase, session: Session) -> None:
 
 
 def show_video_metadata(video: VideoRecord) -> None:
-    st.write(
-        {
-            "Original filename": video.original_filename,
-            "Stored path": video.stored_path,
-            "Size": _format_bytes(video.file_size_bytes),
-            "Duration": _format_optional_seconds(video.duration_seconds),
-            "FPS": video.fps,
-            "Resolution": _format_resolution(video.width, video.height),
-            "Frame count": video.frame_count,
-            "Uploaded": video.uploaded_at.isoformat(),
-            "Notes": video.notes,
-        }
-    )
+    metadata = st.columns(4)
+    metadata[0].metric("Duration", _format_optional_seconds(video.duration_seconds))
+    metadata[1].metric("Resolution", _format_resolution(video.width, video.height))
+    metadata[2].metric("Frame rate", "—" if video.fps is None else f"{video.fps:g} FPS")
+    metadata[3].metric("File size", _format_bytes(video.file_size_bytes))
+    st.caption(f"{video.original_filename} · uploaded {video.uploaded_at.isoformat()}")
+    with st.expander("Source provenance"):
+        st.code(video.stored_path, language="text")
+        st.write(video.notes or "No source notes recorded.")
 
 
 def show_video_jobs_and_frames(db: PokerDatabase, video: VideoRecord) -> None:
     if video.id is None:
         return
+
+    show_cv_reconstruction(db, video)
+    with st.expander("Advanced diagnostics · legacy frame extraction"):
+        show_legacy_frame_extraction(db, video)
+
+
+def show_cv_reconstruction(db: PokerDatabase, video: VideoRecord) -> None:
+    """Render the non-blocking reconstruction launch and current job state."""
+    if video.id is None:
+        return
+    workflow_step(
+        3,
+        "Reconstruct completed hands",
+        "Run the offline CV pipeline and import auditable draft hands.",
+        state="active",
+    )
+    linked_session = db.fetch_session(video.session_id) if video.session_id is not None else None
+    default_name = linked_session.name if linked_session else Path(video.original_filename).stem
+    session_name = st.text_input(
+        "Imported session name",
+        value=f"{default_name} · reconstructed",
+        key=f"cv_session_name_{video.id}",
+        help="Reconstructed hands are imported into a new review session so the source remains auditable.",
+    )
+    latest_jobs = [
+        job for job in db.fetch_jobs_by_video(video.id) if job.job_type == "cv_reconstruction"
+    ]
+    active = next((job for job in latest_jobs if job.status in {"queued", "running"}), None)
+    if st.button(
+        "Run CV reconstruction",
+        type="primary",
+        disabled=active is not None,
+        key=f"cv_start_{video.id}",
+    ):
+        try:
+            started = start_cv_job(db, video.id, video.stored_path, session_name)
+            flash(f"Reconstruction job #{started.id} started.")
+            st.rerun()
+        except (CVJobAlreadyRunningError, ValueError, RuntimeError) as exc:
+            st.error(str(exc))
+
+    latest_jobs = [
+        job for job in db.fetch_jobs_by_video(video.id) if job.job_type == "cv_reconstruction"
+    ]
+    if latest_jobs:
+        latest = latest_jobs[0]
+        st.progress(
+            latest.progress_percent / 100, text=f"{latest.status.title()} · {latest.message}"
+        )
+        status_cols = st.columns(4)
+        status_cols[0].metric("Status", latest.status.replace("_", " ").title())
+        status_cols[1].metric("Progress", f"{latest.progress_percent:.0f}%")
+        status_cols[2].metric("Job", f"#{latest.id}")
+        heartbeat = latest.heartbeat_at or latest.started_at
+        status_cols[3].metric(
+            "Heartbeat", heartbeat.strftime("%H:%M:%S UTC") if heartbeat else "Waiting"
+        )
+        if latest.error_message:
+            st.error(latest.error_message)
+        if st.button("Refresh status", key=f"cv_refresh_{video.id}"):
+            st.rerun()
+        if latest.status == "completed":
+            st.success("Reconstruction is complete. Open Hands or Study from the left rail.")
+    else:
+        st.caption("No reconstruction has been run for this source video.")
+
+    workflow_step(
+        4,
+        "Review imported hands",
+        "Open the generated drafts in Study and verify their source evidence.",
+        state="complete" if latest_jobs and latest_jobs[0].status == "completed" else "pending",
+    )
+    st.caption(
+        "Completed jobs create needs-correction drafts with source confidence and provenance."
+    )
+
+
+def show_legacy_frame_extraction(db: PokerDatabase, video: VideoRecord) -> None:
+    """Keep the original diagnostic frame tool available without dominating Import."""
 
     st.markdown("#### Frame Extraction")
     settings_left, settings_right = st.columns(2)
@@ -1299,8 +2254,7 @@ def show_video_jobs_and_frames(db: PokerDatabase, video: VideoRecord) -> None:
             if summary.errors:
                 flash(
                     f"Extracted {summary.frames_extracted} frames with "
-                    f"{len(summary.errors)} warnings: {'; '.join(summary.errors)}",
-                    icon="⚠️",
+                    f"{len(summary.errors)} warnings: {'; '.join(summary.errors)}"
                 )
             else:
                 flash(f"Extracted {summary.frames_extracted} frames to {summary.output_dir}.")
@@ -1334,7 +2288,9 @@ def show_video_jobs_and_frames(db: PokerDatabase, video: VideoRecord) -> None:
         "Confirm delete extracted frames for this video",
         key=f"delete_frames_confirm_{video.id}",
     )
-    if st.button("Delete extracted frames", key=f"delete_frames_{video.id}", disabled=not confirm_delete):
+    if st.button(
+        "Delete extracted frames", key=f"delete_frames_{video.id}", disabled=not confirm_delete
+    ):
         deleted = delete_extracted_frames(db, video.id)
         flash(f"Deleted {deleted} extracted frame records/files.")
         st.rerun()
@@ -1353,7 +2309,7 @@ def show_video_jobs_and_frames(db: PokerDatabase, video: VideoRecord) -> None:
             delete_extracted_frames(db, video.id)  # frame files first; rows would cascade anyway
             db.delete_video(video.id)
             Path(video.stored_path).unlink(missing_ok=True)
-            flash(f"Deleted video {video.original_filename}.", icon="🗑️")
+            flash(f"Deleted video {video.original_filename}.")
             st.rerun()
 
 
@@ -1441,7 +2397,13 @@ def show_roi_calibration(db: PokerDatabase) -> None:
     _safe_image(frame.image_path, caption=f"Calibration frame at {frame.timestamp_seconds:.2f}s")
     try:
         frame_width, frame_height = image_dimensions(frame.image_path)
-        st.write({"Frame width": frame_width, "Frame height": frame_height, "Frame path": frame.image_path})
+        st.write(
+            {
+                "Frame width": frame_width,
+                "Frame height": frame_height,
+                "Frame path": frame.image_path,
+            }
+        )
     except ValueError as exc:
         st.error(str(exc))
         return
@@ -1491,9 +2453,11 @@ def show_roi_calibration(db: PokerDatabase) -> None:
             "I understand this permanently deletes the profile and its regions.",
             key=f"confirm_delete_profile_{profile.id}",
         )
-        if st.button("Delete profile", key=f"roi_delete_{profile.id}", disabled=not confirm_profile):
+        if st.button(
+            "Delete profile", key=f"roi_delete_{profile.id}", disabled=not confirm_profile
+        ):
             db.delete_roi_profile(profile.id)
-            flash(f"Deleted ROI profile '{profile.name}'.", icon="🗑️")
+            flash(f"Deleted ROI profile '{profile.name}'.")
             st.rerun()
 
     show_roi_import_export(db, profile)
@@ -1532,7 +2496,9 @@ def show_roi_profile_tools(
     with right:
         st.markdown("##### Starter preset")
         st.caption("Creates editable placeholder regions for common ClubWPT Gold table elements.")
-        seats = st.number_input("Seats", min_value=6, max_value=9, value=9, step=1, key="roi_preset_seats")
+        seats = st.number_input(
+            "Seats", min_value=6, max_value=9, value=9, step=1, key="roi_preset_seats"
+        )
         if st.button("Create ClubWPT Gold starter preset"):
             create_starter_clubwpt_profile(
                 db,
@@ -1593,8 +2559,12 @@ def show_add_roi_region_form(
             y = st.number_input("Y", min_value=0, value=0, step=1)
             width = st.number_input("Width", min_value=1, value=40, step=1)
             height = st.number_input("Height", min_value=1, value=40, step=1)
-            seat_index = st.number_input("Seat index (0 = none)", min_value=0, max_value=10, value=0, step=1)
-            card_index = st.number_input("Card index (0 = none)", min_value=0, max_value=5, value=0, step=1)
+            seat_index = st.number_input(
+                "Seat index (0 = none)", min_value=0, max_value=10, value=0, step=1
+            )
+            card_index = st.number_input(
+                "Card index (0 = none)", min_value=0, max_value=5, value=0, step=1
+            )
         submitted = st.form_submit_button("Add region")
     if submitted:
         try:
@@ -1616,7 +2586,9 @@ def show_add_roi_region_form(
             flash("ROI region added.")
             st.rerun()
         except sqlite3.IntegrityError:
-            st.error(f"An ROI region with the key '{roi_key.strip()}' already exists in this profile.")
+            st.error(
+                f"An ROI region with the key '{roi_key.strip()}' already exists in this profile."
+            )
         except (ValueError, ValidationError) as exc:
             st.error(f"Could not add ROI region: {exc}")
 
@@ -1683,7 +2655,9 @@ def show_edit_roi_region_form(
             roi_type = st.selectbox(
                 "ROI type",
                 ROI_TYPES,
-                index=ROI_TYPES.index(region.roi_type) if region.roi_type in ROI_TYPES else ROI_TYPES.index("unknown"),
+                index=ROI_TYPES.index(region.roi_type)
+                if region.roi_type in ROI_TYPES
+                else ROI_TYPES.index("unknown"),
             )
             label = st.text_input("Label", value=region.label)
             notes = st.text_area("Notes", value=region.notes, height=70)
@@ -1694,8 +2668,12 @@ def show_edit_roi_region_form(
             height = st.number_input("Height", min_value=1, value=region.height, step=1)
             seat_value = region.seat_index or 0
             card_value = region.card_index or 0
-            seat_index = st.number_input("Seat index (0 = none)", min_value=0, max_value=10, value=seat_value, step=1)
-            card_index = st.number_input("Card index (0 = none)", min_value=0, max_value=5, value=card_value, step=1)
+            seat_index = st.number_input(
+                "Seat index (0 = none)", min_value=0, max_value=10, value=seat_value, step=1
+            )
+            card_index = st.number_input(
+                "Card index (0 = none)", min_value=0, max_value=5, value=card_value, step=1
+            )
         update, preview, delete = st.columns(3)
         submitted_update = update.form_submit_button("Update")
         submitted_preview = preview.form_submit_button("Preview crop")
@@ -1728,7 +2706,9 @@ def show_edit_roi_region_form(
             flash("ROI region updated.")
             st.rerun()
         except sqlite3.IntegrityError:
-            st.error(f"An ROI region with the key '{roi_key.strip()}' already exists in this profile.")
+            st.error(
+                f"An ROI region with the key '{roi_key.strip()}' already exists in this profile."
+            )
         except (ValueError, ValidationError) as exc:
             st.error(f"Could not update ROI region: {exc}")
     if submitted_preview:

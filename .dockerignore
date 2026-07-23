@@ -1,0 +1,17 @@
+.git
+.pytest_cache
+__pycache__
+*.py[cod]
+*.db
+.env
+.venv
+data/*
+!data/.gitkeep
+cv_lab/results
+cv_lab/runs
+cv_lab/datasets
+cv_lab/labeling_poker/data
+.mpl_config
+.yolo_config
+yolo11s.pt
+yolo11s-cls.pt

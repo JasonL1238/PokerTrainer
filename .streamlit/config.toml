@@ -1,10 +1,10 @@
 [theme]
 base = "dark"
-# Flat, professional dark navy — GTO-tool style without heavy gradients.
-primaryColor = "#7C5CFA"
-backgroundColor = "#0E1220"
-secondaryBackgroundColor = "#161C2E"
-textColor = "#E8EAF2"
+# PokerTrainer product palette: near-black felt, graphite surfaces, emerald action.
+primaryColor = "#35D07F"
+backgroundColor = "#080B0A"
+secondaryBackgroundColor = "#0D1311"
+textColor = "#F1F3ED"
 font = "sans serif"
 
 [server]

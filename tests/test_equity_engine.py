@@ -8,10 +8,10 @@ run unconditionally; the import is guarded only to skip cleanly if it is absent.
 import pytest
 
 from poker_tracker.math.equity import (
-    Eval7EquityCalculator,
-    EquityResult,
-    PlaceholderEquityCalculator,
     _HAS_EVAL7,
+    EquityResult,
+    Eval7EquityCalculator,
+    PlaceholderEquityCalculator,
     get_equity_calculator,
 )
 
@@ -131,12 +131,16 @@ def test_monte_carlo_reports_standard_error():
     assert result.method == "monte_carlo"
     assert result.std_error is not None
     assert 0 < result.std_error < 0.01
+    assert result.samples == 20_000
+    assert result.valid_combos is not None
 
 
 def test_enumeration_has_no_standard_error():
     result = _eq("Ah Kh", "Qh Jh Th", "premium")
     assert result.method == "enumeration"
     assert result.std_error is None
+    assert result.samples is None
+    assert result.valid_combos is not None
 
 
 def test_multiway_equity_pot_share():
@@ -146,6 +150,20 @@ def test_multiway_equity_pot_share():
     # Top set vs two dominated pairs should hold nearly the whole pot.
     assert result.equity == pytest.approx(0.997, abs=0.005)
     assert result.std_error is not None
+    assert result.samples == 20_000
+    assert result.valid_combos == 12
+
+
+def test_weighted_range_sampling_respects_frequency_weights():
+    calc = Eval7EquityCalculator(iterations=60_000)
+    weighted = calc.calculate_equity("As Ah", "", "10%(KK),QQ")
+    qq_only = calc.calculate_equity("As Ah", "", "QQ")
+    kk_only = calc.calculate_equity("As Ah", "", "KK")
+    assert weighted.equity is not None
+    assert qq_only.equity is not None
+    assert kk_only.equity is not None
+    # The 10%-weighted KK component should keep the result much closer to QQ.
+    assert abs(weighted.equity - qq_only.equity) < abs(weighted.equity - kk_only.equity)
 
 
 def test_multiway_equity_is_reproducible_and_below_heads_up():

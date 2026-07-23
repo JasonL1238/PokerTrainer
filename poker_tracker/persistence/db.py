@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import json
+import os
 import threading
 from contextlib import contextmanager
 from datetime import date, datetime
@@ -26,8 +27,11 @@ from poker_tracker.ui.roi import validate_roi_bounds
 
 # Anchored to the project root so launching from another directory does not
 # silently create a second, empty database.
-DEFAULT_DB_PATH = str(Path(__file__).resolve().parent.parent.parent / "poker_tracker.db")
-SCHEMA_VERSION = 5
+DEFAULT_DB_PATH = os.environ.get(
+    "POKER_DB_PATH",
+    str(Path(__file__).resolve().parent.parent.parent / "poker_tracker.db"),
+)
+SCHEMA_VERSION = 6
 
 
 class PokerDatabase:
@@ -41,6 +45,8 @@ class PokerDatabase:
         self._connection = sqlite3.connect(self.db_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._execute("PRAGMA foreign_keys = ON")
+        self._execute("PRAGMA journal_mode = WAL")
+        self._execute("PRAGMA synchronous = NORMAL")
 
     def close(self) -> None:
         with self._lock:
@@ -227,6 +233,8 @@ class PokerDatabase:
                 progress_percent REAL NOT NULL DEFAULT 0,
                 message TEXT NOT NULL DEFAULT '',
                 error_message TEXT NOT NULL DEFAULT '',
+                pid INTEGER,
+                heartbeat_at TEXT,
                 created_at TEXT NOT NULL,
                 started_at TEXT,
                 completed_at TEXT,
@@ -529,6 +537,13 @@ class PokerDatabase:
         ).fetchall()
         return [_hand_from_row(row) for row in rows]
 
+    def fetch_all_hands(self) -> list[Hand]:
+        """Return all hands for portfolio-level browsing and insights."""
+        rows = self._execute(
+            "SELECT * FROM hands ORDER BY created_at DESC, id DESC"
+        ).fetchall()
+        return [_hand_from_row(row) for row in rows]
+
     def fetch_session(self, session_id: int) -> Session | None:
         row = self._execute(
             "SELECT * FROM sessions WHERE id = ?", (session_id,)
@@ -699,9 +714,9 @@ class PokerDatabase:
             """
             INSERT INTO processing_jobs (
                 job_type, status, video_id, progress_percent, message, error_message,
-                created_at, started_at, completed_at
+                pid, heartbeat_at, created_at, started_at, completed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload["job_type"],
@@ -710,6 +725,8 @@ class PokerDatabase:
                 payload["progress_percent"],
                 payload["message"],
                 payload["error_message"],
+                payload["pid"],
+                _serialize_optional_datetime(payload["heartbeat_at"]),
                 _serialize_datetime(payload["created_at"]),
                 _serialize_optional_datetime(payload["started_at"]),
                 _serialize_optional_datetime(payload["completed_at"]),
@@ -726,6 +743,8 @@ class PokerDatabase:
         progress_percent: float | None = None,
         message: str | None = None,
         error_message: str | None = None,
+        pid: int | None = None,
+        heartbeat_at: datetime | None = None,
         started_at: datetime | None = None,
         completed_at: datetime | None = None,
     ) -> None:
@@ -736,7 +755,7 @@ class PokerDatabase:
             """
             UPDATE processing_jobs
             SET status = ?, progress_percent = ?, message = ?, error_message = ?,
-                started_at = ?, completed_at = ?
+                pid = ?, heartbeat_at = ?, started_at = ?, completed_at = ?
             WHERE id = ?
             """,
             (
@@ -744,6 +763,10 @@ class PokerDatabase:
                 current.progress_percent if progress_percent is None else progress_percent,
                 current.message if message is None else message,
                 current.error_message if error_message is None else error_message,
+                current.pid if pid is None else pid,
+                _serialize_optional_datetime(
+                    heartbeat_at if heartbeat_at is not None else current.heartbeat_at
+                ),
                 _serialize_optional_datetime(started_at if started_at is not None else current.started_at),
                 _serialize_optional_datetime(
                     completed_at if completed_at is not None else current.completed_at
@@ -770,6 +793,19 @@ class PokerDatabase:
         rows = self._execute(
             "SELECT * FROM processing_jobs ORDER BY created_at DESC, id DESC LIMIT ?",
             (limit,),
+        ).fetchall()
+        return [_processing_job_from_row(row) for row in rows]
+
+    def fetch_running_jobs(self) -> list[ProcessingJob]:
+        rows = self._execute(
+            "SELECT * FROM processing_jobs WHERE status = 'running' ORDER BY created_at, id"
+        ).fetchall()
+        return [_processing_job_from_row(row) for row in rows]
+
+    def fetch_active_jobs(self) -> list[ProcessingJob]:
+        rows = self._execute(
+            "SELECT * FROM processing_jobs WHERE status IN ('queued', 'running') "
+            "ORDER BY created_at, id"
         ).fetchall()
         return [_processing_job_from_row(row) for row in rows]
 
@@ -1010,10 +1046,13 @@ class PokerDatabase:
         self._commit()
 
 
-# Versioned migrations for schema changes beyond v5. Register the next change as
-# _MIGRATIONS[6] = _migrate_to_v6 and bump SCHEMA_VERSION; init_db() applies them
-# in order and refuses to open databases written by a newer app.
-_MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {}
+def _migrate_to_v6(db: PokerDatabase) -> None:
+    db._ensure_column("processing_jobs", "pid", "INTEGER")
+    db._ensure_column("processing_jobs", "heartbeat_at", "TEXT")
+
+
+# Versioned migrations run in order and refuse databases written by newer apps.
+_MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {6: _migrate_to_v6}
 
 
 def _serialize_date(value: date) -> str:
@@ -1096,6 +1135,7 @@ def _processing_job_from_row(row: sqlite3.Row) -> ProcessingJob:
     data["created_at"] = _parse_datetime(data["created_at"])
     data["started_at"] = _parse_optional_datetime(data["started_at"])
     data["completed_at"] = _parse_optional_datetime(data["completed_at"])
+    data["heartbeat_at"] = _parse_optional_datetime(data.get("heartbeat_at"))
     return ProcessingJob(**data)
 
 

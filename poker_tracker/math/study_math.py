@@ -78,6 +78,20 @@ def bluff_to_value_ratio(bet_size: float, pot_size: float) -> float:
     return bet_size / (pot_size + bet_size)
 
 
+def geometric_bet_fraction(spr: float, streets_remaining: int) -> float:
+    """Return the equal pot-fraction bet that gets stacks in by the river.
+
+    Assumes heads-up play, no rake, a bet and call on every remaining street,
+    and the same fraction of the start-of-street pot each time. For ``n``
+    streets and SPR ``s``: ``((1 + 2s) ** (1/n) - 1) / 2``.
+    """
+    if spr < 0:
+        raise ValueError("spr must not be negative.")
+    if streets_remaining not in (1, 2, 3):
+        raise ValueError("streets_remaining must be 1, 2, or 3.")
+    return ((1 + 2 * spr) ** (1 / streets_remaining) - 1) / 2
+
+
 def realized_equity(raw_equity: float, realization_factor: float) -> float:
     """Estimate realized equity: raw_equity * realization_factor.
 

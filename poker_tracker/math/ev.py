@@ -1,19 +1,32 @@
 from __future__ import annotations
 
+from poker_tracker.math.pot_odds import rake_amount
 
-def call_ev(equity: float, pot_before_call: float, call_amount: float) -> float:
+
+def call_ev(
+    equity: float,
+    pot_before_call: float,
+    call_amount: float,
+    *,
+    rake_rate: float = 0.0,
+    rake_cap: float | None = None,
+) -> float:
     """Approximate EV of calling.
 
     Assumes no future betting. `pot_before_call` is the pot Hero is facing,
     including the bet to be called. Winning nets the pot; losing costs the call.
-    Formula: equity * pot_before_call - (1 - equity) * call_amount.
+    Without rake, the formula is
+    ``equity * pot_before_call - (1 - equity) * call_amount``. With rake, the
+    equivalent return form is ``equity * net_final_pot - call_amount``.
     This is consistent with `required_equity_to_call`: EV is exactly 0 at the
     break-even equity call/(pot+call).
     """
     _require_probability(equity, "equity")
     _require_positive(pot_before_call, "pot_before_call")
     _require_positive(call_amount, "call_amount")
-    return equity * pot_before_call - (1 - equity) * call_amount
+    gross_final_pot = pot_before_call + call_amount
+    net_final_pot = gross_final_pot - rake_amount(gross_final_pot, rake_rate, rake_cap)
+    return equity * net_final_pot - call_amount
 
 
 def bluff_ev(fold_frequency: float, pot_size: float, bet_size: float) -> float:
@@ -46,6 +59,23 @@ def semi_bluff_ev(
     _require_positive(bet_size, "bet_size")
     called_ev = equity_when_called * (pot_size + bet_size) - (1 - equity_when_called) * bet_size
     return fold_frequency * pot_size + (1 - fold_frequency) * called_ev
+
+
+def semi_bluff_break_even_fold_frequency(
+    equity_when_called: float,
+    pot_size: float,
+    bet_size: float,
+) -> float:
+    """Return folds needed for a one-street bet to break even."""
+    _require_probability(equity_when_called, "equity_when_called")
+    _require_positive(pot_size, "pot_size")
+    _require_positive(bet_size, "bet_size")
+    called_ev = equity_when_called * (pot_size + bet_size) - (
+        1 - equity_when_called
+    ) * bet_size
+    if called_ev >= 0:
+        return 0.0
+    return -called_ev / (pot_size - called_ev)
 
 
 def _require_probability(value: float, name: str) -> None:

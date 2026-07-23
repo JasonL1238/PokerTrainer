@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 import uuid
+import os
 from pathlib import Path
 from typing import BinaryIO
 
@@ -10,11 +11,14 @@ from typing import BinaryIO
 # Anchored to the project root so the app behaves the same regardless of the
 # working directory it is launched from.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR = Path(os.environ.get("POKER_DATA_DIR", PROJECT_ROOT / "data"))
 VIDEOS_DIR = DATA_DIR / "videos"
 FRAMES_DIR = DATA_DIR / "frames"
 EXPORTS_DIR = DATA_DIR / "exports"
 ROI_PREVIEWS_DIR = DATA_DIR / "roi_previews"
+CV_TIMELINES_DIR = DATA_DIR / "cv_timelines"
+BACKUPS_DIR = DATA_DIR / "backups"
+JOB_LOGS_DIR = DATA_DIR / "job_logs"
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi"}
 
 
@@ -24,7 +28,10 @@ def ensure_data_directories(base_dir: Path = DATA_DIR) -> dict[str, Path]:
     frames = base_dir / "frames"
     exports = base_dir / "exports"
     roi_previews = base_dir / "roi_previews"
-    for path in (base_dir, videos, frames, exports, roi_previews):
+    cv_timelines = base_dir / "cv_timelines"
+    backups = base_dir / "backups"
+    job_logs = base_dir / "job_logs"
+    for path in (base_dir, videos, frames, exports, roi_previews, cv_timelines, backups, job_logs):
         path.mkdir(parents=True, exist_ok=True)
     return {
         "data": base_dir,
@@ -32,6 +39,9 @@ def ensure_data_directories(base_dir: Path = DATA_DIR) -> dict[str, Path]:
         "frames": frames,
         "exports": exports,
         "roi_previews": roi_previews,
+        "cv_timelines": cv_timelines,
+        "backups": backups,
+        "job_logs": job_logs,
     }
 
 

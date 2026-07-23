@@ -1,8 +1,12 @@
 __pycache__/
 .pytest_cache/
 .venv/
+.env
+deploy/oci/.env
 *.pyc
 poker_tracker.db
+poker_tracker.db-*
+artifacts/ui-review/
 
 # Tool caches / local config
 .mpl_config/

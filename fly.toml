@@ -1,0 +1,35 @@
+app = "pokertrainer-personal"
+primary_region = "ord"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8501"
+  POKER_DB_PATH = "/data/poker_tracker.db"
+  POKER_DATA_DIR = "/data"
+  POKERTRAINER_REQUIRE_AUTH = "true"
+  YOLO_CONFIG_DIR = "/data/.ultralytics"
+
+[[mounts]]
+  source = "pokertrainer_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8501
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "60s"
+    method = "GET"
+    path = "/_stcore/health"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "4gb"
+  cpus = 2
