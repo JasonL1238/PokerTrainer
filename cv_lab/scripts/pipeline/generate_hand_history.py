@@ -28,7 +28,6 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any
 
 SB = 0.5
 BB = 1.0
@@ -87,7 +86,7 @@ def render_hand(hand: dict, video: str) -> str:
 
     hero = next((p for p in players.values() if p["is_hero"]), None)
     if hero is not None and hand.get("hero"):
-        lines.append(f"*** HOLE CARDS ***")
+        lines.append("*** HOLE CARDS ***")
         lines.append(f"Dealt to Hero [{' '.join(hand['hero'])}]")
 
     board = hand.get("board") or []

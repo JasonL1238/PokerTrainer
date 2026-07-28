@@ -13,7 +13,7 @@ or the duplicate/exclude shortcut to reject a frame's predictions outright.
 Samples on an odd-second grid (1s, 3s, 5s, ...) so it doesn't just re-surface
 the same frames already staged by sweep_and_flag_weak_cards.py's even-second grid.
 
-  python cv_lab/scripts/stage_model1_review_frames.py \
+  python cv_lab/scripts/training/stage_model1_review_frames.py \
       --videos "data/videos/*.mov" --per-video 40 --queue-name model1_review
 """
 from __future__ import annotations

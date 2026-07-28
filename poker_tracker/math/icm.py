@@ -78,5 +78,5 @@ def _validate_stacks_and_payouts(stacks: list[float], payouts: list[float]) -> N
         raise ValueError("payouts must not exceed the number of players.")
     if any(payout < 0 for payout in payouts):
         raise ValueError("payouts must be non-negative.")
-    if any(later > earlier for earlier, later in zip(payouts, payouts[1:])):
+    if any(later > earlier for earlier, later in zip(payouts, payouts[1:], strict=False)):
         raise ValueError("payouts must be non-increasing.")

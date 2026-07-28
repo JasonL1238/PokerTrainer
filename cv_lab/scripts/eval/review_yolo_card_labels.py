@@ -295,7 +295,9 @@ def main() -> None:
     )
 
     st.markdown("### Apply After Review")
-    st.code(f"python cv_lab/scripts/apply_yolo_card_corrections.py --dataset {dataset}")
+    st.code(
+        f"python cv_lab/scripts/training/apply_yolo_card_corrections.py --dataset {dataset}"
+    )
     st.caption(
         f"Missing boxes are logged in {missing_path}. Those need real boxes before they can be used for YOLO training."
     )

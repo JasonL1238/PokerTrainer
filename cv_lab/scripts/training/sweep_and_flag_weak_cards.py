@@ -7,7 +7,7 @@ predicted rank falls in a known-weak set (confirmed confusions like 3<->5,
 the labeling images dir and its file_id written to a labeling_poker priority
 queue, so a human labeler sees it first.
 
-  python cv_lab/scripts/sweep_and_flag_weak_cards.py \
+  python cv_lab/scripts/training/sweep_and_flag_weak_cards.py \
       --videos "data/videos/*.mov" --interval 2.0 --device mps \
       --queue-name cv_weak_cards
 """
@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import glob
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -27,9 +26,19 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from cv_lab.scripts.pipeline.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
-from cv_lab.scripts.pipeline.card_classifier import CardClassifier, DEFAULT_CLS_WEIGHTS  # noqa: E402
-from cv_lab.scripts.pipeline.run_two_model_pipeline import DEFAULT_DETECTOR, _detect_regions  # noqa: E402
+from cv_lab.scripts.pipeline.card_classifier import (  # noqa: E402
+    DEFAULT_CLS_WEIGHTS,
+    CardClassifier,
+)
+from cv_lab.scripts.pipeline.evaluate_yolo_cards import (  # noqa: E402
+    DEFAULT_YOLOV12_VENDOR,
+    _load_yolo_class,
+    _resolve_vendor_path,
+)
+from cv_lab.scripts.pipeline.run_two_model_pipeline import (  # noqa: E402
+    DEFAULT_DETECTOR,
+    _detect_regions,
+)
 
 DEFAULT_IMAGES_DIR = REPO_ROOT / "cv_lab" / "datasets" / "yolo_cards_autolabel_v1" / "images"
 DEFAULT_PRIORITY_DIR = REPO_ROOT / "cv_lab" / "labeling_poker" / "priority"
@@ -364,7 +373,7 @@ def main() -> None:
     queue_path.write_text("\n".join(merged_ids) + ("\n" if merged_ids else ""), encoding="utf-8")
 
     n_weak = sum(1 for f in all_flagged if f["n_weak_rank"] > 0)
-    print(f"\n=== SUMMARY ===")
+    print("\n=== SUMMARY ===")
     print(f"videos swept: {len(videos)}")
     print(f"frames flagged this run: {len(all_flagged)} ({n_weak} contain a weak-rank card)")
     print(f"queue total: {len(merged_ids)}")

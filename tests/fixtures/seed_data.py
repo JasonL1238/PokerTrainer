@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
-from poker_tracker.coaching.review import generate_mock_review
+from tests.fixtures.review import generate_mock_review
 
 
 def create_sample_data(db: PokerDatabase) -> Session:
@@ -204,6 +204,11 @@ def _create_hand(
                 position=position,
                 action_type=action_type,
                 amount=amount,
+                # The compact demo histories intentionally omit forced bets and
+                # some intervening actions.  Their monetary values are useful
+                # display evidence, but are not complete enough for canonical
+                # chip accounting.
+                amount_semantics="unknown",
             )
         )
     if saved_hand.review_status == "reviewed":

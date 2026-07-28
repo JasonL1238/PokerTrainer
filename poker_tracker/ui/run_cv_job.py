@@ -1,25 +1,26 @@
 """Detached worker for completed-session video reconstruction."""
+
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from cv_lab.scripts.pipeline.export_yolo_card_hands_for_app import export_timeline
 from poker_tracker.persistence.db import PokerDatabase
-from poker_tracker.persistence.import_export import import_session
+from poker_tracker.persistence.import_export import import_hands_into_session, import_session
 from poker_tracker.ui.jobs import mark_completed, mark_failed, update_progress
-from poker_tracker.ui.video_storage import BACKUPS_DIR, CV_TIMELINES_DIR, ensure_data_directories
-
+from poker_tracker.ui.video_storage import BACKUPS_DIR, ensure_data_directories
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PIPELINE_SCRIPT = REPO_ROOT / "cv_lab" / "scripts" / "pipeline" / "run_two_model_pipeline.py"
 DEFAULT_TIMEOUT_SECONDS = 60 * 60
-HEARTBEAT_INTERVAL_SECONDS = 20
+HEARTBEAT_INTERVAL_SECONDS = 2
 BACKUP_KEEP_COUNT = 5
 
 
@@ -29,13 +30,16 @@ def run_job(
     video_path: Path,
     session_name: str,
     db_path: Path,
+    target_session_id: int | None = None,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> int:
     db = PokerDatabase(db_path)
     db.init_db()
     paths = ensure_data_directories()
     timeline_path = Path(paths["cv_timelines"]) / f"job_{job_id}_timeline.json"
+    progress_path = timeline_path.with_name(f"job_{job_id}_progress.json")
     export_path = Path(paths["exports"]) / f"job_{job_id}_session.json"
+    frame_root = Path(paths.get("frames", timeline_path.parent / "frames"))
     deadline = time.monotonic() + timeout_seconds
     try:
         if not video_path.is_file():
@@ -58,8 +62,12 @@ def run_job(
             "cpu",
             "--out",
             str(timeline_path),
+            "--frame-dir",
+            str(frame_root / f"cv_job_{job_id}"),
+            "--progress-file",
+            str(progress_path),
         ]
-        _run_pipeline(command, db, job_id, deadline)
+        _run_pipeline(command, db, job_id, deadline, progress_path)
 
         _heartbeat(db, job_id, 82, "Validating reconstructed hands")
         payload = export_timeline(
@@ -71,7 +79,16 @@ def run_job(
         _heartbeat(db, job_id, 92, "Backing up study database")
         backup_path = backup_database(db_path, Path(paths["backups"]))
         _heartbeat(db, job_id, 96, "Importing reconstructed hands")
-        imported = import_session(db, payload)
+        imported = (
+            import_hands_into_session(db, payload, target_session_id)
+            if target_session_id is not None
+            else import_session(db, payload)
+        )
+        job = db.fetch_processing_job(job_id)
+        if job is None:
+            raise RuntimeError("Processing job disappeared before import completed.")
+        if db.fetch_session(imported.id) is not None:
+            db.update_video_session(job.video_id, imported.id)
         exported_count = payload.get("cv_import_summary", {}).get("exported_hands", 0)
         mark_completed(
             db,
@@ -87,6 +104,7 @@ def run_job(
             pass
         return 1
     finally:
+        progress_path.unlink(missing_ok=True)
         db.close()
 
 
@@ -95,27 +113,50 @@ def backup_database(db_path: Path, backup_dir: Path = BACKUPS_DIR) -> Path:
     if str(db_path) == ":memory:":
         raise ValueError("Cannot back up an in-memory database.")
     backup_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     destination = backup_dir / f"poker_tracker_{stamp}.sqlite3"
     with sqlite3.connect(str(db_path)) as source, sqlite3.connect(str(destination)) as target:
         source.backup(target)
-    backups = sorted(backup_dir.glob("poker_tracker_*.sqlite3"), key=lambda path: path.stat().st_mtime, reverse=True)
+    backups = sorted(
+        backup_dir.glob("poker_tracker_*.sqlite3"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
     for old in backups[BACKUP_KEEP_COUNT:]:
         old.unlink(missing_ok=True)
     return destination
 
 
-def _run_pipeline(command: list[str], db: PokerDatabase, job_id: int, deadline: float) -> None:
+def _run_pipeline(
+    command: list[str],
+    db: PokerDatabase,
+    job_id: int,
+    deadline: float,
+    progress_path: Path,
+) -> None:
     process = subprocess.Popen(command, cwd=str(REPO_ROOT))
     last_heartbeat = 0.0
+    last_progress = 8.0
     try:
         while process.poll() is None:
             _check_deadline(deadline)
             now = time.monotonic()
             if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
-                elapsed = max(0, DEFAULT_TIMEOUT_SECONDS - int(deadline - now))
-                estimated = min(78, 8 + elapsed / 60)
-                _heartbeat(db, job_id, estimated, "Reconstructing completed-session video")
+                progress = _read_pipeline_progress(progress_path)
+                if progress is not None:
+                    current, total, stage = progress
+                    if stage == "timeline":
+                        last_progress = 79.0
+                        message = "Building reconstructed hand timeline"
+                    else:
+                        last_progress = max(
+                            last_progress,
+                            min(78.0, 8.0 + (70.0 * current / total)),
+                        )
+                        message = f"Reconstructing video · frame {current}/{total}"
+                else:
+                    message = "Loading models and preparing video"
+                _heartbeat(db, job_id, last_progress, message)
                 last_heartbeat = now
             time.sleep(1)
     except BaseException:
@@ -129,9 +170,21 @@ def _run_pipeline(command: list[str], db: PokerDatabase, job_id: int, deadline: 
         raise RuntimeError(f"Reconstruction pipeline exited with code {process.returncode}.")
 
 
+def _read_pipeline_progress(progress_path: Path) -> tuple[int, int, str] | None:
+    """Read the pipeline's atomic progress snapshot, tolerating startup races."""
+    try:
+        payload = json.loads(progress_path.read_text(encoding="utf-8"))
+        current = max(0, int(payload["current"]))
+        total = max(1, int(payload["total"]))
+        stage = str(payload.get("stage", "frames"))
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+    return min(current, total), total, stage
+
+
 def _heartbeat(db: PokerDatabase, job_id: int, progress: float, message: str) -> None:
     update_progress(db, job_id, progress, message)
-    db.update_processing_job(job_id, heartbeat_at=datetime.now(timezone.utc))
+    db.update_processing_job(job_id, heartbeat_at=datetime.now(UTC))
 
 
 def _check_deadline(deadline: float) -> None:
@@ -145,6 +198,7 @@ def main() -> int:
     parser.add_argument("--video", type=Path, required=True)
     parser.add_argument("--session-name", required=True)
     parser.add_argument("--db", type=Path, required=True)
+    parser.add_argument("--target-session-id", type=int)
     parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     args = parser.parse_args()
     return run_job(
@@ -152,6 +206,7 @@ def main() -> int:
         video_path=args.video,
         session_name=args.session_name,
         db_path=args.db,
+        target_session_id=args.target_session_id,
         timeout_seconds=args.timeout_seconds,
     )
 

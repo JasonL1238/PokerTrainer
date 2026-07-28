@@ -37,7 +37,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirna
 
 from cv_lab.labeling_poker.config import CARD_RANKS, CARD_SUITS, normalize_card_label  # noqa: E402
 from cv_lab.labeling_poker.db import connect, get_annotations, get_status  # noqa: E402
-from cv_lab.scripts.training.build_mixed_card_dataset import _find_image, _parse_names as _parse_names_block  # noqa: E402
+from cv_lab.scripts.training.build_mixed_card_dataset import _find_image  # noqa: E402
+from cv_lab.scripts.training.build_mixed_card_dataset import (  # noqa: E402
+    _parse_names as _parse_names_block,
+)
 
 # 52 canonical classes, matching normalize_card_label's output form.
 CANONICAL_CLASSES = [f"{r}{s}" for r in CARD_RANKS for s in CARD_SUITS]

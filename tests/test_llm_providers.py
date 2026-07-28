@@ -4,49 +4,49 @@ from poker_tracker.coaching.coaching_prompts import (
     build_hand_review_prompt,
     build_session_review_prompt,
 )
-from poker_tracker.math.analytics import compute_session_stats
-from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.coaching.hand_history import format_hand_history
 from poker_tracker.coaching.llm_providers import (
     CloudLLMProvider,
-    MockLLMProvider,
+    LLMProviderError,
     build_coaching_response,
     get_provider_from_env,
     parse_sections,
     provider_config_from_env,
 )
-from poker_tracker.persistence.models import Action, Hand, Session
 from poker_tracker.coaching.safety import ensure_post_session_prompt, validate_post_session_prompt
+from poker_tracker.math.analytics import compute_session_stats
+from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.persistence.models import Action, Hand, Session
+from tests.fixtures.llm_provider import FakeLLMProvider
 
 
-def test_mock_provider_hand_review_generation() -> None:
+def test_fake_provider_hand_review_generation() -> None:
     prompt = _hand_prompt()
-    response = MockLLMProvider().generate_hand_review(prompt)
+    response = FakeLLMProvider().generate_hand_review(prompt)
 
     assert "Hand Summary:" in response
     assert "EV / Math Notes:" in response
     assert "Do not invent equities" in response
 
 
-def test_mock_provider_session_review_generation() -> None:
+def test_fake_provider_session_review_generation() -> None:
     prompt = _session_prompt()
-    response = MockLLMProvider().generate_session_review(prompt)
+    response = FakeLLMProvider().generate_session_review(prompt)
 
     assert "Session Summary:" in response
     assert "Biggest Leaks:" in response
     assert "Next Study Plan:" in response
 
 
-def test_provider_fallback_when_cloud_config_missing(monkeypatch) -> None:
+def test_provider_is_unavailable_when_cloud_config_missing(monkeypatch) -> None:
     monkeypatch.setenv("POKER_TRACKER_LLM_PROVIDER", "openai")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
     config = provider_config_from_env()
-    provider = get_provider_from_env("cloud")
-
-    assert config.provider_name == "mock"
+    assert config.provider_name == "cloud"
     assert config.has_api_key is False
-    assert isinstance(provider, MockLLMProvider)
+    with pytest.raises(LLMProviderError, match="OPENAI_API_KEY"):
+        get_provider_from_env("cloud")
 
 
 def test_cloud_provider_selected_only_when_key_exists(monkeypatch) -> None:
@@ -83,7 +83,7 @@ def test_provider_rejects_unsafe_prompt() -> None:
         ensure_post_session_prompt(unsafe)
 
     with pytest.raises(ValueError):
-        MockLLMProvider().generate_hand_review(unsafe)
+        FakeLLMProvider().generate_hand_review(unsafe)
 
 
 def test_prompt_contains_post_session_constraints_and_no_invention_rule() -> None:
@@ -101,7 +101,7 @@ def test_hand_review_can_be_stored_and_fetched() -> None:
     session = db.create_session(Session(name="LLM test"))
     hand = db.create_hand(Hand(session_id=session.id, hand_number=1, hero_cards="Ah Qs"))
     prompt = build_hand_review_prompt(session, hand, [], [])
-    provider = MockLLMProvider()
+    provider = FakeLLMProvider()
     raw = provider.generate_hand_review(prompt)
 
     saved = db.create_coaching_response(
@@ -117,7 +117,7 @@ def test_hand_review_can_be_stored_and_fetched() -> None:
     fetched = db.fetch_coaching_reviews_by_hand(hand.id)
 
     assert saved.id is not None
-    assert fetched[0].provider_name == "mock"
+    assert fetched[0].provider_name == "test"
     assert fetched[0].parsed_sections["Hand Summary"]
     assert "OPENAI_API_KEY" not in fetched[0].raw_prompt
 
@@ -129,7 +129,7 @@ def test_session_review_can_be_stored_and_fetched() -> None:
     db.init_db()
     session = db.create_session(Session(name="Session review"))
     prompt = build_session_review_prompt(session, compute_session_stats(db, session.id), [])
-    provider = MockLLMProvider()
+    provider = FakeLLMProvider()
     raw = provider.generate_session_review(prompt)
 
     db.create_coaching_response(

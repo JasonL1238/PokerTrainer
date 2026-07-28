@@ -5,13 +5,19 @@ import numpy as np
 import pytest
 
 from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.persistence.models import VideoRecord
 from poker_tracker.ui.frame_extraction import (
     delete_extracted_frames,
     extract_frames_for_video,
     select_representative_frames,
 )
-from poker_tracker.ui.jobs import create_job, mark_completed, mark_failed, mark_running, update_progress
-from poker_tracker.persistence.models import VideoRecord
+from poker_tracker.ui.jobs import (
+    create_job,
+    mark_completed,
+    mark_failed,
+    mark_running,
+    update_progress,
+)
 from poker_tracker.ui.video_metadata import extract_video_metadata
 from poker_tracker.ui.video_storage import (
     ensure_data_directories,

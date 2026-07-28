@@ -18,14 +18,15 @@ Seat order matches landmark_anchor.REF_SEAT_COINS index (0..7).
 from __future__ import annotations
 
 # --- repo-root on sys.path so cv_lab.scripts.* absolute imports resolve ---
-import os as _os, sys as _sys
+import os as _os
+import sys as _sys
+
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))))
 
 import numpy as np
-import cv2
 
-from cv_lab.scripts.pipeline.landmark_anchor import REF_SEAT_COINS, REF_POT_COIN
-from cv_lab.scripts.pipeline.read_pot import glyph_boxes, _norm_glyph, _recognize
+from cv_lab.scripts.pipeline.landmark_anchor import REF_SEAT_COINS
+from cv_lab.scripts.pipeline.read_pot import _norm_glyph, _recognize, glyph_boxes
 
 # stack number box relative to a seat coin, in reference-normalized full-frame
 # coords: from just right of the coin, extending right, centered on coin height.

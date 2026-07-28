@@ -4,7 +4,16 @@ import pytest
 
 from cv_lab.labeling_poker.app import create_app
 from cv_lab.labeling_poker.config import normalize_card_label
-from cv_lab.labeling_poker.db import connect, get_annotations, get_status, next_matching, progress, save_annotations, seek, sync_files
+from cv_lab.labeling_poker.db import (
+    connect,
+    get_annotations,
+    get_status,
+    next_matching,
+    progress,
+    save_annotations,
+    seek,
+    sync_files,
+)
 from cv_lab.labeling_poker.export import image_size, split_ids, write_dataset
 from cv_lab.labeling_poker.label_audit import (
     audit_boxes,

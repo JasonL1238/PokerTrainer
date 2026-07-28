@@ -20,8 +20,8 @@ to LABEL at build time; runtime is pure template matching).
 """
 from __future__ import annotations
 
-import numpy as np
 import cv2
+import numpy as np
 
 # canonical board slots (x0, x1, y0, y1) in reference-normalized coords
 BOARD_SLOTS = [

@@ -8,7 +8,7 @@ samples every `interval` seconds between `start` and `end` — for densely
 walking a single hand to find street transitions / decision points.
 
 Usage:
-    python cv_lab/scripts/extract_window.py --video data/videos/clubwpt_session_01.mov \
+    python cv_lab/scripts/pipeline/extract_window.py --video data/videos/clubwpt_session_01.mov \
         --start 180 --end 270 --interval 2 --out cv_lab/hand01/frames --preview-width 900
     # add --full to also write full-res PNGs (default: preview JPGs only)
 """

@@ -11,7 +11,7 @@ writes back a mean-grayscale ``brightness`` value -- so existing fixtures can
 be reused (via rebuild_timeline_from_frames.py) without re-running the region
 detector or card classifier.
 
-    python cv_lab/scripts/add_brightness_to_fixture.py \
+    python cv_lab/scripts/pipeline/add_brightness_to_fixture.py \
         --frames cv_lab/results/frames_v05.json \
         --video "data/videos/Screen Recording 2026-07-11 at 12.45.27 PM.mov" \
         --out cv_lab/results/frames_v05.json

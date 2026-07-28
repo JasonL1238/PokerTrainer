@@ -15,8 +15,6 @@ from poker_tracker.math.cards import (
     spaced_cards,
 )
 from poker_tracker.math.ranges import (
-    RangeDescription,
-    get_range_description,
     normalize_range_label,
     range_notation,
 )
@@ -62,55 +60,13 @@ class EquityCalculator(Protocol):
     ) -> EquityResult:
         """Estimate Hero equity for post-session review."""
 
-
-class PlaceholderEquityCalculator:
-    """Deterministic low-confidence equity estimator.
-
-    This is not a real poker equity engine. It exists so the UI, prompts, and
-    review logic can be wired to an interface before a real calculator is added.
-    """
-
-    def calculate_equity(
+    def calculate_equity_multiway(
         self,
         hero_cards: str,
         board_cards: str,
-        villain_range: str,
+        villain_ranges: list[str],
     ) -> EquityResult:
-        hero = parse_hero_cards(hero_cards)
-        board = parse_board_cards(board_cards)
-        label = normalize_range_label(villain_range)
-        range_description = get_range_description(label)
-        equity = _rough_placeholder_equity(hero, board, range_description)
-        return EquityResult(
-            hero_hand=compact_cards(hero),
-            board=spaced_cards(board),
-            villain_range_label=label,
-            equity=equity,
-            method="placeholder",
-            confidence=0.2,
-            notes="Not a real equity calculation yet. Use only as a rough placeholder.",
-        )
-
-
-def _rough_placeholder_equity(hero: list, board: list, villain_range: RangeDescription) -> float:
-    base_by_range = {
-        "premium": 0.34,
-        "tight": 0.40,
-        "standard": 0.47,
-        "loose": 0.53,
-        "very_loose": 0.58,
-        "unknown": 0.50,
-    }
-    equity = base_by_range[villain_range.label]
-    ranks = [card.rank for card in hero]
-    board_ranks = [card.rank for card in board]
-    if ranks[0] == ranks[1]:
-        equity += 0.04
-    if any(rank in board_ranks for rank in ranks):
-        equity += 0.05
-    if len(board) >= 4 and ranks[0] != ranks[1]:
-        equity -= 0.02
-    return max(0.05, min(0.95, round(equity, 3)))
+        """Estimate Hero pot-share equity against multiple ranges."""
 
 
 class Eval7EquityCalculator:
@@ -472,14 +428,12 @@ def _combinations(items: list, choose: int):
 
 
 def get_equity_calculator() -> EquityCalculator:
-    """Return the best available equity calculator.
-
-    Prefers the real eval7-backed engine; falls back to the labeled placeholder
-    only if eval7 is not installed, so callers never have to branch on it.
-    """
-    if _HAS_EVAL7:
-        return Eval7EquityCalculator()
-    return PlaceholderEquityCalculator()
+    """Return the real equity calculator or fail when its dependency is unavailable."""
+    if not _HAS_EVAL7:
+        raise RuntimeError(
+            "Real equity calculations are unavailable because eval7 is not installed."
+        )
+    return Eval7EquityCalculator()
 
 
 # TODO: Solver outputs (strategy frequencies/EV) should be stored/labeled separately

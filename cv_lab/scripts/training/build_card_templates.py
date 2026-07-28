@@ -4,12 +4,15 @@ Templates are LABELLED offline (I know these hands' cards); runtime is pure
 template match. Board slots + the two hero index corners feed the same bank so
 board and hero share one set of rank/suit templates.
 """
-import sys, os
+import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 import cv2
-from cv_lab.scripts.pipeline.landmark_anchor import anchor
+
 import cv_lab.scripts.pipeline.read_cards as rc
 import cv_lab.scripts.pipeline.read_hero as rh
+from cv_lab.scripts.pipeline.landmark_anchor import anchor
 
 DF = "/Users/jasonli/Documents/GitHub/PokerTrainer/cv_lab/hand01/decision_frames"
 ST = "/Users/jasonli/Documents/GitHub/PokerTrainer/cv_lab/hand01/spade_test"
@@ -35,10 +38,11 @@ def add(rk, su, rank_glyph, suit_glyph):
 for path, cards in BOARD_LABELS:
     img = cv2.imread(path)
     a = anchor(img)
-    for slot, card in zip(rc.BOARD_SLOTS, cards):
+    for slot, card in zip(rc.BOARD_SLOTS, cards, strict=False):
         crop = rc.slot_crop(img, a["map_roi"], slot)
         if not rc.card_present(crop):
-            print("WARN: no card at", path, card); continue
+            print("WARN: no card at", path, card)
+            continue
         rank = card[:-1].replace("10", "T")
         add(rank, card[-1], rc._rank_glyph(crop), rc._suit_glyph(crop))
 
@@ -47,7 +51,7 @@ for path, cards in HERO_LABELS:
     a = anchor(img)
     x0, x1, y0, y1 = a["map_roi"](rh.hero_roi_box())
     roi = img[max(y0, 0):y1, max(x0, 0):x1]
-    for face_spec, card in zip(rh.FACES, cards):
+    for face_spec, card in zip(rh.FACES, cards, strict=False):
         face = rh._deskew(roi, face_spec)
         rsub = rh._sub(face, rh.IDX_X0, rh.IDX_X1, rh.RANK_Y0, rh.RANK_Y1)
         ssub = rh._sub(face, rh.IDX_X0, rh.IDX_X1, rh.SUIT_Y0, rh.SUIT_Y1)

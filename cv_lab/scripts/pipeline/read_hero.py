@@ -18,14 +18,15 @@ Reuses read_cards templates (same card art/font; template match is scale-norm).
 from __future__ import annotations
 
 # --- repo-root on sys.path so cv_lab.scripts.* absolute imports resolve ---
-import os as _os, sys as _sys
+import os as _os
+import sys as _sys
+
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))))
 
-import numpy as np
 import cv2
 
 from cv_lab.scripts.pipeline.landmark_anchor import REF_SEAT_COINS
-from cv_lab.scripts.pipeline.read_cards import (_match, RANK_SIZE, SUIT_SIZE, _tight)
+from cv_lab.scripts.pipeline.read_cards import RANK_SIZE, SUIT_SIZE, _match, _tight
 
 HERO_SEAT = 7  # bottom-center seat coin (Mochi / hero)
 # hero-card ROI relative to the hero seat coin (reference-normalized full-frame).
@@ -72,7 +73,8 @@ def _deskew(roi_bgr, face):
     cw, ch = wf * W, hf * H
     M = cv2.getRotationMatrix2D((cx, cy), ang, 1.0)
     rot = cv2.warpAffine(roi_bgr, M, (W, H))
-    x0 = int(max(cx - cw / 2, 0)); y0 = int(max(cy - ch / 2, 0))
+    x0 = int(max(cx - cw / 2, 0))
+    y0 = int(max(cy - ch / 2, 0))
     return rot[y0:int(cy + ch / 2), x0:int(cx + cw / 2)]
 
 

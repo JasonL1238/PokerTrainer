@@ -5,9 +5,9 @@ drive build_yolo_hand_timeline end to end and assert a complete reconstructed ha
 positions, ordered actions with bet sizes from stack deltas, pot, winner, and the
 arithmetic reconciliation. Also confirms the spine output validates cleanly.
 """
+from cv_lab.scripts.eval.validate_yolo_card_timeline import validate_timeline
 from cv_lab.scripts.pipeline import region_detections as rd
 from cv_lab.scripts.pipeline.build_yolo_hand_timeline import build_hand_timeline
-from cv_lab.scripts.eval.validate_yolo_card_timeline import validate_timeline
 
 W = H = 1000
 
@@ -98,6 +98,12 @@ def test_spine_derives_action_sizes_from_stack_deltas():
     order = {"preflop": 0, "flop": 1, "turn": 2, "river": 3}
     seq = [order[a["street"]] for a in hand["actions"]]
     assert seq == sorted(seq)
+    assert all(action["source_image"] for action in hand["actions"])
+    assert all(action["source_time_s"] is not None for action in hand["actions"])
+    assert {action["derivation"] for action in hand["actions"]} >= {
+        "stack_delta",
+        "action_pill",
+    }
 
 
 def test_spine_reconciles_pot_and_winner():

@@ -2,7 +2,11 @@ import json
 
 import pytest
 
-from cv_lab.scripts.eval.validate_yolo_card_timeline import MalformedTimeline, main, validate_timeline
+from cv_lab.scripts.eval.validate_yolo_card_timeline import (
+    MalformedTimeline,
+    main,
+    validate_timeline,
+)
 
 
 def _timeline(states, hand=None):

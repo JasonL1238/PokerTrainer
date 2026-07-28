@@ -12,8 +12,8 @@ matching glyphs are averaged per character into one unit-vector template.
 Word templates: each (annotation_id -> word) pill crop is reduced to its whole-word
 white-text mask and averaged per word.
 
-    python cv_lab/scripts/calibrate_ocr.py            # build + save templates
-    python cv_lab/scripts/calibrate_ocr.py --eval     # also re-read all crops & score
+    python cv_lab/scripts/training/calibrate_ocr.py            # build + save templates
+    python cv_lab/scripts/training/calibrate_ocr.py --eval     # also re-read all crops & score
 """
 from __future__ import annotations
 
@@ -36,7 +36,6 @@ from cv_lab.scripts.pipeline.ocr_readers import (  # noqa: E402
     _norm,
     binarize_text,
     segment_glyphs,
-    tokenize,
 )
 
 # annotation_id -> transcribed numeric value (verified via calibration montage).
@@ -105,7 +104,7 @@ def build_templates(db: Path, imgdir: Path) -> TemplateOCR:
         if len(value_glyphs) != want or len(tall) != prefix + want + 2:
             print(f"  ! id{aid} '{value}': tall={len(tall)} != {prefix}+{want}+2(BB), skipped")
             continue
-        for g, ch in zip(value_glyphs, digits_only):
+        for g, ch in zip(value_glyphs, digits_only, strict=False):
             digit_acc.setdefault(ch, []).append(_norm(g.mask, DIGIT_SIZE))
 
         # Affix-letter templates so the reader rejects non-value glyphs instead of
@@ -155,8 +154,10 @@ def build_templates(db: Path, imgdir: Path) -> TemplateOCR:
             glyphs = [g for g in glyphs if g.h >= 0.5 * max_h]
         if not glyphs:
             continue
-        x0 = min(g.x for g in glyphs); y0 = min(g.y for g in glyphs)
-        x1 = max(g.x + g.w for g in glyphs); y1 = max(g.y + g.h for g in glyphs)
+        x0 = min(g.x for g in glyphs)
+        y0 = min(g.y for g in glyphs)
+        x1 = max(g.x + g.w for g in glyphs)
+        y1 = max(g.y + g.h for g in glyphs)
         word_acc.setdefault(word, []).append(_norm(mask[y0:y1, x0:x1] > 0, WORD_SIZE))
 
     words: dict[str, np.ndarray] = {}
@@ -183,8 +184,8 @@ def evaluate(bank: TemplateOCR, db: Path, imgdir: Path) -> None:
             print(f"       id{aid:<5} truth={value:<8} crop missing on disk, skipped")
             continue
         val, raw = bank.read_number(crop)
-        got = ("%g" % val) if val is not None else "None"
-        hit = got == ("%g" % float(value))
+        got = (f"{val:g}") if val is not None else "None"
+        hit = got == (f"{float(value):g}")
         ok += hit
         attempted += 1
         tag = "bet*" if aid in BET_EVAL else "    "

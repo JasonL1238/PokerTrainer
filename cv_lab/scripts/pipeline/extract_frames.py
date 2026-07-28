@@ -4,7 +4,7 @@ Deliberately separate from poker_tracker/. Uses PyAV (bundles its own FFmpeg)
 because macOS screen-recording .mov files often fail to open in OpenCV's build.
 
 Usage:
-    python cv_lab/scripts/extract_frames.py --video data/videos/clubwpt_session_01.mov \
+    python cv_lab/scripts/pipeline/extract_frames.py --video data/videos/clubwpt_session_01.mov \
         --count 12 --out cv_lab/frames --preview-width 900
 """
 from __future__ import annotations

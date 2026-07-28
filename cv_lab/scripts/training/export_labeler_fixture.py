@@ -3,9 +3,9 @@
 This lets the reconstruction spine (build_yolo_hand_timeline.py) run on your
 hand-labeled ground-truth boxes with NO trained detector and NO OCR:
 
-    python cv_lab/scripts/export_labeler_fixture.py --video-prefix v00 \
+    python cv_lab/scripts/training/export_labeler_fixture.py --video-prefix v00 \
         --out cv_lab/results/labeled_frames_v00.json
-    python cv_lab/scripts/build_yolo_hand_timeline.py \
+    python cv_lab/scripts/pipeline/build_yolo_hand_timeline.py \
         --frames cv_lab/results/labeled_frames_v00.json \
         --out cv_lab/results/hand_timeline_v00.json
 

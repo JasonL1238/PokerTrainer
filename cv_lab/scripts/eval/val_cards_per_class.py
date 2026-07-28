@@ -6,13 +6,13 @@ per-class scores) so you can see exactly which cards a fine-tune helped or hurt.
 
 Usage:
   # baseline the OLD model before fine-tuning
-  python cv_lab/scripts/val_cards_per_class.py \
+  python cv_lab/scripts/eval/val_cards_per_class.py \
       --weights "cv_lab/models/best (4).pt" \
       --data cv_lab/datasets/yolo_cards_clubwpt_mixed/data.yaml \
       --save-json cv_lab/results/card_baseline.json
 
   # after fine-tuning, compare
-  python cv_lab/scripts/val_cards_per_class.py \
+  python cv_lab/scripts/eval/val_cards_per_class.py \
       --weights cv_lab/runs/yolo_cards/clubwpt_mixed/weights/best.pt \
       --data cv_lab/datasets/yolo_cards_clubwpt_mixed/data.yaml \
       --baseline cv_lab/results/card_baseline.json
@@ -26,7 +26,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-from cv_lab.scripts.pipeline.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
+from cv_lab.scripts.pipeline.evaluate_yolo_cards import (  # noqa: E402
+    DEFAULT_YOLOV12_VENDOR,
+    _load_yolo_class,
+    _resolve_vendor_path,
+)
 
 
 def _per_class_map(model, data: str, imgsz: int, device: str) -> dict[str, float]:

@@ -7,15 +7,18 @@ label the montage by eye (offline; permitted for template building) and
 build_bank_from_labels.py turns the labels into templates. No VLM, no runtime
 model.
 """
-import sys, os, json
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-import numpy as np
-import cv2
-import av
+import json
+import os
+import sys
 
-from cv_lab.scripts.pipeline.classify_screen import classify
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+import av
+import cv2
+import numpy as np
+
 import cv_lab.scripts.pipeline.read_cards as rc
 import cv_lab.scripts.pipeline.read_hero as rh
+from cv_lab.scripts.pipeline.classify_screen import classify
 
 VIDEO = "/Users/jasonli/Documents/GitHub/PokerTrainer/data/videos/clubwpt_session_01.mov"
 OUT = "/Users/jasonli/Documents/GitHub/PokerTrainer/cv_lab/harvest"
@@ -85,7 +88,7 @@ def main():
     cols = 12
     rows = (n + cols - 1) // cols
     montage = np.full((rows * cell, cols * cell, 3), 40, np.uint8)
-    for idx, (_, col, crop, md) in enumerate(kept):
+    for idx, (_, _col, crop, md) in enumerate(kept):
         md["idx"] = idx
         meta.append(md)
         cv2.imwrite(f"{OUT}/card_{idx:03d}.png", crop)

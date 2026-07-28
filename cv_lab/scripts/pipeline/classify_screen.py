@@ -14,7 +14,9 @@ wrong count, high residual). So we classify directly off the anchor:
 from __future__ import annotations
 
 # --- repo-root on sys.path so cv_lab.scripts.* absolute imports resolve ---
-import os as _os, sys as _sys
+import os as _os
+import sys as _sys
+
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))))
 
 from cv_lab.scripts.pipeline.landmark_anchor import anchor

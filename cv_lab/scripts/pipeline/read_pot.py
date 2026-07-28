@@ -19,8 +19,8 @@ generalizes to those readers later.
 """
 from __future__ import annotations
 
-import numpy as np
 import cv2
+import numpy as np
 
 GLYPH_SIZE = (20, 28)   # (w, h) normalized digit
 
@@ -63,7 +63,7 @@ def build_templates(labeled_frames):
         chars = [c for c in s if c.isdigit()]
         if len(chars) != len(digits):
             continue  # segmentation mismatch -> skip for template building
-        for box, ch in zip(digits, chars):
+        for box, ch in zip(digits, chars, strict=False):
             bank[ch].append(_norm_glyph(bw, box))
     return bank
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import ProcessingJob
@@ -50,4 +50,4 @@ def mark_failed(db: PokerDatabase, job_id: int, error_message: str) -> None:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)

@@ -20,12 +20,10 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from poker_tracker.persistence.db import PokerDatabase
-from poker_tracker.persistence.import_export import EXPORT_VERSION, import_session
-from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
-
-from cv_lab.scripts.eval.validate_yolo_card_timeline import validate_timeline
-
+from cv_lab.scripts.eval.validate_yolo_card_timeline import validate_timeline  # noqa: E402
+from poker_tracker.persistence.db import PokerDatabase  # noqa: E402
+from poker_tracker.persistence.import_export import EXPORT_VERSION, import_session  # noqa: E402
+from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session  # noqa: E402
 
 DEFAULT_TIMELINE = "cv_lab/results/yolo_card_timeline_card_changes_v1.json"
 DEFAULT_OUT = "cv_lab/results/yolo_card_hands_draft_session.json"
@@ -139,11 +137,14 @@ def _build_players(hand: dict[str, Any]) -> list[HandPlayer]:
     """Build HandPlayer rows from a reconstruction-spine hand (empty for card-only)."""
     players: list[HandPlayer] = []
     for row in hand.get("players", []) or []:
+        seat = row.get("seat")
         name = row.get("player_name") or (
-            "Hero" if row.get("is_hero") else (row.get("position") or f"Seat{row.get('seat')}")
+            "Hero" if row.get("is_hero") else (row.get("position") or f"Seat{seat}")
         )
         players.append(HandPlayer(
             hand_id=0,
+            player_key=f"seat:{seat}" if seat is not None else f"name:{name}",
+            seat_index=seat,
             player_name=name,
             position=row.get("position", "") or "",
             starting_stack=row.get("starting_stack"),
@@ -156,14 +157,17 @@ def _build_actions(hand: dict[str, Any]) -> list[Action]:
     """Build Action rows from a reconstruction-spine hand (empty for card-only)."""
     actions: list[Action] = []
     for row in hand.get("actions", []) or []:
+        seat = row.get("seat")
         actions.append(Action(
             hand_id=0,
+            player_key=f"seat:{seat}" if seat is not None else None,
             street=row["street"],
             action_index=row.get("action_index"),
             player_name=row.get("player_name") or f"Seat{row.get('seat')}",
             position=row.get("position", "") or "",
             action_type=row["action_type"],
             amount=row.get("amount"),
+            amount_semantics="incremental",
             pot_before=row.get("pot_before"),
             stack_before=row.get("stack_before"),
         ))

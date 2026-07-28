@@ -23,7 +23,11 @@ from threading import Lock
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-from cv_lab.scripts.pipeline.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
+from cv_lab.scripts.pipeline.evaluate_yolo_cards import (  # noqa: E402
+    DEFAULT_YOLOV12_VENDOR,
+    _load_yolo_class,
+    _resolve_vendor_path,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 # Promoted stable weights; falls back to the raw run dir if not yet promoted.
@@ -52,7 +56,8 @@ class CardClassifier:
                     if not self.weights.exists():
                         raise FileNotFoundError(
                             f"card classifier weights not found: {self.weights}\n"
-                            "train Model 2 first: cv_lab/scripts/train_card_classifier.py"
+                            "train Model 2 first: "
+                            "cv_lab/scripts/training/train_card_classifier.py"
                         )
                     vendor = _resolve_vendor_path(self.vendor)
                     YOLO = _load_yolo_class(vendor)
@@ -85,7 +90,7 @@ class CardClassifier:
         if self.device:
             kwargs["device"] = self.device
         results = model.predict([c for _, c in valid], **kwargs)
-        for (i, _), res in zip(valid, results):
+        for (i, _), res in zip(valid, results, strict=False):
             probs = res.probs
             if probs is not None:
                 idx = int(probs.top1)

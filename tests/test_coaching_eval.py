@@ -1,3 +1,5 @@
+import pytest
+
 from poker_tracker.coaching.coaching_eval import (
     UNSAFE_PHRASES,
     CoachingEvalReport,
@@ -7,14 +9,15 @@ from poker_tracker.coaching.coaching_prompts import REQUIRED_REVIEW_SECTIONS
 from poker_tracker.coaching.llm_providers import (
     ANTHROPIC_DEFAULT_MODEL,
     AnthropicLLMProvider,
-    MockLLMProvider,
+    LLMProviderError,
     get_provider_from_env,
     provider_config_from_env,
 )
+from tests.fixtures.llm_provider import FakeLLMProvider
 
 
-def test_mock_provider_passes_all_golden_hands() -> None:
-    report = run_coaching_eval(MockLLMProvider())
+def test_fake_provider_passes_all_golden_hands() -> None:
+    report = run_coaching_eval(FakeLLMProvider())
 
     assert isinstance(report, CoachingEvalReport)
     assert report.total == 5
@@ -26,8 +29,8 @@ def test_mock_provider_passes_all_golden_hands() -> None:
         assert case.failures == []
 
 
-def test_mock_report_has_all_required_sections() -> None:
-    report = run_coaching_eval(MockLLMProvider())
+def test_fake_report_has_all_required_sections() -> None:
+    report = run_coaching_eval(FakeLLMProvider())
 
     # The mock returns every required section, so no case should report a
     # missing-section failure.
@@ -36,18 +39,18 @@ def test_mock_report_has_all_required_sections() -> None:
             assert f"Missing required section: {section}" not in case.failures
 
 
-def test_anthropic_provider_falls_back_to_mock_without_key(monkeypatch) -> None:
+def test_anthropic_provider_is_unavailable_without_key(monkeypatch) -> None:
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
-    provider = get_provider_from_env("anthropic")
+    with pytest.raises(LLMProviderError, match="ANTHROPIC_API_KEY"):
+        get_provider_from_env("anthropic")
 
-    assert isinstance(provider, MockLLMProvider)
 
-
-def test_claude_alias_also_falls_back_to_mock_without_key(monkeypatch) -> None:
+def test_claude_alias_is_also_unavailable_without_key(monkeypatch) -> None:
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
-    assert isinstance(get_provider_from_env("claude"), MockLLMProvider)
+    with pytest.raises(LLMProviderError, match="ANTHROPIC_API_KEY"):
+        get_provider_from_env("claude")
 
 
 def test_provider_config_returns_anthropic_when_configured(monkeypatch) -> None:
@@ -73,13 +76,13 @@ def test_provider_config_anthropic_honors_model_override(monkeypatch) -> None:
     assert config.model_name == "claude-custom"
 
 
-def test_provider_config_anthropic_without_key_is_mock(monkeypatch) -> None:
+def test_provider_config_anthropic_without_key_is_unavailable(monkeypatch) -> None:
     monkeypatch.setenv("POKER_TRACKER_LLM_PROVIDER", "anthropic")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
     config = provider_config_from_env()
 
-    assert config.provider_name == "mock"
+    assert config.provider_name == "anthropic"
     assert config.has_api_key is False
 
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-
 # Positional preflop baselines for 100bb 9-max no-limit hold'em cash games.
 # These are GTO-informed study charts for post-session review, not solver output:
 # they exist so villain/hero ranges in the Math Review tab can start from a

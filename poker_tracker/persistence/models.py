@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from poker_tracker.math.cards import CardParseError, parse_visible_cards
 from poker_tracker.persistence.validation import normalize_cards, validate_tags
-
 
 Street = Literal["preflop", "flop", "turn", "river", "showdown"]
 ActionType = Literal[
@@ -17,16 +17,59 @@ ActionType = Literal[
     "bet",
     "raise",
     "all-in",
+    "ante",
     "post_blind",
     "show",
     "win",
 ]
+AmountSemantics = Literal["incremental", "raise_to", "unknown"]
+SettlementStatus = Literal["unsettled", "settled", "reconciled", "needs_correction"]
+SettlementEntryType = Literal["award", "refund"]
+ForcedBetType = Literal[
+    "small_blind",
+    "big_blind",
+    "ante",
+    "big_blind_ante",
+    "straddle",
+    "dead_blind",
+    "bring_in",
+]
 ReviewStatus = Literal["unreviewed", "reviewed", "needs_correction"]
+FrameReviewStatus = Literal["unreviewed", "correct", "incorrect"]
 SourceType = Literal["manual", "cv_import", "corrected_cv"]
 ReviewType = Literal["hand", "session"]
 SafetyMode = Literal["post_session_only"]
+CorrectionType = Literal[
+    "hand_facts",
+    "player_update",
+    "action_create",
+    "action_update",
+    "action_delete",
+]
+HandIssueStatus = Literal["open", "resolved"]
+HandIssueType = Literal[
+    "hand_boundary",
+    "cards",
+    "players",
+    "stacks",
+    "actions",
+    "pot_or_result",
+    "accounting",
+    "coaching",
+    "other",
+]
 JobStatus = Literal["queued", "running", "completed", "failed"]
 JobType = Literal["frame_extraction", "cv_reconstruction"]
+SolverRunStatus = Literal[
+    "queued",
+    "running",
+    "cancelling",
+    "completed",
+    "failed",
+    "cancelled",
+    "stale",
+]
+SolverRangeSource = Literal["builtin", "user"]
 ROIType = Literal[
     "hero_card",
     "board_card",
@@ -52,7 +95,7 @@ HAND_TAGS = {
 
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class Session(BaseModel):
@@ -106,7 +149,7 @@ class Hand(BaseModel):
         return validate_tags(value, HAND_TAGS)
 
     @model_validator(mode="after")
-    def validate_visible_card_uniqueness(self) -> "Hand":
+    def validate_visible_card_uniqueness(self) -> Hand:
         if self.hero_cards and self.board_cards:
             try:
                 parse_visible_cards(self.hero_cards, self.board_cards)
@@ -120,6 +163,8 @@ class HandPlayer(BaseModel):
 
     id: int | None = None
     hand_id: int
+    player_key: str = Field(default_factory=lambda: str(uuid4()), min_length=1)
+    seat_index: int | None = Field(default=None, ge=0, le=9)
     player_name: str = Field(min_length=1)
     position: str = ""
     starting_stack: float | None = Field(default=None, ge=0)
@@ -132,12 +177,16 @@ class Action(BaseModel):
 
     id: int | None = None
     hand_id: int
+    player_key: str | None = Field(default=None, min_length=1)
     street: Street
     action_index: int | None = Field(default=None, ge=1)
     player_name: str = Field(min_length=1)
     position: str = ""
     action_type: ActionType
     amount: float | None = Field(default=None, ge=0)
+    amount_semantics: AmountSemantics = "incremental"
+    forced_bet_type: ForcedBetType | None = None
+    is_live_post: bool | None = None
     pot_before: float | None = Field(default=None, ge=0)
     stack_before: float | None = Field(default=None, ge=0)
     notes: str = ""
@@ -148,6 +197,50 @@ class Action(BaseModel):
         if value == "all_in":
             return "all-in"
         return value
+
+
+class HandSettlement(BaseModel):
+    """Persisted assumptions and reconciliation summary for a completed hand."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    hand_id: int
+    status: SettlementStatus = "unsettled"
+    dead_money: float = Field(default=0, ge=0)
+    rake_rate: float = Field(default=0, ge=0, le=1)
+    rake_cap: float | None = Field(default=None, ge=0)
+    rake_rounding_unit: float = Field(default=0.01, gt=0)
+    no_flop_no_drop: bool = False
+    gross_pot: float | None = Field(default=None, ge=0)
+    rake_amount: float | None = Field(default=None, ge=0)
+    net_pot: float | None = Field(default=None, ge=0)
+    is_balanced: bool = False
+    warnings: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class SettlementEntry(BaseModel):
+    """A declared pot award or explicit uncalled-chip refund."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None = None
+    hand_id: int
+    entry_type: SettlementEntryType
+    pot_index: int | None = Field(default=None, ge=0)
+    player_key: str | None = Field(default=None, min_length=1)
+    player_name: str = Field(min_length=1)
+    amount: float | None = Field(default=None, ge=0)
+    entry_order: int = Field(default=1, ge=1)
+
+    @model_validator(mode="after")
+    def validate_pot_index(self) -> SettlementEntry:
+        if self.entry_type == "award" and self.pot_index is None:
+            raise ValueError("Award entries require a pot index.")
+        if self.entry_type == "refund" and self.pot_index is not None:
+            raise ValueError("Refund entries cannot reference a pot index.")
+        return self
 
 
 class HandReview(BaseModel):
@@ -162,20 +255,53 @@ class HandReview(BaseModel):
     study_lesson: str
     next_review_question: str = ""
     notes: str = ""
+    is_stale: bool = False
+    stale_reason: str = ""
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class HandCorrection(BaseModel):
+    """Auditable before/after evidence retained from post-session correction."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None = None
+    hand_id: int
+    correction_type: CorrectionType
+    before_state: dict[str, object] = Field(default_factory=dict)
+    after_state: dict[str, object] = Field(default_factory=dict)
+    notes: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class HandIssue(BaseModel):
+    """A saved debug-later report with an immutable evidence snapshot."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None = None
+    hand_id: int
+    status: HandIssueStatus = "open"
+    issue_types: list[HandIssueType] = Field(min_length=1)
+    description: str = Field(min_length=1)
+    evidence_snapshot: dict[str, object] = Field(default_factory=dict)
+    resolution_notes: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    resolved_at: datetime | None = None
+
+
 class LLMProviderConfig(BaseModel):
-    provider_name: str = "mock"
-    model_name: str = "mock-local"
+    provider_name: str = "unconfigured"
+    model_name: str = ""
     has_api_key: bool = False
 
 
 class CoachingRequest(BaseModel):
     prompt: str
     review_type: ReviewType
-    provider_name: str = "mock"
-    model_name: str = "mock-local"
+    provider_name: str = "unconfigured"
+    model_name: str = ""
     hand_id: int | None = None
     session_id: int | None = None
     safety_mode: SafetyMode = "post_session_only"
@@ -194,7 +320,57 @@ class CoachingResponse(BaseModel):
     hand_id: int | None = None
     session_id: int | None = None
     parsed_sections: dict[str, str] = Field(default_factory=dict)
+    is_stale: bool = False
+    stale_reason: str = ""
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class SolverRangeProfile(BaseModel):
+    """Reusable user-owned range input for post-session solver work."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None = None
+    name: str = Field(min_length=1, max_length=120)
+    notation: str = Field(min_length=1)
+    table_size: int | None = Field(default=None, ge=2, le=10)
+    position: str = ""
+    scenario: str = ""
+    pot_type: str = ""
+    stack_bb: float | None = Field(default=None, gt=0)
+    description: str = ""
+    source: SolverRangeSource = "user"
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class SolverRun(BaseModel):
+    """Durable metadata for one external postflop solve."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None = None
+    hand_id: int
+    status: SolverRunStatus = "queued"
+    backend_name: str = "texassolver"
+    backend_version: str = ""
+    input_hash: str = Field(min_length=1)
+    spot: dict[str, object] = Field(default_factory=dict)
+    range_ip: dict[str, object] = Field(default_factory=dict)
+    range_oop: dict[str, object] = Field(default_factory=dict)
+    assumptions: list[str] = Field(default_factory=list)
+    evidence: dict[str, object] = Field(default_factory=dict)
+    command_path: str = ""
+    result_path: str = ""
+    log_path: str = ""
+    exploitability_pct: float | None = Field(default=None, ge=0)
+    runtime_seconds: float | None = Field(default=None, ge=0)
+    error_message: str = ""
+    pid: int | None = Field(default=None, ge=1)
+    heartbeat_at: datetime | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
 
 
 class VideoRecord(BaseModel):
@@ -241,6 +417,23 @@ class ExtractedFrame(BaseModel):
     frame_index: int = Field(ge=0)
     image_path: str
     created_at: datetime = Field(default_factory=utc_now)
+
+
+class ReconstructionFrameReview(BaseModel):
+    """Human verdict for one source frame used by a reconstructed hand."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int | None = None
+    job_id: int
+    hand_number: int = Field(ge=1)
+    source_image: str = Field(min_length=1)
+    timestamp_seconds: float = Field(ge=0)
+    status: FrameReviewStatus = "unreviewed"
+    issue_types: list[str] = Field(default_factory=list)
+    notes: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
 
 
 class ROIProfile(BaseModel):

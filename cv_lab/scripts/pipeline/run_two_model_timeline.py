@@ -8,10 +8,10 @@ Ties everything together for live validation:
       -> timeline JSON + a fixture JSON (so results are inspectable/re-runnable)
 
     # over a directory of extracted frames
-    python cv_lab/scripts/run_two_model_timeline.py --frames-dir cv_lab/frames --device mps
+    python cv_lab/scripts/pipeline/run_two_model_timeline.py --frames-dir cv_lab/frames --device mps
 
     # over sampled frames straight from a video
-    python cv_lab/scripts/run_two_model_timeline.py \
+    python cv_lab/scripts/pipeline/run_two_model_timeline.py \
         --video data/videos/clubwpt_session_01.mov --every 5.0 --max-frames 20 --device mps
 """
 from __future__ import annotations
@@ -27,9 +27,9 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from cv_lab.scripts.pipeline.two_model_infer import TwoModelPipeline  # noqa: E402
-from cv_lab.scripts.pipeline import region_detections as rd  # noqa: E402
 from cv_lab.scripts.pipeline import build_yolo_hand_timeline as bt  # noqa: E402
+from cv_lab.scripts.pipeline import region_detections as rd  # noqa: E402
+from cv_lab.scripts.pipeline.two_model_infer import TwoModelPipeline  # noqa: E402
 
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 _T_RE = re.compile(r"t(\d+(?:\.\d+)?)s?", re.IGNORECASE)

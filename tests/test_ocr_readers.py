@@ -1,4 +1,4 @@
-"""Offline tests for the deterministic template OCR (cv_lab/scripts/ocr_readers.py).
+"""Offline tests for the deterministic template OCR.
 
 The production template bank (ocr_templates.npz) is a local calibration artifact,
 so these tests build a synthetic bank from cv2-rendered glyphs instead: digits are

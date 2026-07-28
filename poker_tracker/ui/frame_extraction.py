@@ -7,8 +7,14 @@ from pathlib import Path
 import cv2
 
 from poker_tracker.persistence.db import PokerDatabase
-from poker_tracker.ui.jobs import create_job, mark_completed, mark_failed, mark_running, update_progress
 from poker_tracker.persistence.models import ExtractedFrame
+from poker_tracker.ui.jobs import (
+    create_job,
+    mark_completed,
+    mark_failed,
+    mark_running,
+    update_progress,
+)
 from poker_tracker.ui.video_storage import FRAMES_DIR, video_frame_dir
 
 

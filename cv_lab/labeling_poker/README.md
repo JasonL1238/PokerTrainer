@@ -29,7 +29,7 @@ Use the **Browse** menu above the image to revisit saved work: choose **Labeled*
 **Labeled sus** is built by scanning saved boxes for things like duplicate card names in one frame, heavy overlapping face cards, multiple dealer buttons, missing rank/suit on some face cards, and disagreements with the cached two-model predictions. Regenerate it anytime with:
 
 ```bash
-python -m labeling_poker.label_audit
+python -m cv_lab.labeling_poker.label_audit
 ```
 
 Then open `/?view=labeled_sus` (or pick **Labeled sus** in Browse). The status line shows why each frame was flagged. After you fix and re-save, re-run the audit to shrink the queue.
@@ -37,7 +37,7 @@ Then open `/?view=labeled_sus` (or pick **Labeled sus** in Browse). The status l
 **Unlabeled sus** is the same idea for frames that are still undecided: it audits the cached two-model auto-labels (duplicate cards, overlaps, missing ranks, empty predictions, etc.) so you can fix the worst auto-labels first. Regenerate with:
 
 ```bash
-python -m labeling_poker.label_audit --target unlabeled
+python -m cv_lab.labeling_poker.label_audit --target unlabeled
 ```
 
 Then open `/?view=unlabeled_sus` (or pick **Unlabeled sus** in Browse / Gallery). Saving a frame removes it from undecided; re-run the audit to refresh the queue.
@@ -70,16 +70,16 @@ The end-to-end completed-session runner is `cv_lab/scripts/pipeline/run_two_mode
 
 ## Card rank + suit
 
-When a `face_card` box is selected, the sidebar "Card (rank + suit)" picker becomes active. Click a rank (`A`–`2`) and a suit (`♠♥♦♣`) to tag the box with a card label such as `Kd` or `Tc`. The label is optional metadata stored alongside the box; it does not change the YOLO detection class (`face_card` stays class 0). The picker only applies to `face_card` boxes and clears itself when a box is relabeled to another class. YOLO-bootstrap prelabels (e.g. `KD`, `10C`) are canonicalized to the same `rank+suit` form (uppercase rank with `T` for ten, lowercase suit), matching `poker_tracker.cards`.
+When a `face_card` box is selected, the sidebar "Card (rank + suit)" picker becomes active. Click a rank (`A`–`2`) and a suit (`♠♥♦♣`) to tag the box with a card label such as `Kd` or `Tc`. The label is optional metadata stored alongside the box; it does not change the YOLO detection class (`face_card` stays class 0). The picker only applies to `face_card` boxes and clears itself when the box is relabeled to another class. YOLO-bootstrap prelabels (for example, `KD` or `10C`) are canonicalized to the same `rank+suit` form (uppercase rank with `T` for ten and lowercase suit), matching `poker_tracker.math.cards`.
 
 ## Export
 
 Only `labeled` and `clean` images are exported. Clean images receive empty label files and are useful negatives. Duplicate, undecided, and skipped images are excluded. IDs are sorted deterministically and split 80/10/10.
 
 ```bash
-python -m labeling_poker.export \
-  --db labeling_poker/data/labels.sqlite3 \
-  --images labeling_poker/data/images \
+python -m cv_lab.labeling_poker.export \
+  --db cv_lab/labeling_poker/data/labels.sqlite3 \
+  --images cv_lab/labeling_poker/data/images \
   --out cv_lab/datasets/poker_boxes_v1
 ```
 

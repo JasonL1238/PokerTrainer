@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from datetime import date
 
-from poker_tracker.math.equity import EquityResult
-from poker_tracker.persistence.models import Action, Hand, HandPlayer, HandReview
 from poker_tracker.coaching.hand_history import format_hand_history
+from poker_tracker.math.accounting import HandLedger
+from poker_tracker.math.equity import EquityResult
 from poker_tracker.math.pot_odds import format_percentage
 from poker_tracker.math.ranges import get_range_description, normalize_range_label
-
+from poker_tracker.persistence.models import Action, Hand, HandPlayer, HandReview
 
 AGGRESSIVE_ACTIONS = {"bet", "raise", "all-in"}
 PASSIVE_ACTIONS = {"check", "call"}
@@ -21,10 +21,32 @@ def generate_mock_review(
     math_facts: dict[str, float | str] | None = None,
     equity_result: EquityResult | None = None,
     villain_range_label: str | None = None,
+    ledger: HandLedger | None = None,
+    accounting_issues: list[str] | None = None,
+    accounting_authoritative: bool = False,
 ) -> HandReview:
     """Generate deterministic placeholder coaching for a completed hand."""
     session_stub = _SessionStub()
-    history = format_hand_history(session_stub, hand, actions, players or [])
+    resolved_hand = hand
+    if accounting_authoritative and ledger is not None:
+        hero = next((player for player in players or [] if player.is_hero), None)
+        result = (
+            hand.hero_bb_won
+            if hero is None
+            else ledger.net_results.get(hero.player_key, hand.hero_bb_won)
+        )
+        resolved_hand = hand.model_copy(
+            update={"hero_bb_won": result, "pot_size": ledger.gross_pot}
+        )
+    history = format_hand_history(
+        session_stub,
+        resolved_hand,
+        actions,
+        players or [],
+        ledger=ledger,
+        accounting_issues=accounting_issues,
+        accounting_authoritative=accounting_authoritative,
+    )
     aggressive_count = sum(1 for action in actions if action.action_type in AGGRESSIVE_ACTIONS)
     passive_count = sum(1 for action in actions if action.action_type in PASSIVE_ACTIONS)
     facts = math_facts or {}
@@ -33,11 +55,17 @@ def generate_mock_review(
     return HandReview(
         hand_id=_require_hand_id(hand),
         hand_summary=history,
-        theory_coach=_theory_notes(hand, aggressive_count, passive_count, facts, equity_result),
-        exploit_coach=_exploit_notes(hand, range_label),
-        ev_math_notes=_ev_math_notes(hand, aggressive_count, passive_count, facts, equity_result),
-        study_lesson=_study_lesson(hand),
-        next_review_question=_next_review_question(hand, facts, equity_result),
+        theory_coach=_theory_notes(
+            resolved_hand, aggressive_count, passive_count, facts, equity_result
+        ),
+        exploit_coach=_exploit_notes(resolved_hand, range_label),
+        ev_math_notes=_ev_math_notes(
+            resolved_hand, aggressive_count, passive_count, facts, equity_result
+        ),
+        study_lesson=_study_lesson(resolved_hand),
+        next_review_question=_next_review_question(
+            resolved_hand, facts, equity_result
+        ),
     )
 
 
@@ -170,5 +198,4 @@ class _SessionStub:
     platform = "Manual Review"
 
 
-# TODO: Replace this deterministic mock with a real coaching provider behind an interface.
-# TODO: Add equity/solver annotations as separate services, not inside this mock generator.
+# Test-only deterministic coaching fixture.

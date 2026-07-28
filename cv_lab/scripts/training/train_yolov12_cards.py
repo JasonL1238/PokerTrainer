@@ -11,7 +11,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-from cv_lab.scripts.pipeline.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
+from cv_lab.scripts.pipeline.evaluate_yolo_cards import (  # noqa: E402
+    DEFAULT_YOLOV12_VENDOR,
+    _load_yolo_class,
+    _resolve_vendor_path,
+)
 
 
 def main() -> None:

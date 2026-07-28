@@ -1,3 +1,18 @@
+ARG TEXASSOLVER_COMMIT=42313c9cce96130d2341a8fc265160f580956054
+
+FROM debian:bookworm-slim AS texassolver-builder
+ARG TEXASSOLVER_COMMIT
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential ca-certificates cmake git libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --branch console https://github.com/bupticybee/TexasSolver.git /src/TexasSolver \
+    && cd /src/TexasSolver \
+    && git checkout "${TEXASSOLVER_COMMIT}" \
+    && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build --target install --parallel 2
+
 FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -7,15 +22,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     POKER_DB_PATH=/data/poker_tracker.db \
     POKER_DATA_DIR=/data \
     POKERTRAINER_REQUIRE_AUTH=true \
+    POKERTRAINER_SOLVER_THREADS=2 \
+    POKERTRAINER_SOLVER_MEMORY_GB=8 \
+    TEXAS_SOLVER_PATH=/opt/texassolver/console_solver \
     YOLO_CONFIG_DIR=/data/.ultralytics
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg libglib2.0-0 \
+    && apt-get install -y --no-install-recommends ffmpeg libglib2.0-0 libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 pokertrainer \
     && useradd --system --uid 10001 --gid pokertrainer --create-home pokertrainer
 
 WORKDIR /app
+
+COPY --from=texassolver-builder /src/TexasSolver/install/console_solver /opt/texassolver/console_solver
+COPY --from=texassolver-builder /src/TexasSolver/install/resources /opt/texassolver/resources
+COPY --from=texassolver-builder /src/TexasSolver/LICENSE /opt/texassolver/LICENSE
 
 COPY requirements.txt requirements-cv.txt ./
 RUN python -m pip install --upgrade pip \

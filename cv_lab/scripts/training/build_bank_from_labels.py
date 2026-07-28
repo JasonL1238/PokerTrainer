@@ -5,9 +5,13 @@ template building; no VLM, no runtime model). Ambiguous/two-card/noisy crops
 were dropped -- every rank and suit still has multiple clean exemplars.
 Also folds in the clean hand-01 exemplars via build_card_templates.
 """
-import sys, os, json
+import json
+import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 import cv2
+
 import cv_lab.scripts.pipeline.read_cards as rc
 import cv_lab.scripts.pipeline.read_hero as rh
 
@@ -38,7 +42,8 @@ def add(card, rg, sg):
 for idx, card in LABELS.items():
     crop = cv2.imread(f"{HARV}/card_{idx:03d}.png")
     if crop is None:
-        print("missing", idx); continue
+        print("missing", idx)
+        continue
     tag = meta[idx]["tag"]
     if tag.startswith("hero"):
         rsub = rh._sub(crop, rh.IDX_X0, rh.IDX_X1, rh.RANK_Y0, rh.RANK_Y1)

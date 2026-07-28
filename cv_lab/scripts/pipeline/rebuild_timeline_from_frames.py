@@ -5,7 +5,7 @@ run_two_model_pipeline.py --dump-frames writes every sampled frame's detections
 format. This script replays that cache through build_hand_timeline, so spine
 changes can be iterated in seconds instead of re-running video inference.
 
-    python cv_lab/scripts/rebuild_timeline_from_frames.py \
+    python cv_lab/scripts/pipeline/rebuild_timeline_from_frames.py \
         --frames cv_lab/results/frames_v05.json \
         --out cv_lab/results/two_model_timeline_v05.json
 """

@@ -18,9 +18,9 @@ amount/action unfilled, exactly as with the earlier attr=None stubs).
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
 
 import cv2
 import numpy as np
@@ -86,7 +86,7 @@ def tokenize(glyphs: list[Glyph], gap_factor: float = 0.9, min_gap: float = 6.0)
         return []
     med_w = float(np.median([g.w for g in glyphs]))
     tokens: list[list[Glyph]] = [[glyphs[0]]]
-    for prev, g in zip(glyphs, glyphs[1:]):
+    for prev, g in zip(glyphs, glyphs[1:], strict=False):
         gap = g.x - (prev.x + prev.w)
         if gap > max(min_gap, gap_factor * med_w):
             tokens.append([])
@@ -119,7 +119,7 @@ class TemplateOCR:
 
     # ---- persistence ----
     @classmethod
-    def load(cls, path: Path | str = DEFAULT_TEMPLATE_PATH) -> "TemplateOCR | None":
+    def load(cls, path: Path | str = DEFAULT_TEMPLATE_PATH) -> TemplateOCR | None:
         path = Path(path)
         if not path.is_file():
             return None
@@ -171,7 +171,7 @@ class TemplateOCR:
         # Group glyphs into vertical row-bands by y-center first, then read each row.
         tall.sort(key=lambda g: g.y + g.h / 2.0)
         bands: list[list[Glyph]] = [[tall[0]]]
-        for prev, g in zip(tall, tall[1:]):
+        for prev, g in zip(tall, tall[1:], strict=False):
             if (g.y + g.h / 2.0) - (prev.y + prev.h / 2.0) > 0.6 * max_h:
                 bands.append([])
             bands[-1].append(g)
@@ -271,7 +271,7 @@ def pill_color(crop_bgr: np.ndarray) -> str:
     if crop_bgr.size == 0:
         return "gray"
     hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
-    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    h, s, _v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
     sat = s > 70
     if sat.mean() < 0.08:
         return "gray"

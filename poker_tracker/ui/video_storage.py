@@ -1,12 +1,11 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import uuid
-import os
 from pathlib import Path
 from typing import BinaryIO
-
 
 # Anchored to the project root so the app behaves the same regardless of the
 # working directory it is launched from.

@@ -38,6 +38,11 @@ def test_math_workspace_has_compact_scoped_density() -> None:
     assert 'max-height: 16rem' in _THEME_CSS
 
 
+def test_evidence_review_stacks_at_narrow_widths() -> None:
+    assert ".pt-evidence-impact" in _THEME_CSS
+    assert '[class*="st-key-evidence_comparison_"]' in _THEME_CSS
+
+
 def test_sidebar_brand_aligns_with_main_content_before_scroll() -> None:
     assert '[data-testid="stSidebarUserContent"]' in _THEME_CSS
     assert "margin-top: -36px" in _THEME_CSS

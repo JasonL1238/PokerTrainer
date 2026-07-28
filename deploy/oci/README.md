@@ -1,6 +1,10 @@
-# Oracle Cloud Always Free deployment
+# Optional Oracle Cloud deployment reference
 
-This is the free-first deployment path for PokerTrainer's private, completed-session study workflow. It runs one Streamlit/CV container behind Caddy and keeps SQLite, uploaded videos, timelines, logs, and backups on an attached block volume.
+This is a provider-specific reference for a future explicitly requested
+deployment; PokerTrainer currently runs locally and has no active hosted
+environment. The setup runs one Streamlit/CV container behind Caddy and keeps
+SQLite, uploaded videos, timelines, logs, and backups on an attached block
+volume.
 
 ## Release gates
 
@@ -10,9 +14,12 @@ Do not use this host until all gates pass:
 2. `docker buildx build --platform linux/arm64 .` succeeds without changing or unpinning CV dependencies.
 3. The application healthcheck passes on the A1 VM.
 4. A short fixture and one representative session video finish within the configured one-hour timeout without exhausting memory.
-5. Restart, backup, and restore drills pass.
+5. A representative TexasSolver job completes with two threads, stays below
+   the 8 GB solver limit, and does not overlap CV reconstruction.
+6. Restart, backup, and restore drills pass.
 
-If architecture compatibility, capacity, or runtime reliability fails, record the result and use the checked-in Fly configuration instead.
+If architecture compatibility, capacity, or runtime reliability fails, record
+the result and continue running PokerTrainer locally.
 
 ## Provision the host
 

@@ -59,7 +59,7 @@ def normalize_card_label(class_name: str, label: object) -> str | None:
     Accepts both the picker's canonical form ("Kd", "Tc") and the YOLO card
     detector's own naming ("KD", "10C", "joker"), canonicalizing to rank+suit
     with an uppercase rank (T for ten) and a lowercase suit, matching
-    poker_tracker.cards. "joker" and empty values collapse to None.
+    poker_tracker.math.cards. "joker" and empty values collapse to None.
     """
     if class_name != CARD_LABEL_CLASS:
         return None

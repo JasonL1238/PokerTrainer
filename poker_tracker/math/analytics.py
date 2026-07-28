@@ -3,10 +3,11 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 
+from poker_tracker.math.accounting import LedgerError
+from poker_tracker.math.study_math import mean_confidence_interval
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import Hand
-from poker_tracker.math.study_math import mean_confidence_interval
-
+from poker_tracker.services.hand_accounting import reconcile_persisted_hand
 
 AGGRESSIVE_ACTIONS = {"bet", "raise", "all-in"}
 PASSIVE_ACTIONS = {"check", "call"}
@@ -31,6 +32,8 @@ class SessionStats:
     action_counts_by_type: dict[str, int] = field(default_factory=dict)
     aggression_count: int = 0
     passive_count: int = 0
+    reconciled_result_count: int = 0
+    observed_result_count: int = 0
 
 
 def compute_session_stats(db: PokerDatabase, session_id: int) -> SessionStats:
@@ -38,7 +41,36 @@ def compute_session_stats(db: PokerDatabase, session_id: int) -> SessionStats:
     hands = db.fetch_hands_by_session(session_id)
     # Only hands with a recorded result count toward result stats; treating a
     # missing result as 0 BB would deflate the averages.
-    recorded = [hand.hero_bb_won for hand in hands if hand.hero_bb_won is not None]
+    result_hands: list[Hand] = []
+    reconciled_result_count = 0
+    observed_result_count = 0
+    for hand in hands:
+        result = hand.hero_bb_won
+        if hand.id is not None:
+            try:
+                accounting = reconcile_persisted_hand(db, hand.id)
+            except LedgerError:
+                accounting = None
+            if accounting is not None and accounting.is_authoritative:
+                hero = next(
+                    (
+                        player
+                        for player in db.fetch_players_by_hand(hand.id)
+                        if player.is_hero
+                    ),
+                    None,
+                )
+                if hero is not None:
+                    result = accounting.ledger.net_results.get(hero.player_key)
+                    reconciled_result_count += 1
+            elif result is not None:
+                observed_result_count += 1
+        elif result is not None:
+            observed_result_count += 1
+        result_hands.append(hand.model_copy(update={"hero_bb_won": result}))
+    recorded = [
+        hand.hero_bb_won for hand in result_hands if hand.hero_bb_won is not None
+    ]
     total = sum(recorded)
     hand_count = len(hands)
     tag_counts: Counter[str] = Counter()
@@ -65,13 +97,15 @@ def compute_session_stats(db: PokerDatabase, session_id: int) -> SessionStats:
         average_hero_bb=total / len(recorded) if recorded else 0,
         bb_per_100=100 * total / len(recorded) if recorded else 0,
         bb_per_100_ci=bb_per_100_ci,
-        biggest_winning_hands=_top_hands(hands, reverse=True),
-        biggest_losing_hands=_top_hands(hands, reverse=False),
+        biggest_winning_hands=_top_hands(result_hands, reverse=True),
+        biggest_losing_hands=_top_hands(result_hands, reverse=False),
         hands_by_tag=dict(tag_counts),
         hands_by_review_status=dict(status_counts),
         action_counts_by_type=dict(action_counts),
         aggression_count=sum(action_counts[action] for action in AGGRESSIVE_ACTIONS),
         passive_count=sum(action_counts[action] for action in PASSIVE_ACTIONS),
+        reconciled_result_count=reconciled_result_count,
+        observed_result_count=observed_result_count,
     )
 
 

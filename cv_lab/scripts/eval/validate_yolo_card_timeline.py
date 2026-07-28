@@ -11,7 +11,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 VALID_BOARD_COUNTS = {0, 3, 4, 5}
 STREET_ORDER = {0: 0, 3: 1, 4: 2, 5: 3}
 # Action-street ordering for reconstructed hands (spine output).

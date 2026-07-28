@@ -212,6 +212,28 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 .pt-kpi-negative::after { background: var(--pt-negative); }
 .pt-kpi-warning::after { background: var(--pt-warning); }
 
+.pt-coverage { padding: .8rem .9rem; border: 1px solid var(--pt-border); border-radius: var(--pt-radius); background: var(--pt-surface); }
+.pt-coverage-track { display: flex; height: 12px; overflow: hidden; border-radius: 2px; background: var(--pt-surface-soft); }
+.pt-coverage-segment { display: block; min-width: 2px; }
+.pt-coverage-positive { color: var(--pt-positive); background: var(--pt-positive); }
+.pt-coverage-neutral { color: var(--pt-muted); background: var(--pt-muted); }
+.pt-coverage-warning { color: var(--pt-warning); background: var(--pt-warning); }
+.pt-coverage-negative { color: var(--pt-negative); background: var(--pt-negative); }
+.pt-coverage-active { color: var(--pt-accent); background: var(--pt-accent); }
+.pt-coverage-legend { display: flex; flex-wrap: wrap; gap: .45rem .9rem; margin-top: .7rem; color: var(--pt-muted); font-size: .65rem; }
+.pt-coverage-key { display: inline-flex; align-items: center; gap: .32rem; background: transparent; }
+.pt-coverage-key i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.pt-coverage-key strong { color: var(--pt-text); font-family: var(--pt-font-mono); }
+.pt-coverage-empty { color: var(--pt-muted); font-size: .72rem; }
+
+.pt-frequency { display: grid; gap: .5rem; padding: .8rem .9rem; border: 1px solid var(--pt-border); border-radius: var(--pt-radius); background: var(--pt-surface); }
+.pt-frequency-row { display: grid; grid-template-columns: minmax(88px, 1fr) minmax(100px, 2fr) 28px; gap: .65rem; align-items: center; color: var(--pt-muted); font-size: .67rem; }
+.pt-frequency-row > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-frequency-track { height: 9px; overflow: hidden; border-radius: 2px; background: var(--pt-surface-soft); }
+.pt-frequency-track i { display: block; height: 100%; background: var(--pt-accent); }
+.pt-frequency-row strong { color: var(--pt-text); font-family: var(--pt-font-mono); text-align: right; }
+.pt-frequency-empty { color: var(--pt-muted); font-size: .72rem; }
+
 .pt-empty { text-align: center; padding: clamp(1.4rem, 4vw, 2.25rem) 1.5rem; background: var(--pt-surface-soft); border-style: dashed; }
 .pt-empty-marker { width: 24px; height: 2px; margin: 0 auto .65rem; background: var(--pt-accent); }
 .pt-empty h3 { font-size: 0.95rem; margin: 0; }
@@ -290,6 +312,26 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 .st-key-math_workspace [data-testid="stCode"] pre { max-height: 16rem; }
 .st-key-math_workspace h5 { margin: .2rem 0 0; }
 
+/* Frame-to-history reconstruction audit */
+.pt-evidence-position {
+    min-height: 40px; display: grid; place-items: center; text-align: center;
+    color: var(--pt-muted); font-family: var(--pt-font-mono); font-size: .72rem;
+}
+.pt-evidence-position strong { color: var(--pt-text); }
+.pt-evidence-impact {
+    display: grid; gap: .28rem; margin-bottom: .55rem; padding: .72rem .8rem;
+    border: 1px solid var(--pt-border); border-left: 2px solid var(--pt-accent);
+    border-radius: var(--pt-radius-sm); background: var(--pt-surface-soft);
+}
+.pt-evidence-impact span {
+    color: var(--pt-accent); font-size: .61rem; font-weight: 760;
+    letter-spacing: .075em; text-transform: uppercase;
+}
+.pt-evidence-impact strong {
+    color: var(--pt-text); font-size: .78rem; font-weight: 650; line-height: 1.4;
+}
+.pt-evidence-impact small { color: var(--pt-muted); font-size: .66rem; }
+
 @keyframes pt-rise {
     from { opacity: 0; transform: translateY(7px); }
     to { opacity: 1; transform: translateY(0); }
@@ -317,6 +359,12 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
     .st-key-hand_filters [data-testid="stHorizontalBlock"] > div {
         min-width: min(100%, 210px) !important;
         flex: 1 1 30% !important;
+    }
+    [class*="st-key-evidence_comparison_"] > div > [data-testid="stHorizontalBlock"] {
+        flex-direction: column;
+    }
+    [class*="st-key-evidence_comparison_"] > div > [data-testid="stHorizontalBlock"] > div {
+        width: 100% !important; min-width: 100% !important; flex: 1 1 auto !important;
     }
 }
 

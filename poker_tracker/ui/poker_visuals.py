@@ -7,6 +7,11 @@ from html import escape
 
 import streamlit as st
 
+from poker_tracker.math.accounting import (
+    HandLedger,
+    LedgerError,
+    build_ledger_from_records,
+)
 from poker_tracker.persistence.models import Action, HandPlayer
 from poker_tracker.player_labels import actor_label, distinct_position
 
@@ -83,17 +88,9 @@ def poker_table_html(
     players: Sequence[HandPlayer],
     result_bb: float | None = None,
     label: str = "Completed hand replay",
-    preview: bool = False,
 ) -> str:
     """Return an oval digital table using only completed-hand display data."""
     table_players = list(players[:9])
-    if not table_players:
-        table_players = [
-            HandPlayer(
-                hand_id=0, player_name="Hero", position="BTN", starting_stack=100, is_hero=True
-            ),
-            HandPlayer(hand_id=0, player_name="Villain", position="BB", starting_stack=100),
-        ]
     seats = "".join(
         _seat_html(player, index, len(table_players)) for index, player in enumerate(table_players)
     )
@@ -110,10 +107,9 @@ def poker_table_html(
         if result_bb is None
         else f'<span class="pt-table-result {result_class}">{result_bb:+g} BB</span>'
     )
-    preview_label = '<span class="pt-preview-label">PRODUCT PREVIEW</span>' if preview else ""
     return (
         '<figure class="pt-poker-stage">'
-        f"<figcaption>{preview_label}<span>{escape(label)}</span>{result}</figcaption>"
+        f"<figcaption><span>{escape(label)}</span>{result}</figcaption>"
         '<div class="pt-table-shell"><div class="pt-table-felt">'
         f'{seats}<div class="pt-table-center"><div class="pt-board">'
         f'{cards_html(board_cards, empty_count=5, delay_start=100)}</div>'
@@ -135,6 +131,7 @@ def action_timeline_html(
     players: Sequence[HandPlayer] = (),
     effective_stack: float | None = None,
     initial_pot: float | None = None,
+    ledger: HandLedger | None = None,
 ) -> str:
     """Return a compact, scan-friendly decision history for a completed hand."""
     items = list(actions)
@@ -144,6 +141,23 @@ def action_timeline_html(
             "<strong>No decision history recorded</strong>"
             "<small>Add completed-hand actions to build the replay.</small></section>"
         )
+    if ledger is None and players:
+        opening_pot = (
+            items[0].pot_before
+            if items[0].pot_before is not None
+            else (initial_pot or 0)
+        )
+        try:
+            ledger = build_ledger_from_records(
+                players,
+                items,
+                dead_money=opening_pot,
+            )
+        except LedgerError:
+            # Incomplete legacy/CV drafts can still be reviewed. Their recorded
+            # observations remain visible, but they are not presented as a
+            # reconciled derived ledger.
+            ledger = None
     nodes: list[str] = []
     stacks = {
         player.player_name: player.starting_stack
@@ -156,33 +170,48 @@ def action_timeline_html(
         street = action.street.title()
         amount = "—" if action.amount is None else f"{action.amount:g} BB"
         tone = action.action_type.replace("all-in", "raise")
-        if action.stack_before is not None:
-            stacks[action.player_name] = action.stack_before
-            active_players.add(action.player_name)
-        active_stacks = [
-            stacks[name] for name in active_players if name in stacks and stacks[name] is not None
-        ]
-        row_effective_stack = min(active_stacks) if active_stacks else effective_stack
-        if effective_stack is not None:
-            row_effective_stack = (
-                effective_stack
+        snapshot = ledger.snapshots[index] if ledger is not None else None
+        if snapshot is not None:
+            effective_range = snapshot.effective_stack_range_before
+            pot_before = snapshot.pot_before
+            pot_after = snapshot.pot_after
+            pot_is_estimated = action.pot_before is None
+        else:
+            if action.stack_before is not None:
+                stacks[action.player_name] = action.stack_before
+                active_players.add(action.player_name)
+            active_stacks = [
+                stacks[name]
+                for name in active_players
+                if name in stacks and stacks[name] is not None
+            ]
+            row_effective_stack = min(active_stacks) if active_stacks else effective_stack
+            if effective_stack is not None:
+                row_effective_stack = (
+                    effective_stack
+                    if row_effective_stack is None
+                    else min(row_effective_stack, effective_stack)
+                )
+            effective_range = (
+                None
                 if row_effective_stack is None
-                else min(row_effective_stack, effective_stack)
+                else (row_effective_stack, row_effective_stack)
             )
-        pot_before = action.pot_before if action.pot_before is not None else running_pot
-        pot_is_estimated = action.pot_before is None and pot_before is not None
-        is_money_action = action.action_type in {
-            "post_blind",
-            "call",
-            "bet",
-            "raise",
-            "all-in",
-        }
-        pot_after = (
-            pot_before + action.amount
-            if pot_before is not None and action.amount is not None and is_money_action
-            else pot_before
-        )
+            pot_before = action.pot_before if action.pot_before is not None else running_pot
+            pot_is_estimated = action.pot_before is None and pot_before is not None
+            is_money_action = action.action_type in {
+                "ante",
+                "post_blind",
+                "call",
+                "bet",
+                "raise",
+                "all-in",
+            }
+            pot_after = (
+                pot_before + action.amount
+                if pot_before is not None and action.amount is not None and is_money_action
+                else pot_before
+            )
         estimate_mark = "~" if pot_is_estimated else ""
         pot_context = "—"
         if pot_before is not None:
@@ -192,21 +221,43 @@ def action_timeline_html(
                 else f"{estimate_mark}{pot_before:g} → {estimate_mark}{pot_after:g}"
             )
             pot_context = f"{pot_values} BB"
-        effective_context = "—" if row_effective_stack is None else f"{row_effective_stack:g} BB"
+        effective_context = "—"
+        if effective_range is not None:
+            low, high = effective_range
+            effective_context = (
+                f"{low:g} BB" if abs(high - low) < 0.001 else f"{low:g}–{high:g} BB"
+            )
         is_decision = action.street != "showdown" and action.action_type not in {"show", "win"}
-        spr = (
-            row_effective_stack / pot_before
-            if is_decision
-            and row_effective_stack is not None
+        if snapshot is not None:
+            spr_range = snapshot.spr_range_before if is_decision else None
+        elif (
+            is_decision
+            and effective_range is not None
             and pot_before is not None
             and pot_before > 0
-            else None
-        )
-        spr_context = "—" if spr is None else f"{spr:.1f}"
+        ):
+            spr_range = (effective_range[0] / pot_before, effective_range[1] / pot_before)
+        else:
+            spr_range = None
+        spr_context = "—"
+        if spr_range is not None:
+            low, high = spr_range
+            spr_context = f"{low:.1f}" if abs(high - low) < 0.05 else f"{low:.1f}–{high:.1f}"
+        note_parts = [action.notes] if action.notes else []
+        if (
+            snapshot is not None
+            and action.pot_before is not None
+            and abs(action.pot_before - snapshot.pot_before) > 0.05
+        ):
+            note_parts.append(
+                f"Recorded pot {action.pot_before:g} BB differs from ledger "
+                f"{snapshot.pot_before:g} BB."
+            )
+        note_text = " ".join(note_parts)
         notes = (
-            f'<span class="pt-history-note" title="{escape(action.notes)}">'
-            f"<b>Notes</b> {escape(action.notes)}</span>"
-            if action.notes
+            f'<span class="pt-history-note" title="{escape(note_text)}">'
+            f"<b>Notes</b> {escape(note_text)}</span>"
+            if note_text
             else ""
         )
         actor = actor_label(action.player_name, None) or "Unknown player"
@@ -224,12 +275,13 @@ def action_timeline_html(
             f"<span><b>Effective stack</b> {escape(effective_context)}</span>"
             f"<span><b>SPR</b> {escape(spr_context)}</span>{notes}</span></li>"
         )
-        if action.amount is not None and is_money_action and action.player_name in stacks:
-            stacks[action.player_name] = max(0.0, stacks[action.player_name] - action.amount)
-        if action.action_type == "fold":
-            active_players.discard(action.player_name)
-        if pot_after is not None:
-            running_pot = pot_after
+        if snapshot is None:
+            if action.amount is not None and is_money_action and action.player_name in stacks:
+                stacks[action.player_name] = max(0.0, stacks[action.player_name] - action.amount)
+            if action.action_type == "fold":
+                active_players.discard(action.player_name)
+            if pot_after is not None:
+                running_pot = pot_after
     return (
         '<section class="pt-history-panel"><div class="pt-history-head" aria-hidden="true">'
         "<span>No.</span><span>Street</span><span>Actor</span><span>Decision</span><span>Size</span></div>"

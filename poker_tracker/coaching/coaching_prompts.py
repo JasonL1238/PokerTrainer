@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+from poker_tracker.coaching.hand_history import format_hand_history
+from poker_tracker.math.accounting import HandLedger
 from poker_tracker.math.analytics import SessionStats
 from poker_tracker.math.equity import EquityResult
-from poker_tracker.coaching.hand_history import format_hand_history
-from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
 from poker_tracker.math.pot_odds import format_percentage
 from poker_tracker.math.preflop_ranges import range_percent, resolve_preflop_range
 from poker_tracker.math.ranges import get_range_description, normalize_range_label
-
+from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
+from poker_tracker.solver.models import SolverEvidence
 
 REQUIRED_REVIEW_SECTIONS = [
     "Hand Summary",
@@ -49,36 +50,59 @@ def build_hand_review_prompt(
     coaching_mode: str = "Theory + Exploit",
     hero_position: str | None = None,
     hero_range_scenario: str = "RFI",
+    ledger: HandLedger | None = None,
+    accounting_issues: list[str] | None = None,
+    accounting_authoritative: bool = False,
+    solver_evidence: SolverEvidence | None = None,
 ) -> str:
     """Build a structured prompt for a future LLM hand review without calling one."""
     range_label = normalize_range_label(villain_range_label)
     range_description = get_range_description(range_label)
     facts = _format_math_facts(pot_odds_facts or {})
     equity = _format_equity(equity_result)
+    solver = _format_solver_evidence(solver_evidence)
     hero_range_block = _format_hero_range(
         hero_position if hero_position is not None else hand.hero_position,
         hero_range_scenario,
     )
     sections = "\n".join(f"- {section}" for section in REQUIRED_REVIEW_SECTIONS)
+    result_bb = hand.hero_bb_won
+    if accounting_authoritative and ledger is not None and players:
+        hero = next((player for player in players if player.is_hero), None)
+        if hero is not None:
+            result_bb = ledger.net_results.get(hero.player_key, result_bb)
 
     return f"""Post-session safety:
 {POST_SESSION_SAFETY}
 
-Do not invent equities, solver outputs, range facts, population reads, or exact math.
+Do not invent equities, solver outputs, range facts, population reads, exact math, or EV loss.
 If an equity result is labeled placeholder/estimated, state that clearly.
+If solver evidence is supplied, preserve every frequency exactly, explain mixed
+strategies as mixes, and state its material assumptions. TexasSolver strategy JSON
+does not establish exact action EV or BB loss, so do not invent either.
 Coaching mode: {coaching_mode}
 
 Hand history:
-{format_hand_history(session, hand, actions, players or [])}
+{format_hand_history(
+    session,
+    hand,
+    actions,
+    players or [],
+    ledger=ledger,
+    accounting_issues=accounting_issues,
+    accounting_authoritative=accounting_authoritative,
+)}
 
 Hand tags: {", ".join(hand.tags) if hand.tags else "none"}
-Result: {hand.hero_bb_won if hand.hero_bb_won is not None else "unknown"} BB
+Result: {result_bb if result_bb is not None else "unknown"} BB
 Villain range label: {range_description.label}
 Villain range description: {range_description.description}{hero_range_block}
 Pot odds / math facts:
 {facts}
 Equity result:
 {equity}
+Solver evidence:
+{solver}
 
 Return exactly these sections:
 {sections}
@@ -167,4 +191,50 @@ def _format_equity(equity_result: EquityResult | None) -> str:
         f"- method: {equity_result.method}\n"
         f"- confidence: {format_percentage(equity_result.confidence)}\n"
         f"- notes: {equity_result.notes}"
+    )
+
+
+def _format_solver_evidence(evidence: SolverEvidence | None) -> str:
+    if evidence is None:
+        return "- none provided"
+    combo_strategy = (
+        ", ".join(
+            f"{item.action} {format_percentage(item.frequency)}"
+            for item in evidence.action_frequencies
+        )
+        or "unavailable"
+    )
+    range_strategy = (
+        "omitted because combo-specific strategy is available"
+        if evidence.action_frequencies
+        else (
+            ", ".join(
+                f"{item.action} {format_percentage(item.frequency)}"
+                for item in evidence.range_action_frequencies
+            )
+            or "unavailable"
+        )
+    )
+    exploitability = (
+        "unavailable"
+        if evidence.exploitability_pct is None
+        else f"{evidence.exploitability_pct:g}% of the starting pot"
+    )
+    assumptions = "; ".join(evidence.assumptions) or "none recorded"
+    warnings = "; ".join(evidence.warnings) or "none"
+    return (
+        f"- source: {evidence.backend} {evidence.backend_version}\n"
+        f"- spot: {evidence.street} on {evidence.board}; pot {evidence.pot:g} BB; "
+        f"effective stack {evidence.effective_stack:g} BB\n"
+        f"- hero: {evidence.hero_player} with {evidence.hero_combo}\n"
+        f"- recorded_action: {evidence.recorded_action or 'unavailable'}\n"
+        f"- mapped_solver_action: {evidence.mapped_action or 'unavailable'}\n"
+        f"- hero_combo_strategy: {combo_strategy}\n"
+        f"- input_weighted_range_strategy: {range_strategy}\n"
+        f"- IP_range: {evidence.range_ip_name}\n"
+        f"- OOP_range: {evidence.range_oop_name}\n"
+        f"- final_exploitability: {exploitability}\n"
+        f"- assumptions: {assumptions}\n"
+        f"- warnings: {warnings}\n"
+        "- action_ev_and_bb_loss: unavailable; do not infer or invent"
     )

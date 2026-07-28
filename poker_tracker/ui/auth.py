@@ -29,12 +29,11 @@ def check_password() -> bool:
         visual, sign_in = st.columns([1.45, 0.78], gap="large", vertical_alignment="center")
         with visual:
             table_html = poker_table_html(
-                hero_cards="As Kh",
-                board_cards="Qs 7d 2c 9h",
-                pot_size=38.5,
+                hero_cards="",
+                board_cards="",
+                pot_size=None,
                 players=[],
-                label="Simulated completed-hand replay",
-                preview=True,
+                label="Completed-hand data appears after sign-in",
             )
             product_hero(
                 "Review the decisions that define your game.",

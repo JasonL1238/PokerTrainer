@@ -15,9 +15,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 
-from cv_lab.labeling_poker.config import DEFAULT_DB_PATH, EXISTING_DATASET_IMAGES_DIR
-from cv_lab.labeling_poker.db import connect, get_file
-from cv_lab.labeling_poker.inference import predict_two_model
+from cv_lab.labeling_poker.config import (  # noqa: E402
+    DEFAULT_DB_PATH,
+    EXISTING_DATASET_IMAGES_DIR,
+)
+from cv_lab.labeling_poker.db import connect, get_file  # noqa: E402
+from cv_lab.labeling_poker.inference import predict_two_model  # noqa: E402
 
 
 def _queue_ids(path: Path) -> list[str]:

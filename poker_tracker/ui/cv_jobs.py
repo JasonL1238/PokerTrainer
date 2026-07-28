@@ -1,17 +1,19 @@
 """Launch and reconcile offline CV reconstruction subprocesses."""
+
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
-from datetime import datetime, timedelta, timezone
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import ProcessingJob
 from poker_tracker.ui.jobs import mark_failed
 from poker_tracker.ui.video_storage import JOB_LOGS_DIR, ensure_data_directories
-
 
 DEFAULT_STALE_AFTER = timedelta(minutes=15)
 
@@ -25,48 +27,60 @@ def start_cv_job(
     video_id: int,
     video_path: str | Path,
     session_name: str,
+    target_session_id: int | None = None,
 ) -> ProcessingJob:
     """Queue and detach one full offline reconstruction job."""
-    active = db.fetch_active_jobs()
-    if active:
-        current = active[0]
-        raise CVJobAlreadyRunningError(
-            f"Job #{current.id} is already {current.status}. Wait for it to finish or fail."
-        )
     path = Path(video_path)
     if not path.is_file():
         raise ValueError(f"Video file not found: {path}")
     if not session_name.strip():
         raise ValueError("Session name is required.")
 
-    job = db.create_processing_job(
-        ProcessingJob(
-            video_id=video_id,
-            job_type="cv_reconstruction",
-            status="queued",
-            message="Waiting for worker",
+    with db.transaction(immediate=True):
+        active = db.fetch_active_jobs()
+        if active:
+            current = active[0]
+            raise CVJobAlreadyRunningError(
+                f"Job #{current.id} is already {current.status}. "
+                "Wait for it to finish or fail."
+            )
+        active_solver = db.fetch_active_solver_runs()
+        if active_solver:
+            current = active_solver[0]
+            raise CVJobAlreadyRunningError(
+                f"Solver run #{current.id} is already {current.status}. "
+                "Wait for it to finish or cancel it."
+            )
+        job = db.create_processing_job(
+            ProcessingJob(
+                video_id=video_id,
+                job_type="cv_reconstruction",
+                status="queued",
+                message="Waiting for worker",
+            )
         )
-    )
     if job.id is None:
         raise RuntimeError("The processing job could not be saved.")
 
-    ensure_data_directories()
-    JOB_LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = JOB_LOGS_DIR / f"cv_job_{job.id}.log"
-    command = [
-        sys.executable,
-        "-m",
-        "poker_tracker.ui.run_cv_job",
-        "--job-id",
-        str(job.id),
-        "--video",
-        str(path),
-        "--session-name",
-        session_name.strip(),
-        "--db",
-        db.db_path,
-    ]
     try:
+        ensure_data_directories()
+        JOB_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = JOB_LOGS_DIR / f"cv_job_{job.id}.log"
+        command = [
+            sys.executable,
+            "-m",
+            "poker_tracker.ui.run_cv_job",
+            "--job-id",
+            str(job.id),
+            "--video",
+            str(path),
+            "--session-name",
+            session_name.strip(),
+            "--db",
+            db.db_path,
+        ]
+        if target_session_id is not None:
+            command.extend(["--target-session-id", str(target_session_id)])
         with log_path.open("ab") as log_file:
             process = subprocess.Popen(
                 command,
@@ -77,7 +91,7 @@ def start_cv_job(
                 start_new_session=True,
                 close_fds=True,
             )
-    except OSError as exc:
+    except Exception as exc:
         mark_failed(db, job.id, f"Could not start reconstruction worker: {exc}")
         raise RuntimeError("Could not start the reconstruction worker.") from exc
 
@@ -112,6 +126,8 @@ def reconcile_stuck_jobs(
         reference = job.heartbeat_at or job.started_at or job.created_at
         stale = current - _as_utc(reference) > stale_after
         dead = job.pid is None or not _pid_is_alive(job.pid)
+        if stale and not dead and not _terminate_job_group(job.pid):
+            continue
         if dead or stale:
             reason = "worker process is no longer running" if dead else "worker heartbeat expired"
             mark_failed(db, job.id, f"Orphaned after restart: {reason}.")
@@ -129,9 +145,42 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def _terminate_job_group(pid: int | None) -> bool:
+    if pid is None:
+        return True
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+    except PermissionError:
+        return False
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline:
+        if not _pid_is_alive(pid):
+            return True
+        time.sleep(0.05)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return False
+    except PermissionError:
+        return False
+    return True
+
+
 def _as_utc(value: datetime) -> datetime:
-    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)

@@ -7,7 +7,6 @@ from threading import Lock
 
 from .config import DEFAULT_MODEL_PATH, DEFAULT_REGION_MODEL_PATH, YOLOV12_VENDOR_CANDIDATES
 
-
 _MODEL = None
 _MODEL_LOCK = Lock()
 _REGION_MODEL = None
@@ -157,7 +156,7 @@ def predict_two_model(image_path: Path | str, *, conf: float = 0.35, imgsz: int 
     if image is None:
         raise ValueError(f"could not read image {image_path}")
     predictions = _card_classifier().classify_batch([_padded_crop(image, row, pad) for row in card_rows])
-    for row, (label, card_confidence) in zip(card_rows, predictions):
+    for row, (label, card_confidence) in zip(card_rows, predictions, strict=False):
         row["label"] = label
         row["card_confidence"] = round(card_confidence, 4)
     return rows

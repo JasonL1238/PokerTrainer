@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,8 +8,7 @@ import pytest
 
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import ProcessingJob, VideoRecord
-from poker_tracker.ui import cv_jobs
-from poker_tracker.ui import run_cv_job
+from poker_tracker.ui import cv_jobs, run_cv_job
 from poker_tracker.ui.run_cv_job import BACKUP_KEEP_COUNT, backup_database
 
 
@@ -65,7 +64,7 @@ def test_reconcile_stuck_jobs_marks_dead_pid_failed(
 ) -> None:
     db = make_db()
     video = add_video(db, tmp_path / "session.mp4")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     job = db.create_processing_job(
         ProcessingJob(
             job_type="cv_reconstruction",
@@ -85,12 +84,33 @@ def test_reconcile_stuck_jobs_marks_dead_pid_failed(
     db.close()
 
 
+def test_cv_setup_failure_does_not_leave_queued_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = make_db()
+    video = add_video(db, tmp_path / "session.mp4")
+    monkeypatch.setattr(
+        cv_jobs,
+        "ensure_data_directories",
+        lambda: (_ for _ in ()).throw(PermissionError("read only")),
+    )
+
+    with pytest.raises(RuntimeError, match="Could not start"):
+        cv_jobs.start_cv_job(db, video.id, video.stored_path, "Imported study")
+
+    jobs = db.fetch_jobs_by_video(video.id)
+    assert len(jobs) == 1
+    assert jobs[0].status == "failed"
+    assert db.fetch_active_jobs() == []
+    db.close()
+
+
 def test_reconcile_stuck_jobs_marks_stale_live_worker_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = make_db()
     video = add_video(db, tmp_path / "session.mp4")
-    heartbeat = datetime.now(timezone.utc) - timedelta(minutes=20)
+    heartbeat = datetime.now(UTC) - timedelta(minutes=20)
     job = db.create_processing_job(
         ProcessingJob(
             job_type="cv_reconstruction",
@@ -102,14 +122,21 @@ def test_reconcile_stuck_jobs_marks_stale_live_worker_failed(
         )
     )
     monkeypatch.setattr(cv_jobs, "_pid_is_alive", lambda pid: True)
+    terminated: list[int] = []
+    monkeypatch.setattr(
+        cv_jobs,
+        "_terminate_job_group",
+        lambda pid: terminated.append(pid) or True,
+    )
 
     reconciled = cv_jobs.reconcile_stuck_jobs(
         db,
-        now=datetime.now(timezone.utc),
+        now=datetime.now(UTC),
         stale_after=timedelta(minutes=15),
     )
 
     assert reconciled == [job.id]
+    assert terminated == [123]
     assert "heartbeat expired" in db.fetch_processing_job(job.id).error_message
     db.close()
 
@@ -119,7 +146,7 @@ def test_reconcile_keeps_live_fresh_job(
 ) -> None:
     db = make_db()
     video = add_video(db, tmp_path / "session.mp4")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     job = db.create_processing_job(
         ProcessingJob(
             job_type="cv_reconstruction",
@@ -194,3 +221,23 @@ def test_worker_completes_import_and_records_backup(
     assert "Imported 2 hands" in saved.message
     assert len(list(paths["backups"].glob("*.sqlite3"))) == 1
     checked.close()
+
+
+def test_read_pipeline_progress_handles_live_snapshot_and_startup_race(
+    tmp_path: Path,
+) -> None:
+    progress_path = tmp_path / "job_progress.json"
+
+    assert run_cv_job._read_pipeline_progress(progress_path) is None
+
+    progress_path.write_text(
+        '{"stage": "frames", "current": 7, "total": 20}',
+        encoding="utf-8",
+    )
+    assert run_cv_job._read_pipeline_progress(progress_path) == (7, 20, "frames")
+
+    progress_path.write_text(
+        '{"stage": "frames", "current": 30, "total": 20}',
+        encoding="utf-8",
+    )
+    assert run_cv_job._read_pipeline_progress(progress_path) == (20, 20, "frames")

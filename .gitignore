@@ -2,15 +2,19 @@ __pycache__/
 .pytest_cache/
 .venv/
 .env
+CLAUDE.local.md
 deploy/oci/.env
 *.pyc
 poker_tracker.db
 poker_tracker.db-*
+output/
+tmp/
 artifacts/ui-review/
 
 # Tool caches / local config
 .mpl_config/
 .yolo_config/
+.claude/settings.local.json
 
 # Labeling tool local data (labels DB + captured images)
 cv_lab/labeling_poker/data/

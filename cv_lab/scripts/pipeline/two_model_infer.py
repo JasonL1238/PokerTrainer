@@ -13,7 +13,7 @@ Flow per frame:
     3. Non-card classes pass straight through with their box; OCR/pill attribute
        reads remain the spine's separate pluggable layer (unchanged here).
 
-    python cv_lab/scripts/two_model_infer.py --image path/to/frame.png
+    python cv_lab/scripts/pipeline/two_model_infer.py --image path/to/frame.png
 """
 from __future__ import annotations
 
@@ -28,10 +28,14 @@ import cv2
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from cv_lab.scripts.pipeline.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
-from cv_lab.scripts.pipeline.card_classifier import CardClassifier  # noqa: E402
-from cv_lab.scripts.pipeline import region_detections as rd  # noqa: E402
 from cv_lab.labeling_poker.config import CLASSES  # noqa: E402
+from cv_lab.scripts.pipeline import region_detections as rd  # noqa: E402
+from cv_lab.scripts.pipeline.card_classifier import CardClassifier  # noqa: E402
+from cv_lab.scripts.pipeline.evaluate_yolo_cards import (  # noqa: E402
+    DEFAULT_YOLOV12_VENDOR,
+    _load_yolo_class,
+    _resolve_vendor_path,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_REGION_WEIGHTS = REPO_ROOT / "cv_lab" / "models" / "region_spine_v1.pt"

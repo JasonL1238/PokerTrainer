@@ -1,8 +1,17 @@
 import pytest
 from pydantic import ValidationError
 
-from poker_tracker.persistence.db import PokerDatabase, SCHEMA_VERSION
-from poker_tracker.persistence.models import Action, Hand, HandPlayer, HandReview, Session
+from poker_tracker.persistence.db import SCHEMA_VERSION, PokerDatabase
+from poker_tracker.persistence.models import (
+    Action,
+    Hand,
+    HandPlayer,
+    HandReview,
+    ProcessingJob,
+    ReconstructionFrameReview,
+    Session,
+    VideoRecord,
+)
 
 
 def make_db() -> PokerDatabase:
@@ -132,6 +141,56 @@ def test_create_hand_players_and_status_update() -> None:
     assert players[0].is_hero is True
     assert saved.review_status == "reviewed"
 
+    db.close()
+
+
+def test_reconstruction_frame_review_upserts_and_filters_by_hand() -> None:
+    db = make_db()
+    video = db.create_video(
+        VideoRecord(
+            original_filename="session.mp4",
+            stored_path="/tmp/session.mp4",
+            file_size_bytes=10,
+        )
+    )
+    job = db.create_processing_job(
+        ProcessingJob(
+            video_id=video.id,
+            job_type="cv_reconstruction",
+            status="completed",
+        )
+    )
+    first = ReconstructionFrameReview(
+        job_id=job.id,
+        hand_number=1,
+        source_image="/tmp/frame.jpg",
+        timestamp_seconds=4.0,
+        status="incorrect",
+        issue_types=["Action / player"],
+        notes="Seat 4 called.",
+    )
+    db.upsert_reconstruction_frame_review(first)
+    db.upsert_reconstruction_frame_review(
+        first.model_copy(
+            update={"status": "correct", "issue_types": [], "notes": ""}
+        )
+    )
+    db.upsert_reconstruction_frame_review(
+        ReconstructionFrameReview(
+            job_id=job.id,
+            hand_number=2,
+            source_image="/tmp/other.jpg",
+            timestamp_seconds=9.0,
+            status="incorrect",
+            issue_types=["Pot"],
+        )
+    )
+
+    hand_one = db.fetch_reconstruction_frame_reviews(job.id, hand_number=1)
+    assert len(hand_one) == 1
+    assert hand_one[0].status == "correct"
+    assert hand_one[0].issue_types == []
+    assert len(db.fetch_reconstruction_frame_reviews(job.id)) == 2
     db.close()
 
 

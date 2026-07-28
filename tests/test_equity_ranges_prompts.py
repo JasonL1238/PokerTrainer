@@ -1,4 +1,3 @@
-from poker_tracker.math.analytics import compute_session_stats
 from poker_tracker.coaching.coaching_prompts import (
     POST_SESSION_SAFETY,
     REQUIRED_REVIEW_SECTIONS,
@@ -6,24 +5,25 @@ from poker_tracker.coaching.coaching_prompts import (
     build_hand_review_prompt,
     build_session_review_prompt,
 )
-from poker_tracker.persistence.db import PokerDatabase
-from poker_tracker.math.equity import PlaceholderEquityCalculator
 from poker_tracker.coaching.hand_history import format_hand_history
-from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
+from poker_tracker.math.analytics import compute_session_stats
+from poker_tracker.math.equity import Eval7EquityCalculator
 from poker_tracker.math.pot_odds import required_equity_to_call
 from poker_tracker.math.preflop_ranges import get_preflop_range
 from poker_tracker.math.ranges import estimate_villain_range_label, get_range_description
+from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
 
 
 def test_equity_abstraction_returns_valid_result() -> None:
-    result = PlaceholderEquityCalculator().calculate_equity("Ah Qs", "Qd 7s 2c", "loose")
+    result = Eval7EquityCalculator().calculate_equity("Ah Qs", "Qd 7s 2c", "loose")
 
     assert result.hero_hand == "AhQs"
     assert result.board == "Qd 7s 2c"
     assert result.villain_range_label == "loose"
-    assert result.method == "placeholder"
-    assert result.confidence < 0.5
-    assert "Not a real equity calculation" in result.notes
+    assert result.method == "enumeration"
+    assert result.confidence >= 0.9
+    assert "Exact enumeration" in result.notes
     assert result.equity is not None
 
 
@@ -38,7 +38,7 @@ def test_range_label_mapping() -> None:
 
 def test_hand_prompt_contains_required_sections_and_safety() -> None:
     session, hand, actions, players = _sample_hand()
-    equity = PlaceholderEquityCalculator().calculate_equity(
+    equity = Eval7EquityCalculator().calculate_equity(
         hand.hero_cards, hand.board_cards, "standard"
     )
     prompt = build_hand_review_prompt(
@@ -55,7 +55,7 @@ def test_hand_prompt_contains_required_sections_and_safety() -> None:
     assert "Do not invent equities" in prompt
     assert "Hand history:" in prompt
     assert "required_equity_to_call" in prompt
-    assert "placeholder" in prompt
+    assert "enumeration" in prompt
     for section in REQUIRED_REVIEW_SECTIONS:
         assert section in prompt
 

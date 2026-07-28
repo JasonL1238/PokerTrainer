@@ -1,5 +1,5 @@
-from pathlib import Path
 import sqlite3
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -7,8 +7,14 @@ import pytest
 from pydantic import ValidationError
 
 from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.persistence.models import (
+    ExtractedFrame,
+    ProcessingJob,
+    ROIProfile,
+    ROIRegion,
+    VideoRecord,
+)
 from poker_tracker.ui.image_utils import crop_roi_from_image, save_roi_crop_preview
-from poker_tracker.persistence.models import ExtractedFrame, ProcessingJob, ROIProfile, ROIRegion, VideoRecord
 from poker_tracker.ui.roi import clip_roi_to_bounds, validate_roi_bounds
 from poker_tracker.ui.roi_profiles import (
     create_starter_clubwpt_profile,

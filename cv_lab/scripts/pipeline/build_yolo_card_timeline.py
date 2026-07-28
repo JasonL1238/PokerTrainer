@@ -14,7 +14,6 @@ from pathlib import Path
 
 import cv2
 
-
 DEFAULT_DATASET = "cv_lab/datasets/yolo_cards_card_changes_v1"
 DEFAULT_OUT = "cv_lab/results/yolo_card_timeline.json"
 

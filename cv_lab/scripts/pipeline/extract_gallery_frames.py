@@ -4,7 +4,7 @@ manual validation gallery (hand-history text vs. real video frames).
 Not a permanent pipeline script -- a one-off tool for building the artifact
 viewer. Requires the poker-cv conda env (cv2 + av).
 
-    python cv_lab/scripts/extract_gallery_frames.py --out-dir <scratch dir>
+    python cv_lab/scripts/pipeline/extract_gallery_frames.py --out-dir <scratch dir>
 """
 from __future__ import annotations
 

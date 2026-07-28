@@ -72,4 +72,7 @@ def test_password_gate_uses_product_hero(monkeypatch) -> None:
 
     assert not list(app.exception)
     assert any("Review the decisions that define your game" in item.value for item in app.markdown)
-    assert any("Simulated completed-hand replay" in item.value for item in app.markdown)
+    assert any(
+        "Completed-hand data appears after sign-in" in item.value
+        for item in app.markdown
+    )

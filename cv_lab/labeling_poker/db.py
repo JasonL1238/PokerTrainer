@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from collections.abc import Iterable
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Iterable
 
 from .config import IMAGE_SUFFIXES
-
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -104,7 +103,7 @@ def get_status(connection: sqlite3.Connection, file_id: str) -> str:
 def save_annotations(connection: sqlite3.Connection, file_id: str, status_value: str, boxes: Iterable[dict]) -> None:
     if status_value not in {"labeled", "clean", "duplicate"}:
         raise ValueError("status must be labeled, clean, or duplicate")
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     with connection:
         connection.execute("DELETE FROM annotations WHERE file_id = ?", (file_id,))
         if status_value == "labeled":

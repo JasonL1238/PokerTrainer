@@ -24,13 +24,15 @@ should later be re-anchored to on-screen landmarks (POT/BLINDS text) rather than
 absolute fractions -- noted as the generalization step.
 
 Usage:
-  python cv_lab/scripts/select_keyframes.py --video data/videos/clubwpt_session_01.mov \
+  python cv_lab/scripts/pipeline/select_keyframes.py --video data/videos/clubwpt_session_01.mov \
       --start 300 --end 396 --fps 3 --out cv_lab/hand01/auto
 """
 from __future__ import annotations
 
 # --- repo-root on sys.path so cv_lab.scripts.* absolute imports resolve ---
-import os as _os, sys as _sys
+import os as _os
+import sys as _sys
+
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))))
 
 import argparse
@@ -142,7 +144,7 @@ def select(times, whole, roi_series, roi_snaps, merge_diff=2.0):
 
     # representative = first settled (non-changed) sample AFTER each burst; else burst end
     reps = []
-    for (a, b) in bursts:
+    for (_a, b) in bursts:
         r = b + 1 if (b + 1 < n and not changed[b + 1]) else b
         reps.append(r)
     # always include the first settled state at window open

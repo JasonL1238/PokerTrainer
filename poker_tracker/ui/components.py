@@ -95,6 +95,69 @@ def kpi_card(label: str, value: str, detail: str = "", *, tone: str = "default")
     )
 
 
+def coverage_bar_html(rows: Iterable[tuple[str, int]]) -> str:
+    """Return a compact workflow-status distribution without chart runtime state."""
+
+    items = [(status, max(0, int(count))) for status, count in rows]
+    total = sum(count for _, count in items)
+    if total <= 0:
+        return '<div class="pt-coverage pt-coverage-empty">No review statuses recorded.</div>'
+    segments = "".join(
+        (
+            f'<span class="pt-coverage-segment pt-coverage-{_STATUS_TONES.get(status, "neutral")}" '
+            f'style="width:{100 * count / total:.6f}%" '
+            f'aria-label="{escape(status.replace("_", " ").title())}: {count}"></span>'
+        )
+        for status, count in items
+        if count > 0
+    )
+    legend = "".join(
+        (
+            f'<span class="pt-coverage-key pt-coverage-{_STATUS_TONES.get(status, "neutral")}">'
+            '<i aria-hidden="true"></i>'
+            f'{escape(status.replace("_", " ").title())} <strong>{count}</strong></span>'
+        )
+        for status, count in items
+    )
+    return (
+        f'<div class="pt-coverage" aria-label="Review coverage across {total} hands">'
+        f'<div class="pt-coverage-track">{segments}</div>'
+        f'<div class="pt-coverage-legend">{legend}</div></div>'
+    )
+
+
+def coverage_bar(rows: Iterable[tuple[str, int]]) -> None:
+    """Render a review-status distribution in the product design language."""
+
+    st.markdown(coverage_bar_html(rows), unsafe_allow_html=True)
+
+
+def frequency_bars_html(rows: Iterable[tuple[str, int]]) -> str:
+    """Return compact proportional bars for small categorical counts."""
+
+    items = [(str(label), max(0, int(count))) for label, count in rows]
+    maximum = max((count for _, count in items), default=0)
+    if maximum <= 0:
+        return '<div class="pt-frequency pt-frequency-empty">No frequency data recorded.</div>'
+    rendered = "".join(
+        (
+            '<div class="pt-frequency-row">'
+            f'<span>{escape(label)}</span>'
+            '<div class="pt-frequency-track">'
+            f'<i style="width:{100 * count / maximum:.6f}%"></i></div>'
+            f"<strong>{count}</strong></div>"
+        )
+        for label, count in items
+    )
+    return f'<div class="pt-frequency" aria-label="Category frequencies">{rendered}</div>'
+
+
+def frequency_bars(rows: Iterable[tuple[str, int]]) -> None:
+    """Render compact categorical frequencies without a chart runtime."""
+
+    st.markdown(frequency_bars_html(rows), unsafe_allow_html=True)
+
+
 def status_badge(status: str, *, label: str | None = None) -> str:
     """Return safe badge HTML for use inside richer component markup."""
     normalized = status.lower().strip()

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-
 RANKS = "23456789TJQKA"
 SUITS = "hdcs"
 

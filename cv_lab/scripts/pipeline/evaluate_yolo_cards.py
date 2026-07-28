@@ -16,10 +16,8 @@ import av
 import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-import cv_lab.scripts.pipeline.read_table
-import cv_lab.scripts.pipeline.read_cards
-import cv_lab.scripts.pipeline.read_hero
 
+from cv_lab.scripts.pipeline import read_cards, read_hero, read_table  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_YOLOV12_VENDOR = REPO_ROOT.parent / "cv-backend" / "vendor" / "yolov12"

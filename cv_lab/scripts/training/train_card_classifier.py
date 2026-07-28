@@ -9,7 +9,7 @@ Ultralytics classification expects a folder-per-class dataset ROOT (not a
 data.yaml):  <root>/{train,val}/<label>/*.png  -- exactly what
 build_card_cls_dataset.py produces.
 
-  python cv_lab/scripts/train_card_classifier.py \
+  python cv_lab/scripts/training/train_card_classifier.py \
       --data cv_lab/datasets/cards_cls_v5_20260717 \
       --epochs 60 --imgsz 128 --name cards_cls_v5
 """
@@ -21,7 +21,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-from cv_lab.scripts.pipeline.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
+from cv_lab.scripts.pipeline.evaluate_yolo_cards import (  # noqa: E402
+    DEFAULT_YOLOV12_VENDOR,
+    _load_yolo_class,
+    _resolve_vendor_path,
+)
 
 
 def main() -> None:

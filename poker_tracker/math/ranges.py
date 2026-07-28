@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-
 RANGE_LABELS = {"tight", "standard", "loose", "very_loose", "premium", "unknown"}
 
 

@@ -14,7 +14,7 @@ detection head to the 8 region classes.
 Prefer installed ultralytics (pass --yolov12-vendor "") over the yolov12 vendor:
 vendor TAL hits shape-mismatch crashes on dense table frames.
 
-  python cv_lab/scripts/train_region_detector.py \
+  python cv_lab/scripts/training/train_region_detector.py \
       --data cv_lab/datasets/region_spine_v6_20260718/data.yaml \
       --epochs 100 --name region_spine_v6_20260718 --device mps \
       --yolov12-vendor "" --mosaic 0 --no-amp
@@ -27,7 +27,10 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-from cv_lab.scripts.pipeline.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
+from cv_lab.scripts.pipeline.evaluate_yolo_cards import (  # noqa: E402
+    _load_yolo_class,
+    _resolve_vendor_path,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_BASE = "yolo11s.pt"

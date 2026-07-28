@@ -15,7 +15,6 @@ from pathlib import Path
 
 import cv2
 
-
 DEFAULT_DATASET = "cv_lab/datasets/yolo_cards_autolabel_v3"
 DEFAULT_OUT_DIRNAME = "hard_examples"
 

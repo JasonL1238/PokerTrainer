@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from poker_tracker.persistence.models import Hand, ProcessingJob, Session, VideoRecord
 from poker_tracker.ui.view_models import (
@@ -53,7 +53,7 @@ def test_hand_rows_label_source_confidence_and_unknown_cards() -> None:
 
 
 def test_job_rows_include_video_and_relative_age() -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     video = VideoRecord(id=2, original_filename="session.mov", stored_path="/tmp/x", file_size_bytes=1)
     job = ProcessingJob(
         id=3,
@@ -72,7 +72,7 @@ def test_job_rows_include_video_and_relative_age() -> None:
 
 
 def test_confidence_and_age_boundaries() -> None:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     assert confidence_label(None) == "Not scored"
     assert confidence_label(0.85) == "High"
     assert confidence_label(0.6) == "Medium"

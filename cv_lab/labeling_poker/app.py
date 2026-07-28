@@ -13,8 +13,8 @@ from .config import (
     CARD_RANKS,
     CARD_SUIT_SYMBOLS,
     CARD_SUITS,
-    CLASSES,
     CLASS_COLORS,
+    CLASSES,
     DEFAULT_DB_PATH,
     DEFAULT_IMAGES_DIR,
     DEFAULT_PRIORITY_DIR,
@@ -23,7 +23,6 @@ from .config import (
 )
 from .db import (
     connect,
-    file_ids,
     get_annotations,
     get_file,
     get_status,
@@ -368,7 +367,7 @@ def create_app(db_path: Path | str = DEFAULT_DB_PATH, images_dir: Path | str = D
                     label = normalize_card_label(class_name, box.get("label"))
                 except ValueError as exc:
                     return jsonify({"error": str(exc)}), 400
-                clean_boxes.append({"class": class_name, "label": label, **dict(zip(("x1", "y1", "x2", "y2"), values))})
+                clean_boxes.append({"class": class_name, "label": label, **dict(zip(("x1", "y1", "x2", "y2"), values, strict=False))})
             if status_value in {"clean", "duplicate"} and clean_boxes:
                 return jsonify({"error": "clean or duplicate images cannot have boxes"}), 400
             save_annotations(connection, file_id, status_value, clean_boxes)

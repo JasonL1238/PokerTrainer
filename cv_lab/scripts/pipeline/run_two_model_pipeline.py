@@ -15,7 +15,7 @@ This is the live wiring of the Design-A architecture:
 Neither model is invoked by the spine directly -- we build region_detections.Frame
 objects and hand them to build_hand_timeline(), exactly as the fixture path does.
 
-  python cv_lab/scripts/run_two_model_pipeline.py \
+  python cv_lab/scripts/pipeline/run_two_model_pipeline.py \
       --video data/videos/clubwpt_session_01.mov \
       --start 0 --end 120 --interval 2 --device mps \
       --out cv_lab/results/two_model_timeline.json
@@ -24,25 +24,35 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
 
 import av
+import cv2
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 
-from cv_lab.scripts.pipeline.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
-from cv_lab.scripts.pipeline.card_classifier import CardClassifier, DEFAULT_CLS_WEIGHTS  # noqa: E402
 import cv_lab.scripts.pipeline.region_detections as rd  # noqa: E402
 from cv_lab.scripts.pipeline.build_yolo_hand_timeline import build_hand_timeline  # noqa: E402
+from cv_lab.scripts.pipeline.card_classifier import (  # noqa: E402
+    DEFAULT_CLS_WEIGHTS,
+    CardClassifier,
+)
+from cv_lab.scripts.pipeline.evaluate_yolo_cards import (  # noqa: E402
+    DEFAULT_YOLOV12_VENDOR,
+    _load_yolo_class,
+    _resolve_vendor_path,
+)
 
 DEFAULT_DETECTOR = REPO_ROOT / "cv_lab" / "models" / "region_spine_v1.pt"
 if not DEFAULT_DETECTOR.exists():
     DEFAULT_DETECTOR = REPO_ROOT / "cv_lab" / "runs" / "yolo_cards" / "region_spine_v1" / "weights" / "best.pt"
 DEFAULT_VIDEO = REPO_ROOT / "data" / "videos" / "clubwpt_session_01.mov"
+REVIEW_FRAME_MAX_WIDTH = 1280
 
 
 def _iou(a: dict, b: dict) -> float:
@@ -114,6 +124,42 @@ def _sample_times(container, stream, start: float, end: float, interval: float):
         t += interval
 
 
+def _save_review_frame(image, destination: Path) -> None:
+    """Save a compact visual-audit copy without changing model input pixels."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    height, width = image.shape[:2]
+    if width > REVIEW_FRAME_MAX_WIDTH:
+        scale = REVIEW_FRAME_MAX_WIDTH / width
+        image = cv2.resize(
+            image,
+            (REVIEW_FRAME_MAX_WIDTH, max(1, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    if not cv2.imwrite(
+        str(destination), image, [cv2.IMWRITE_JPEG_QUALITY, 80]
+    ):
+        raise RuntimeError(f"Could not save review frame: {destination}")
+
+
+def _write_progress(
+    destination: Path | None,
+    *,
+    current: int,
+    total: int,
+    stage: str,
+) -> None:
+    """Publish compact machine-readable progress for the detached UI worker."""
+    if destination is None:
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_suffix(f"{destination.suffix}.tmp")
+    temporary.write_text(
+        json.dumps({"stage": stage, "current": current, "total": total}),
+        encoding="utf-8",
+    )
+    temporary.replace(destination)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -138,6 +184,16 @@ def main() -> None:
     parser.add_argument("--dump-frames", default="",
                         help="optional: write fixture-compatible frames (region_detections.load_frames) "
                              "so the spine can be re-run on cached detections without GPU inference")
+    parser.add_argument(
+        "--frame-dir",
+        default="",
+        help="optional: save compact source frames used by the evidence-review UI",
+    )
+    parser.add_argument(
+        "--progress-file",
+        default="",
+        help="optional: publish live frame-processing progress as JSON",
+    )
     parser.add_argument("--yolov12-vendor", default=str(DEFAULT_YOLOV12_VENDOR))
     args = parser.parse_args()
 
@@ -153,15 +209,34 @@ def main() -> None:
     print(f"sampling {args.video}  [{args.start}s..{args.end}s every {args.interval}s]")
     container = av.open(args.video)
     stream = container.streams.video[0]
+    progress_path = Path(args.progress_file).resolve() if args.progress_file else None
+    total_samples = max(1, math.floor((args.end - args.start) / args.interval) + 1)
+    _write_progress(
+        progress_path,
+        current=0,
+        total=total_samples,
+        stage="frames",
+    )
     frames: list[rd.Frame] = []
     raw_dump: list[dict] = []
     n_cards = 0
     for i, (t, img) in enumerate(_sample_times(container, stream, args.start, args.end, args.interval)):
         rows = _detect_regions(detector, img, conf=args.conf, imgsz=args.imgsz, iou=args.iou,
                                device=args.device, dedupe_iou=args.dedupe_iou)
+        image_name = f"t{t:09.2f}"
+        if args.frame_dir:
+            image_path = Path(args.frame_dir).resolve() / f"{image_name}.jpg"
+            _save_review_frame(img, image_path)
+            image_name = str(image_path)
         frame = rd.frame_from_models(img, t, rows, classifier=classifier,
-                                     image_name=f"t{t:07.2f}", pad=args.pad, video_frame=i)
+                                     image_name=image_name, pad=args.pad, video_frame=i)
         frames.append(frame)
+        _write_progress(
+            progress_path,
+            current=i + 1,
+            total=total_samples,
+            stage="frames",
+        )
         cards = [d for d in frame.detections if d.cls == "face_card" and d.attr]
         n_cards += len(cards)
         if args.dump_detections:
@@ -177,7 +252,22 @@ def main() -> None:
 
     print(f"\nsampled {len(frames)} frames, {n_cards} named cards total")
     print("building hand timeline via reconstruction spine...")
+    _write_progress(
+        progress_path,
+        current=total_samples,
+        total=total_samples,
+        stage="timeline",
+    )
     timeline = build_hand_timeline(frames)
+    if args.frame_dir:
+        used_images = {
+            str(Path(state["image"]).resolve())
+            for state in timeline.get("states", [])
+            if state.get("image")
+        }
+        for saved_frame in Path(args.frame_dir).resolve().glob("*.jpg"):
+            if str(saved_frame.resolve()) not in used_images:
+                saved_frame.unlink()
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

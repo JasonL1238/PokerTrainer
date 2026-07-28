@@ -26,12 +26,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+from cv_lab.scripts.pipeline import region_detections as rd
 from cv_lab.scripts.pipeline.build_yolo_card_timeline import (
     _best_board,
     _stage,
     _street_events,
 )
-from cv_lab.scripts.pipeline import region_detections as rd
 
 DEFAULT_OUT = "cv_lab/results/yolo_hand_timeline.json"
 
@@ -59,7 +59,7 @@ def _sampling_interval(frames: list[rd.Frame]) -> float:
     with no caller change. Falls back to the calibration interval when it can't
     be measured (0/1 frame, or non-increasing times)."""
     ts = [f.time_s for f in frames if f.time_s is not None]
-    deltas = sorted(b - a for a, b in zip(ts, ts[1:]) if b - a > _EPS)
+    deltas = sorted(b - a for a, b in zip(ts, ts[1:], strict=False) if b - a > _EPS)
     return deltas[len(deltas) // 2] if deltas else _CALIB_INTERVAL_S
 
 
@@ -457,7 +457,7 @@ def _settle_index(hand: list[dict[str, Any]]) -> int:
         suffix_max_pot[i] = max(p, suffix_max_pot[i + 1])
     pot_so_far: float | None = None
     best_idx, best_jump = n - 1, 0.0
-    for idx, (prev, cur) in enumerate(zip(hand, hand[1:]), start=1):
+    for idx, (prev, cur) in enumerate(zip(hand, hand[1:], strict=False), start=1):
         if prev["pot"] is not None:
             pot_so_far = prev["pot"] if pot_so_far is None else max(pot_so_far, prev["pot"])
         threshold = max(3.0, 0.4 * (pot_so_far or 0.0))
@@ -502,14 +502,37 @@ def _reconstruct_actions(
     acted: dict[str, set[int]] = {}          # street -> seats seen acting
     street_raised: dict[str, bool] = {}      # street -> saw raise/bet/all-in
 
-    def emit(street, seat, atype, amount, pot_before, stack_before):
+    def emit(
+        street,
+        seat,
+        atype,
+        amount,
+        pot_before,
+        stack_before,
+        *,
+        source: dict[str, Any] | None,
+        derivation: str,
+    ):
         street_index[street] = street_index.get(street, 0) + 1
         if atype in {"bet", "raise", "all-in"}:
             street_has_bet[street] = True
             street_raised[street] = True
         acted.setdefault(street, set()).add(seat)
-        actions.append(_action(street, street_index[street], seat, positions, player_name,
-                               atype, amount, pot_before, stack_before))
+        actions.append(
+            _action(
+                street,
+                street_index[street],
+                seat,
+                positions,
+                player_name,
+                atype,
+                amount,
+                pot_before,
+                stack_before,
+                source=source,
+                derivation=derivation,
+            )
+        )
 
     # ---- pre-observed actions standing in the hand's FIRST state ----
     # A hand often enters view mid-preflop: pills and bet_texts already on the
@@ -523,14 +546,24 @@ def _reconstruct_actions(
             bet = first["bets"].get(seat)
             if pill == "fold":
                 folded.add(seat)
-                emit("preflop", seat, "fold", None, None, first["stacks"].get(seat))
+                emit(
+                    "preflop", seat, "fold", None, None, first["stacks"].get(seat),
+                    source=first, derivation="action_pill",
+                )
             elif pill in {"raise", "bet", "call"}:
                 emit("preflop", seat, pill if pill != "bet" else "raise",
-                     bet, None, first["stacks"].get(seat))
+                     bet, None, first["stacks"].get(seat),
+                     source=first, derivation="action_pill")
             elif pill == "check":
-                emit("preflop", seat, "check", None, None, first["stacks"].get(seat))
+                emit(
+                    "preflop", seat, "check", None, None, first["stacks"].get(seat),
+                    source=first, derivation="action_pill",
+                )
             elif pill is None and bet is not None and bet > 1.0 + _EPS:
-                emit("preflop", seat, "call", bet, None, first["stacks"].get(seat))
+                emit(
+                    "preflop", seat, "call", bet, None, first["stacks"].get(seat),
+                    source=first, derivation="bet_text",
+                )
 
     settle = _settle_index(hand)
     window = hand[: settle + 1]
@@ -550,7 +583,7 @@ def _reconstruct_actions(
     # bet across that gap, the felt's still-showing raise reads as a fresh bet the
     # next frame and duplicates the action (see run-length debounce note at top).
     carried_bet: dict[tuple[str, int], float] = {}
-    for i, (prev, cur) in enumerate(zip(window, window[1:])):
+    for i, (prev, cur) in enumerate(zip(window, window[1:], strict=False)):
         nxt = window[i + 2] if i + 2 < len(window) else None
         board_hwm = max(board_hwm, len(prev["board_cards"]))
         street = _street_for_count(board_hwm, prev["stage"])
@@ -559,7 +592,7 @@ def _reconstruct_actions(
         pot_before = prev["pot"]
 
         # ---- money actions (bet_text delta, corroborated by the stack) ----
-        money_seats: dict[int, tuple[float, float | None]] = {}  # seat -> (amount, stack_before)
+        money_seats: dict[int, tuple[float, float | None, str]] = {}
         for seat in sorted(set(cur["bets"]) | set(cur["stacks"])):
             if seat in folded or seat not in positions:
                 continue
@@ -568,9 +601,11 @@ def _reconstruct_actions(
             stack_dropped = before is not None and after is not None and after < before - _EPS
             stack_flat = before is not None and after is not None and abs(after - before) <= _EPS
             amount = None
+            derivation = ""
             if stack_dropped:
                 # the debounced stack delta is the most reliable size
                 amount = round(before - after, 2)
+                derivation = "stack_delta"
             elif not stack_flat:
                 # stack unreadable this transition: fall back to the bet_text
                 # delta. (A bet_text rising while the stack is provably unchanged
@@ -593,10 +628,11 @@ def _reconstruct_actions(
                         base = 0.0
                     if cur_bet > base + _EPS:
                         amount = round(cur_bet - base, 2)
+                        derivation = "bet_text_delta"
             if amount is not None and amount >= 0.5 - _EPS:
-                money_seats[seat] = (amount, before)
+                money_seats[seat] = (amount, before, derivation)
 
-        for seat, (amount, stack_before) in sorted(money_seats.items()):
+        for seat, (amount, stack_before, derivation) in sorted(money_seats.items()):
             pill = cur["pills"].get(seat)
             after = cur["stacks"].get(seat)
             if after is not None and after <= _EPS:
@@ -605,7 +641,10 @@ def _reconstruct_actions(
                 atype = pill
             else:
                 atype = "call" if street_has_bet.get(street) else "bet"
-            emit(street, seat, atype, amount, pot_before, stack_before)
+            emit(
+                street, seat, atype, amount, pot_before, stack_before,
+                source=cur, derivation=derivation,
+            )
 
         # ---- folds: card_back disappeared OR a fresh fold pill (hero: pill only) ----
         # A fold is only possible facing a bet; "folds" detected on a street where
@@ -644,7 +683,13 @@ def _reconstruct_actions(
                 if before is not None and before <= _EPS:
                     continue  # an all-in player's cards flip over; they can't fold
             folded.add(seat)
-            emit(street, seat, "fold", None, pot_before, prev["stacks"].get(seat))
+            emit(
+                street, seat, "fold", None, pot_before, prev["stacks"].get(seat),
+                source=cur,
+                derivation=(
+                    "action_pill" if seat in pill_folds else "card_back_disappeared"
+                ),
+            )
 
         # ---- checks: fresh check pill, no money this transition ----
         # A fresh check pill arriving together WITH a new board card belongs to
@@ -658,7 +703,10 @@ def _reconstruct_actions(
                 continue
             if seat in money_seats or seat in folded or seat not in positions:
                 continue
-            emit(check_street, seat, "check", None, pot_before, prev["stacks"].get(seat))
+            emit(
+                check_street, seat, "check", None, pot_before, prev["stacks"].get(seat),
+                source=cur, derivation="action_pill",
+            )
 
         # carry each seat's standing bet_text forward as a per-street high-water
         # mark so a later single-frame dropout can't reset its base to 0
@@ -694,10 +742,32 @@ def _reconstruct_actions(
                 # on the last street, only a showdown (>=2 seats never folded)
                 # proves the unseen players actually got to check
                 if street != order[-1] or len(actionable) >= 2:
-                    emit(street, seat, "check", None, None, None)
+                    source = next(
+                        (
+                            state
+                            for state in reversed(window)
+                            if _STREET_BY_COUNT.get(len(state["board_cards"])) == street
+                        ),
+                        window[-1],
+                    )
+                    emit(
+                        street, seat, "check", None, None, None,
+                        source=source, derivation="inferred_round_complete",
+                    )
             elif street == "preflop" and positions.get(seat) == "BB" \
                     and not street_raised.get("preflop"):
-                emit(street, seat, "check", None, None, None)
+                source = next(
+                    (
+                        state
+                        for state in reversed(window)
+                        if not state["board_cards"]
+                    ),
+                    window[0],
+                )
+                emit(
+                    street, seat, "check", None, None, None,
+                    source=source, derivation="inferred_round_complete",
+                )
 
     # Emission interleaves sources (transitions, cur-street checks, synthesis),
     # so impose global street order; within a street the emit order stands.
@@ -706,7 +776,20 @@ def _reconstruct_actions(
     return actions
 
 
-def _action(street, index, seat, positions, player_name, atype, amount, pot_before, stack_before):
+def _action(
+    street,
+    index,
+    seat,
+    positions,
+    player_name,
+    atype,
+    amount,
+    pot_before,
+    stack_before,
+    *,
+    source: dict[str, Any] | None,
+    derivation: str,
+):
     return {
         "street": street,
         "action_index": index,
@@ -719,6 +802,10 @@ def _action(street, index, seat, positions, player_name, atype, amount, pot_befo
         "amount": amount,
         "pot_before": pot_before,
         "stack_before": stack_before,
+        "source_time_s": None if source is None else source.get("time_s"),
+        "source_image": None if source is None else source.get("image"),
+        "source_state_index": None if source is None else source.get("state_index"),
+        "derivation": derivation,
     }
 
 

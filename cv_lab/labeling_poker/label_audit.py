@@ -17,7 +17,6 @@ from pathlib import Path
 from .config import CARD_LABEL_RE, DEFAULT_DB_PATH, DEFAULT_PRIORITY_DIR
 from .db import connect, get_annotations
 
-
 SEVERITY = {
     "duplicate_card_labels": 100,
     "invalid_card_label": 95,

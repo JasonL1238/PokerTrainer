@@ -7,7 +7,7 @@ from poker_tracker.math.analytics import compute_session_stats
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.import_export import export_hand, export_session, import_session
 from poker_tracker.persistence.models import Action, Hand, Session
-from poker_tracker.persistence.seed_data import create_sample_data
+from tests.fixtures.seed_data import create_sample_data
 
 
 def make_db() -> PokerDatabase:
@@ -54,6 +54,12 @@ def test_seed_data_creation() -> None:
     assert len(hands) == 5
     assert {"MISSED_VALUE", "MULTIWAY", "PREFLOP_3BET_SPOT"}.issubset(stats.hands_by_tag)
     assert stats.biggest_losing_hands[0].hero_bb_won == -65
+    for hand in hands:
+        monetary_actions = [
+            action for action in db.fetch_actions_by_hand(hand.id) if action.amount is not None
+        ]
+        assert monetary_actions
+        assert all(action.amount_semantics == "unknown" for action in monetary_actions)
 
     db.close()
 

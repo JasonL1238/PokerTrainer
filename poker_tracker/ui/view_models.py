@@ -1,9 +1,9 @@
 """Pure display transformations used by the product UI."""
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Iterable, Mapping
+from datetime import UTC, datetime
 
 from poker_tracker.persistence.models import Hand, ProcessingJob, Session, VideoRecord
 
@@ -129,7 +129,7 @@ def build_job_rows(
     now: datetime | None = None,
 ) -> list[JobRow]:
     video_names = {video.id: video.original_filename for video in videos if video.id is not None}
-    current = now or datetime.now(timezone.utc)
+    current = now or datetime.now(UTC)
     return [
         JobRow(
             job_id=job.id or 0,
@@ -157,9 +157,9 @@ def confidence_label(score: float | None) -> str:
 
 
 def format_age(value: datetime, now: datetime | None = None) -> str:
-    current = now or datetime.now(timezone.utc)
+    current = now or datetime.now(UTC)
     if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
+        value = value.replace(tzinfo=UTC)
     seconds = max(0, int((current - value).total_seconds()))
     if seconds < 60:
         return "Just now"

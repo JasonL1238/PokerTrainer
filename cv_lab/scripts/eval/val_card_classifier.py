@@ -6,7 +6,7 @@ matrix, printed worst-first, so you can see exactly which cards the model is wea
 on and target more data there.
 
 Usage:
-  python cv_lab/scripts/val_card_classifier.py \
+  python cv_lab/scripts/eval/val_card_classifier.py \
       --weights cv_lab/models/card_cls_v1.pt \
       --data cv_lab/datasets/cards_cls_v5_20260717
 """
@@ -18,7 +18,11 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-from cv_lab.scripts.pipeline.evaluate_yolo_cards import DEFAULT_YOLOV12_VENDOR, _load_yolo_class, _resolve_vendor_path  # noqa: E402
+from cv_lab.scripts.pipeline.evaluate_yolo_cards import (  # noqa: E402
+    DEFAULT_YOLOV12_VENDOR,
+    _load_yolo_class,
+    _resolve_vendor_path,
+)
 
 
 def main() -> None:

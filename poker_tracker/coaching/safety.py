@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-
 REQUIRED_SAFETY_PHRASES = [
     "post-session",
     "completed hands",

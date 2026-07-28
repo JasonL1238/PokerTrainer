@@ -2,9 +2,9 @@
 
 This module measures the *structural* quality of hand-review coaching on a
 fixed set of golden hands. It is deliberately provider-agnostic: it drives any
-object satisfying the ``LLMProvider`` protocol (``MockLLMProvider`` for
-deterministic offline runs, ``AnthropicLLMProvider`` / ``CloudLLMProvider`` when
-a real API key is present) and scores the returned text with cheap heuristics.
+object satisfying the ``LLMProvider`` protocol. Test suites inject a deterministic
+fixture; production runs use ``AnthropicLLMProvider`` or ``CloudLLMProvider`` with
+a real API key. The harness scores returned text with cheap heuristics.
 
 The three checks are:
 
@@ -26,10 +26,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from poker_tracker.coaching.coaching_prompts import REQUIRED_REVIEW_SECTIONS, build_hand_review_prompt
+from poker_tracker.coaching.coaching_prompts import (
+    REQUIRED_REVIEW_SECTIONS,
+    build_hand_review_prompt,
+)
 from poker_tracker.coaching.llm_providers import LLMProvider, parse_sections
 from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
-
 
 # Live-play / real-time-assistance phrasing that must never appear in a
 # post-session review. Scanned case-insensitively against the response text.

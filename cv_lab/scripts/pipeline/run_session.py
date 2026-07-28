@@ -7,12 +7,15 @@ street-by-street stitch + arithmetic reconciliation -> reconstructed hands.
 Outputs a timeline + a list of reconstructed hands and a completeness score.
 Sampling is sequential-decode every `--stride` frames (default 30 -> ~2 fps).
 """
-import sys, os, json, argparse
+import argparse
+import json
+import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-import numpy as np
 import av
 
-import cv_lab.scripts.pipeline.read_table
+from cv_lab.scripts.pipeline import read_table  # noqa: E402
 
 VIDEO = "/Users/jasonli/Documents/GitHub/PokerTrainer/data/videos/clubwpt_session_01.mov"
 MODELS = "/Users/jasonli/Documents/GitHub/PokerTrainer/cv_lab/models"
@@ -90,7 +93,7 @@ def segment(timeline):
     tbl = [s for s in timeline if s.get("screen") == "table"]
     clean = _denoise_pot(tbl)
     bc = _smooth_bc(tbl)
-    for s, p in zip(tbl, clean):
+    for s, p in zip(tbl, clean, strict=False):
         s["pot_clean"] = p
     hands, cur = [], []
     reached_flop, hand_max, prev_bc = False, 0.0, 0

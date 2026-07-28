@@ -23,8 +23,8 @@ its whole-frame-normalized coords == canonical table coords).
 """
 from __future__ import annotations
 
-import numpy as np
 import cv2
+import numpy as np
 
 # canonical reference frame dims (t0360) and coin constellation (normalized 0..1)
 REF_W, REF_H = 2138, 1402

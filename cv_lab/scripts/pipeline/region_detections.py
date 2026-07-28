@@ -22,9 +22,10 @@ ground-truth boxes and synthetic fixtures work with no OCR/model.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 # Canonical rank+suit normaliser shared with the labeler ("KD"/"10C" -> "Kd"/"Tc").
 from cv_lab.labeling_poker.config import CLASSES, normalize_card_label
@@ -295,7 +296,7 @@ def assign_regions(frame: Frame) -> dict[str, Any]:
         seat(0)["card_back"] = True
 
     # Resolve pills now that dealt-in status per seat is known.
-    for i, info in seats.items():
+    for _i, info in seats.items():
         pill_det = info.pop("_pill_det", None)
         if pill_det is not None:
             info["pill_action"] = read_pill_action(pill_det, dealt_in=info["card_back"])

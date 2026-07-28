@@ -15,13 +15,15 @@ derivable from the blind posts, so this is a cross-check.)
 from __future__ import annotations
 
 # --- repo-root on sys.path so cv_lab.scripts.* absolute imports resolve ---
-import os as _os, sys as _sys
+import os as _os
+import sys as _sys
+
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))))
 
-import numpy as np
 import cv2
+import numpy as np
 
-from cv_lab.scripts.pipeline.landmark_anchor import REF_SEAT_COINS, REF_W, REF_H
+from cv_lab.scripts.pipeline.landmark_anchor import REF_SEAT_COINS, REF_W
 
 
 def _seat_pixels(anchor_map):

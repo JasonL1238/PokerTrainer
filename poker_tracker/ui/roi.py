@@ -5,7 +5,6 @@ from typing import Any
 
 from poker_tracker.persistence.models import ROIRegion, ROIType
 
-
 ROI_TYPES: tuple[ROIType, ...] = (
     "hero_card",
     "board_card",

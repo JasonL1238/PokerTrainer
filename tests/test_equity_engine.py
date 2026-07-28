@@ -11,7 +11,6 @@ from poker_tracker.math.equity import (
     _HAS_EVAL7,
     EquityResult,
     Eval7EquityCalculator,
-    PlaceholderEquityCalculator,
     get_equity_calculator,
 )
 
@@ -78,12 +77,6 @@ def test_dominated_hand_has_low_equity_vs_premium():
     # 72o vs a premium range on a dry board should be poor.
     result = _eq("7d 2c", "Ah Ks Qh", "premium")
     assert result.equity < 0.15
-
-
-def test_placeholder_still_available_as_labeled_fallback():
-    placeholder = PlaceholderEquityCalculator().calculate_equity("As Ah", "", "premium")
-    assert placeholder.method == "placeholder"
-    assert placeholder.confidence == pytest.approx(0.2)
 
 
 def test_custom_range_notation_accepted():
