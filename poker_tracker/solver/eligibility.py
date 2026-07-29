@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from poker_tracker.persistence.models import Action, Hand, HandPlayer
 from poker_tracker.services.hand_accounting import AccountingReconciliation
+from poker_tracker.services.study_readiness import accounting_is_established
 from poker_tracker.solver.models import (
     EligibilityResult,
     RecordedSolverAction,
@@ -35,8 +36,18 @@ def prepare_solver_spot(
     warnings: list[str] = []
     if hand.id is None:
         reasons.append("The hand must be saved before solver analysis.")
-    if accounting is None or not accounting.is_authoritative:
-        reasons.append("Reconcile a legal, balanced completed-hand ledger first.")
+    # `accounting_is_established`, not `is_authoritative`. The spot's pot sizes
+    # are built from this ledger's snapshots, and declared dead money is added
+    # straight into pot 0, so an unanswered declaration inflates the geometry the
+    # solve is run on -- and the saved artefact is then retained as evidence about
+    # the hand. The coaching button beside this one was already gated on the
+    # established predicate, so leaving the raw flag here left a second, unguarded
+    # route to a saved `coaching_responses` row for the same hand.
+    if not accounting_is_established(hand, accounting):
+        reasons.append(
+            "Reconcile a legal, balanced completed-hand ledger first, and confirm "
+            "any declared settlement assumption it rests on."
+        )
     game = hand.game_type.strip().lower()
     if not game:
         reasons.append("Record the game type as no-limit Hold'em cash.")

@@ -49,6 +49,11 @@ export POKER_DB_PATH=/path/to/poker_tracker.db
 export POKER_DATA_DIR=/path/to/data
 ```
 
+`POKER_DB_BUSY_TIMEOUT_MS` (default `30000`) is how long a second process — a CV
+job, a solver job, or a second app start — waits for a lock instead of failing
+with "database is locked". Raise it if a migration on a very large database
+outlasts it.
+
 ## Shared-password authentication
 
 Local development remains available without a password. Web deployments fail closed when authentication is required:
@@ -80,7 +85,77 @@ Only one local processing job can run at a time. On restart, dead or stale worke
 Corrections are written transactionally to SQLite. Editing hand facts, players,
 or actions changes CV imports to `corrected_cv`, records the original and
 corrected values in `hand_corrections`, invalidates settlement, and marks prior
-hand/session coaching stale without deleting it.
+hand/session coaching stale without deleting it. Deleting a hand marks its
+session's coaching stale for the same reason.
+
+Everything you declare in the Accounting reconciliation panel — the **rake
+policy**, which removes chips the recording never showed; **dead money**, which
+adds them; and the **pot awards**, which decide who is paid and therefore what
+the hero result is — is checked by reconciling the hand twice: once with what you
+declared, and once with the whole declaration withdrawn. The hand is
+**assumption-dependent** when withdrawing it changes either the verdict (it stops
+reconciling) or the figures (it still reconciles, but the pot, the rake, a payout
+or the hero result come out different). Both halves matter: a freshly imported
+hand often records none of the figures the cross-check compares, so it reconciles
+under every policy while the declaration still moves the hero result shown in
+every list, stat and prompt.
+
+The pot awards are in that set because on a reconstructed hand nothing observed
+them. The CV pipeline emits no settlement rows at all, so the winner of every pot
+is typed in — in the same panel, in the same save, as the rake — and it is the
+single input the payouts and the hero result are computed from. On a hand with no
+recorded pot size and no recorded result, choosing the other winner moves the
+reported result by the whole pot.
+
+An assumption-dependent hand is blocked from study until you press **Confirm this
+assumption** beside each listed declaration in Study → Summary → Accounting
+reconciliation, which records the exact chip movement you are attesting to.
+Nothing else clears it: not the "I confirm this hand is correct" tick, which is a
+judgement about the reconstruction rather than a claim about the room, and not
+the **Acknowledge** button in the Source warnings panel, which answers pipeline
+codes and is never offered a settlement assumption.
+
+Confirming is also what re-enables everything the block disabled. Until every
+measured declaration is answered, the hand's derived result is left out of the
+session win rate, out of the hero-result column of every list, and out of the
+math facts handed to a coaching provider, and the hand is not solver-eligible;
+once answered, it is published everywhere at once. A hand you entered yourself is
+answered by definition and is never held back.
+
+Because the check measures chips rather than inspecting fields, a declaration that
+moves nothing is never raised: a rate with a zero cap, no-flop-no-drop on a hand
+that saw no flop, or a chip unit coarser than the whole rake are all silent. And
+because the confirmation carries both the measured amount and the declaration it
+was measured on, it covers that declaration only — if a later correction grows the
+pot the same policy applies to, or the policy changes to one that happens to
+remove the same chips, you are asked again.
+
+A separate, simpler measurement — "does this declaration move chips at all?" —
+records `declared_unobserved_chips` and `declared_unobserved_rake` as an audit
+note on the hand's own evidence, shown as **Declared settlement inputs**. They are
+not pipeline warnings and never appear in the Source warnings panel: what the
+pipeline could not prove and what you declared are different claims, and nothing
+in readiness reads the second.
+
+The exemption is for hands **you entered here**, where every figure is your own
+entry: those are measured and reported but never blocked, and never withheld from
+coaching, the win rate or the solver either — an ordinary room rake on a hand you
+typed in is your own observation, and there is no attestation for the product to
+ask you for. It is not granted by the
+`manual` label, because an import payload can write that label. Every hand that
+arrives through import is stamped as imported and attests to its own declared
+assumptions in the database it lands in — the same reason import never lands a
+`reviewed` status and never carries your acknowledgements across.
+
+The settlement editor's **Chip unit** rounds the rake and nothing else. It is a
+room rule — a house that drops whole dollars against a 0.50 blind is ordinary —
+and it no longer decides the granularity a chopped pot is divided at. That
+granularity is derived from the hand's own amounts: the finest decimal place any
+observed contribution or declared dead-money figure is written in, capped at one
+whole chip. Indivisible chips are still real, so a 21-chip pot chopped two ways is
+still pushed 11/10 in the audited `Order` column's order, but no value you type in
+`Chip unit` changes a derived payout, and a rake share is never charged to a pot
+beyond what that pot holds.
 
 If the cause is not known yet, use **Flag this hand for future debugging**.
 PokerTrainer saves the issue categories, description, and a snapshot of the
@@ -89,18 +164,97 @@ Hands page provides a cross-session inbox of every unresolved issue. A later
 debugging pass can download the snapshot, fix the pipeline, and record resolution
 notes without losing the original evidence.
 
-JSON export version 4 carries correction, issue, and coaching history through
-backup/import workflows. Schema version 12 is additive: v10 added correction
-history and review staleness, v11 added solver records, and v12 adds the
-debugging issue queue. Existing rows remain intact. Startup migrates older
-databases automatically; older application versions intentionally refuse to
-open a newer database.
+A hand is only presented as study-ready when every blocker clears: explicit
+completion, valid and unique hero/board cards, confirmed table layout,
+authoritative reconciled accounting, no open debugging issue, no unresolved
+source warning, no stale coaching or solver result being shown as current, and —
+for a reconstructed hand — your explicit confirmation. The Study page lists each
+blocker by category with the exact action that clears it. Reconstruction
+confidence is shown as a bucketed label only; no single percentage is ever
+presented as proof the whole hand is correct. Partial and uncertain hands stay
+fully inspectable, replayable, and correctable — they simply cannot be marked
+reviewed.
+
+Every blocker names an action you can actually take. The two stale-evidence
+blockers each carry an escape hatch for the case where re-running is not
+available to you: **Delete stale run** removes a solver result a correction
+invalidated when the hand is no longer solver-eligible, and **Discard stale
+coaching** deletes a stale retained review when no LLM provider is configured.
+Importing a session marks every coaching review stale by construction, so without
+that control an imported hand would sit behind a blocker naming a button you
+cannot press. Neither control touches a current result. The solver control is not
+drawn while a cancellation is still in flight — that blocker says to wait for the
+cancellation instead.
+
+`Reviewed` is a workflow label, not a readiness verdict, and PokerTrainer never
+presents it as one: readiness is re-derived on every render, and any edit to a
+hand's players, actions, or settlement returns a reviewed hand to
+`needs_correction` so a promotion cannot outlive the evidence it was granted on.
+
+JSON export version 5 carries correction, issue, coaching, and completion history
+through backup/import workflows. Import still accepts versions 1-4 and gives them
+safe conservative defaults. Importing a session preserves a manual hand's review
+status but always lands a reconstructed hand as `needs_correction`: your
+confirmation that a reconstructed hand is correct is deliberately per-render and
+never persisted, so it cannot travel in a file, and the importing operator has not
+yet seen the evidence. For the same reason, source-warning acknowledgements do not
+travel either: a v5 export of a hand whose warnings you accepted re-imports with
+those warnings unaccepted, so the importing operator accepts them themselves. The
+codes are preserved in full — only your attestation to them is dropped. Retained
+coaching travels the same way: the text of every saved review is imported in full
+and marked *stale*, because a review describes the hand, ledger and winners of the
+database that wrote it and nothing in the importing database can verify that claim.
+Re-run coaching there to make it current. Schema
+version 13 is additive: v10 added correction
+history and review staleness, v11 added solver records, v12 added the debugging
+issue queue, and v13 adds explicit hand completion
+(`complete`/`partial`/`uncertain`/`not_applicable`) and its versioned
+reconstruction evidence. Existing manual hands become `not_applicable`; existing
+reconstructed hands migrate conservatively to `uncertain` and `needs_correction`
+and must be re-confirmed. Existing rows remain intact. Startup migrates older
+databases automatically; older application versions intentionally refuse to open
+a newer database, and a version 5 export cannot be read back by an older release,
+so keep a copy of any pre-upgrade export you may need to restore. A database whose
+schema version stamp is missing, unreadable, behind the schema the file actually
+contains, or ahead of it is refused rather than re-migrated, and the message says to restore from a
+backup: re-running the version 13 migration against a live database would discard
+every review confirmation recorded since it first ran. A brand-new database cannot
+reach that state: the base tables, the migration chain, and the version stamp are
+written in one transaction, so an interrupted first start — a power loss, an OOM
+kill, a container restart, Ctrl-C — leaves an empty file the next start simply
+creates again.
+
+A consistent, self-contained backup is written to `data/backups` before any real
+file database is migrated, and each snapshot is left in `journal_mode=delete` so
+it can be verified and restore-drilled from a read-only or archival mount.
+**Migration fails closed:** if the snapshot cannot be written — a read-only
+container filesystem, an unmounted data volume, or a full disk — startup raises
+and no migration runs. The error names the backup directory it could not write
+and states that the database is unchanged, rather than reporting SQLite's
+`unable to open database file`, which reads as database corruption. Make the
+`data/` mount writable before the first start after an upgrade.
+
+Pre-migration snapshots are **pinned**: they are named
+`poker_tracker-premigration-<timestamp>.sqlite3` and the five-slot per-import
+rotation never matches them, so routine snapshots cannot delete the only rollback
+point for an irreversible migration. They keep their own five retention slots, so
+a repeatedly failing migration — which snapshots the whole database on every
+start — cannot fill the backup mount either. They are stamped at the pre-upgrade
+schema version, so `data_health` verifies and restore-drills them without the
+current-version comparison it applies to rotating snapshots. Delete them yourself
+once the upgrade is proven.
+Per-import snapshots keep the rotating `poker_tracker_<timestamp>.sqlite3` name
+and the newest five are retained. Rotation matches that exact timestamped name and
+nothing else, so your own files in `data/backups` are never deleted even when they
+start with `poker_tracker_`. Opening a database this app refuses — one
+written by a newer release, or one whose version stamp is unreadable — never
+writes to the file, so an archival or read-only restore mount is safe to point at.
 
 File layout:
 
 ```text
 data/
-  backups/       rotating pre-import SQLite backups
+  backups/       pinned pre-migration and rotating pre-import SQLite backups
   cv_timelines/  retained reconstruction timelines
   exports/       generated session exports
   frames/        diagnostic extracted frames
@@ -189,12 +343,26 @@ installation with no backups reports a warning.
 
 ```bash
 python -m pytest -q
+python -m ruff check .
+python -m mypy
 ```
 
-The suite covers persistence, migrations, solver ranges/eligibility/CLI parsing,
-the debugging issue queue, correction audit/export, Study UI mutation, coaching
-safety, math, video handling, CV reconstruction, job recovery, backups, view
-models, authentication, and the Streamlit product shell.
+The suite covers persistence, migrations, hand completion and study readiness,
+solver ranges/eligibility/CLI parsing, the debugging issue queue, correction
+audit/export, Study UI mutation, coaching safety, math, video handling, CV
+reconstruction, job recovery, backups, view models, authentication, and the
+Streamlit product shell. It also carries dedicated readiness-bypass and
+adversarial-round regressions that try to make an unproven hand look
+study-ready.
+
+One test is skipped on purpose:
+`tests/test_ocr_readers.py::test_without_chip_template_chip_would_join_run` is a
+negative control documenting why the chip affix exists, and it skips when the
+synthetic chip glyph falls below the classifier confidence floor, because the
+misread it demonstrates then does not occur. Any other skip is a real problem.
+
+`python -m mypy` uses the narrow file list configured in `pyproject.toml`; it is
+not whole-repository type checking.
 
 ## Container
 

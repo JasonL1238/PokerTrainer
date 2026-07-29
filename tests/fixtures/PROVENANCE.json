@@ -1,0 +1,241 @@
+{
+ "purpose": "Frozen evidence for the CV geometry/OCR defect fixes. Development-corpus recordings only; no locked-test or validation recording is represented here.",
+ "cv": {
+  "g0621_ar1750_board_frame.json": {
+   "source": "Screen Recording 2026-06-21 12.41.17 AM (2062x1178, AR 1.750), t=42.0s",
+   "content": "one region_detections frame: 8 stack_text, 7 face_card (5 community + 2 hero), pot_text, dealer_button, card_back, active_turn_indicator",
+   "why": "all 5 community cards sit at raw normalized cy 0.335-0.338, outside the hardcoded board band 0.36<=cy<=0.55, so 0 of 5 are classified board"
+  },
+  "g0715_side_pot_frame.json": {
+   "source": "data/videos/Screen Recording 2026-07-15 10.16.07 PM (2132x1378), t=9.0s",
+   "content": "one frame carrying TWO pot_text detections: main 24.09 (conf 0.915) and side 0.2 (conf 0.382)",
+   "why": "assign_regions keeps max(conf) only; the side pot is silently discarded"
+  },
+  "g0715_pot_series_frames.json": {
+   "source": "same recording, t=0.0/3.0/5.0",
+   "content": "the pot_text series read as 891.0 / 165.0 / 24.09 (true 89.1 / 165 / 240.9) plus a stack_text that truly reads 0 BB"
+  },
+  "g0715_settle_states.json": {
+   "source": "reconstructed timeline states for the same recording",
+   "content": "15 states; idx 8 is the real sweep (seat 4: 82.1 -> 323.0), idx 13 is the next deal (dealer 6->7, pot 1.0, seat 2 misread 79.7->797.0), idx 14 is an all-dropout tail frame"
+  },
+  "g0723a_baseline_ar1397_frames.json.gz": {
+   "source": "Screen Recording 2026-07-23 3.21.47 PM (2054x1470, AR 1.397) -- the reference geometry the card zones and SEAT_ANCHORS_BY_CLASS are expressed in",
+   "content": "361 frames, 7728 retained detector + card-classifier rows, gzipped compact JSON; the whole recording, sampled at 1s",
+   "why": "recording-level no-regression pin: 7 hands, exact boards/heroes/streets. Four export: hands 1 and 2 are held back by action_sequence_illegal (seat 7 calls then folds with nothing raised between; seat 3 folds after going all-in) and hand 3 by a pre-existing board regression. Also supplies the clean direction for the rejection signals.",
+   "note": "attr values are the OCR reads of the pre-fix measurement run, including the 20 bet_text reads of 0.50 that came back 50.0 (Defect 2c). Retained deliberately: identical detector rows in means any difference out is attributable to the reconstruction code alone. Assertions against this fixture are card-level and OCR-independent."
+  },
+  "g0621_ar1750_frames.json.gz": {
+   "source": "Screen Recording 2026-06-21 12.41.17 AM (2062x1178, AR 1.750) -- the widest geometry in the development corpus",
+   "content": "361 frames, 8111 retained detector + card-classifier rows, gzipped compact JSON",
+   "why": "the whole-session form of Defect 1. Legacy zones classify 1 of 1152 face-card detections as board; anchored zones recover 435. Hand 1 goes from board=[] / streets=['preflop'] / 13 preflop actions to a 5-card board across flop/turn/river.",
+   "note": "same OCR caveat as the baseline fixture"
+  },
+  "g0723b_stack_reads_1272x896.json": {
+   "source": "Screen Recording 2026-07-23 3.33.54 PM (1272x896, the smallest geometry), 197 frames carrying >=4 stack_text reads",
+   "content": "the per-frame stack ledger as read BEFORE the OCR decimal fix: 245 of the reads are inflated 100x by a dropped decimal (max/median p50 139.3, max 211.2; 155 frames carry an outlier)",
+   "why": "the measured positive case for the stack-magnitude rejection rule (Defect 4 signal B). The clean direction comes from the baseline fixture, whose 361 frames peak at 2.03x."
+  },
+  "g0621_lost_board_hand.json": {
+   "source": "the reconstructed hand 1 the PRE-FIX pipeline produced for the 06-21 recording",
+   "content": "a four-street showdown reconstructed as board=[], streets=['preflop'], 13 actions all preflop, pot 225.9, 'Hero wins' +116 BB, warnings=[]",
+   "why": "Defect 4 on real evidence. Pre-fix this exported with board_cards='' at confidence 0.95, tags=[], in a session scored 0.989. Note streets collapsed WITH the board (both derive from the same community-card readings), so the street-count check cannot see it; the action sequence is the only independent witness."
+  },
+  "g0723b_truncated_last_hand_frames.json.gz": {
+   "source": "Screen Recording 2026-07-23 3.33.54 PM (1272x896, the smallest geometry), t=180.0..196.0 -- the END of the recording (cv2 reports 11837 frames at 60 fps = 197.28 s)",
+   "content": "17 frames spanning the tail of hand 3 and the whole of the recording-truncated hand 4",
+   "why": "the last hand of a recording is the one place a fabricated terminal event has nothing to contradict it. This hand is still preflop -- no flop dealt, no pot swept, hero folded, five seats contested -- and it exported as result='Villain wins', board_cards='', confidence 1.0, tags=[], completion_status='complete', with terminal_event='showdown' on a ZERO-card board. The entire winner claim came from seat 3's stack reading 182.0 at t=195 and 182.5 at t=196: 0.5 BB of jitter, 0.03x the 17.5 BB pot.",
+   "note": "attr values are the reads of the geometry measurement run, as with the other cv fixtures"
+  }
+ },
+ "ocr": {
+  "note": "Native-resolution HUD crops taken at the xyxy recorded in each run's detections.json. Read with the production template bank (cv_lab/models/ocr_templates.npz), which is TRACKED for exactly this reason: while it was gitignored, 8 of these tests skipped on every clean checkout, in CI and in the Docker build.",
+  "stack_314_90_at_1272x896.png": {
+   "true": 314.9,
+   "current_read": 31490.0,
+   "defect": "absolute >=5px decimal-gap floor at small render size",
+   "source": "Screen Recording 2026-07-23 3.33.54 PM (1272x896), stack_text",
+   "source_precision": "recording and class recorded from the geometry encoded in the filename and the measurement run that produced it; the exact timestamp was not retained when the crop was frozen"
+  },
+  "bet_19_50_at_1272x896.png": {
+   "true": 19.5,
+   "current_read": 1950.0,
+   "defect": "same",
+   "source": "Screen Recording 2026-07-23 3.33.54 PM (1272x896), bet_text",
+   "source_precision": "recording and class recorded from the geometry encoded in the filename and the measurement run that produced it; the exact timestamp was not retained when the crop was frozen"
+  },
+  "bet_0_50_at_2054x1470.png": {
+   "true": 0.5,
+   "current_read": 50.0,
+   "defect": "decimal component h=3px dropped by min_h_px=4; raw '050'",
+   "source": "Screen Recording 2026-07-23 3.21.47 PM (2054x1470), bet_text",
+   "source_precision": "recording and class recorded from the geometry encoded in the filename and the measurement run that produced it; the exact timestamp was not retained when the crop was frozen"
+  },
+  "pot_89_1_one_decimal.png": {
+   "true": 89.1,
+   "current_read": 891.0,
+   "defect": "1-decimal rendering; 2-gap median degeneracy",
+   "source": "Screen Recording 2026-07-15 10.16.07 PM (2132x1378), pot_text",
+   "source_precision": "recording and class recorded from the geometry encoded in the filename and the measurement run that produced it; the exact timestamp was not retained when the crop was frozen"
+  },
+  "pot_240_9_one_decimal.png": {
+   "true": 240.9,
+   "current_read": 24.09,
+   "defect": "split_at = len(digits)-2 assumes 2 decimals",
+   "source": "Screen Recording 2026-07-15 10.16.07 PM (2132x1378), pot_text",
+   "source_precision": "recording and class recorded from the geometry encoded in the filename and the measurement run that produced it; the exact timestamp was not retained when the crop was frozen"
+  },
+  "pot_165_integer.png": {
+   "true": 165.0,
+   "current_read": 165.0,
+   "defect": "none - negative control, must stay 165.0",
+   "source": "Screen Recording 2026-07-15 10.16.07 PM (2132x1378), pot_text",
+   "source_precision": "recording and class recorded from the geometry encoded in the filename and the measurement run that produced it; the exact timestamp was not retained when the crop was frozen"
+  },
+  "stack_0_true_zero.png": {
+   "true": 0.0,
+   "current_read": 0.0,
+   "defect": "none - true zero, must stay (0.0, '0') and never become None",
+   "source": "Screen Recording 2026-07-15 10.16.07 PM (2132x1378), stack_text (all-in seat showing '0 BB')",
+   "source_precision": "recording and class recorded from the geometry encoded in the filename and the measurement run that produced it; the exact timestamp was not retained when the crop was frozen"
+  },
+  "stack_218_at_1272x896.png": {
+   "true": 218.0,
+   "current_read": 21.0,
+   "defect": "run-completeness: the '8' scores 0.677 as the affix 'B' against 0.826 as '8' at 12px glyph height, truncating the run to '21'. 16 consecutive samples; shipped as a player's starting_stack at confidence 1.0",
+   "source": "Screen Recording 2026-07-23 3.33.54 PM (1272x896), t=130.0, stack_text"
+  },
+  "stack_clipped_box_at_2722x1832.png": {
+   "true": 71.2,
+   "current_read": 0.0,
+   "defect": "the detector box shrank from w=216 to w=112, showing only '20 BB' of '71.20 BB'. The confident 0.0 was indistinguishable from a genuine all-in and invented an all-in action in an exported hand",
+   "source": "Screen Recording 2026-07-11 12.45.27 PM (2722x1832), t=77.0, stack_text"
+  },
+  "bet_chips_only_at_1272x896.png": {
+   "true": null,
+   "current_read": 0.0,
+   "defect": "the crop holds only chip sprites and no text; a chip's white annulus matches the '0' template. Not separable at the glyph level -- handled downstream, where a bet_text of 0 is treated as unread",
+   "source": "Screen Recording 2026-07-23 3.33.54 PM (1272x896), t=19.0, bet_text"
+  },
+  "pot_9_single_digit_at_2722x1832.png": {
+   "true": 9.0,
+   "current_read": 0.0,
+   "defect": "the 'O' of 'POT:' and the value are both one-glyph runs and the tie broke on match score, so the pot read 0.0. Preferring the COMPLETE run fixes it",
+   "source": "Screen Recording 2026-07-11 12.45.27 PM (2722x1832), t=53.0, pot_text"
+  },
+  "bet_chip_sprite_no_text.png": {
+   "true": null,
+   "current_read": 0.0,
+   "defect": "a bet_text crop holding ONLY the green chip sprite and no text at all; the sprite's pale annulus scores 0.836 against the '0' template and returned a confident 0.0 byte-identical to a genuine all-in '0 BB'. The accepted glyph is 1.12x wider than tall, against w/h <= 0.83 for all 47121 real digit glyphs.",
+   "source": "Screen Recording 2026-07-23 3.33.54 PM (1272x896), bet_text",
+   "source_precision": "recording and class recorded from the geometry encoded in the filename and the measurement run that produced it; the exact timestamp was not retained when the crop was frozen"
+  },
+  "stack_343_60_at_1272x896.png": {
+   "true": 343.6,
+   "current_read": "343.6 at 1.00x and 0.95x, 34360.0 at 0.90x, 343.6 at 0.85x",
+   "defect": "the decimal recovery is documented as scale-relative but was not: at 0.90x a spurious left-edge dot candidate produced a split at index 0, the arity rule rejected it, and the reader returned the UNSPLIT digits as a confident 100x inflation instead of trying the next candidate or failing closed. Non-monotonic in scale.",
+   "source": "Screen Recording 2026-07-23 3.33.54 PM (1272x896), stack_text",
+   "source_precision": "recording and class recorded from the geometry encoded in the filename and the measurement run that produced it; the exact timestamp was not retained when the crop was frozen"
+  },
+  "stack_leading_decimal_clipped_at_2054x1470.png": {
+   "true": null,
+   "true_note": "the seat's stack is 180.6/181.1 on neighbouring frames; this box is clipped to '.60 BB' and carries no readable integer part",
+   "current_read": 60.0,
+   "defect": "the numeral begins AT the decimal point. dot_centers requires x0 < dot < x1 and x0 is the left edge of the truncated run, so the rendered decimal is invisible; the truncation net did not fire either because the dot's own width pushed the measured gap to 0.43 of run height, above the 0.28 word-break floor. Confident 60.0 with decimal_source='none' for 3 consecutive samples on the BASELINE geometry",
+   "source": "Screen Recording 2026-07-23 3.21.47 PM (2054x1470), t=48.0, stack_text, box [342.2, 374.0, 449.9, 419.4]"
+  },
+  "pot_212_50_trailing_zero_at_2054x1470.png": {
+   "true": 212.5,
+   "current_read": null,
+   "defect": "the trailing fractional '0' of 'POT: 212.50 BB' scores 0.861 as the chip affix 'c' against 0.846 as '0' and sits 2px from the run, so the run-completeness net declared the whole numeral a fragment and the pot read UNKNOWN for 8 consecutive samples -- the entire settlement window of an exported hand. 42 previously-correct reads were lost this way across the corpus",
+   "source": "Screen Recording 2026-07-23 3.21.47 PM (2054x1470), t=265.0, pot_text, box [934.8, 522.1, 1219.2, 593.4]"
+  },
+  "_corpus_note": "Every fixture here comes from a DEVELOPMENT recording. The 5 development recordings are 06-21 12.41.17 AM, 07-11 12.45.27 PM, 07-15 10.16.07 PM, 07-23 3.21.47 PM and 07-23 3.33.54 PM. No locked-test or validation recording is named by any fixture, test or measurement harness in this repo.",
+  "bet_18_30_suffix_absorbed_1399x986.png": {
+   "true": 18.3,
+   "current_read": 1830.88,
+   "defect": "the decimal-gap arm preempted the dot_unreconciled fail-closed guard; the 'BB' suffix is absorbed as '88' at this render size, the real dot's split leaves 4 fractional places, and the gap arm then split at the word space before the suffix",
+   "source": "Screen Recording 2026-07-23 3.33.54 PM (1272x896), bet_text at t=33.0, re-rendered at 1.10x (a 1399x986 window, inside the supported range)"
+  },
+  "bet_0_50_dot_lost_at_890x627.png": {
+   "true": 0.5,
+   "current_read": 0.0,
+   "defect": "a confident 0.0 -- the value an all-in seat genuinely reads -- produced from a legible '0.50' whose dot was lost to binarization; run height 9, at the OLD calibration floor",
+   "source": "Screen Recording 2026-07-23 3.33.54 PM (1272x896), bet_text at t=2.0, re-rendered at 0.70x"
+  },
+  "bet_chip_annulus_square_at_2722x1832.png": {
+   "true": null,
+   "current_read": 0.0,
+   "defect": "a bet_text crop holding chip sprites and NO text; the pale annulus binarizes to a component that rounds to exactly square at reduced render size, so a _MAX_DIGIT_ASPECT of 1.0 -- inclusive at the confuser's own value -- accepts it as a digit and returns a confident 0.0",
+   "source": "Screen Recording 2026-07-11 12.45.27 PM (2722x1832), bet_text at t=264.0"
+  },
+  "pot_240_9_chip_overlaps_run_at_2132x1378.png": {
+   "true": 240.9,
+   "current_read": 2.0,
+   "defect": "an unaccepted glyph OVERLAPS the digit run. _bridged_gap returns a negative number for it and the adjacency test's `0 <= gap` lower bound therefore never saw it, so a chip stack sitting on '40.9' left a single '2' that passed every other check -- a confident 120x under-read, invariant under all 27 constant ablations. The only such read in 17785 value-producing reads on the six development recordings.",
+   "source": "Screen Recording 2026-07-15 10.16.07 PM (2132x1378), pot_text, t=6.0s",
+   "expected_after": "UNKNOWN, decimal_source='unexplained_ink_in_numeral'"
+  },
+  "bet_chip_covered_malformed_suffix_at_2054x1470.png": {
+   "true": null,
+   "current_read": 1.0,
+   "defect": "a bet_text crop whose value is entirely covered by chip sprites. One sprite edge reads as a confident '1' and the suffix reads '3B', so the crop carries no legible number at all yet shipped a confident 1.0. Caught by the suffix condition: the numeral is not terminated by 'BB'.",
+   "source": "Screen Recording 2026-07-23 3.21.47 PM (2054x1470), bet_text, t=3.0s",
+   "expected_after": "UNKNOWN, decimal_source='suffix_not_bb'"
+  },
+  "stack_1131_90_above_calibrated_band_at_2138x1402.png": {
+   "true": 1131.9,
+   "current_read": 7.0,
+   "defect": "the client renders this seat panel far larger than any geometry the template bank was fitted on (run height 45-60 px against a calibrated band of 12-32). The bank matches a sprite fragment as a confident '7' and ships it for a stack the screen renders as 1131.90 BB -- a 162x under-read, 16 samples on this recording. Nothing measured the UPPER edge of the calibrated range.",
+   "source": "clubwpt_session_01.mov (2138x1402), stack_text, t=6.0s",
+   "expected_after": "UNKNOWN, decimal_source='above_calibrated_render_size'"
+  },
+  "stack_191_wide_gap_at_1272x896.png": {
+   "true": 191.0,
+   "current_read": 191.0,
+   "defect": "none -- this is a DELIBERATE COVERAGE LOSS, frozen so the cost is visible. The read is correct on the pixels ('191 BB'), but its widest inter-digit gap is 3px inside a 12px run (0.250 of run height), which is inside the band a LOCATED decimal has been measured to occupy (min 3/13 = 0.2308). An integer asserted from inside that band is indistinguishable from a decimal whose dot was lost to binarization, so it is refused. 47 reads on the six development recordings pay this cost.",
+   "source": "Screen Recording 2026-07-23 3.33.54 PM (1272x896), stack_text, t=181.0s",
+   "expected_after": "UNKNOWN, decimal_source='integer_over_decimal_band'"
+  },
+  "stack_99_50_menu_occluded_at_2138x1402.png": {
+   "true": "unreadable (screen renders 99.50 BB; only '.50 BB' survives the occlusion)",
+   "pre_fix_read": 50.0,
+   "defect": "the client's left side menu slides over seat 3's panel at t=554; the surviving sliver of the hidden digit and the out-of-run decimal point landed in the unpoliced `dots` bucket, so the reader shipped a confident 50.0 for a stack the neighbouring samples (t=520..553, t=555..556) read as 99.50",
+   "expected": "UNKNOWN, unexplained_ink_in_numeral",
+   "source": "clubwpt_session_01.mov (2138x1402, development), stack_text seat 3, t=554.0"
+  },
+  "pot_6_50_sprite_occluded_at_2722x1832.png": {
+   "true": "unreadable (pot is 6.50 BB at t=258-259; a dealt-card sprite covers the '6')",
+   "pre_fix_read": 50.0,
+   "defect": "note 13 section 6's known regression, unrepaired for two rounds: the card sprite leaves a 19x10 fragment invisible to every bucket and a decimal point left of the run start, and the reader shipped 50.0 for a 6.50 pot (7.7x)",
+   "expected": "UNKNOWN, unexplained_ink_in_numeral",
+   "source": "Screen Recording 2026-07-11 12.45.27 PM (2722x1832, development), pot_text, t=257.0"
+  },
+  "stack_198_suffix_named_at_2054x1470.png": {
+   "true": 198.0,
+   "defect": "none -- this crop is the ADMITTING-direction pin for _AFFIX_MAX_REL_H: its 'BB' caps are proven affixes only because the gate names them, and ablating the gate to 0.0 flips this read (and 56 more like it) to UNKNOWN while the whole pre-existing suite stayed green",
+   "expected": "198.0, integer",
+   "source": "Screen Recording 2026-07-23 3.21.47 PM (2054x1470, development), stack_text, t=170.0"
+  },
+  "stack_197_at_2054x1470.png": {
+   "true": 197.0,
+   "current_read": 197.0,
+   "defect": "none -- unmodified control for the dot-forgery pair below",
+   "source": "Screen Recording 2026-07-23 3.21.47 PM (2054x1470), stack_text, t=302"
+  },
+  "stack_197_speck_forged_decimal_at_2054x1470.png": {
+   "true": 197.0,
+   "current_read": null,
+   "was_before_fix": 1.97,
+   "defect": "dot forgery: a 2x2 text-coloured speck stamped at the baseline of the 4px letter gap between '1' and '9' of the control crop was accepted as a decimal separator (only the SPLIT was checked, never the hosting gap) and shipped a confident 1.97 -- a 100x under-read. The hosting gap is 0.18 of run height; no located decimal in the 13,669-read calibration table occupies a gap under 3/13 = 0.2308, so the read is refused (unexplained_ink_in_numeral). Adversarial round-2 finding; the speck is synthetic, the crop and the speck family (chip-sprite edges, card-border ringing, the frozen '218 BB' top-edge speck) are production-real.",
+   "source": "stack_197_at_2054x1470.png + one 2x2 speck (round-2 adversary A, attack A)"
+  },
+  "stack_343_60_sprite_far_fragments_at_1272x896.png": {
+   "true": 343.6,
+   "current_read": null,
+   "was_before_fix": 0.0,
+   "defect": "wide occluder: the repo's own chip-sprite fixture (bet_chip_sprite_no_text.png, 1.6x run height) pasted over the leading digits of a real '343.60 BB' crop leaves three unexplained mask fragments beyond the 0.28*run_h adjacency window, and the surviving trailing '0' shipped as a confident 0.0 -- which the spine books as an all-in. P2's far arm now polices glyph-scale row ink at any distance (unexplained_ink_in_numeral). Round-2 adversary A, attack D.",
+   "source": "optA g0723b t=138 stack_text_21 ('343.60 BB', 1272x896) + tests/fixtures/ocr/bet_chip_sprite_no_text.png"
+  }
+ }
+}

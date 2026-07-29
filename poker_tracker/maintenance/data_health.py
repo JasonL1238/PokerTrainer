@@ -6,6 +6,7 @@ import argparse
 import fnmatch
 import json
 import os
+import shutil
 import sqlite3
 import stat
 import sys
@@ -17,6 +18,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from poker_tracker.persistence.backup import PINNED_GLOB as _PINNED_GLOB
+
 CheckStatus = Literal["pass", "warning", "fail"]
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -25,6 +28,10 @@ DEFAULT_DATABASE_PATH = Path(
 )
 DEFAULT_DATA_DIR = Path(os.environ.get("POKER_DATA_DIR", PROJECT_ROOT / "data"))
 BACKUP_GLOB = "poker_tracker_*.sqlite3"
+# Kept in step with backup.PINNED_GLOB by import rather than by a second literal:
+# the two drifting apart is exactly what hid the pre-migration snapshot from this
+# audit in the first place.
+PINNED_GLOB = _PINNED_GLOB
 DETAIL_LIMIT = 20
 
 _ARTIFACT_REFERENCES: tuple[tuple[str, str, str], ...] = (
@@ -48,6 +55,14 @@ _MINIMUM_SCHEMA: dict[str, set[str]] = {
     "processing_jobs": {"id", "status", "video_id"},
     "extracted_frames": {"id", "video_id", "job_id", "image_path"},
 }
+
+# Columns a database is only required to have once it claims the schema version
+# that introduced them. Keeping them out of _MINIMUM_SCHEMA lets a retained
+# pre-v13 backup stay healthy; keying them on the stored version means a database
+# stamped 13 without them is reported instead of silently passing.
+_VERSIONED_SCHEMA: tuple[tuple[int, str, frozenset[str]], ...] = (
+    (13, "hands", frozenset({"completion_status", "completion_evidence"})),
+)
 
 
 @dataclass(frozen=True)
@@ -198,6 +213,7 @@ def _audit_database(
             results.append(_foreign_key_check(connection))
             results.append(_schema_check(connection, expected_schema_version))
             results.append(_schema_contract_check(connection))
+            results.append(_attestation_corroboration_check(connection))
             results.append(_artifact_check(connection, database_path, data_dir))
     except (OSError, sqlite3.Error) as exc:
         results.append(
@@ -209,6 +225,51 @@ def _audit_database(
             )
         )
     return tuple(results)
+
+
+def _is_wal_mode(database_path: Path) -> bool:
+    """Read the file header's write-version byte; 2 means WAL. Opens nothing."""
+    try:
+        with database_path.open("rb") as handle:
+            header = handle.read(20)
+    except OSError:
+        return False
+    return len(header) >= 19 and header[18] == 2
+
+
+def _open_snapshot_read_only(
+    snapshot_path: Path, staging: Path
+) -> sqlite3.Connection:
+    """Audit a retained snapshot without writing anything beside it.
+
+    SQLite cannot read a WAL-mode database at all without creating a ``-shm``
+    sidecar -- ``mode=ro`` and ``PRAGMA query_only`` do not change that, because
+    the shared-memory index is how WAL readers find committed frames. So the
+    "read-only" backup audit was writing ``-shm``/``-wal`` pairs into the
+    operator's backup directory and leaving them there, becoming an ongoing
+    producer of exactly the orphaned sidecars data health reports on; and on a
+    read-only or archival mount -- which PLAN requires backups to be able to live
+    on -- the same open raised ``attempt to write a readonly database`` and an
+    intact backup was reported as FAILED.
+
+    ``backup_database`` writes new snapshots in ``journal_mode=DELETE`` for this
+    reason, but that only covers snapshots this build writes: every snapshot an
+    older build left behind is still WAL. Those are staged into the caller's
+    temporary directory first, with any sidecars that legitimately belong to
+    them, so the copy carries the sidecars and the original is only ever read.
+    ``immutable=1`` would avoid the copy and is wrong here: it tells SQLite to
+    ignore the ``-wal`` file, which would silently audit a stale prefix of a
+    snapshot that still had committed frames outstanding.
+    """
+    if not _is_wal_mode(snapshot_path):
+        return _connect_read_only(snapshot_path)
+    staged = staging / f"staged-{snapshot_path.name}"
+    shutil.copyfile(snapshot_path, staged)
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{snapshot_path}{suffix}")
+        if sidecar.exists():
+            shutil.copyfile(sidecar, Path(f"{staged}{suffix}"))
+    return _connect_read_only(staged)
 
 
 def _connect_read_only(database_path: Path) -> sqlite3.Connection:
@@ -255,6 +316,71 @@ def _foreign_key_check(connection: sqlite3.Connection) -> CheckResult:
         "fail",
         f"Found {count} broken database relationship(s).",
         _details_with_hidden_count(details, count),
+    )
+
+
+def _attestation_corroboration_check(connection: sqlite3.Connection) -> CheckResult:
+    """Every settlement attestation should have the correction row that made it.
+
+    A settlement-assumption attestation is the one half of that mechanism that is
+    NOT re-derived on read: the dependence is re-measured from the chips every
+    time, but the operator's answer to it is a string in a column, and
+    ``study_readiness.unattested_assumption_dependence`` trusts it. The codes are
+    deterministic -- a blake2s over the declared and neutral policy text, the
+    gross pot, the declared dead money and the formatted movement -- so a
+    hand-edited database can compute one without ever having seen the product,
+    and that hand reads back study-ready with an empty blocker tuple.
+
+    Storing a human assertion means the assertion can be forged; that is true of
+    every attestation in this product and is not fixable by re-derivation. What
+    IS checkable is corroboration: ``db.acknowledge_accounting_assumption`` writes
+    a ``hand_corrections`` row naming the code in the same transaction, so an
+    attestation with no such row was not written by this product. A warning, not
+    a failure -- a hand imported from an older build, or one whose correction
+    history was pruned, is unproven rather than proven false.
+    """
+    for table in ("hands", "hand_corrections"):
+        if not _table_exists(connection, table):
+            return CheckResult(
+                "settlement_attestations",
+                "warning",
+                "Settlement attestations could not be audited.",
+                (f"missing table: {table}",),
+            )
+    details: list[str] = []
+    for row in connection.execute(
+        "SELECT id, completion_evidence FROM hands "
+        "WHERE completion_evidence LIKE '%confirmed_assumption_codes%'"
+    ):
+        try:
+            evidence = json.loads(row["completion_evidence"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(evidence, dict):
+            continue
+        codes = evidence.get("confirmed_assumption_codes")
+        if not isinstance(codes, list):
+            continue
+        recorded = "\n".join(
+            str(item[0] or "")
+            for item in connection.execute(
+                "SELECT notes FROM hand_corrections WHERE hand_id = ?", (row["id"],)
+            )
+        )
+        for code in codes:
+            if isinstance(code, str) and code and code not in recorded:
+                details.append(f"hand {row['id']}: {code}")
+    if not details:
+        return CheckResult(
+            "settlement_attestations",
+            "pass",
+            "Every stored settlement attestation has a matching correction record.",
+        )
+    return CheckResult(
+        "settlement_attestations",
+        "warning",
+        f"{len(details)} settlement attestation(s) have no correction record.",
+        _limited_details(details),
     )
 
 
@@ -314,9 +440,32 @@ def _schema_check(
     )
 
 
+def _stored_schema_version(connection: sqlite3.Connection) -> int | None:
+    """The version the database claims, or None when it is missing or unreadable."""
+    if not _table_exists(connection, "schema_metadata"):
+        return None
+    row = connection.execute(
+        "SELECT value FROM schema_metadata WHERE key = 'schema_version'"
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return None
+
+
 def _schema_contract_check(connection: sqlite3.Connection) -> CheckResult:
     problems: list[str] = []
-    for table, required_columns in _MINIMUM_SCHEMA.items():
+    required: dict[str, set[str]] = {
+        table: set(columns) for table, columns in _MINIMUM_SCHEMA.items()
+    }
+    stored_version = _stored_schema_version(connection)
+    if stored_version is not None:
+        for introduced_in, table, columns in _VERSIONED_SCHEMA:
+            if stored_version >= introduced_in:
+                required.setdefault(table, set()).update(columns)
+    for table, required_columns in required.items():
         if not _table_exists(connection, table):
             problems.append(f"missing table: {table}")
             continue
@@ -463,11 +612,7 @@ def _audit_backups(
 
     try:
         with os.scandir(backup_dir) as entries:
-            backups = sorted(
-                Path(entry.path)
-                for entry in entries
-                if fnmatch.fnmatchcase(entry.name, BACKUP_GLOB)
-            )
+            names = sorted(Path(entry.path) for entry in entries)
     except OSError as exc:
         return CheckResult(
             "backups",
@@ -475,6 +620,16 @@ def _audit_backups(
             "Backup directory cannot be read.",
             (f"{type(exc).__name__}: {exc}",),
         )
+    rotating = [path for path in names if fnmatch.fnmatchcase(path.name, BACKUP_GLOB)]
+    # Pinned pre-migration snapshots sit outside BACKUP_GLOB so the five-slot
+    # rotation cannot delete them. That also made them invisible here: right after
+    # a migration the report said no backups existed about a directory holding
+    # exactly the one snapshot that can undo it, and the restore drill never opened
+    # it, so a truncated rollback point stayed undetectable until it was needed.
+    # They are stamped at the OLD schema version, which is why they are verified
+    # and restore-drilled without an expected-version comparison.
+    pinned = [path for path in names if fnmatch.fnmatchcase(path.name, PINNED_GLOB)]
+    backups = [*rotating, *pinned]
     if not backups:
         return CheckResult(
             "backups",
@@ -485,11 +640,14 @@ def _audit_backups(
 
     failures: list[str] = []
     warnings: list[str] = []
-    for backup in backups:
+    for backup, expected in (
+        *((path, expected_schema_version) for path in rotating),
+        *((path, None) for path in pinned),
+    ):
         backup_failures, backup_warnings = _backup_issues(
             backup,
             live_database=live_database,
-            expected_schema_version=expected_schema_version,
+            expected_schema_version=expected,
             restore=restore_backups,
         )
         failures.extend(backup_failures)
@@ -542,18 +700,19 @@ def _backup_issues(
                 [f"{backup_path.name}: hard-linked files are not independent backups"],
                 [],
             )
-        with closing(_connect_read_only(backup_path)) as source:
-            failures, warnings = _connection_issues(
-                source,
-                expected_schema_version=expected_schema_version,
-            )
-            if failures or not restore:
-                return (
-                    [f"{backup_path.name}: {failure}" for failure in failures],
-                    [f"{backup_path.name}: {warning}" for warning in warnings],
+        with tempfile.TemporaryDirectory(prefix="pokertrainer-audit-") as temp_dir:
+            staging = Path(temp_dir)
+            with closing(_open_snapshot_read_only(backup_path, staging)) as source:
+                failures, warnings = _connection_issues(
+                    source,
+                    expected_schema_version=expected_schema_version,
                 )
-            with tempfile.TemporaryDirectory(prefix="pokertrainer-restore-") as temp_dir:
-                restored_path = Path(temp_dir) / "restored.sqlite3"
+                if failures or not restore:
+                    return (
+                        [f"{backup_path.name}: {failure}" for failure in failures],
+                        [f"{backup_path.name}: {warning}" for warning in warnings],
+                    )
+                restored_path = staging / "restored.sqlite3"
                 with closing(sqlite3.connect(restored_path)) as restored:
                     source.backup(restored)
                 with closing(_connect_read_only(restored_path)) as restored:

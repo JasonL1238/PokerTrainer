@@ -39,6 +39,8 @@ def _create_database(
                 hand_number INTEGER NOT NULL,
                 review_status TEXT NOT NULL,
                 source_type TEXT NOT NULL,
+                completion_status TEXT NOT NULL DEFAULT 'not_applicable',
+                completion_evidence TEXT NOT NULL DEFAULT '{}',
                 FOREIGN KEY (session_id) REFERENCES sessions(id)
             );
             CREATE TABLE hand_players (
@@ -517,3 +519,55 @@ def test_cli_json_fails_for_inaccessible_explicit_backup_directory(
     assert backup_check["name"] == "backups"
     assert backup_check["status"] == "fail"
     assert backup_check["message"] == "Backup directory cannot be read."
+
+
+def test_minimum_schema_does_not_require_completion_columns() -> None:
+    """A retained pre-v13 backup must stay healthy: a missing contract column is a
+    hard fail that _connection_issues escalates to a backup failure."""
+    from poker_tracker.maintenance.data_health import _MINIMUM_SCHEMA
+
+    assert "completion_status" not in _MINIMUM_SCHEMA["hands"]
+    assert "completion_evidence" not in _MINIMUM_SCHEMA["hands"]
+
+
+def test_schema_contract_requires_completion_columns_once_v13_is_claimed(
+    tmp_path: Path,
+) -> None:
+    """Regression: a database stamped 13 without the Phase 1 columns used to pass
+    both schema_version and schema_contract, so the audit gave no signal at all."""
+    database = tmp_path / "stamped13.sqlite3"
+    _create_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE hands DROP COLUMN completion_status")
+        connection.execute("ALTER TABLE hands DROP COLUMN completion_evidence")
+
+    report = audit_data_health(
+        database,
+        data_dir=tmp_path,
+        backup_dir=tmp_path / "backups",
+        expected_schema_version=SCHEMA_VERSION,
+    )
+    contract = _checks_by_name(report)["schema_contract"]
+
+    assert contract.status == "fail"
+    assert any("completion_status" in detail for detail in contract.details)
+
+
+def test_schema_contract_still_passes_for_a_pre_v13_database(tmp_path: Path) -> None:
+    database = tmp_path / "legacy.sqlite3"
+    _create_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE hands DROP COLUMN completion_status")
+        connection.execute("ALTER TABLE hands DROP COLUMN completion_evidence")
+        connection.execute(
+            "UPDATE schema_metadata SET value = '12' WHERE key = 'schema_version'"
+        )
+
+    report = audit_data_health(
+        database,
+        data_dir=tmp_path,
+        backup_dir=tmp_path / "backups",
+        expected_schema_version=SCHEMA_VERSION,
+    )
+
+    assert _checks_by_name(report)["schema_contract"].status == "pass"

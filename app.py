@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import date
@@ -53,6 +54,13 @@ from poker_tracker.math.study_math import (
     outs_to_equity_rule,
     realized_equity,
 )
+from poker_tracker.persistence.completion import (
+    CompletionEvidence,
+    acknowledge_codes,
+    dump_completion_evidence,
+    is_assumption_dependence_code,
+    parse_completion_evidence,
+)
 from poker_tracker.persistence.db import DEFAULT_DB_PATH, PokerDatabase
 from poker_tracker.persistence.import_export import export_hand, export_session, import_session
 from poker_tracker.persistence.models import (
@@ -74,8 +82,19 @@ from poker_tracker.persistence.models import (
 from poker_tracker.player_labels import actor_label
 from poker_tracker.services.hand_accounting import (
     AccountingReconciliation,
+    attest_assumption,
     persist_reconciliation,
     reconcile_persisted_hand,
+)
+from poker_tracker.services.study_readiness import (
+    BlockerCategory,
+    StudyReadiness,
+    accounting_is_established,
+    evaluate_study_readiness,
+    hand_requires_assumption_attestation,
+    hand_requires_user_confirmation,
+    is_reconstructed_hand,
+    unattested_assumption_dependence,
 )
 from poker_tracker.solver.eligibility import prepare_solver_spot
 from poker_tracker.solver.jobs import (
@@ -111,6 +130,7 @@ from poker_tracker.ui.components import (
     product_hero,
     section_header,
     section_header_with_meta,
+    status_badge,
     trust_badge,
     workflow_step,
 )
@@ -162,6 +182,8 @@ from poker_tracker.ui.view_models import (
     build_job_rows,
     build_portfolio_summary,
     build_session_rows,
+    completion_evidence_rows,
+    confidence_label,
 )
 
 STREETS = ["preflop", "flop", "turn", "river", "showdown"]
@@ -224,6 +246,289 @@ def show_flash() -> None:
         st.toast(queued)
 
 
+BLOCKER_CATEGORY_LABELS: dict[BlockerCategory, str] = {
+    "completion": "Completion",
+    "cards": "Cards",
+    "facts": "Stored facts",
+    "layout": "Table layout",
+    "accounting": "Accounting",
+    "issues": "Debugging issues",
+    "coaching": "Coaching evidence",
+    "solver": "Solver evidence",
+    "confirmation": "Your confirmation",
+}
+
+
+def study_confirmation_key(
+    hand: Hand, accounting: AccountingReconciliation | None
+) -> str:
+    """Scope the never-persisted confirmation to the hand AND the evidence shown.
+
+    The tick reads "I have read the evidence above and confirm this hand is
+    correct", so it may not outlive that evidence. Keyed on the hand id alone it
+    did: after a correction that changed the hero's stack, invalidated the
+    settlement and staled the coaching, the box was still ticked, so
+    USER_CONFIRMATION_MISSING never came back. The only case that did reset was an
+    accident of widget garbage collection -- the acknowledge handler reruns before
+    the checkbox is drawn -- which every control rendered below the checkbox
+    missed. Changing the key retires the old widget's state instead.
+    """
+    return f"study_confirm_{hand.id}_{_study_evidence_digest(hand, accounting)}"
+
+
+def _study_evidence_digest(
+    hand: Hand, accounting: AccountingReconciliation | None
+) -> str:
+    """A short, stable digest of exactly the facts the confirmation attests to."""
+    ledger = None if accounting is None else accounting.ledger
+    material: list[object] = [
+        hand.completion_status,
+        json.dumps(hand.completion_evidence, sort_keys=True, default=str),
+        hand.source_type,
+        hand.hero_cards,
+        hand.board_cards,
+        hand.hero_position,
+        hand.table_size,
+        hand.pot_size,
+        hand.hero_bb_won,
+    ]
+    if accounting is None:
+        material.append("accounting-unavailable")
+    else:
+        material.extend(
+            [
+                accounting.is_authoritative,
+                tuple(accounting.issues),
+                tuple(
+                    sorted(
+                        (
+                            entry.entry_type,
+                            entry.pot_index,
+                            entry.player_key or "",
+                            entry.amount,
+                        )
+                        for entry in accounting.entries
+                    )
+                ),
+            ]
+        )
+    if ledger is not None:
+        material.extend(
+            [
+                ledger.gross_pot,
+                ledger.rake,
+                ledger.net_pot,
+                tuple(sorted(ledger.net_results.items())),
+            ]
+        )
+    return hashlib.sha256(repr(material).encode("utf-8")).hexdigest()[:16]
+
+
+def hand_study_readiness(
+    db: PokerDatabase,
+    hand: Hand,
+    accounting: AccountingReconciliation | None,
+    accounting_error: str | None,
+    *,
+    user_confirmed: bool = False,
+) -> StudyReadiness:
+    """Fetch the evidence readiness composes for a surface that does not already hold it."""
+
+    if hand.id is None:
+        return evaluate_study_readiness(
+            hand,
+            accounting=accounting,
+            accounting_error=accounting_error,
+            user_confirmed=user_confirmed,
+        )
+    return evaluate_study_readiness(
+        hand,
+        accounting=accounting,
+        accounting_error=accounting_error,
+        hand_issues=db.fetch_hand_issues(hand_id=hand.id),
+        coaching_reviews=db.fetch_coaching_reviews_by_hand(hand.id),
+        # Legacy hand_reviews rows are staled by the same correction path and are
+        # still rendered in the Hands workspace, so they are retained coaching
+        # evidence too and must be able to block.
+        hand_reviews=db.fetch_reviews_by_hand(hand.id),
+        solver_runs=db.fetch_solver_runs_by_hand(hand.id),
+        user_confirmed=user_confirmed,
+    )
+
+
+def guarded_update_hand_status(
+    db: PokerDatabase,
+    hand: Hand,
+    readiness: StudyReadiness,
+    status: str,
+) -> bool:
+    """Single choke point for review-status writes; refuses to promote a blocked hand."""
+
+    if status == "reviewed" and not readiness.is_ready:
+        st.error(
+            "This hand is not study-ready. Clear the blockers listed above before "
+            "marking it reviewed."
+        )
+        return False
+    if hand.id is None:
+        st.error("This hand has not been saved yet.")
+        return False
+    try:
+        db.update_hand_status(hand.id, status)
+    except ValueError as exc:
+        st.error(str(exc))
+        return False
+    return True
+
+
+def review_status_options(hand: Hand, readiness: StudyReadiness) -> tuple[list[str], int]:
+    """Offer 'reviewed' only when nothing blocks, and never re-add it as a fallback.
+
+    A hand whose stored status is 'reviewed' while a blocker stands -- imported
+    from an older database, hand-edited, or promoted before a later edit
+    invalidated it -- used to have 'reviewed' re-appended purely because the
+    stored value had to appear in the option list. The control then offered, and
+    preselected, the one value the page's own blocker list said was false.
+    """
+    options = [
+        item for item in REVIEW_STATUSES if item != "reviewed" or readiness.is_ready
+    ]
+    if hand.review_status in options:
+        return options, options.index(hand.review_status)
+    st.caption(
+        f"Stored status: {hand.review_status.replace('_', ' ')}. It is not offered "
+        "while the blockers above stand."
+    )
+    return options, options.index("needs_correction")
+
+
+def render_study_readiness(readiness: StudyReadiness) -> None:
+    """Show every blocker grouped by category with the exact action that clears it.
+
+    Deliberately renders no aggregate score or percentage: a single number would
+    read as proof the whole hand is correct.
+    """
+
+    if readiness.is_ready:
+        st.markdown(
+            status_badge("reviewed", label="Study-ready · 0 blockers"),
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Completion, cards, layout, accounting, issues, coaching, and solver "
+            "evidence all pass."
+        )
+        return
+    st.markdown(
+        status_badge(
+            "needs_correction",
+            label=f"Not study-ready · {len(readiness.blockers)} blocker(s)",
+        ),
+        unsafe_allow_html=True,
+    )
+    for category, blockers in readiness.by_category().items():
+        st.markdown(
+            status_badge(
+                "needs_correction",
+                label=f"{BLOCKER_CATEGORY_LABELS[category]} · {len(blockers)} blocker(s)",
+            ),
+            unsafe_allow_html=True,
+        )
+        for blocker in blockers:
+            st.markdown(f"**{blocker.reason}**")
+            st.caption(f"Clears when: {blocker.clearing_action}")
+            for item in blocker.detail:
+                st.caption(f"· {item}")
+
+
+def show_reconstruction_evidence(hand: Hand, evidence: CompletionEvidence) -> None:
+    """Draw the evidence the confirmation checkbox asks the operator to attest to.
+
+    The checkbox says "I have read the evidence above". Every one of these fields
+    had a producer (the CV exporter), a persistence layer, an export format and a
+    digest consumer, and no display consumer at all, so on a hand where the tick
+    was the only remaining gate the entire content above it was the one sentence
+    saying it had not been ticked. That made the final Phase 1 control a rubber
+    stamp while its own label claimed otherwise.
+    """
+
+    if hand.id is None:
+        return
+    rows = completion_evidence_rows(evidence)
+    with st.expander("Reconstruction evidence", expanded=False):
+        st.caption(
+            "Written by the reconstruction pipeline and never edited by hand. "
+            "This is the evidence the confirmation below refers to."
+        )
+        for label, value in rows:
+            st.markdown(f"**{label}** · {value}")
+
+
+def show_source_warning_controls(
+    db: PokerDatabase,
+    hand: Hand,
+    evidence: CompletionEvidence,
+) -> None:
+    """Acknowledge pipeline source codes; the only user path from uncertain to complete."""
+
+    # A measured settlement-assumption dependence is never offered here. It has
+    # its own channel and its own control, which states the chip movement being
+    # attested to; this panel's button says only "Acknowledge" and is captioned
+    # as a pipeline note. `parse_completion_evidence` already keeps the two
+    # channels apart on every read, so this filter is the second lock on the same
+    # door rather than the only one.
+    codes = [
+        code
+        for code in (*evidence.warning_codes, *evidence.rejection_codes)
+        if not is_assumption_dependence_code(code)
+    ]
+    if hand.id is None or not codes:
+        return
+    acknowledged = set(evidence.acknowledged_codes)
+    rejections = set(evidence.rejection_codes)
+    unresolved = len(evidence.unresolved_codes)
+    with st.expander(f"Source warnings · {unresolved} unresolved of {len(codes)}"):
+        st.caption(
+            "Acknowledging records the accepted warning as an auditable correction. "
+            "It can never make a partial recording complete, and it is not offered "
+            "for a rejection code: a rejection is the pipeline refusing the hand, "
+            "and only a new reconstruction can clear it."
+        )
+        for index, code in enumerate(codes):
+            code_col, action_col = st.columns([2.2, 1])
+            is_acknowledged = code in acknowledged
+            is_rejection = code in rejections
+            if is_rejection:
+                label = f"{code} · rejected by the pipeline"
+            else:
+                label = f"{code} · {'acknowledged' if is_acknowledged else 'unresolved'}"
+            code_col.markdown(
+                status_badge(
+                    "reviewed" if is_acknowledged and not is_rejection else "needs_correction",
+                    label=label,
+                ),
+                unsafe_allow_html=True,
+            )
+            if is_rejection:
+                action_col.caption("Re-run the reconstruction")
+                continue
+            if is_acknowledged:
+                continue
+            if action_col.button(
+                "Acknowledge",
+                key=f"study_ack_{hand.id}_{index}",
+                width="stretch",
+            ):
+                updated = acknowledge_codes(evidence, [code])
+                db.update_hand_completion(
+                    hand.id,
+                    completion_evidence=dump_completion_evidence(updated),
+                    notes=f"Acknowledged source warning {code}.",
+                )
+                flash(f"Acknowledged source warning {code}.")
+                st.rerun()
+
+
 def main() -> None:
     st.set_page_config(page_title="PokerTrainer", layout="wide")
     inject_theme()
@@ -270,22 +575,85 @@ def main() -> None:
         show_settings_workspace(db, selected_session)
 
 
-def _hands_with_accounting_results(db: PokerDatabase, hands: list[Hand]) -> list[Hand]:
+AccountingCache = dict[int, tuple["AccountingReconciliation | None", str | None]]
+
+
+def new_accounting_cache() -> AccountingCache:
+    """One render pass's reconciliations, keyed by hand id.
+
+    Deliberately created by the caller and never module-global. Every surface
+    that uses one builds it, reads through it, and drops it inside a single
+    render, so a settlement write in a form handler -- which is always followed
+    by ``st.rerun()`` -- can never be answered from a cache the write invalidated.
+
+    Insights and Study each reconciled the same hand twice per render: once
+    through ``_hands_with_accounting_results`` to substitute the derived hero
+    result into the list, and again through ``_accounting_or_error`` (Insights)
+    or the Study page's own call. A reconciliation is now two ledger builds on
+    a hand that declares a settlement policy, so paying for it twice is the cost
+    this change would otherwise have added.
+    """
+    return {}
+
+
+def _reconcile_cached(
+    db: PokerDatabase, hand_id: int, cache: AccountingCache | None
+) -> tuple[AccountingReconciliation | None, str | None]:
+    if cache is not None and hand_id in cache:
+        return cache[hand_id]
+    try:
+        entry: tuple[AccountingReconciliation | None, str | None] = (
+            reconcile_persisted_hand(db, hand_id),
+            None,
+        )
+    except LedgerError as exc:
+        entry = (None, str(exc))
+    if cache is not None:
+        cache[hand_id] = entry
+    return entry
+
+
+def _hands_with_accounting_results(
+    db: PokerDatabase, hands: list[Hand], cache: AccountingCache | None = None
+) -> list[Hand]:
     resolved: list[Hand] = []
     for hand in hands:
         result = hand.hero_bb_won
+        substituted = False
         if hand.id is not None:
-            try:
-                accounting = reconcile_persisted_hand(db, hand.id)
-            except LedgerError:
-                accounting = None
-            if accounting is not None and accounting.is_authoritative:
+            accounting, _ = _reconcile_cached(db, hand.id, cache)
+            # Not `is_authoritative`. This substitution is where a derived figure
+            # becomes the hand's result in every list, the Overview panel, the
+            # portfolio summary and the Insights KPIs, so it is exactly the place
+            # that must not publish a number an unanswered declaration produced.
+            if _accounting_is_established(hand, accounting):
                 players = db.fetch_players_by_hand(hand.id)
                 hero = next((player for player in players if player.is_hero), None)
                 if hero is not None:
                     result = accounting.ledger.net_results.get(hero.player_key, result)
-        resolved.append(hand.model_copy(update={"hero_bb_won": result}))
+                    substituted = result != hand.hero_bb_won
+        # The copy is marked so a writer can refuse it. These objects are display
+        # values -- a DERIVED hero result standing in for an observed one -- and
+        # one of them reached 'Correct hand facts', where saving an unrelated
+        # field persisted the derivation into `hands.hero_bb_won`.
+        resolved.append(
+            hand.model_copy(
+                update={
+                    "hero_bb_won": result,
+                    "derived_result_substituted": substituted,
+                }
+            )
+        )
     return resolved
+
+
+def _accounting_or_error(
+    db: PokerDatabase, hand: Hand, cache: AccountingCache | None = None
+) -> tuple[AccountingReconciliation | None, str | None]:
+    """Reconcile one hand for a surface that renders many, mirroring the Study page."""
+    if hand.id is None:
+        return None, None
+    return _reconcile_cached(db, hand.id, cache)
 
 
 def _format_persisted_hand_history(db: PokerDatabase, session: Session, hand: Hand) -> str:
@@ -305,10 +673,8 @@ def _format_persisted_hand_history(db: PokerDatabase, session: Session, hand: Ha
         actions,
         players,
         ledger=None if accounting is None else accounting.ledger,
-        accounting_issues=(
-            [error] if error else ([] if accounting is None else list(accounting.issues))
-        ),
-        accounting_authoritative=bool(accounting and accounting.is_authoritative),
+        accounting_issues=_accounting_prompt_issues(accounting, error),
+        accounting_authoritative=_accounting_is_established(hand, accounting),
     )
 
 
@@ -335,7 +701,7 @@ def show_product_overview(db: PokerDatabase) -> None:
             board_cards=featured.board_cards,
             pot_size=(
                 featured_accounting.ledger.gross_pot
-                if featured_accounting is not None and featured_accounting.is_authoritative
+                if _accounting_is_established(featured, featured_accounting)
                 else featured.pot_size
             ),
             players=featured_players,
@@ -362,7 +728,11 @@ def show_product_overview(db: PokerDatabase) -> None:
         table_html,
         proof_points=(
             (str(summary.hand_count), "saved hands"),
-            (f"{summary.review_percent:.0f}%", "reviewed"),
+            # "marked reviewed", never a bare "reviewed": review_status is a
+            # workflow label and this is the first number a user sees. Unqualified,
+            # one percentage read as proof that every saved hand is correct, which
+            # is exactly what the rest of the app is careful never to claim.
+            (f"{summary.review_percent:.0f}%", "marked reviewed"),
             (hand_label, "replay surface"),
         ),
     )
@@ -383,10 +753,13 @@ def show_product_overview(db: PokerDatabase) -> None:
         with columns[1]:
             kpi_card("Hands", str(summary.hand_count), "Across every saved session")
         with columns[2]:
+            # A workflow label, never a readiness verdict: a hand can be marked
+            # reviewed and still be blocked on accounting, issues, coaching, or
+            # solver evidence. Insights carries the readiness count.
             kpi_card(
                 "Review coverage",
                 f"{summary.review_percent:.0f}%",
-                f"{summary.reviewed_count} hands completed",
+                f"{summary.reviewed_count} hands marked reviewed",
                 tone="positive" if summary.review_percent >= 75 else "default",
             )
         with columns[3]:
@@ -598,7 +971,8 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
         "Replay the hand, inspect the evidence, and turn one completed decision into a reusable lesson.",
     )
     sessions = db.fetch_sessions()
-    all_hands = _hands_with_accounting_results(db, db.fetch_all_hands())
+    accounting_cache = new_accounting_cache()
+    all_hands = _hands_with_accounting_results(db, db.fetch_all_hands(), accounting_cache)
     if not all_hands:
         empty_state("Nothing queued for study", "Import or add a completed hand first.")
         return
@@ -617,23 +991,30 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
 
     actions = db.fetch_actions_by_hand(hand.id)
     players = db.fetch_players_by_hand(hand.id)
-    accounting: AccountingReconciliation | None = None
-    accounting_error: str | None = None
-    try:
-        accounting = reconcile_persisted_hand(db, hand.id)
-    except LedgerError as exc:
-        accounting_error = str(exc)
+    # The list above already reconciled this hand; a second build would be the
+    # same two ledgers over the same records.
+    accounting, accounting_error = _reconcile_cached(db, hand.id, accounting_cache)
     coaching_reviews = db.fetch_coaching_reviews_by_hand(hand.id)
     hand_issues = db.fetch_hand_issues(hand_id=hand.id)
-    open_hand_issues = [issue for issue in hand_issues if issue.status == "open"]
-    stale_coaching_pending = any(review.is_stale for review in coaching_reviews) and not any(
-        not review.is_stale for review in coaching_reviews
-    )
-    can_mark_reviewed = bool(
-        accounting
-        and accounting.is_authoritative
-        and not stale_coaching_pending
-        and not open_hand_issues
+    solver_runs = db.fetch_solver_runs_by_hand(hand.id)
+    completion_evidence = parse_completion_evidence(hand.completion_evidence)
+    is_reconstructed = is_reconstructed_hand(hand)
+    # Read before the widget renders: on the rerun after the tick, session state
+    # already holds the value, which is what makes the checkbox gate effective.
+    user_confirmed = bool(st.session_state.get(study_confirmation_key(hand, accounting), False))
+    readiness = evaluate_study_readiness(
+        hand,
+        accounting=accounting,
+        accounting_error=accounting_error,
+        hand_issues=hand_issues,
+        coaching_reviews=coaching_reviews,
+        # Legacy hand_reviews rows are staled by the same correction path and are
+        # blocking evidence too. Omitting them here made this page -- which feeds
+        # three of the five review-status writers -- report "Study-ready · 0
+        # blockers" on a hand every other surface refused.
+        hand_reviews=db.fetch_reviews_by_hand(hand.id),
+        solver_runs=solver_runs,
+        user_confirmed=user_confirmed,
     )
 
     with st.container(key="study_workspace"):
@@ -683,26 +1064,45 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
                     f"Played {hand_session.date_played} · {hand_session.stakes or 'Stakes not recorded'}"
                 )
                 st.caption(f"Source · {hand.source_type.replace('_', ' ').title()}")
-                confidence = (
-                    "Not scored"
-                    if hand.confidence_score is None
-                    else f"{100 * hand.confidence_score:.0f}%"
+                st.caption(
+                    f"Reconstruction confidence · {confidence_label(hand.confidence_score)}"
                 )
-                st.caption(f"Reconstruction confidence · {confidence}")
+                st.caption("A bucketed model signal, not proof the hand is correct.")
+                data_callout(
+                    "Completion",
+                    hand.completion_status.replace("_", " ").title(),
+                )
+
+                st.markdown("##### Study readiness")
+                render_study_readiness(readiness)
+                if is_reconstructed:
+                    show_reconstruction_evidence(hand, completion_evidence)
+                    show_source_warning_controls(db, hand, completion_evidence)
+                # Drawn under exactly the condition USER_CONFIRMATION_MISSING is
+                # emitted under -- reconstructed OR imported -- so the blocker
+                # never names a checkbox that is not on the page. An imported
+                # hand declaring `source_type: manual` owes this confirmation
+                # too: the importing operator has not vouched for it.
+                if hand_requires_user_confirmation(hand):
+                    st.checkbox(
+                        "I have read the evidence above and confirm this hand is correct",
+                        key=study_confirmation_key(hand, accounting),
+                    )
+
+                # Never offer "reviewed" while blocked; the guarded writer below is
+                # the defense in depth behind this.
+                status_options, status_index = review_status_options(hand, readiness)
+                status_key = f"study_status_{hand.id}"
+                if st.session_state.get(status_key) not in status_options:
+                    st.session_state.pop(status_key, None)
                 status = st.selectbox(
                     "Review status",
-                    REVIEW_STATUSES,
-                    index=REVIEW_STATUSES.index(hand.review_status),
-                    key=f"study_status_{hand.id}",
+                    status_options,
+                    index=status_index,
+                    key=status_key,
                 )
                 if st.button("Save review status", key=f"study_save_{hand.id}", width="stretch"):
-                    if status == "reviewed" and not can_mark_reviewed:
-                        st.error(
-                            "Resolve saved issues, reconcile the hand, and rerun any stale "
-                            "coaching before marking it reviewed."
-                        )
-                    else:
-                        db.update_hand_status(hand.id, status)
+                    if guarded_update_hand_status(db, hand, readiness, status):
                         flash("Review status updated.")
                         st.rerun()
 
@@ -717,11 +1117,11 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
                 board_cards=hand.board_cards,
                 pot_size=(
                     accounting.ledger.gross_pot
-                    if accounting is not None and accounting.is_authoritative
+                    if _accounting_is_established(hand, accounting)
                     else hand.pot_size
                 ),
                 players=players,
-                result_bb=_hero_ledger_result(accounting, players, hand.hero_bb_won),
+                result_bb=_hero_ledger_result(hand, accounting, players, hand.hero_bb_won),
                 label=f"{hand_session.name} · {hand.hero_position or 'Position not recorded'}",
             )
             section_header_with_meta(
@@ -748,12 +1148,8 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
                         actions,
                         players,
                         ledger=None if accounting is None else accounting.ledger,
-                        accounting_issues=(
-                            [accounting_error]
-                            if accounting_error
-                            else ([] if accounting is None else list(accounting.issues))
-                        ),
-                        accounting_authoritative=bool(accounting and accounting.is_authoritative),
+                        accounting_issues=_accounting_prompt_issues(accounting, accounting_error),
+                        accounting_authoritative=_accounting_is_established(hand, accounting),
                     ),
                     language="text",
                 )
@@ -775,7 +1171,7 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
                         "Final pot",
                         (
                             f"{accounting.ledger.gross_pot:g} BB · reconciled"
-                            if accounting is not None and accounting.is_authoritative
+                            if _accounting_is_established(hand, accounting)
                             else "—"
                             if hand.pot_size is None
                             else f"{hand.pot_size:g} BB · observed"
@@ -833,6 +1229,7 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
                         players,
                         accounting,
                         accounting_error,
+                        readiness,
                     )
                 with coach_tab:
                     show_study_coach_review(
@@ -844,6 +1241,7 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
                         accounting,
                         accounting_error,
                         coaching_reviews,
+                        readiness,
                     )
                 with notes_tab:
                     st.markdown("##### Hand notes")
@@ -938,8 +1336,26 @@ def show_hand_issue_controls(
 
 
 def show_hand_fact_editor(db: PokerDatabase, hand: Hand) -> None:
-    """Edit reconstructed evidence in place and retain the original values."""
+    """Edit reconstructed evidence in place and retain the original values.
 
+    Reads the STORED hand rather than the one it was handed. Every Study surface
+    builds its hand list through ``_hands_with_accounting_results``, which
+    replaces ``hero_bb_won`` with the derived ledger result for display, and that
+    same object reached this form: the 'Hero result (BB)' input rendered
+    pre-filled with the derivation while the column was NULL, and saving any
+    other field on the form -- a note, a tag -- wrote the derivation into the
+    OBSERVED column and recorded it in ``hand_corrections`` as a fact the
+    operator stated. With a rake declared, the number written was the operator's
+    own rake policy applied to the action line: a settlement assumption laundered
+    into the observation column that the whole accounting cross-check treats as
+    independent evidence (see ``hand_accounting._cross_check``, which compares
+    ``hands.hero_bb_won`` EXACTLY for exactly that reason).
+    """
+
+    if hand.id is not None:
+        stored = db.fetch_hand(hand.id)
+        if stored is not None:
+            hand = stored
     with st.expander("Correct hand facts", expanded=hand.review_status == "needs_correction"):
         st.caption(
             "Saving changes updates this hand in SQLite, records before/after evidence, "
@@ -1046,6 +1462,7 @@ def show_study_coach_review(
     accounting: AccountingReconciliation | None,
     accounting_error: str | None,
     reviews,
+    readiness: StudyReadiness,
 ) -> None:
     """Show current coaching and allow an explicit post-correction rerun."""
 
@@ -1070,6 +1487,22 @@ def show_study_coach_review(
         st.warning(
             f"{len(stale_reviews)} prior coaching review(s) are retained as stale evidence."
         )
+    # The second clearing action STALE_COACHING_EVIDENCE names, and the only one
+    # that works without a configured provider -- which is the state every
+    # imported hand starts in, because import_session stales all of them. The
+    # solver twin has had Delete stale run for the same reason since round 8.
+    # Driven by the blocker, not by `stale_reviews`: the legacy hand_reviews rows
+    # block too and are not in this tab's list, so a hand staled only there would
+    # otherwise show the blocker with no control anywhere that clears it.
+    if hand.id is not None and readiness.has("STALE_COACHING_EVIDENCE"):
+        if st.button(
+            "Discard stale coaching",
+            key=f"coach_discard_stale_{hand.id}",
+            width="stretch",
+        ):
+            discarded = db.discard_stale_coaching(hand.id)
+            flash(f"Discarded {discarded} stale coaching review(s).")
+            st.rerun()
 
     provider_choice = st.selectbox(
         "Rerun provider",
@@ -1099,7 +1532,7 @@ def show_study_coach_review(
         index=range_options.index(estimate_villain_range_label(hand.tags, hand.notes)),
         key=f"study_coach_range_{hand.id}",
     )
-    is_authoritative = bool(accounting and accounting.is_authoritative)
+    is_authoritative = _accounting_is_established(hand, accounting)
     solver_evidence = None
     if hand.id is not None:
         completed_runs = [
@@ -1116,7 +1549,17 @@ def show_study_coach_review(
                 )
             except ValidationError:
                 st.warning("Latest saved solver evidence is invalid and was not attached.")
-    if not is_authoritative:
+    if unattested_assumption_dependence(hand, accounting):
+        # Naming the ledger here was false on exactly the hands that reach it:
+        # the ledger IS legal and balanced, which is why a dependence could be
+        # measured at all, and the action the operator needs is in a different
+        # panel from the one this sentence used to send them to.
+        st.warning(
+            "Coaching is disabled until you confirm the declared settlement "
+            "assumptions this hand's reconciliation rests on, in Summary → "
+            "Accounting reconciliation."
+        )
+    elif not is_authoritative:
         st.warning(
             "Reconcile a legal, balanced ledger before generating coaching from this hand."
         )
@@ -1125,24 +1568,26 @@ def show_study_coach_review(
         hand,
         actions,
         players,
-        pot_odds_facts=_accounting_prompt_math_facts(accounting),
+        pot_odds_facts=_accounting_prompt_math_facts(hand, accounting),
         villain_range_label=range_label,
         coaching_mode=coaching_mode,
         ledger=None if accounting is None else accounting.ledger,
-        accounting_issues=(
-            [accounting_error]
-            if accounting_error
-            else ([] if accounting is None else list(accounting.issues))
-        ),
+        accounting_issues=_accounting_prompt_issues(accounting, accounting_error),
         accounting_authoritative=is_authoritative,
         solver_evidence=solver_evidence,
     )
     with st.expander("Exact post-session prompt"):
         st.code(prompt, language="text")
+    if readiness.has("OPEN_DEBUGGING_ISSUE"):
+        st.warning("Resolve the open debugging issue before generating coaching.")
     if st.button(
         "Generate and save corrected-hand coaching",
         key=f"study_rerun_coaching_{hand.id}",
-        disabled=provider is None or not is_authoritative,
+        disabled=(
+            provider is None
+            or not is_authoritative
+            or readiness.has("OPEN_DEBUGGING_ISSUE")
+        ),
         width="stretch",
     ):
         try:
@@ -1163,8 +1608,17 @@ def show_study_coach_review(
                     session_id=session.id,
                 )
             )
-            db.update_hand_status(hand.id, "reviewed")
-            flash(f"Saved current coaching review #{saved.id}.")
+            # The coaching is kept either way; only the promotion is gated. flash()
+            # is used so the outcome survives the rerun below.
+            if readiness.is_ready and guarded_update_hand_status(
+                db, hand, readiness, "reviewed"
+            ):
+                flash(f"Saved current coaching review #{saved.id}.")
+            else:
+                flash(
+                    f"Saved coaching review #{saved.id}. Review status unchanged: "
+                    "this hand is not study-ready."
+                )
             st.rerun()
         except (LLMProviderError, ValueError) as exc:
             st.error(f"Could not generate coaching: {exc}")
@@ -1182,6 +1636,7 @@ def show_solver_review(
     players: list[HandPlayer],
     accounting: AccountingReconciliation | None,
     accounting_error: str | None,
+    readiness: StudyReadiness,
 ) -> None:
     """Configure and run one auditable post-session TexasSolver analysis."""
 
@@ -1193,7 +1648,9 @@ def show_solver_review(
     if not prepared.eligibility.eligible or prepared.spot is None:
         for reason in prepared.eligibility.reasons:
             st.error(reason)
-        _show_solver_runs(db, session, hand, players, actions, accounting, accounting_error, runs)
+        _show_solver_runs(
+            db, session, hand, players, actions, accounting, accounting_error, runs, readiness
+        )
         return
 
     spot = prepared.spot
@@ -1260,7 +1717,9 @@ def show_solver_review(
             ValueError,
         ) as exc:
             st.error(str(exc))
-    _show_solver_runs(db, session, hand, players, actions, accounting, accounting_error, runs)
+    _show_solver_runs(
+        db, session, hand, players, actions, accounting, accounting_error, runs, readiness
+    )
 
 
 def _solver_range_selector(
@@ -1388,6 +1847,7 @@ def _show_solver_runs(
     accounting: AccountingReconciliation | None,
     accounting_error: str | None,
     runs,
+    readiness: StudyReadiness,
 ) -> None:
     if not runs:
         return
@@ -1415,6 +1875,21 @@ def _show_solver_runs(
         return
     if latest.status in {"failed", "cancelled", "stale"}:
         st.warning(latest.error_message or f"Solver run is {latest.status}.")
+        # The clearing action STALE_SOLVER_EVIDENCE names. Re-running is not always
+        # possible: a correction can leave a hand solver-ineligible with a stale
+        # run that would otherwise block study forever.
+        if latest.id is not None and st.button(
+            "Delete stale run",
+            key=f"solver_delete_{latest.id}",
+            width="stretch",
+        ):
+            try:
+                db.delete_solver_run(latest.id)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                flash(f"Deleted solver run #{latest.id}.")
+                st.rerun()
         return
     try:
         evidence = SolverEvidence.model_validate(latest.evidence)
@@ -1464,10 +1939,16 @@ def _show_solver_runs(
         provider = get_provider_from_env(provider_key)
     except LLMProviderError as exc:
         st.warning(str(exc))
+    if readiness.has("OPEN_DEBUGGING_ISSUE"):
+        st.warning("Resolve the open debugging issue before explaining this solver result.")
     if st.button(
         "Explain solver result with AI",
         key=f"solver_explain_{latest.id}",
-        disabled=provider is None or not bool(accounting and accounting.is_authoritative),
+        disabled=(
+            provider is None
+            or not _accounting_is_established(hand, accounting)
+            or readiness.has("OPEN_DEBUGGING_ISSUE")
+        ),
         width="stretch",
     ):
         prompt = build_hand_review_prompt(
@@ -1475,14 +1956,10 @@ def _show_solver_runs(
             hand,
             actions,
             players,
-            pot_odds_facts=_accounting_prompt_math_facts(accounting),
+            pot_odds_facts=_accounting_prompt_math_facts(hand, accounting),
             ledger=None if accounting is None else accounting.ledger,
-            accounting_issues=(
-                [accounting_error]
-                if accounting_error
-                else ([] if accounting is None else list(accounting.issues))
-            ),
-            accounting_authoritative=bool(accounting and accounting.is_authoritative),
+            accounting_issues=_accounting_prompt_issues(accounting, accounting_error),
+            accounting_authoritative=_accounting_is_established(hand, accounting),
             solver_evidence=evidence,
         )
         try:
@@ -1502,20 +1979,30 @@ def _show_solver_runs(
                     session_id=session.id,
                 )
             )
-            db.update_hand_status(hand.id, "reviewed")
-            flash(f"Saved solver-grounded coaching review #{saved.id}.")
+            # The explanation is kept either way; only the promotion is gated.
+            if readiness.is_ready and guarded_update_hand_status(
+                db, hand, readiness, "reviewed"
+            ):
+                flash(f"Saved solver-grounded coaching review #{saved.id}.")
+            else:
+                flash(
+                    f"Saved solver-grounded coaching review #{saved.id}. Review status "
+                    "unchanged: this hand is not study-ready."
+                )
             st.rerun()
         except (LLMProviderError, ValueError) as exc:
             st.error(f"Could not explain solver result: {exc}")
 
 
 def _hero_ledger_result(
+    hand: Hand,
     accounting: AccountingReconciliation | None,
     players: list[HandPlayer],
     observed_result: float | None,
 ) -> float | None:
-    if accounting is None or not accounting.is_authoritative:
+    if not _accounting_is_established(hand, accounting):
         return observed_result
+    assert accounting is not None
     hero = next((player for player in players if player.is_hero), None)
     if hero is None:
         return observed_result
@@ -1594,6 +2081,95 @@ def _settlement_entry_editor_label(
     return f"[Needs reassignment] {entry.player_name or 'Unknown player'} · {identifier}"
 
 
+def show_assumption_dependence_controls(
+    db: PokerDatabase,
+    hand: Hand,
+    accounting: AccountingReconciliation | None,
+) -> None:
+    """Draw the exact control ACCOUNTING_ASSUMPTION_DEPENDENT names, and nothing else.
+
+    It lives inside the Accounting reconciliation panel rather than in the Source
+    warnings panel on purpose. A settlement assumption is not a pipeline warning:
+    it is a claim the operator made in the four inputs directly below this, and
+    the other clearing action -- withdrawing the claim -- is those same inputs. It
+    is also deliberately separate from 'I have read the evidence above and confirm
+    this hand is correct', which asks a broader question that a reader can answer
+    honestly without ever having looked at the rake.
+
+    The button records the MEASURED code, so what is stored is an attestation to
+    a chip quantity. If the pot later changes under an unchanged policy, the
+    measurement changes with it, the stored code no longer matches, and the
+    blocker returns without anything needing to notice that the settlement row
+    was untouched.
+    """
+
+    if hand.id is None or accounting is None or not accounting.assumption_dependence:
+        return
+    acknowledged = set(
+        parse_completion_evidence(hand.completion_evidence).confirmed_assumption_codes
+    )
+    # The same predicate the blocker is emitted under and the same one the writer
+    # behind this button enforces, so the control is drawn exactly when it can do
+    # something. It used to be `is_reconstructed_hand`, while the writer refused
+    # every `source_type == 'manual'` row: on a manual hand whose completion
+    # status was not `not_applicable` -- a state `create_hand` accepts -- the
+    # button was drawn, the write was discarded, and the page still flashed
+    # "Confirmed".
+    reconstructed = hand_requires_assumption_attestation(hand)
+    st.markdown("**Declared settlement assumptions this reconciliation rests on**")
+    st.caption(
+        "Removing these declarations stops this hand reconciling, so the pot, the "
+        "rake, and the hero result are not established by the recording alone. "
+        "Confirming records the exact chip movement you are attesting to; it is "
+        "not a confirmation of the hand as a whole."
+        if reconstructed
+        else "Recorded for audit. You entered this hand yourself, so a declared "
+        "ante, dead blind, rake or pot award is your own observation: it is "
+        "measured and shown here, and it never blocks study, coaching or the "
+        "solver."
+    )
+    for index, dependence in enumerate(accounting.assumption_dependence):
+        detail_col, action_col = st.columns([2.4, 1])
+        is_confirmed = dependence.code in acknowledged
+        detail_col.markdown(
+            status_badge(
+                "reviewed" if is_confirmed or not reconstructed else "needs_correction",
+                label=f"{dependence.input_name} · "
+                f"{'confirmed' if is_confirmed else 'unconfirmed'}",
+            ),
+            unsafe_allow_html=True,
+        )
+        detail_col.caption(dependence.describe())
+        if is_confirmed or not reconstructed:
+            continue
+        if action_col.button(
+            "Confirm this assumption",
+            key=f"accounting_assumption_{hand.id}_{index}",
+            width="stretch",
+        ):
+            if attest_assumption(db, hand.id, dependence.code):
+                flash(f"Confirmed the declared {dependence.input_name} for this hand.")
+                st.rerun()
+            else:
+                # Reachable, and reported honestly rather than assumed: a control
+                # must never say "Confirmed" over a write that was discarded. The
+                # measurement is re-derived inside `attest_assumption`, so a
+                # dependence that stopped existing between this page rendering and
+                # this button being pressed -- another tab saving the settlement,
+                # a correction landing -- refuses here instead of recording an
+                # attestation to a quantity that no longer exists.
+                #
+                # No rerun on this branch: rerunning discarded the message before
+                # it was ever drawn, which is why the guard round 10 added had no
+                # observable behaviour to test and survived mutation.
+                st.error(
+                    "Nothing was recorded: this hand no longer measures that "
+                    "assumption, or it does not require an attestation. Reload the "
+                    "hand to see the current measurement."
+                )
+    st.divider()
+
+
 def show_accounting_editor(
     db: PokerDatabase,
     hand: Hand,
@@ -1615,6 +2191,7 @@ def show_accounting_editor(
             if accounting is not None and accounting.settlement is not None
             else db.fetch_hand_settlement(hand.id) or HandSettlement(hand_id=hand.id)
         )
+        show_assumption_dependence_controls(db, hand, accounting)
         player_labels = _accounting_player_labels(players)
         if not player_labels:
             st.info("Add players and starting stacks before reconciling.")
@@ -1824,7 +2401,8 @@ def show_insights_workspace(db: PokerDatabase) -> None:
         "Insights",
         "Evidence-backed patterns from your completed hands—without fabricated solver scores.",
     )
-    hands = _hands_with_accounting_results(db, db.fetch_all_hands())
+    accounting_cache = new_accounting_cache()
+    hands = _hands_with_accounting_results(db, db.fetch_all_hands(), accounting_cache)
     if not hands:
         empty_state(
             "Not enough evidence", "Insights appear after completed hands are imported or recorded."
@@ -1850,12 +2428,37 @@ def show_insights_workspace(db: PokerDatabase) -> None:
             kpi_card(
                 "Unresolved",
                 str(len(unresolved)),
-                "Needs review or correction",
+                "Review status is not 'reviewed'",
                 tone="negative" if unresolved else "positive",
             )
         with metric_cols[2]:
-            low_confidence = sum((hand.confidence_score or 1) < 0.6 for hand in hands)
-            kpi_card("Low confidence", str(low_confidence), "Verify source reconstruction")
+            # A blocker count, not an aggregate confidence score: one percentage
+            # would read as proof the whole hand is correct. It counts hands, not
+            # blockers, and it consults every category rather than the completion
+            # column alone -- counting completion only reported 0 for a hand whose
+            # ledger did not reconcile. Per-render user confirmation cannot be
+            # evaluated across a list, so it is excluded and named below.
+            blocked = [
+                hand
+                for hand in hands
+                if hand.id is not None
+                and not hand_study_readiness(
+                    db,
+                    hand,
+                    *_accounting_or_error(db, hand, accounting_cache),
+                    user_confirmed=True,
+                ).is_ready
+            ]
+            kpi_card(
+                "Not study-ready",
+                str(len(blocked)),
+                "Completion, cards, layout, accounting, issue, or evidence blockers",
+                tone="negative" if blocked else "positive",
+            )
+    st.caption(
+        "Review status is a workflow label. Study readiness is derived per hand "
+        "and additionally requires your explicit confirmation on the Study page."
+    )
     left, right = st.columns(2)
     with left:
         section_header("Study themes", "Tag frequency and sample size")
@@ -1908,7 +2511,8 @@ def show_insights_workspace(db: PokerDatabase) -> None:
     else:
         empty_state(
             "No unresolved recorded results",
-            "Review coverage is clear for hands with recorded BB outcomes.",
+            "Every hand with a recorded BB outcome is marked reviewed. That is a "
+            "workflow status, not a study-readiness verdict.",
         )
 
 
@@ -2115,6 +2719,29 @@ def _open_hand_for_study(hand: Hand) -> None:
     navigate_to(Page.STUDY)
 
 
+def delete_hand_and_artifacts(db: PokerDatabase, hand_id: int) -> str | None:
+    """Delete one hand after stopping and removing its solver runs.
+
+    Returns an error message instead of deleting when an active solver cannot be
+    stopped yet. This is the writer behind every 'Delete hand' control, and it
+    exists because ``NEW_RECONSTRUCTION_STEPS`` names the deletion as part of its
+    clearing action: an import ADDS the rebuilt hands beside the existing ones,
+    so the superseded copy must be deletable from the session's hand list or the
+    blocker names an action the product cannot perform.
+    """
+    for run in db.fetch_solver_runs_by_hand(hand_id):
+        if run.status in {"queued", "running", "cancelling"}:
+            cancelled = cancel_solver_run(db, run.id)
+            if cancelled.status == "cancelling":
+                return (
+                    "The active solver could not be stopped yet. "
+                    "Try deleting again after it exits."
+                )
+        remove_solver_run_artifacts(run)
+    db.delete_hand(hand_id)
+    return None
+
+
 def render_hand_results(
     db: PokerDatabase,
     hands: list[Hand],
@@ -2178,6 +2805,31 @@ def render_hand_results(
             ):
                 _open_hand_for_study(item)
                 st.rerun()
+            # The control NEW_RECONSTRUCTION_STEPS depends on: comparing a
+            # blocked hand against its rebuilt copy ends with deleting one of
+            # them, and this row is the session's hand list where that happens.
+            with st.expander("Delete hand"):
+                st.warning(
+                    f"Deleting hand #{item.hand_number} removes its actions, "
+                    "players, settlement, reviews, issues, and solver runs. "
+                    "This cannot be undone."
+                )
+                confirm_delete = st.checkbox(
+                    "I understand this permanently deletes this hand and all "
+                    "related rows.",
+                    key=f"{key_prefix}_confirm_delete_{item.id}",
+                )
+                if st.button(
+                    "Delete hand",
+                    key=f"{key_prefix}_delete_{item.id}",
+                    disabled=not confirm_delete,
+                ):
+                    error = delete_hand_and_artifacts(db, item.id)
+                    if error:
+                        st.error(error)
+                    else:
+                        flash(f"Hand #{item.hand_number} deleted.")
+                        st.rerun()
 
 
 def show_session_hand_browser(db: PokerDatabase, session: Session) -> None:
@@ -2621,7 +3273,11 @@ def create_hand_form(db: PokerDatabase, session_id: int | None) -> None:
                 placeholder="Unknown",
             )
             result = st.text_input("Result text", placeholder="Hero wins")
-            review_status = st.selectbox("Review status", REVIEW_STATUSES)
+            # A hand being created has no accounting and no review, so "reviewed"
+            # is never a legitimate starting status here.
+            review_status = st.selectbox(
+                "Review status", ["unreviewed", "needs_correction"]
+            )
 
         tags = st.multiselect("Tags", sorted(HAND_TAGS))
         notes = st.text_area("Hand notes / pro-style hand history", height=100)
@@ -2639,6 +3295,12 @@ def create_hand_form(db: PokerDatabase, session_id: int | None) -> None:
                 f"Hand #{int(hand_number)} already exists in this session. Pick a different number."
             )
             return
+        # A hand entered by hand but declared reconstructed carries no evidence, so
+        # it starts unproven instead of being mintable as reviewed.
+        is_declared_reconstructed = source_type != "manual"
+        completion_status = "uncertain" if is_declared_reconstructed else "not_applicable"
+        if is_declared_reconstructed:
+            review_status = "needs_correction"
         try:
             # One transaction: a validation error in any player/action row rolls
             # back the whole hand instead of persisting a partial save.
@@ -2659,6 +3321,7 @@ def create_hand_form(db: PokerDatabase, session_id: int | None) -> None:
                         hero_bb_won=_optional_float(hero_bb_won),
                         review_status=review_status,
                         source_type=source_type,
+                        completion_status=completion_status,
                         tags=tags,
                         notes=notes.strip(),
                     )
@@ -2832,10 +3495,19 @@ def save_action_rows(db: PokerDatabase, hand_id: int | None, action_rows: list[d
 
 
 def show_saved_hands(db: PokerDatabase, session: Session) -> None:
+    # NOTE: currently unreferenced by the running app; recorded under
+    # "Known non-blocking gaps" in PLAN Phase 1. It holds the only per-hand-export
+    # control, so it is retained rather than deleted, and its review-status write
+    # still goes through guarded_update_hand_status. The delete-hand control the
+    # clearing actions depend on is NOT only here any more: every hand row
+    # rendered by render_hand_results carries one.
     if session.id is None:
         return
 
-    hands = _hands_with_accounting_results(db, db.fetch_hands_by_session(session.id))
+    accounting_cache = new_accounting_cache()
+    hands = _hands_with_accounting_results(
+        db, db.fetch_hands_by_session(session.id), accounting_cache
+    )
     if not hands:
         st.info("No hands saved for this session yet.")
         return
@@ -2874,20 +3546,58 @@ def show_saved_hands(db: PokerDatabase, session: Session) -> None:
                 language="text",
             )
 
+            accounting, accounting_error = _reconcile_cached(
+                db, hand.id, accounting_cache
+            )
+            readiness = hand_study_readiness(
+                db,
+                hand,
+                accounting,
+                accounting_error,
+                user_confirmed=bool(
+                    st.session_state.get(study_confirmation_key(hand, accounting), False)
+                ),
+            )
+            render_study_readiness(readiness)
+            if is_reconstructed_hand(hand):
+                show_reconstruction_evidence(
+                    hand, parse_completion_evidence(hand.completion_evidence)
+                )
+            if hand_requires_user_confirmation(hand):
+                st.checkbox(
+                    "I have read the evidence above and confirm this hand is correct",
+                    key=study_confirmation_key(hand, accounting),
+                )
+
+            status_options, status_index = review_status_options(hand, readiness)
+            status_key = f"status_{hand.id}"
+            if st.session_state.get(status_key) not in status_options:
+                st.session_state.pop(status_key, None)
             status = st.selectbox(
                 "Review status",
-                REVIEW_STATUSES,
-                index=REVIEW_STATUSES.index(hand.review_status),
-                key=f"status_{hand.id}",
+                status_options,
+                index=status_index,
+                key=status_key,
             )
             if st.button("Update status", key=f"status_button_{hand.id}"):
-                db.update_hand_status(hand.id, status)
-                st.rerun()
+                if guarded_update_hand_status(db, hand, readiness, status):
+                    st.rerun()
 
             show_player_editor(db, players)
             show_action_editor(db, actions, players)
 
             for review in db.fetch_reviews_by_hand(hand.id):
+                if review.is_stale:
+                    # Retained history, not current coaching: this advice was
+                    # generated against facts that have since been corrected.
+                    st.markdown(
+                        status_badge("needs_correction", label="Stale coaching · not current"),
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(
+                        review.stale_reason
+                        or "Hand evidence changed after this review was saved."
+                    )
                 st.markdown("##### Hand Summary")
                 st.write(review.hand_summary)
                 st.markdown("##### Theory Coach")
@@ -2913,17 +3623,10 @@ def show_saved_hands(db: PokerDatabase, session: Session) -> None:
                 "Confirm delete this hand and all related rows", key=f"confirm_delete_{hand.id}"
             )
             if st.button("Delete hand", key=f"delete_hand_{hand.id}", disabled=not confirm_delete):
-                for run in db.fetch_solver_runs_by_hand(hand.id):
-                    if run.status in {"queued", "running", "cancelling"}:
-                        cancelled = cancel_solver_run(db, run.id)
-                        if cancelled.status == "cancelling":
-                            st.error(
-                                "The active solver could not be stopped yet. "
-                                "Try deleting again after it exits."
-                            )
-                            return
-                    remove_solver_run_artifacts(run)
-                db.delete_hand(hand.id)
+                error = delete_hand_and_artifacts(db, hand.id)
+                if error:
+                    st.error(error)
+                    return
                 st.rerun()
 
 
@@ -3202,7 +3905,10 @@ def show_import_export(db: PokerDatabase, session: Session) -> None:
 def show_math_review(db: PokerDatabase, session: Session) -> None:
     if session.id is None:
         return
-    hands = _hands_with_accounting_results(db, db.fetch_hands_by_session(session.id))
+    accounting_cache = new_accounting_cache()
+    hands = _hands_with_accounting_results(
+        db, db.fetch_hands_by_session(session.id), accounting_cache
+    )
     if not hands:
         st.info("Save or load hands before using Math Review.")
         return
@@ -3224,12 +3930,7 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
     hand = next(item for item in hands if item.id == selected_hand_id)
     actions = db.fetch_actions_by_hand(hand.id)
     players = db.fetch_players_by_hand(hand.id)
-    try:
-        accounting = reconcile_persisted_hand(db, hand.id)
-        accounting_error = None
-    except LedgerError as exc:
-        accounting = None
-        accounting_error = str(exc)
+    accounting, accounting_error = _reconcile_cached(db, hand.id, accounting_cache)
 
     with st.expander("Completed-hand history", expanded=False):
         st.code(
@@ -3239,12 +3940,8 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
                 actions,
                 players,
                 ledger=None if accounting is None else accounting.ledger,
-                accounting_issues=(
-                    [accounting_error]
-                    if accounting_error
-                    else ([] if accounting is None else list(accounting.issues))
-                ),
-                accounting_authoritative=bool(accounting and accounting.is_authoritative),
+                accounting_issues=_accounting_prompt_issues(accounting, accounting_error),
+                accounting_authoritative=_accounting_is_established(hand, accounting),
             ),
             language="text",
         )
@@ -3256,7 +3953,8 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
     stack_default = float(hand.effective_stack or 0)
     rake_pct_default = 0.0
     rake_cap_default: float | None = None
-    if accounting is not None and accounting.is_authoritative:
+    if _accounting_is_established(hand, accounting):
+        assert accounting is not None
         hero = next((player for player in players if player.is_hero), None)
         hero_key = None if hero is None else hero.player_key
         hero_calls = [
@@ -3407,8 +4105,7 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
 
     math_facts: dict[str, float | str] = {}
     inputs_match_ledger = bool(
-        accounting
-        and accounting.is_authoritative
+        _accounting_is_established(hand, accounting)
         and pot_before_call == call_pot_default
         and call_amount == call_default
         and pot_size == bet_pot_default
@@ -3637,12 +4334,8 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
         equity_result=equity_result,
         villain_range_label=range_label,
         ledger=None if accounting is None else accounting.ledger,
-        accounting_issues=(
-            [accounting_error]
-            if accounting_error
-            else ([] if accounting is None else list(accounting.issues))
-        ),
-        accounting_authoritative=bool(accounting and accounting.is_authoritative),
+        accounting_issues=_accounting_prompt_issues(accounting, accounting_error),
+        accounting_authoritative=_accounting_is_established(hand, accounting),
     )
 
     with st.expander("Structured coaching prompt"):
@@ -3812,7 +4505,10 @@ def show_coach_review(db: PokerDatabase, session: Session) -> None:
     st.subheader("Post-Session Coach Review")
     st.caption("Provider reviews are for completed hands/sessions only.")
 
-    hands = _hands_with_accounting_results(db, db.fetch_hands_by_session(session.id))
+    accounting_cache = new_accounting_cache()
+    hands = _hands_with_accounting_results(
+        db, db.fetch_hands_by_session(session.id), accounting_cache
+    )
     if not hands:
         st.info("Save or load hands before generating coach reviews.")
         return
@@ -3833,7 +4529,9 @@ def show_coach_review(db: PokerDatabase, session: Session) -> None:
     review_scope = st.radio("Review scope", ["Hand", "Session"], horizontal=True)
 
     if review_scope == "Hand":
-        show_hand_coach_review(db, session, hands, provider, coaching_mode)
+        show_hand_coach_review(
+            db, session, hands, provider, coaching_mode, accounting_cache
+        )
     else:
         show_session_coach_review(db, session, hands, provider, coaching_mode)
 
@@ -3844,6 +4542,7 @@ def show_hand_coach_review(
     hands: list[Hand],
     provider,
     coaching_mode: str,
+    accounting_cache: AccountingCache | None = None,
 ) -> None:
     labels = {
         hand.id: (
@@ -3862,24 +4561,15 @@ def show_hand_coach_review(
     hand = next(item for item in hands if item.id == selected_hand_id)
     actions = db.fetch_actions_by_hand(hand.id)
     players = db.fetch_players_by_hand(hand.id)
-    try:
-        accounting = reconcile_persisted_hand(db, hand.id)
-        accounting_error = None
-    except LedgerError as exc:
-        accounting = None
-        accounting_error = str(exc)
+    accounting, accounting_error = _reconcile_cached(db, hand.id, accounting_cache)
     history = format_hand_history(
         session,
         hand,
         actions,
         players,
         ledger=None if accounting is None else accounting.ledger,
-        accounting_issues=(
-            [accounting_error]
-            if accounting_error
-            else ([] if accounting is None else list(accounting.issues))
-        ),
-        accounting_authoritative=bool(accounting and accounting.is_authoritative),
+        accounting_issues=_accounting_prompt_issues(accounting, accounting_error),
+        accounting_authoritative=_accounting_is_established(hand, accounting),
     )
     st.code(history, language="text")
 
@@ -3889,8 +4579,21 @@ def show_hand_coach_review(
         index=sorted(RANGE_LABELS).index(estimate_villain_range_label(hand.tags, hand.notes)),
         key="coach_range_label",
     )
-    math_facts = _accounting_prompt_math_facts(accounting)
-    if accounting is None or not accounting.is_authoritative:
+    math_facts = _accounting_prompt_math_facts(hand, accounting)
+    # `unattested_...`, not `assumption_dependence`: a dependence the operator has
+    # already confirmed -- or one on a hand they entered themselves, where no
+    # attestation control is ever drawn -- is answered, and a message telling them
+    # to go and perform an action they have already performed (or that the product
+    # does not offer) is the failure PLAN.md's "a blocker never names an action the
+    # product cannot perform" rule exists to prevent.
+    if unattested_assumption_dependence(hand, accounting):
+        st.warning(
+            "Coaching is disabled until you confirm the declared settlement "
+            "assumptions this hand's reconciliation rests on, in Study → Summary "
+            "→ Accounting reconciliation. Until then its pot, rake, and hero "
+            "result are not established by the recording."
+        )
+    elif accounting is None or not accounting.is_authoritative:
         st.warning(
             "Coaching is disabled until the completed hand has a legal, balanced reconciliation."
         )
@@ -3906,20 +4609,43 @@ def show_hand_coach_review(
         villain_range_label=range_label,
         coaching_mode=coaching_mode,
         ledger=None if accounting is None else accounting.ledger,
-        accounting_issues=(
-            [accounting_error]
-            if accounting_error
-            else ([] if accounting is None else list(accounting.issues))
-        ),
-        accounting_authoritative=bool(accounting and accounting.is_authoritative),
+        accounting_issues=_accounting_prompt_issues(accounting, accounting_error),
+        accounting_authoritative=_accounting_is_established(hand, accounting),
     )
     show_prompt_safety(prompt)
     with st.expander("Exact prompt sent to provider"):
         st.code(prompt, language="text")
 
+    # This surface does not otherwise fetch issue, coaching, or solver evidence, so
+    # readiness is composed here before the promotion is offered.
+    readiness = hand_study_readiness(
+        db,
+        hand,
+        accounting,
+        accounting_error,
+        user_confirmed=bool(
+            st.session_state.get(study_confirmation_key(hand, accounting), False)
+        ),
+    )
+    st.markdown("##### Study readiness")
+    render_study_readiness(readiness)
+    if is_reconstructed_hand(hand):
+        show_reconstruction_evidence(
+            hand, parse_completion_evidence(hand.completion_evidence)
+        )
+    if hand_requires_user_confirmation(hand):
+        st.checkbox(
+            "I have read the evidence above and confirm this hand is correct",
+            key=study_confirmation_key(hand, accounting),
+        )
+
     if st.button(
         "Generate and save post-session hand review",
-        disabled=accounting is None or not accounting.is_authoritative,
+        disabled=(
+            not _accounting_is_established(hand, accounting)
+            or readiness.has("OPEN_DEBUGGING_ISSUE")
+            or readiness.has("ACCOUNTING_ASSUMPTION_DEPENDENT")
+        ),
     ):
         try:
             with st.spinner("Generating hand review..."):
@@ -3934,8 +4660,16 @@ def show_hand_coach_review(
                     session_id=session.id,
                 )
             )
-            db.update_hand_status(hand.id, "reviewed")
-            flash(f"Saved provider review #{saved.id}.")
+            # The review is kept either way; only the promotion is gated.
+            if readiness.is_ready and guarded_update_hand_status(
+                db, hand, readiness, "reviewed"
+            ):
+                flash(f"Saved provider review #{saved.id}.")
+            else:
+                flash(
+                    f"Saved provider review #{saved.id}. Review status unchanged: "
+                    "this hand is not study-ready."
+                )
             st.rerun()
         except (LLMProviderError, ValueError) as exc:
             st.error(f"Could not generate review: {exc}")
@@ -4050,11 +4784,55 @@ def _optional_prompt_math_facts(
     return {"required_equity_to_call": required_equity_to_call(call_amount, pot_before_call)}
 
 
+def _accounting_is_established(
+    hand: Hand, accounting: AccountingReconciliation | None
+) -> bool:
+    """One-line delegate to the single service-level definition.
+
+    It stays here only so every UI call site reads the same short name. The rule
+    itself lives in ``services.study_readiness.accounting_is_established``,
+    beside the readiness blocker it has to agree with, because it used to be a
+    second expression in a second module: this file answered "is there any
+    measured dependence?" while readiness answered "is there one the operator has
+    not attested to, on a hand that owes an attestation at all?". The two
+    disagreed in both directions -- an attested reconstructed hand stayed
+    study-ready with coaching permanently disabled, and a manual hand carrying an
+    ordinary room rake had coaching disabled with no control anywhere that could
+    ever enable it.
+    """
+    return accounting_is_established(hand, accounting)
+
+
+def _accounting_prompt_issues(
+    accounting: AccountingReconciliation | None, accounting_error: str | None
+) -> list[str]:
+    """Everything a reader of the hand history must know about its accounting.
+
+    A measured settlement-assumption dependence belongs in this list for the same
+    reason a ledger warning does: it is a reason the figures below it are not
+    established. It is stated in chips, so the sentence survives being read by a
+    provider that has never seen the Study page.
+    """
+    if accounting_error:
+        return [accounting_error]
+    if accounting is None:
+        return []
+    return [
+        *accounting.issues,
+        *(
+            f"Reconciles only under a declared settlement assumption — "
+            f"{dependence.describe()}"
+            for dependence in accounting.assumption_dependence
+        ),
+    ]
+
+
 def _accounting_prompt_math_facts(
-    accounting: AccountingReconciliation | None,
+    hand: Hand, accounting: AccountingReconciliation | None
 ) -> dict[str, float | str]:
-    if accounting is None or not accounting.is_authoritative:
+    if not _accounting_is_established(hand, accounting):
         return {}
+    assert accounting is not None
     facts: dict[str, float | str] = {
         "accounting_status": "reconciled, chip-balanced, betting-sequence legal",
         "gross_pot_bb": accounting.ledger.gross_pot,

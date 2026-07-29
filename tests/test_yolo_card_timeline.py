@@ -7,6 +7,25 @@ def test_zone_for_box_assigns_hero_board_other():
     assert _zone_for_box(0.90, 0.20) == "other"
 
 
+def test_legacy_zone_for_box_is_unanchored_and_documented():
+    """Pin the KNOWN failure of the legacy unanchored rectangles so nobody
+    re-wires them into the reconstruction spine.
+
+    On the 06-21 recording (2062x1178, AR 1.750) the real community row sits at
+    raw normalized cy 0.335-0.338. The legacy board window starts at cy 0.36, so
+    every board card there is zoned "other" -- 435 detections, silently re-routed
+    to villain seats. The spine anchors instead (landmark_anchor.zone_for_ref).
+    """
+    assert _zone_for_box(0.45, 0.337) == "other"
+    assert "LEGACY" in (_zone_for_box.__doc__ or "")
+
+
+def test_hard_example_miner_imports_the_single_zone_definition():
+    from cv_lab.scripts.training import mine_yolo_card_hard_examples as miner
+
+    assert miner._zone_for_box is _zone_for_box
+
+
 def test_stage_from_board_count():
     assert _stage(0) == "preflop"
     assert _stage(2) == "partial_board"

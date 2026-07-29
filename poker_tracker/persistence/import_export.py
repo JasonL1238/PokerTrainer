@@ -5,6 +5,13 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from poker_tracker.persistence.completion import (
+    IMPORTED_HAND_KEY,
+    UNREADABLE_CARDS_KEY,
+    derive_completion_status,
+    parse_completion_evidence,
+    strip_derived_evidence_markers,
+)
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import (
     Action,
@@ -19,8 +26,10 @@ from poker_tracker.persistence.models import (
     SettlementEntry,
 )
 
-EXPORT_VERSION = 4
-SUPPORTED_IMPORT_VERSIONS = {1, 2, 3, EXPORT_VERSION}
+EXPORT_VERSION = 5
+# The literal 4 must stay listed: bumping EXPORT_VERSION alone would silently
+# drop support for payloads written by the previous release.
+SUPPORTED_IMPORT_VERSIONS = {1, 2, 3, 4, EXPORT_VERSION}
 
 
 def export_hand(db: PokerDatabase, hand_id: int) -> dict[str, Any]:
@@ -89,6 +98,7 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
     validated_hands: list[
         tuple[
             Hand,
+            dict[str, object],
             list[HandPlayer],
             list[Action],
             HandSettlement | None,
@@ -104,6 +114,13 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
         hand_data = dict(hand_payload["hand"])
         hand_data.pop("id", None)
         hand_data["session_id"] = 0
+        # Captured BEFORE the marker is stripped. It is the only surviving record
+        # of a card column the exporting database could not read, and without it
+        # INVALID_HERO_OR_BOARD_CARDS is a consumer whose producer -- the corrupt
+        # column, which the exporter has already blanked -- disappears across the
+        # round trip.
+        unreadable = _recorded_unreadable_cards(hand_data.get("completion_evidence"))
+        _apply_completion_import_defaults(hand_data)
         hand = Hand(**hand_data)
 
         players: list[HandPlayer] = []
@@ -143,6 +160,7 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
             imported = dict(review_data)
             imported.pop("id", None)
             imported["hand_id"] = 0
+            _mark_imported_analysis_stale(imported)
             reviews.append(HandReview(**imported))
 
         coaching_reviews: list[CoachingResponse] = []
@@ -151,6 +169,7 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
             imported.pop("id", None)
             imported["hand_id"] = 0
             imported["session_id"] = 0
+            _mark_imported_analysis_stale(imported)
             coaching_reviews.append(CoachingResponse(**imported))
 
         corrections: list[HandCorrection] = []
@@ -170,6 +189,7 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
         validated_hands.append(
             (
                 hand,
+                unreadable,
                 players,
                 actions,
                 settlement,
@@ -187,6 +207,7 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
         imported.pop("id", None)
         imported["hand_id"] = None
         imported["session_id"] = 0
+        _mark_imported_analysis_stale(imported)
         session_coaching_reviews.append(CoachingResponse(**imported))
 
     with db.transaction():
@@ -195,6 +216,7 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
             raise RuntimeError("Imported session did not receive an id.")
         for (
             hand,
+            unreadable,
             players,
             actions,
             settlement,
@@ -207,12 +229,20 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
             saved_hand = db.create_hand(hand.model_copy(update={"session_id": session.id}))
             if saved_hand.id is None:
                 raise RuntimeError("Imported hand did not receive an id.")
+            if unreadable:
+                db.restore_unreadable_card_columns(saved_hand.id, unreadable)
             for player in players:
                 db.create_hand_player(player.model_copy(update={"hand_id": saved_hand.id}))
             for action in actions:
                 db.create_action(action.model_copy(update={"hand_id": saved_hand.id}))
             if settlement is not None:
                 db.upsert_hand_settlement(settlement.model_copy(update={"hand_id": saved_hand.id}))
+            if settlement_entries:
+                # Never nested under `settlement is not None`: a settlement row is
+                # not required to declare a winner (`create_settlement_entry` needs
+                # none, and the exporter emits the entries regardless), so nesting
+                # silently dropped every award on a settled, balanced hand and left
+                # it unsettled with no error and no reported count.
                 db.replace_settlement_entries(
                     saved_hand.id,
                     [
@@ -237,6 +267,7 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
                     issue.model_copy(update={"hand_id": saved_hand.id}),
                     apply_workflow=False,
                 )
+            _enforce_review_status_floor(db, saved_hand.id, hand.review_status)
         for review in session_coaching_reviews:
             db.create_coaching_response(
                 review.model_copy(update={"session_id": session.id})
@@ -267,6 +298,11 @@ def import_hands_into_session(
         for hand in db.fetch_hands_by_session(temporary.id):
             if hand.id is not None:
                 db.move_hand_to_session(hand.id, session_id)
+        # move_hand_to_session re-parents review_type='hand' rows only. Without
+        # this, coaching_reviews.session_id ON DELETE CASCADE silently deleted
+        # every session-level coaching review the payload carried, with no error
+        # and no reported count.
+        db.move_session_coaching_reviews(temporary.id, session_id)
         db.delete_session(temporary.id)
 
     refreshed = db.fetch_session(session_id)
@@ -277,6 +313,187 @@ def import_hands_into_session(
 
 def import_session_json(db: PokerDatabase, path: str | Path) -> Session:
     return import_session(db, json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+IMPORTED_ANALYSIS_STALE_REASON = (
+    "Imported from another database; rerun coaching against these records."
+)
+
+
+def _mark_imported_analysis_stale(review_data: dict[str, Any]) -> None:
+    """Land every imported coaching row stale, whatever the payload declared.
+
+    ``is_stale`` is a blocker input -- ``STALE_COACHING_EVIDENCE`` exists to stop
+    a review written against superseded facts being presented as CURRENT -- and
+    ``HandReview(**imported)`` / ``CoachingResponse(**imported)`` accepted it
+    verbatim, so editing one boolean in an exported JSON file cleared the
+    blocker and republished stale coaching as current.
+
+    Nothing in the importing database can verify the claim: a retained review
+    describes the hand, ledger and winners of the database that produced it, and
+    what arrives here are different rows with different ids. This is the same
+    rule that already applies to an acknowledgement and to a ``reviewed``
+    promotion -- an assertion about evidence cannot travel in the payload that
+    carries the evidence. The text itself is preserved, so nothing is lost: it is
+    re-run in the importing database.
+    """
+    review_data["is_stale"] = True
+    if not str(review_data.get("stale_reason") or "").strip():
+        review_data["stale_reason"] = IMPORTED_ANALYSIS_STALE_REASON
+
+
+def _enforce_review_status_floor(
+    db: PokerDatabase, hand_id: int, declared_status: str
+) -> None:
+    """No hand lands 'reviewed' from a payload, whatever source_type it declares.
+
+    ``create_hand`` writes the declared review_status verbatim, so this runs
+    after the hand's rows exist and demotes what a payload may not claim.
+    ``reviewed`` is this database operator's attestation: readiness requires
+    explicit user confirmation, which is derived per render and deliberately
+    never persisted, so it cannot travel in a payload -- the importing operator
+    has not seen this hand. That argument does not depend on ``source_type``,
+    and scoping the floor on it was the hole: a payload relabelled
+    ``source_type: manual`` was re-promoted straight to ``reviewed`` by this
+    very function, on the strength of two strings the same payload wrote. The
+    same rule already applies to every other travelling assertion -- imported
+    coaching lands stale, acknowledgements and attestations are reset.
+
+    A genuine manual export loses its label too, because it is byte-identical to
+    the forgery and the label is one tick and one save away for the operator who
+    now vouches for it. (The v13 MIGRATION keeps manual review statuses -- a
+    migrated database is the same operator's own data, not somebody's JSON.)
+    """
+
+    if declared_status != "reviewed":
+        return
+    db.update_hand_status(hand_id, "needs_correction")
+
+
+# How restrictive each reconstructed-hand completion status is. Import may move a
+# hand up this ordering (weaken its claim) and never down it. `not_applicable` is
+# deliberately absent: it is the manual-hand exemption, is refused outright on a
+# reconstructed payload above, and is not comparable with the rest.
+_IMPORT_COMPLETION_RESTRICTION = {"complete": 0, "uncertain": 1, "partial": 2}
+
+
+def _apply_completion_import_defaults(hand_data: dict[str, Any]) -> None:
+    """Re-derive one imported hand's completion status from its own evidence.
+
+    Runs before any application-data write so a rejected payload leaves no
+    partial session behind. Version-independent by design: a v5 payload's
+    declared completion_status is exactly as untrusted as a pre-v5 payload's
+    absent one, because both arrive as user-supplied JSON.
+    """
+
+    source = hand_data.get("source_type") or "manual"
+    if source != "manual" and hand_data.get("completion_status") == "not_applicable":
+        raise ValueError(
+            "Imported hand declares a reconstructed source_type with "
+            "completion_status 'not_applicable'."
+        )
+    # source_type is the one field the whole completion invariant hangs on: the
+    # 'manual' + 'not_applicable' pair exempts a hand from every completion,
+    # layout, source-warning, and confirmation blocker. A payload that declares
+    # 'manual' while carrying reconstruction evidence is claiming the exemption
+    # for a hand the pipeline built, so it is refused rather than trusted.
+    # `claims_reconstruction` (any nonzero evidence_version), NOT `is_known`:
+    # gating the refusal on readability meant a payload that bumped
+    # evidence_version past what this build reads defeated it while KEEPING the
+    # pipeline's rejection codes in the stored row.
+    if source == "manual" and parse_completion_evidence(
+        hand_data.get("completion_evidence")
+    ).claims_reconstruction:
+        raise ValueError(
+            "Imported hand declares source_type 'manual' but carries "
+            "reconstruction completion evidence."
+        )
+    evidence = hand_data.get("completion_evidence")
+    evidence = strip_derived_evidence_markers(evidence)
+    # An acknowledgement is an operator attesting to a code in THIS database, and
+    # it is an input to `derive_completion_status` through `unresolved_codes`. A
+    # payload that declared a warning AND acknowledged it was internally
+    # consistent, so the ceiling below could not see it: the hand derived
+    # 'complete' with an empty blocker tuple, having been attested to by nobody,
+    # and a genuine `hero_seat_mismatch` arriving pre-acknowledged silenced
+    # UNSUPPORTED_TABLE_LAYOUT while app.py drew no Acknowledge control for it.
+    # Stripped for exactly the reason `reviewed` is never landed on a reconstructed
+    # hand: the importing operator has not seen this hand's evidence. The codes
+    # themselves are preserved, so nothing is lost -- they are re-acknowledged in
+    # the importing database. Reset rather than removed, so the stored blob keeps
+    # the shape a v5 export writes.
+    if "acknowledged_codes" in evidence:
+        evidence["acknowledged_codes"] = []
+    # A settlement-assumption attestation is the same kind of statement, made
+    # about chips instead of pipeline codes: it says THIS operator asserts these
+    # unobserved chips were really taken or added. The importing operator has
+    # asserted nothing, so it is reset here too, and the dependence -- which is
+    # re-measured from the chips on every read -- simply reappears until they do.
+    if "confirmed_assumption_codes" in evidence:
+        evidence["confirmed_assumption_codes"] = []
+    # Stamped on every imported hand, whatever it declares its source_type to be.
+    # The manual exemption is the argument "you entered this hand yourself, so a
+    # declared ante or rake is your own observation", and that argument is false
+    # for a hand that arrived as user-supplied JSON. A payload declaring
+    # `source_type: manual` with no evidence is byte-identical to a genuine
+    # manual export, so no guard can disprove the claim -- but it does not have
+    # to: what the payload cannot manufacture is having been entered here. This
+    # marker carries no `evidence_version`, so it does not make a manual hand
+    # "carry reconstruction evidence" and the refusal above is unaffected.
+    evidence[IMPORTED_HAND_KEY] = True
+    hand_data["completion_evidence"] = evidence
+    # The declared completion_status is never trusted, at any export version: a
+    # payload is user-supplied JSON and reaches create_hand, which has no guard.
+    # derive_completion_status is the only promotion path to 'complete', and a
+    # pre-v5 payload carries no evidence, so it derives 'uncertain' for a
+    # reconstructed hand and 'not_applicable' for a manual one -- the same
+    # conservative defaults the previous version-keyed branch applied.
+    derived = derive_completion_status(
+        parse_completion_evidence(hand_data["completion_evidence"]),
+        source_type=source,
+    )
+    # ...and it is never trusted upward either. Both the declared status and the
+    # evidence it is re-derived from arrive in the same user-supplied JSON, so a
+    # forger who writes a CONSISTENT evidence blob would otherwise win. Import
+    # applies safe defaults: it may only ever weaken what the payload claimed.
+    #
+    # The comparison runs over the whole ordering, not just the `complete` step.
+    # Keying it on `derived == "complete"` silently swapped a declared, permanent
+    # `partial` for the re-derived, acknowledgeable `uncertain` -- which is what
+    # every stripped, corrupt, pre-v5 or future-`evidence_version` payload derives
+    # -- and one Acknowledge click then walked the hand to `complete`.
+    declared = hand_data.get("completion_status")
+    if (
+        declared in _IMPORT_COMPLETION_RESTRICTION
+        and derived in _IMPORT_COMPLETION_RESTRICTION
+        and _IMPORT_COMPLETION_RESTRICTION[declared]
+        > _IMPORT_COMPLETION_RESTRICTION[derived]
+    ):
+        derived = declared
+    hand_data["completion_status"] = derived
+    # Redundant in outcome, and deliberately kept as a local invariant rather than
+    # advertised as the guard. `_enforce_review_status_floor` is where the
+    # protection actually lives: it unconditionally writes 'needs_correction' for
+    # every declared 'reviewed' a few lines later, inside the same transaction,
+    # whatever source_type the payload claims, and removing IT is killed by
+    # tests. Removing this line changes no observable outcome; it states here,
+    # at the point the status is decided, that an unproven hand may not declare
+    # itself reviewed in a JSON file.
+    if (
+        hand_data.get("completion_status") not in {"complete", "not_applicable"}
+        and hand_data.get("review_status") == "reviewed"
+    ):
+        hand_data["review_status"] = "needs_correction"
+
+
+def _recorded_unreadable_cards(evidence: object) -> dict[str, object]:
+    """What the exporting database recorded under UNREADABLE_CARDS_KEY, if anything."""
+    if not isinstance(evidence, dict):
+        return {}
+    recorded = evidence.get(UNREADABLE_CARDS_KEY)
+    if not isinstance(recorded, dict):
+        return {}
+    return {str(key): value for key, value in recorded.items()}
 
 
 def _dump_model(model: Any) -> dict[str, Any]:

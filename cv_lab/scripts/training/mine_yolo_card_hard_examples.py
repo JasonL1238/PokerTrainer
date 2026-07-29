@@ -15,6 +15,22 @@ from pathlib import Path
 
 import cv2
 
+# Zoning here is ANCHOR-FREE by necessity: this miner reads a card-only CSV, so it
+# has no stack_text landmarks to fit the table transform from. It used to fall back
+# to build_yolo_card_timeline._zone_for_box, the legacy raw normalized rectangles,
+# and that is not neutral for a triage tool: those rectangles lose 100% of the
+# community row at aspect ratio 1.750 (measured, 1 of 1152 detections zoned board),
+# so on any recording of that family the miner buckets every board card as "other"
+# and mis-prioritises exactly the geometry that was broken.
+#
+# The shape test needs no anchor at all. A community row is a set of cards sharing
+# a y within tolerance whose horizontal span is board-SHAPED in units of the row's
+# OWN median card width -- a ratio of two quantities that both carry the frame's
+# scale, so no aspect ratio can move it. Same rule, same constants, as the
+# reconstruction spine's board-row net.
+from cv_lab.scripts.pipeline.build_yolo_card_timeline import _zone_for_box
+from cv_lab.scripts.pipeline.region_detections import _community_row
+
 DEFAULT_DATASET = "cv_lab/datasets/yolo_cards_autolabel_v3"
 DEFAULT_OUT_DIRNAME = "hard_examples"
 
@@ -69,15 +85,6 @@ def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, flo
     area_b = max(0.0, bx1 - bx0) * max(0.0, by1 - by0)
     union = area_a + area_b - inter
     return inter / union if union else 0.0
-
-
-def _zone_for_box(cx: float, cy: float) -> str:
-    """Same broad normalized card zones used by build_yolo_card_timeline.py."""
-    if 0.40 <= cx <= 0.58 and cy >= 0.64:
-        return "hero"
-    if 0.32 <= cx <= 0.64 and 0.36 <= cy <= 0.55:
-        return "board"
-    return "other"
 
 
 def _frame_sort_key(row: dict) -> tuple[str, float, int, str]:
@@ -148,6 +155,53 @@ def _active_rows_by_image(rows: list[dict]) -> dict[str, list[dict]]:
     return by_image
 
 
+def _zones_for_cards(centers: list[tuple[float, float, float]]) -> list[str]:
+    """Zone each card from the card constellation alone: no anchor, no rectangles.
+
+    board -- the largest board-SHAPED same-row set (see _community_row). Scale- and
+             aspect-free by construction, so it survives the AR 1.750 family that
+             the legacy rectangles lose entirely.
+    hero  -- the two lowest remaining cards, if they sit side by side below the
+             board row. Hero's own hole cards are the only pair the client renders
+             at the bottom of the table.
+    other -- everything else (villain showdown reveals, mid-deal strips).
+
+    The legacy rectangles remain the fallback for cards the shape test cannot
+    place, and that is a deliberate, bounded compromise rather than a leftover: a
+    community row needs at least 3 cards, so a frame showing only ONE or TWO board
+    cards has no shape to test -- and "1 or 2 board cards" is precisely what the
+    partial_board_count triage signal exists to surface. Dropping the fallback
+    would make that signal unreachable. The residual exposure is therefore frames
+    with fewer than three community cards on an unusual aspect ratio, not the
+    whole-session loss this replaced.
+    """
+    if not centers:
+        return []
+    rows = [(cx, cy, "", w) for cx, cy, w in centers]
+    board = {id(r) for r in _community_row(rows)}
+    board_y = max((r[1] for r in rows if id(r) in board), default=None)
+    rest = [r for r in rows if id(r) not in board]
+    hero: set[int] = set()
+    if len(rest) >= 2:
+        low = sorted(rest, key=lambda r: -r[1])[:2]
+        widths = [r[3] for r in low if r[3] > 0]
+        span = abs(low[0][0] - low[1][0])
+        side_by_side = bool(widths) and span <= 2.5 * max(widths)
+        same_row = abs(low[0][1] - low[1][1]) <= 0.05
+        below_board = board_y is None or min(r[1] for r in low) > board_y
+        if side_by_side and same_row and below_board:
+            hero = {id(r) for r in low}
+    out = []
+    for r in rows:
+        if id(r) in board:
+            out.append("board")
+        elif id(r) in hero:
+            out.append("hero")
+        else:
+            out.append(_zone_for_box(r[0], r[1]))
+    return out
+
+
 def _frame_state(
     frame: dict,
     rows: list[dict],
@@ -162,6 +216,7 @@ def _frame_state(
     zones = {"hero": [], "board": [], "other": []}
     labels: list[str] = []
     boxes: list[tuple[float, float, float, float]] = []
+    centers: list[tuple[float, float, float]] = []   # (cx, cy, width) normalized
     min_conf: float | None = None
 
     for row in rows:
@@ -180,7 +235,11 @@ def _frame_state(
         boxes.append(box)
         cx = ((x0 + x1) / 2.0) / image_width if image_width else 0.0
         cy = ((y0 + y1) / 2.0) / image_height if image_height else 0.0
-        zones[_zone_for_box(cx, cy)].append(label)
+        w = (x1 - x0) / image_width if image_width else 0.0
+        centers.append((cx, cy, w))
+
+    for label, zone in zip(labels, _zones_for_cards(centers), strict=False):
+        zones[zone].append(label)
 
     duplicate_labels = sorted(label for label, count in Counter(labels).items() if count > 1)
     if duplicate_labels:

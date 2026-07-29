@@ -50,6 +50,16 @@ def _fmt(amount: float) -> str:
     return f"{amount:.2f}".rstrip("0").rstrip(".") or "0"
 
 
+# The Option-A contract makes None a ROUTINE value for every money field, not
+# just action amounts: a refused or absent first-state read leaves
+# starting_stack None on 10 of 31 current development hands, and formatting one
+# raised TypeError -- which, through main()'s single join, aborted rendering of
+# EVERY hand in the file including the renderable ones. An unknown is rendered
+# as unknown, exactly as the action-amount branches below already do.
+def _fmt_stack(amount: float | None) -> str:
+    return "stack unread" if amount is None else f"{_fmt(amount)}bb in chips"
+
+
 def _seat_label(p: dict) -> str:
     return "Hero" if p["is_hero"] else p["player_name"]
 
@@ -75,7 +85,7 @@ def render_hand(hand: dict, video: str) -> str:
 
     for seat in sorted(players):
         p = players[seat]
-        lines.append(f"Seat {seat}: {_seat_label(p)} ({_fmt(p['starting_stack'])}bb in chips)")
+        lines.append(f"Seat {seat}: {_seat_label(p)} ({_fmt_stack(p['starting_stack'])})")
 
     sb_seat = next((s for s, p in players.items() if p["position"] == "SB"), None)
     bb_seat = next((s for s, p in players.items() if p["position"] == "BB"), None)
@@ -146,10 +156,13 @@ def render_hand(hand: dict, video: str) -> str:
             s for s, p in players.items()
             if s not in folded and not (p["is_hero"] and hero_folded)
         ]
-        remaining = [players[s]["starting_stack"] - total_committed[s] for s in in_hand]
+        # SPR needs every live stack: with any unknown, the effective stack
+        # is unknown, and an SPR computed from the known subset would be a
+        # confident number resting on a hole. Skip it rather than guess.
+        known = [players[s]["starting_stack"] for s in in_hand]
         line = f"Pot after {street_pot_label[street]}: {_fmt(pot_total)}bb"
-        if len(remaining) >= 2 and pot_total > 0:
-            eff = min(remaining)
+        if len(known) >= 2 and pot_total > 0 and all(v is not None for v in known):
+            eff = min(v - total_committed[s] for s, v in zip(in_hand, known, strict=True))
             line += f" (SPR {eff / pot_total:.1f})"
         lines.append(line)
         committed = {s: 0.0 for s in players}
@@ -178,20 +191,34 @@ def render_hand(hand: dict, video: str) -> str:
             elif atype == "check":
                 lines.append(f"{label}: checks")
             elif atype == "call":
-                if amt is not None:
+                if amt is None:
+                    # An unread amount is unknown, not zero. `amt or 0.0` printed
+                    # "calls 0" for a size the reader never recovered, two lines
+                    # after the guard above correctly refused to add it to the
+                    # running total.
+                    lines.append(f"{label}: calls (amount unread)")
+                else:
                     committed[seat] = committed.get(seat, 0.0) + amt
-                lines.append(f"{label}: calls {_fmt(amt or 0.0)}")
+                    lines.append(f"{label}: calls {_fmt(amt)}")
             elif atype in ("bet", "raise", "all-in"):
-                prior = committed.get(seat, 0.0)
-                new_total = prior + (amt or 0.0)
-                committed[seat] = new_total
                 suffix = " and is all in" if atype == "all-in" else ""
+                if amt is None:
+                    # Folding an unknown into current_bet as 0 leaves the bet to
+                    # call unmoved, which mislabels every later action on the
+                    # street as a call or a raise of the wrong size. Print the
+                    # action, keep the arithmetic out of it.
+                    verb = "bets" if current_bet <= 0 else "raises"
+                    lines.append(f"{label}: {verb} (amount unread){suffix}")
+                    continue
+                prior = committed.get(seat, 0.0)
+                new_total = prior + amt
+                committed[seat] = new_total
                 if new_total <= current_bet:
                     # short all-in (or noisy delta) that doesn't clear the bet
                     # to call is a call, not a raise, however the pill read it.
-                    lines.append(f"{label}: calls {_fmt(amt or 0.0)}{suffix}")
+                    lines.append(f"{label}: calls {_fmt(amt)}{suffix}")
                 elif current_bet <= 0:
-                    lines.append(f"{label}: bets {_fmt(amt or 0.0)}{suffix}")
+                    lines.append(f"{label}: bets {_fmt(amt)}{suffix}")
                 else:
                     incr = new_total - current_bet
                     lines.append(f"{label}: raises {_fmt(incr)} to {_fmt(new_total)}{suffix}")
@@ -219,7 +246,8 @@ def render_hand(hand: dict, video: str) -> str:
         shown = p.get("shown_cards")
         if seat == winner_seat:
             shown_bit = f" showed [{' '.join(shown)}] and" if shown else ""
-            lines.append(f"Seat {seat}: {label}{pos}{shown_bit} collected ({_fmt(pot)}bb)")
+            collected = "pot unread" if pot is None else f"{_fmt(pot)}bb"
+            lines.append(f"Seat {seat}: {label}{pos}{shown_bit} collected ({collected})")
         elif p["is_hero"] and hand.get("hero"):
             lines.append(f"Seat {seat}: {label}{pos} showed [{' '.join(hand['hero'])}] and lost")
         elif shown:

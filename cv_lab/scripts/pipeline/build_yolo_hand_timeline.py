@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Iterable
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 from cv_lab.scripts.pipeline import region_detections as rd
@@ -32,6 +34,7 @@ from cv_lab.scripts.pipeline.build_yolo_card_timeline import (
     _stage,
     _street_events,
 )
+from cv_lab.scripts.pipeline.landmark_anchor import ANCHOR_MIN_SESSION_FITS
 
 DEFAULT_OUT = "cv_lab/results/yolo_hand_timeline.json"
 
@@ -49,6 +52,59 @@ _EPS = 1e-6
 # fixtures reconstruct byte-identically.
 _CALIB_INTERVAL_S = 2.0
 _FOLD_MIN_RUN_CALIB = 3   # hero greyed-out fold: reject True-runs < 3 samples @2s
+
+# A pot that collapses to below this fraction of the running accepted pot, once
+# that pot is above _POT_COLLAPSE_FLOOR_BB, is the NEXT deal's blind pot showing
+# through, not this hand's. Calibrated once and used by both consumers
+# (_debounce_pot and _trim_trailing_next_deal) so there is one collapse rule.
+_POT_COLLAPSE_FLOOR_BB = 6.0
+_POT_COLLAPSE_RATIO = 0.3
+
+# Smallest client render the CV stack has been calibrated against: the 07-23
+# 3.33.54 PM development recording. Below this the seat anchors and the OCR
+# templates are both extrapolating -- see _layout_profile.
+_MIN_CALIBRATED_WIDTH = 1272
+_MIN_CALIBRATED_HEIGHT = 896
+
+# Action types that MOVE MONEY. Only these can carry "an amount of unknown size";
+# a check or a fold legitimately has amount None and always did, which is exactly
+# why None on the Action model cannot be overloaded to mean unknown money.
+_MONEY_ACTIONS = frozenset({"bet", "raise", "call", "all-in"})
+
+# Winner plausibility. A seat that swept the pot gained approximately the pot, so
+# a candidate "gain" far below it is stack OCR jitter rather than a sweep.
+# Measured over every winner the spine reconstructs on the 5 development
+# geometries (19 hands): gain/pot lands in [0.962, 1.034], tightly clustered
+# because the sweep IS the pot. The one measured defect sits at 0.029 -- 0.5 BB
+# of jitter between two consecutive reads on a 17.5 BB pot. 0.5 is 0.52x the
+# smallest real ratio and 17x the defect, and it deliberately tolerates a
+# main-pot winner taking only half of a main+side total (the corpus's one
+# side-pot hand still measures 1.0, so that headroom is unexercised margin).
+# Inert when the pot is unknown: a relative floor needs a denominator.
+_WIN_GAIN_MIN_POT_RATIO = 0.5
+
+# Chip conservation slack, in BB. See _contribution_residual. A negative residual
+# is arithmetically impossible under incremental amount semantics, so the only
+# tolerance needed is for rounding on the two-decimal reads that feed both sides.
+# Measured over the development corpus after the duplicate-action fix, every
+# healthy hand's residual is >= 0; the smallest defect is -3.0 BB and the largest
+# -122.9 BB. 1.0 BB is well under the smallest defect and well above any rounding.
+_CONTRIBUTION_RESIDUAL_SLACK_BB = 1.0
+
+# Stack-ledger coherence (rejection signal C). Chips only ever LEAVE a player
+# until the pot is awarded, so no pre-settlement stack can exceed that player's
+# own stack at the start of the hand. That is exact and threshold-free, and it is
+# deliberately NOT "the stack must never rise": a rise IS legal -- the client
+# returns the uncalled part of an over-shove before the sweep, which on the
+# development corpus shows up as 0.0 -> 18.9 (g0723a hand 2, seat 0 shoved 167.0
+# into a 148.1 call) and 0.0 -> 128.4 (hand 5, seat 5). Both are real, and a
+# "never rises" rule flags both. What cannot happen is a seat holding MORE than
+# it started with: a truncated "218 BB" read as 21.0 made seat 3 start the hand
+# on 21.0 and hold 210.5 two actions later, and that hand exported at confidence
+# 1.0 with warnings=none.
+# The +1.0 BB slack absorbs read jitter without admitting any measured defect
+# (the smallest is a full order of magnitude).
+_STACK_RISE_SLACK_BB = 1.0
 
 
 def _sampling_interval(frames: list[rd.Frame]) -> float:
@@ -73,20 +129,204 @@ def _scaled_run(calib_count: int, interval_s: float) -> int:
 # --------------------------------------------------------------------------- #
 # Pass 1: per-frame table state + collapse to distinct states
 # --------------------------------------------------------------------------- #
-def _frame_state(frame: rd.Frame) -> dict[str, Any]:
-    view = rd.assign_regions(frame)
+def _session_anchor(frames: list[rd.Frame]) -> rd.TableAnchor | None:
+    """Median table transform over every frame that anchors on its own.
+
+    Used only as the fallback for a frame whose own ``stack_text`` constellation
+    is too sparse to fit. Safe because the table does not move within a recording:
+    the session-median transform reproduces the per-frame transform to within
+    0.0038 reference-y units at worst (p50 0.0001-0.0005) over the 5 development
+    geometries -- an order of magnitude inside the card-zone band guards.
+    """
+    fits = [a for a in (rd.anchor_for_frame(f) for f in frames) if a is not None]
+    if len(fits) < ANCHOR_MIN_SESSION_FITS:
+        return None
+    return rd.TableAnchor(
+        s=median(a.s for a in fits),
+        tx=median(a.tx for a in fits),
+        ty=median(a.ty for a in fits),
+        resid=median(a.resid for a in fits),
+        n_points=0,
+        source="session",
+    )
+
+
+# DELETED IN THIS PHASE: `_reject_stack_outliers`, `_STACK_OUTLIER_RATIO`,
+# `_STACK_OUTLIER_MIN_READS` and `_DECIMAL_NOT_LOCATED` -- the sibling-median net
+# that dropped a stack read at least 6.0x the frame's other stacks when the read
+# had located no decimal point.
+#
+# Its premise was "no field in this corpus legitimately exceeds ~400 BB", measured
+# on five recordings, and it is FALSE on the sixth development recording:
+# clubwpt_session_01 carries 541 reads at or above 1000 BB (max 1157.10), every
+# one of them provable under the reader's new contract and legible on screen.
+# Instrumented on that recording the net fires on 83 frames and drops a legible
+# 1110.0 BB stack against a ~150 sibling median every single time, then raises
+# `amount_scale_implausible` -- a SPINE_FATAL code at severity 0.50 -- on three of
+# its hands. Measured effect of deleting it under the new reader contract: exports
+# rise from 16 to 19 (clubwpt_session_01 6 -> 9) with no other recording changed.
+#
+# The failure it was built for -- a decimal dropped by the OCR, "79.7" read as
+# "797.0" -- is now refused AT THE READER by P5 (`integer_over_decimal_band`),
+# where the evidence for it exists: the run's own inter-digit spacing. A
+# magnitude comparison against unrelated seats never had that evidence; it had a
+# ratio, and the ratio does not separate a broken read from a deep stack.
+#
+# `amounts_rejected` / `stack_outlier_check_skipped` went with it. A counter that
+# can only ever report 0 reads as "checked and clean", which is the exact failure
+# mode this file keeps flagging elsewhere.
+
+
+def _stack_ledger_violations(
+    pre_settlement: list[dict[str, Any]], players: Iterable[int]
+) -> list[dict[str, Any]]:
+    """Seats holding MORE than they started the hand with, before settlement.
+
+    Evaluated on the pre-settlement window only, so the winner's sweep -- the one
+    way a player legitimately ends up above its starting stack -- is out of scope
+    by construction. See _STACK_RISE_SLACK_BB for why this is not "the stack must
+    never rise".
+
+    A seat is only in the ledger while it still holds cards. A seat that has
+    folded is out of the hand and the client will top it back up to the buy-in
+    without waiting for the hand to finish -- measured on the baseline recording,
+    seat 6 folds on the turn and refills 164.0 -> 200.0 while the river is still
+    being played.
+    """
+    hits: list[dict[str, Any]] = []
+    for seat in players:
+        series = [(s["time_s"], s["stacks"][seat]) for s in pre_settlement
+                  if seat in s.get("stacks", {}) and s["stacks"][seat] is not None
+                  and seat in (s.get("dealt_in") or [])]
+        if not series:
+            continue
+        start = series[0][1]
+        for time_s, value in series[1:]:
+            if value > start + _STACK_RISE_SLACK_BB:
+                hits.append({"seat": seat, "time_s": time_s, "start": start, "to": value})
+                break
+    return hits
+
+
+def _contribution_residual(hand: dict[str, Any]) -> float | None:
+    """pot - sum(action amounts), or None when either side is unknown.
+
+    Action amounts are INCREMENTAL (each is the chips that seat added at that
+    moment), so every chip in an action is a chip in the pot and the sum can never
+    EXCEED it. A POSITIVE residual is expected and uninteresting -- blinds and
+    antes are already posted before the first observed state. A NEGATIVE residual
+    means the reconstruction booked money the pot does not contain: a duplicated
+    action, or an uncalled over-shove recorded at its full size against a shorter
+    caller. Four of 15 exported development hands were negative, one by 122.9 BB
+    on a 212.5 BB pot, all at confidence 1.0 with warnings=none.
+    """
+    pot = hand.get("pot")
+    if pot is None:
+        return None
+    known = [a["amount"] for a in hand.get("actions") or [] if a.get("amount") is not None]
+    if not known:
+        return None
+    return round(pot - sum(known), 2)
+
+
+def _uncalled_shove_headroom(actions: Iterable[dict[str, Any]]) -> float:
+    """The largest amount an all-in seat could have had RETURNED to it uncalled.
+
+    A shove above what any single opponent can match is refunded before the pot is
+    swept, so its excess is money the seat pushed and the pot correctly never
+    contained. That makes a negative contribution residual legal to exactly this
+    depth and no further. Measured on the development corpus, both negative
+    residuals are covered: -13.4 against 18.9 of headroom, and -122.9 against
+    128.4. The duplicate-action defect this net exists to catch had a residual of
+    -3.0 with no all-in anywhere, i.e. zero headroom.
+    """
+    committed: dict[int, float] = {}
+    all_in: set[int] = set()
+    for a in actions:
+        seat = a.get("seat")
+        if seat is None:
+            continue
+        if a.get("amount") is not None:
+            committed[seat] = committed.get(seat, 0.0) + a["amount"]
+        if a.get("action_type") == "all-in":
+            all_in.add(seat)
+    headroom = 0.0
+    for seat in all_in:
+        others = max((v for s, v in committed.items() if s != seat), default=0.0)
+        headroom = max(headroom, committed.get(seat, 0.0) - others)
+    return round(headroom, 2)
+
+
+def _result_contradicts_hero_net(result: str, hero_bb_won: float | None) -> bool:
+    """True when the published result and the hero's net disagree in SIGN.
+
+    Two fields derived from the same stack ledger, never compared: a hand shipped
+    result="Villain wins" alongside hero_bb_won=+65.2 (the hero had in fact bet
+    both opponents off the turn). Zero is not a contradiction -- a hero who folded
+    for free, or whose net is unobserved, nets 0 under either result.
+    """
+    if hero_bb_won is None or abs(hero_bb_won) <= _EPS:
+        return False
+    if result == "Hero wins":
+        return hero_bb_won < 0
+    if result == "Villain wins":
+        return hero_bb_won > 0
+    return False
+
+
+def _frame_state(frame: rd.Frame, session_anchor: rd.TableAnchor | None = None) -> dict[str, Any]:
+    view = rd.assign_regions(frame, anchor=rd.anchor_for_frame(frame) or session_anchor)
     seats = view["seats"]
     dealt_in = sorted(i for i, info in seats.items() if info["card_back"])
     stacks = {i: info["stack"] for i, info in seats.items() if info["stack"] is not None}
-    bets = {i: info.get("bet") for i, info in seats.items() if info.get("bet") is not None}
+    # UNKNOWN, carried as a first-class per-seat fact instead of being dropped.
+    # `stacks` omits a refused seat exactly as it omits a seat with no box, and
+    # note 10 recorded what that costs: "an unknown stack is dropped, not carried;
+    # unknown is neither zero nor unknown, it is invisible". Every consumer of
+    # `stacks` must consult this map before falling back to another state.
+    stacks_unknown = dict(view.get("stack_unknown") or {})
+    unknown_by_code = dict(view.get("amounts_unknown_by_code") or {})
+    # Unknowns MINTED HERE (pot_zero_impossible / bet_zero_impossible) increment
+    # BOTH the by-code map and the count. They used to go into the map only, so
+    # `amounts_unknown` and "the per-reason breakdown of the count above" (the
+    # exporter's own words) were computed from different populations and the
+    # breakdown could sum past the count -- the two fields disagreed by
+    # construction, and a pot dropout never reached the unread-amount rate that
+    # caps confidence.
+    extra_unknown = 0
+
+    def _bump(code: str) -> None:
+        nonlocal extra_unknown
+        unknown_by_code[code] = unknown_by_code.get(code, 0) + 1
+        extra_unknown += 1
+
+    # A bet_text of exactly 0 is never real: the client renders no bet row at all
+    # when a seat has nothing in front of it, so a "0 BB" bet is a crop holding
+    # only chip sprites, whose white annulus matches the '0' template. That makes
+    # it evidence of NO BET (the seat has nothing on the felt), not of an
+    # unreadable bet -- so it is excluded from `bets` exactly as before and is NOT
+    # a refusal. It is named on the record rather than applied silently, so a
+    # zero-storm on the bet region is visible instead of looking like "no bet".
+    bets = {i: info.get("bet") for i, info in seats.items()
+            if info.get("bet") is not None and info["bet"] > 0.0}
+    bets_unknown = dict(view.get("bet_unknown") or {})
+    bet_zero_impossible = sorted(i for i, info in seats.items()
+                                 if info.get("bet") is not None and info["bet"] <= 0.0)
+    for _ in bet_zero_impossible:
+        _bump("bet_zero_impossible")
     pills = {i: info["pill_action"] for i, info in seats.items() if info["pill_action"]}
     board = view["board"]
     # A pot text of exactly 0 is never real once a hand is in progress (blinds and
-    # antes are posted before the first observed state); it is an OCR dropout on the
-    # pot region. Treat it as unread so it can't anchor initial_pot / final_pot.
+    # antes are posted before the first observed state). Unlike the bet row, the
+    # client ALWAYS renders a pot, so a zero here is a dropout on the pot region
+    # and the amount is UNKNOWN -- named, and carried, so nothing substitutes a
+    # neighbouring state's pot for it.
     pot = view["pot"]
+    pot_unknown = view.get("pot_unknown")
     if pot is not None and pot <= 0.0:
         pot = None
+        pot_unknown = "pot_zero_impossible"
+        _bump("pot_zero_impossible")
     return {
         "time_s": frame.time_s,
         "image": frame.image,
@@ -97,13 +337,47 @@ def _frame_state(frame: rd.Frame) -> dict[str, Any]:
         "villain_cards": view.get("villain_cards", {}),
         "hero_dim": view.get("hero_dim", False),
         "pot": pot,
+        "pot_unknown": pot_unknown,
+        # A detected second pot. The spine does NOT reconstruct side-pot
+        # arithmetic; carrying the value is what lets the hand be rejected
+        # explicitly instead of the side pot being silently discarded.
+        "side_pot": view.get("side_pot"),
+        "side_pot_unknown": view.get("side_pot_unknown"),
         "dealt_in": dealt_in,
         "stacks": stacks,
+        "stacks_unknown": stacks_unknown,
         "bets": bets,
+        "bets_unknown": bets_unknown,
+        "bet_zero_impossible": bet_zero_impossible,
         "pills": pills,
         "dealer_seat": view["dealer_seat"],
         "active_seat": view["active_seat"],
         "hero_seat_mismatch": view.get("hero_seat_mismatch", False),
+        # POSITIVE confirmation, not the absence of a contradiction: see
+        # region_detections.assign_regions.
+        "hero_seat_confirmed": view.get("hero_seat_confirmed", False),
+        "pot_text_off_column": view.get("pot_text_off_column", 0),
+        "stack_conflicts": view.get("stack_conflicts", 0),
+        # Anchor health. Deliberately NOT part of _signature: a residual that
+        # drifts by a thousandth between frames must not create a distinct state.
+        "anchor_ok": view.get("anchor_ok", False),
+        "anchor_source": view.get("anchor_source"),
+        "unanchored_cards": view.get("unanchored_cards", 0),
+        # Read-quality signals. Also deliberately outside _signature: a rejected
+        # amount already changed `stacks`, which IS in the signature.
+        "board_row_missed": view.get("board_row_missed", False),
+        "board_row_partial": view.get("board_row_partial", False),
+        "pot_collapses_repaired": 0,
+        "amounts_unknown": view.get("amounts_unknown", 0) + extra_unknown,
+        "amounts_unknown_by_code": unknown_by_code,
+        # Seats whose money movement across a transition could not be MEASURED
+        # because a stack read was refused. Filled by _reconstruct_actions, which
+        # is where transitions are walked; declared here so the key always exists.
+        "unmeasured_transitions": [],
+        # Set by _settle_index when a settlement-scan transition is skipped
+        # because this state's pot read was refused (the old code substituted a
+        # STALE pot from an earlier state for the unread one).
+        "settle_scan_skipped": False,
         "missing": None,
     }
 
@@ -119,9 +393,44 @@ def _signature(state: dict[str, Any]) -> tuple:
         tuple(sorted(state["bets"].items())),
         tuple(sorted(state["pills"].items())),
         state["pot"],
+        # A side pot appearing or clearing is a genuine table change, not jitter.
+        state.get("side_pot"),
         state["dealer_seat"],
         state["active_seat"],
     )
+
+
+def _flag_identity_splits(raw: list[dict[str, Any]], key: str) -> None:
+    """Mark states where a card slot's IDENTITY is contested, before the debounce
+    absorbs the disagreement.
+
+    A same-length change in a card list is not board growth and not a partial
+    read: it is the classifier reading one slot two different ways while the card
+    sits on the table. ``_debounce_cards`` is built to swallow exactly that, and
+    afterwards nothing downstream can tell "the classifier agreed with itself"
+    from "the classifier was overruled". The majority is then published as fact --
+    and measured on the 07-23 3.21 PM recording the majority is WRONG: the turn
+    card reads 8d eight times and 8h twice, the card on screen is unmistakably the
+    eight of hearts, and 'Js 6h 4c 8d' exported at confidence 1.0 with tags [].
+    The real board has two hearts and a live flush draw; the exported one does not.
+
+    Compared against the previous non-empty READING rather than against the
+    debounce's accepted value: when the excursion is the second reading of a
+    street there is nothing accepted yet, and the contest would be invisible.
+
+    Measured over the five development recordings: 4 of 21 hands carry a contest.
+    Different-length disagreements (board growth, partial reads) are NOT contests
+    and are excluded -- 8 of those occur.
+    """
+    prev: tuple | None = None
+    for state in raw:
+        cards = tuple(state[key])
+        if not cards:
+            prev = None
+            continue
+        if prev is not None and len(cards) == len(prev) and cards != prev:
+            state[f"{key}_identity_split"] = True
+        prev = cards
 
 
 def _debounce_cards(raw: list[dict[str, Any]], key: str) -> None:
@@ -140,7 +449,11 @@ def _debounce_cards(raw: list[dict[str, Any]], key: str) -> None:
     excursion however many frames it spans -- and at 2s (where such excursions are
     single-frame) it is equivalent to the next-reading confirmation below, so 2s
     reconstructions are unchanged. Left unrejected, a multi-frame hero excursion at
-    1s fabricates a hand boundary (dealer/hero misreading together)."""
+    1s fabricates a hand boundary (dealer/hero misreading together).
+
+    See _flag_identity_splits, which runs first and records the disagreements this
+    function is about to absorb.
+    """
     accepted: tuple | None = None
     for idx, state in enumerate(raw):
         cards = tuple(state[key])
@@ -190,10 +503,21 @@ def _debounce_bool_confirm(raw: list[dict[str, Any]], key: str, min_run: int = 3
     a card-flip/bet animation, or a brief glow/highlight effect, transiently
     darkening the hero-card crop for a couple of samples). A real greyed-out
     fold holds for the rest of the hand -- empirically dozens of samples --
-    so this costs it nothing. Calibrated against a real false positive: a
-    2-in-a-row dark reading coincided with a live, still-winning hand (v01#9)
-    while every confirmed real fold ran 5+ samples; requiring 2 was not
-    enough margin, so this needs 3.
+    so this costs it nothing.
+
+    ON THE VALUE 3 (via _FOLD_MIN_RUN_CALIB), stated honestly. The figure was
+    originally chosen against a false positive observed on a recording later
+    recognised as belonging to the held-out split, so that observation is not
+    usable evidence and is not cited here. Re-measured on the six DEVELOPMENT
+    recordings (1s sampling, threshold scaled to 6): confirmed hero folds run
+    6-64 samples, every raw dim run terminates at a hand boundary or the
+    recording end, and no run reverts to bright mid-hand -- so the development
+    corpus contains no false positive at all and cannot distinguish 1 from 3.
+    3 is RETAINED as the conservative resolution of that open interval: the
+    error mode of a threshold set too high is a missed fold (result stays
+    "unobserved" -- a coverage loss), while too low fabricates a hero fold (a
+    wrong result), and only the second is a release blocker. Lowering it would
+    need positive evidence no permitted recording supplies.
 
     ``reset_key``, when given, breaks a run wherever that field's value
     changes (e.g. hero_cards) -- a run must not bridge a hand boundary: the
@@ -225,8 +549,12 @@ def build_states(frames: list[rd.Frame]) -> tuple[list[dict[str, Any]], list[dic
     """Return (distinct states, events). Raw per-frame states are debounced first
     (cards, pot, stacks, bets -- single-frame OCR/classifier blips are rejected
     unless the next reading confirms them), then collapsed to distinct states."""
-    raw = [_frame_state(f) for f in frames]
+    session_anchor = _session_anchor(frames)
+    raw = [_frame_state(f, session_anchor) for f in frames]
     interval_s = _sampling_interval(frames)
+    # Record the identity contests BEFORE the debounce absorbs them.
+    _flag_identity_splits(raw, "hero_cards")
+    _flag_identity_splits(raw, "board_cards")
     _debounce_cards(raw, "hero_cards")
     _debounce_cards(raw, "board_cards")
     _debounce_bool_confirm(raw, "hero_dim",
@@ -357,8 +685,25 @@ def _debounce_pot(hand: list[dict[str, Any]]) -> None:
         pot = state["pot"]
         if pot is None:
             continue
-        if accepted is not None and pot < 1.0 <= accepted:
+        # Collapse floor. The strict "< 1.0" alone misses the exact case it was
+        # written for: after the sweep the next deal's blind pot reads EXACTLY
+        # 1.0 (one big blind) and slipped straight through. The proportional arm
+        # reuses the already-calibrated pair from _trim_trailing_next_deal, so
+        # there is one collapse rule with two consumers, and it is additive --
+        # everything the old floor caught, it still catches.
+        collapsed = accepted is not None and (
+            pot < 1.0 <= accepted
+            or (accepted > _POT_COLLAPSE_FLOOR_BB and pot < _POT_COLLAPSE_RATIO * accepted)
+        )
+        if collapsed:
             state["pot"] = accepted
+            # Counted SEPARATELY from amounts_rejected. A collapse is repaired --
+            # the accepted pot is restored and the hand's output is right -- while
+            # a rejected stack is lost to unknown. Escalating the two together
+            # made a hand whose pot reconstructed correctly (two transient pot
+            # misreads on 07-15, both repaired) look like a hand whose reader was
+            # systematically broken, and would have rejected good hands.
+            state["pot_collapses_repaired"] = state.get("pot_collapses_repaired", 0) + 1
             continue
         if accepted is None or abs(pot - accepted) <= _EPS:
             accepted = pot
@@ -400,6 +745,152 @@ def _stack_series(hand: list[dict[str, Any]], seat: int) -> list[float]:
     return [s["stacks"][seat] for s in hand if seat in s["stacks"]]
 
 
+def _observed_starting_stack(hand: list[dict[str, Any]], seat: int) -> float | None:
+    """The seat's stack at the START of the hand as the table state proves it:
+    the FIRST observed state's read PLUS the chips already standing in front of
+    the seat at that moment. None when either half is unknown.
+
+    ``_stack_series(...)[0]`` -- the first SURVIVING reading -- is not the same
+    quantity. A seat whose stack_text failed to read early in the hand is dropped
+    from those states entirely (an unknown and an absent box are indistinguishable
+    in ``state["stacks"]``), so the first surviving reading is taken after the seat
+    has already put money in, and the field named ``starting_stack`` published a
+    mid-hand stack as fact. Measured by blanking one seat's reads over a real
+    hand: BTN 123.4 -> 115.4, SB 218.0 -> 210.5, with warnings=none either time.
+    Understating a starting stack corrupts effective stack and SPR directly.
+
+    The committed half is not optional. The client renders stacks PRE-DEBITED
+    (see _committed_at_start), so the raw first-state read EXCLUDES the seat's
+    standing bet while the action ledger books that same money as an action --
+    which understated 31 player rows across the 12 exported development hands by
+    exactly the seat's first-state bet, and on one all-in seat crossed into
+    arithmetic impossibility: a seat contributing 99.5 BB from a published
+    starting stack of 97.5, at confidence 1.0 with warnings=[].
+
+    Measured cost of refusing to guess: 3 of 148 player rows across the five
+    development recordings (their first surviving reading is 4-5 states in).
+    """
+    if not hand:
+        return None
+    base = hand[0]["stacks"].get(seat)
+    if base is None:
+        return None
+    committed = _committed_at_start(hand, seat)
+    if committed is None:
+        # A refused bet read inside the committed-scan window: the amount already
+        # on the felt is unknown, so the starting stack is too.
+        return None
+    return round(base + committed, 2)
+
+
+def _observed_starting_stack_unknown(hand: list[dict[str, Any]], seat: int) -> str | None:
+    """Why the seat's starting stack is unknown, or None (it is known, or absent).
+
+    Same states ``_observed_starting_stack`` reads, so the pair never disagrees.
+    """
+    if not hand:
+        return None
+    if hand[0]["stacks"].get(seat) is None:
+        return (hand[0].get("stacks_unknown") or {}).get(seat)
+    if _committed_at_start(hand, seat) is None:
+        return "committed_at_start_unknown"
+    return None
+
+
+def _series_has_hole(states: list[dict[str, Any]], seat: int) -> bool:
+    """True when any state in `states` REFUSED this seat's stack read.
+
+    A series with a hole is not a shorter series -- it is a series whose gaps are
+    of unknown size, so every quantity derived by differencing it (contribution,
+    sweep gain, hero net) rests on an unmeasured step. Estimators built on one
+    abstain rather than widening their window to fill it from elsewhere.
+    """
+    return any(seat in (s.get("stacks_unknown") or {}) for s in states)
+
+
+def _committed_at_start(hand: list[dict[str, Any]], seat: int) -> float | None:
+    """Chips already standing in front of `seat` when the hand came into view.
+
+    The client renders stacks PRE-DEBITED: chips pushed into the pot leave the
+    displayed stack immediately. So a stack delta measured across the observed
+    window silently excludes everything committed before the first sample, and
+    that is not a rare edge -- it covers the blinds on every hand and the whole
+    preflop action on any hand the segmenter picks up late.
+
+    Measured consequence: the 07-23 3.33.54 PM session's first hand shows the
+    hero's 24.0 BB raise standing in bet_text for 18 consecutive states while the
+    hero's stack never moves, so `series[-1] - series[0]` reported +52.8 for a hand
+    whose true net was +28.8 -- an 83% overstatement published as a bare number
+    with warnings=[].
+
+    Scan forward only while the seat's stack still reads its first value: once the
+    stack moves, later bet_text belongs to actions the delta already accounts for.
+    bet_text flickers between states (it is absent on 3 of the 19 states above),
+    so take the largest reading in that span rather than the first.
+
+    WHY A LATER READING IS A MEASUREMENT AND NOT A BACKFILL. The client
+    pre-debits: chips joining the felt leave the displayed stack in the same
+    render. So while the seat's stack READS its starting value, the standing bet
+    is a CONSTANT -- it cannot have grown (that debits the stack and ends the
+    window) and it cannot have shrunk (a street close clears it to nothing, it
+    never shows a smaller number). Every successful bet read inside the
+    proven-constant window therefore measures the same standing amount, and a
+    refusal on one state is answered by a read on another.
+
+    Four consequences, each load-bearing:
+      * the scan STOPS at the first state whose stack read for this seat is
+        REFUSED -- constancy is proven by the run of equal stack reads, and a
+        refusal breaks the proof (a debit could hide inside it: measured on a
+        synthetic arm, scanning past a refused stack read booked a 24.0 raise
+        whose true first-state size was 4.0);
+      * a bet reading counts only from a state whose OWN stack read equals the
+        start -- an absent-stack state neither extends the proof nor supplies a
+        reading (its bet may postdate a hidden debit);
+      * every reading inside the window must AGREE. The constancy argument cuts
+        both ways: a constant stack means the standing bet cannot have changed,
+        so two reads of DIFFERENT values inside one window falsify the premise
+        the window rests on -- at least one of the boxes is not this seat's
+        standing bet (a neighbouring seat's box misattributed by the anchors,
+        or next-deal leakage). Taking the max was a choice among contradictory
+        evidence: measured on g0621 hand 2, a folded seat whose stack never
+        moved carried a 3.0 read preflop and a 15.0 read on the turn, and the
+        max published starting_stack 115.7 for a seat whose true committed
+        chips were 0 -- and would have booked a phantom "call 15.0". A window
+        with disagreeing reads returns None: the standing amount is UNKNOWN;
+      * when the window contains a REFUSED bet and NO successful read, the
+        standing amount is UNKNOWN (None), not 0.0: a bet box was detected and
+        declined to read, and the maximum over nothing is not a measurement.
+        Callers treat None as unknown -- the pre-observed action branch emits
+        amount=None, and hero_bb_won / starting_stack become unknown.
+    """
+    series = _stack_series(hand, seat)
+    if not series:
+        return 0.0
+    start = series[0]
+    committed: float | None = None
+    saw_refusal = False
+    for state in hand:
+        if (state.get("stacks_unknown") or {}).get(seat):
+            break  # constancy proof broken: nothing past here is in evidence
+        stack = state["stacks"].get(seat)
+        if stack is None:
+            continue  # no stack read: skip -- neither proof nor reading
+        if abs(stack - start) > _EPS:
+            break  # the stack moved: the window is over
+        if (state.get("bets_unknown") or {}).get(seat):
+            saw_refusal = True
+        bet = state["bets"].get(seat)
+        if bet is not None:
+            if committed is not None and abs(bet - committed) > _EPS:
+                # Two different values inside one proven-constant window:
+                # contradictory evidence, not a measurement to rank.
+                return None
+            committed = bet
+    if committed is not None:
+        return round(committed, 2)
+    return None if saw_refusal else 0.0
+
+
 def _mode(values: list[Any]) -> Any:
     from collections import Counter
     values = [v for v in values if v is not None]
@@ -423,19 +914,30 @@ def _trim_trailing_next_deal(hand: list[dict[str, Any]]) -> list[dict[str, Any]]
     end = len(hand)
     while end > 1:
         s = hand[end - 1]
+        no_hero = len(s["hero_cards"]) != 2
+        # A tail state with no hero cards, no pot read, no dealer read and no
+        # stack reads carries zero information -- it can neither corroborate nor
+        # refute anything. SKIPPING it (rather than stopping on it, which is what
+        # the loop used to do the moment a state failed both tests) is what lets
+        # the next-deal state BEHIND it be trimmed: an unreadable frame must not
+        # shield the next deal. Observed for real on 07-15, where a fully-dropped
+        # final frame hid the next deal's blind pot and made a 240.9 BB hand
+        # report a final pot of 1.0.
+        uninformative = (no_hero and s["pot"] is None
+                         and s["dealer_seat"] is None and not s["stacks"])
         dealer_moved = (modal_dealer is not None and s["dealer_seat"] is not None
                         and s["dealer_seat"] != modal_dealer)
-        pot_collapsed = (max_pot is not None and max_pot > 6.0 and s["pot"] is not None
-                         and s["pot"] < 0.3 * max_pot)
-        no_hero = len(s["hero_cards"]) != 2
-        if no_hero and (dealer_moved or pot_collapsed):
+        pot_collapsed = (max_pot is not None and max_pot > _POT_COLLAPSE_FLOOR_BB
+                         and s["pot"] is not None
+                         and s["pot"] < _POT_COLLAPSE_RATIO * max_pot)
+        if uninformative or (no_hero and (dealer_moved or pot_collapsed)):
             end -= 1
         else:
             break
     return hand[:end]
 
 
-def _settle_index(hand: list[dict[str, Any]]) -> int:
+def _settle_index(hand: list[dict[str, Any]], players: set[int] | None = None) -> int:
     """Index of the state where the pot is swept to the winner, or the last index
     if never seen. The sweep is the single LARGEST qualifying stack jump in the
     hand -- during play stacks only fall (chips go in), so any increase is a pot
@@ -444,27 +946,65 @@ def _settle_index(hand: list[dict[str, Any]]) -> int:
     seat precedes the true sweep by a frame (it truncates the window before the
     winner is paid, flipping the result). States after the sweep are next-deal
     noise: the next hand's antes tick every stack down and its blinds post while
-    the old hero cards linger."""
+    the old hero cards linger.
+
+    ``players`` restricts the sweep search to seats that were actually dealt into
+    THIS hand. Without it any seat on the table can set the cut, including one
+    that was never in the hand -- on 07-15 a seat that sat out the whole hand was
+    dealt into the NEXT one, and its buy-in showing up as a stack jump truncated
+    the hand seven states past its real settlement."""
     n = len(hand)
     # Suffix max of the pot from each index onward: a real settlement is TERMINAL
     # -- the pot is swept and only the next deal's small blinds follow -- so a
     # candidate jump is rejected if the pot later grows well beyond its own level.
     # This stops a mid-hand phantom (a stack OCR blip on a seat that then folds)
     # from truncating the hand before the real sweep.
+    #
+    # A state whose pot is unread (refused OR absent) contributes NOTHING to the
+    # suffix max -- it is skipped, not coerced to 0.0 (`hand[i]["pot"] or 0.0`
+    # was the one place this function still substituted a number for an unread
+    # pot, sixteen lines above its own refusal to do exactly that). The result is
+    # a maximum over the KNOWN future pots, i.e. a LOWER BOUND, and the guard
+    # built on it is one-sided by construction: it only ever REJECTS a candidate,
+    # and only on proven evidence (a later pot that is genuinely larger). An
+    # unread future pot can neither create nor suppress a rejection here; it
+    # simply supplies no evidence. Measured against the pre-Option-A behaviour
+    # (never skipping): the chosen settle index is identical on all 31
+    # development hands.
     suffix_max_pot = [0.0] * (n + 1)
     for i in range(n - 1, -1, -1):
-        p = hand[i]["pot"] or 0.0
-        suffix_max_pot[i] = max(p, suffix_max_pot[i + 1])
+        p = hand[i]["pot"]
+        suffix_max_pot[i] = max(p if p is not None else 0.0, suffix_max_pot[i + 1])
     pot_so_far: float | None = None
     best_idx, best_jump = n - 1, 0.0
     for idx, (prev, cur) in enumerate(zip(hand, hand[1:], strict=False), start=1):
         if prev["pot"] is not None:
             pot_so_far = prev["pot"] if pot_so_far is None else max(pot_so_far, prev["pot"])
         threshold = max(3.0, 0.4 * (pot_so_far or 0.0))
+        if cur["pot"] is None and cur.get("pot_unknown"):
+            # The pot at this state was REFUSED, and the terminal-sweep test below
+            # needs this state's own pot. `cur["pot"] or pot_so_far` substituted a
+            # STALE pot carried from an earlier state for the unread one -- a
+            # backfill from a neighbouring state, which is the one thing an UNKNOWN
+            # must never receive. An unmeasurable transition is skipped, not
+            # guessed; the scan simply looks elsewhere for the sweep.
+            cur["settle_scan_skipped"] = True
+            continue
+        # Reached only when cur["pot"] is a value OR the pot box was ABSENT
+        # (pot_unknown is None) -- the refused case was skipped above. For an
+        # absent box, `pot_so_far` (the running max of the pots actually read)
+        # stands in, and the substitution feeds ONLY the one-sided guard below:
+        # it can reject a candidate, never produce a value, and understating
+        # cur_pot only makes the guard stricter. Fixture states carrying no pot
+        # data at all resolve to 0.0 against a 0.0 suffix max, leaving the stack
+        # scan untouched -- which is why absence, unlike refusal, is not a
+        # settle_scan_skipped fact: nothing here declined to read it.
         cur_pot = cur["pot"] if cur["pot"] is not None else (pot_so_far or 0.0)
         if suffix_max_pot[idx + 1] > cur_pot + threshold:
             continue  # pot keeps growing after this -> not the terminal sweep
         for seat, after in cur["stacks"].items():
+            if players is not None and seat not in players:
+                continue
             before = prev["stacks"].get(seat)
             if before is None:
                 continue
@@ -534,14 +1074,36 @@ def _reconstruct_actions(
             )
         )
 
+    # Initialized BEFORE the pre-observed scan so that scan can record a
+    # standing bet nothing may size (a refused first-state read on a pill-less
+    # seat) as an unmeasured transition instead of dropping it. It used to be
+    # initialized just before the transition loop, which would have wiped any
+    # entry the scan wrote.
+    for state in hand:
+        state["unmeasured_transitions"] = []
+
     # ---- pre-observed actions standing in the hand's FIRST state ----
     # A hand often enters view mid-preflop: pills and bet_texts already on the
     # table are completed actions we never saw happen. Bets at or below the big
     # blind with no pill are blind posts, not actions. (This table renders
     # amounts in BB units, so the big blind is 1.0.)
+    #
+    # THE SEAT SET is every player, not merely the seats visible in the first
+    # state's pill/bet maps. A seat present only in `bets_unknown` -- a standing
+    # bet whose read was REFUSED -- was never iterated at all, and a seat whose
+    # bet box FLICKERED off the very first state (while its pill, which flashes
+    # for under a second, had already expired) had no entry anywhere: in both
+    # arms a call the client rendered on the felt for the whole window, and
+    # whose amount the constancy proof publishes into starting_stack, was
+    # silently absent from the ledger with every unknown channel reading clean.
+    # An observed money action is never silently dropped: it is booked when the
+    # constancy window proves its size, and recorded as an unmeasured
+    # transition when a refusal leaves it unprovable.
     first = hand[0]
+    first_bets_unknown = first.get("bets_unknown") or {}
     if not first["board_cards"]:
-        for seat in sorted(set(first["pills"]) | set(first["bets"])):
+        for seat in sorted(set(positions) | set(first["pills"])
+                           | set(first["bets"]) | set(first_bets_unknown)):
             pill = first["pills"].get(seat)
             bet = first["bets"].get(seat)
             if pill == "fold":
@@ -550,8 +1112,35 @@ def _reconstruct_actions(
                     "preflop", seat, "fold", None, None, first["stacks"].get(seat),
                     source=first, derivation="action_pill",
                 )
-            elif pill in {"raise", "bet", "call"}:
-                emit("preflop", seat, pill if pill != "bet" else "raise",
+            elif pill in {"raise", "bet", "call", rd.PILL_BET_OR_CALL}:
+                if bet is None and not (first.get("bets_unknown") or {}).get(seat):
+                    # bet_text flickers: it is absent on the hand's very first
+                    # state of the 07-23 3.33.54 PM session and present (24.0) on
+                    # the next 18. Publishing `raise amount=None` there left the
+                    # hero's own raise size unstated in an exported hand while it
+                    # was legible on screen throughout.
+                    #
+                    # ONLY for an ABSENT box. A REFUSED first-state bet is not a
+                    # gap this scan may fill: `first["bets"].get(seat)` returns
+                    # None for both, and falling through here published a number
+                    # from a LATER state as this action's amount, with every
+                    # unknown channel reading clean -- measured 6x overstatement
+                    # of the hero's own preflop raise on a synthetic two-arm
+                    # fixture differing only in attr_source, and two live corpus
+                    # hands (g0723a hand 1 seat 6, g0723b hand 1 seat 0). The
+                    # refusal keeps amount=None, which books the action as
+                    # unknown-money exactly like the mid-hand branch at
+                    # `prev_bet_unknown`.
+                    standing = _committed_at_start(hand, seat)
+                    bet = (standing if standing is not None and standing > _EPS
+                           else None)
+                # Preflop the blinds are already a standing bet, so the green
+                # CALL/BET ambiguity has only one legal reading here: a preflop
+                # "bet" does not exist, it is a raise, and an unraised green pill
+                # is a call. (Post-flop the same token is resolved structurally --
+                # see the money branch below.)
+                atype = {"bet": "raise", rd.PILL_BET_OR_CALL: "call"}.get(pill, pill)
+                emit("preflop", seat, atype,
                      bet, None, first["stacks"].get(seat),
                      source=first, derivation="action_pill")
             elif pill == "check":
@@ -564,8 +1153,42 @@ def _reconstruct_actions(
                     "preflop", seat, "call", bet, None, first["stacks"].get(seat),
                     source=first, derivation="bet_text",
                 )
+            elif pill is None and bet is None:
+                # The pill-less arms the old iteration could never reach.
+                if first_bets_unknown.get(seat):
+                    # A REFUSED first-state bet: a bet box was detected and the
+                    # reader declined to size it. A refusal is never backfilled
+                    # from a later state (the same rule the pill branch above
+                    # follows), and a refused box cannot even prove an ACTION
+                    # happened -- a blind post produces the same box -- so no
+                    # action is emitted. But money of unknown size is standing
+                    # on the felt, and that is exactly what an unmeasured
+                    # transition is: it reaches amounts_unknown_in_ledger and
+                    # blocks the hand from exporting as complete.
+                    first["unmeasured_transitions"].append(seat)
+                elif first["stacks"].get(seat) is not None:
+                    # Bet box ABSENT on the first state (bet_text flickers; the
+                    # pill expired long ago). The constancy window anchored at
+                    # this state's own stack read -- the same proof that feeds
+                    # starting_stack -- says whether money was standing and how
+                    # much: while the stack reads its starting value the
+                    # standing bet is a constant, so a read anywhere in the
+                    # window measures the amount standing NOW. Anchoring at the
+                    # first state is required: a window that starts at a later
+                    # stack read proves nothing about this state.
+                    standing = _committed_at_start(hand, seat)
+                    if standing is None:
+                        # A refusal inside the window with no proven read: the
+                        # standing amount is unknown, not absent and not zero.
+                        first["unmeasured_transitions"].append(seat)
+                    elif standing > 1.0 + _EPS:
+                        emit(
+                            "preflop", seat, "call", standing, None,
+                            first["stacks"].get(seat),
+                            source=first, derivation="bet_text",
+                        )
 
-    settle = _settle_index(hand)
+    settle = _settle_index(hand, set(positions))
     window = hand[: settle + 1]
     # High-water mark of board length seen so far this hand: a real board only
     # grows, so any observed SHRINK is a detection blip (board_cards has the
@@ -592,24 +1215,59 @@ def _reconstruct_actions(
         pot_before = prev["pot"]
 
         # ---- money actions (bet_text delta, corroborated by the stack) ----
-        money_seats: dict[int, tuple[float, float | None, str]] = {}
-        for seat in sorted(set(cur["bets"]) | set(cur["stacks"])):
+        money_seats: dict[int, tuple[float | None, float | None, str]] = {}
+        prev_unknown = prev.get("stacks_unknown") or {}
+        cur_unknown = cur.get("stacks_unknown") or {}
+        cur_bet_unknown = cur.get("bets_unknown") or {}
+        prev_bet_unknown = prev.get("bets_unknown") or {}
+        for seat in sorted(set(cur["bets"]) | set(cur["stacks"]) | set(cur_unknown)):
             if seat in folded or seat not in positions:
                 continue
             before = prev["stacks"].get(seat)
             after = cur["stacks"].get(seat)
             stack_dropped = before is not None and after is not None and after < before - _EPS
-            stack_flat = before is not None and after is not None and abs(after - before) <= _EPS
+            # A REFUSED read on either end of the transition: the delta is not
+            # merely missing, it is unmeasurable.
+            stack_refused = bool(prev_unknown.get(seat) or cur_unknown.get(seat))
             amount = None
             derivation = ""
+            unmeasurable = False
             if stack_dropped:
                 # the debounced stack delta is the most reliable size
                 amount = round(before - after, 2)
                 derivation = "stack_delta"
-            elif not stack_flat:
-                # stack unreadable this transition: fall back to the bet_text
-                # delta. (A bet_text rising while the stack is provably unchanged
-                # is rendering lag of an action already emitted from the stack.)
+            elif stack_refused:
+                # THE REFUSAL BRANCH, split off from "the stack is absent" below.
+                # It used to share it: `before is None or after is None` made "the
+                # reader could not read this stack" the TRIGGER for a weaker
+                # estimator, so a refusal did not reduce what the spine claimed,
+                # it changed which evidence the claim rested on. Measured on
+                # g0723b hand 1: blanking the hero's stack reads made this fall
+                # through to the bet_text delta, which re-emitted a raise that was
+                # merely still standing on the felt -- `preflop 0 raise 24.0`
+                # booked TWICE, 92.3 BB of action against a 73.8 BB pot. The spine
+                # got MORE wrong, not merely less complete, as reads became
+                # unknown.
+                #
+                # An estimator may fill a gap whose edges it can see; it may not
+                # fill a hole a refusal punched. So: no money action is derived
+                # here, and the transition is recorded as unmeasured.
+                unmeasurable = True
+            elif before is None or after is None:
+                # stack ABSENT this transition (no box, or the fixture path):
+                # fall back to the bet_text delta. (A bet_text rising while the
+                # stack is provably unchanged is rendering lag of an action
+                # already emitted from the stack.)
+                # The guard used to be `not stack_flat`, i.e. the fallback was
+                # skipped only when the stack was PROVABLY unchanged -- so a stack
+                # that RISED between two reads (190.5 -> 182.0 -> 182.5, half a BB
+                # of OCR jitter) let it run, and the seat's raise, already emitted
+                # from the stack delta on the previous transition, was emitted a
+                # second time at a slightly different size ("raise 8.5" then
+                # "raise 8.0"). That double-counts the money and is the direct
+                # cause of an exported hand whose contributions exceed its pot.
+                # A seat whose stack is readable and did not FALL put no chips in;
+                # the fallback exists for the unreadable case only.
                 cur_bet = cur["bets"].get(seat)
                 prev_bet = prev["bets"].get(seat)
                 same_street = len(prev["board_cards"]) == len(cur["board_cards"])
@@ -624,13 +1282,59 @@ def _reconstruct_actions(
                         base = prev_bet
                     elif same_street and prior is not None:
                         base = prior
+                    elif same_street and prev_bet_unknown.get(seat):
+                        # The previous state's bet was REFUSED and the high-water
+                        # mark was dropped with it (see the carry loop below), so
+                        # there is no base to subtract. Falling through to 0.0
+                        # would attribute the seat's whole standing bet to this
+                        # transition -- a backfill of the missing base with a
+                        # number no state supplied.
+                        base = None
                     else:
                         base = 0.0
-                    if cur_bet > base + _EPS:
+                    if base is None:
+                        unmeasurable = True
+                    elif cur_bet > base + _EPS:
                         amount = round(cur_bet - base, 2)
                         derivation = "bet_text_delta"
             if amount is not None and amount >= 0.5 - _EPS:
                 money_seats[seat] = (amount, before, derivation)
+            elif unmeasurable:
+                # AN UNMEASURED TRANSITION IS NOT "a read was refused here". It is
+                # "money is KNOWN to have moved and its size is unmeasurable",
+                # which is the only shape that damages the ledger. A refusal on an
+                # idle seat -- no pill, no bet on the felt -- costs the hand
+                # nothing but the read itself, and that is already carried as a
+                # soft signal (`amounts_unknown`, which caps the confidence
+                # score). Conflating the two would let one unreadable crop on a
+                # seat that never acted reject an otherwise sound hand: a coverage
+                # cost with no correctness benefit.
+                pill = cur["pills"].get(seat)
+                fresh_pill = (pill in {"raise", "bet", "call", "all-in",
+                                       rd.PILL_BET_OR_CALL}
+                              and prev["pills"].get(seat) != pill)
+                cur_bet = cur["bets"].get(seat)
+                prev_bet = prev["bets"].get(seat)
+                same_street = len(prev["board_cards"]) == len(cur["board_cards"])
+                known_base = (prev_bet if (same_street and prev_bet is not None)
+                              else (carried_bet.get((street, seat)) if same_street
+                                    else 0.0))
+                bet_grew = (cur_bet is not None and cur_bet >= 0.5 - _EPS
+                            and (known_base is None or cur_bet > known_base + _EPS))
+                if fresh_pill or bet_grew:
+                    cur["unmeasured_transitions"].append(seat)
+                # A pill PROVES the act happened even when nothing can size it.
+                # The pill is evidence of the ACT, not of the SIZE, so the action
+                # is emitted with amount=None -- never dropped, never given a
+                # fabricated number. Freshness is required (the same bar the check
+                # and fold handlers use) so a pill standing across several states
+                # books one action, not one per state. A bet_text that merely GREW
+                # over an unknown base is not enough to emit on: it is
+                # indistinguishable from the same raise being re-displayed, which
+                # is precisely the duplication the carried high-water mark exists
+                # to suppress.
+                if fresh_pill:
+                    money_seats[seat] = (None, before, "amount_unknown")
 
         for seat, (amount, stack_before, derivation) in sorted(money_seats.items()):
             pill = cur["pills"].get(seat)
@@ -640,6 +1344,19 @@ def _reconstruct_actions(
             elif pill in {"raise", "bet", "call"}:
                 atype = pill
             else:
+                # Reached for an unreadable pill AND for the green CALL/BET
+                # ambiguity (rd.PILL_BET_OR_CALL). Structure resolves it: a seat
+                # putting chips in on a street where nobody has bet is BETTING;
+                # only a standing bet makes "call" a possible action at all.
+                #
+                # Forcing green -> "call" instead published `turn: seat:3 call
+                # 11.5` on a turn the flop had checked through, and the knock-on
+                # was worse than the wrong label: street_has_bet stayed False, so
+                # the fold handler (which correctly refuses folds on a street with
+                # nothing to fold to) DISCARDED the villain's observed FOLD pill,
+                # and the round-completion pass then synthesised a CHECK for that
+                # seat. Five of the 21 reconstructed hands carried such a call,
+                # every one with spine warnings=[].
                 atype = "call" if street_has_bet.get(street) else "bet"
             emit(
                 street, seat, atype, amount, pot_before, stack_before,
@@ -714,6 +1431,14 @@ def _reconstruct_actions(
             if bv is not None:
                 key = (street, seat)
                 carried_bet[key] = max(carried_bet.get(key, 0.0), bv)
+        # ...but never ACROSS a refusal. The high-water mark is a reading from a
+        # DIFFERENT state, and carrying it over a state whose bet read the reader
+        # positively refused is exactly the backfill this phase removes: the mark
+        # would stand in for a number the pixels declined to supply. Dropping it
+        # makes the base unknown, which the fallback above turns into an
+        # unmeasured transition rather than a guess.
+        for seat in cur_bet_unknown:
+            carried_bet.pop((street, seat), None)
 
     # ---- synthesized closing checks ----
     # 2s sampling and instant street closes hide some checks: a street that ended
@@ -849,8 +1574,21 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
 
     dealt_counts = Counter(seat for s in hand for seat in s["dealt_in"])
     opening = {seat for s in hand[:2] for seat in s["dealt_in"]}
-    players = sorted(seat for seat, n in dealt_counts.items()
-                     if n >= 2 or seat in opening)
+    # A seat that folded BEFORE the hand came into view has no card_back at all --
+    # the client removes its cards and leaves only the FOLD pill, which stays on
+    # the felt. _reconstruct_actions reads exactly that pill and books the fold, so
+    # a card_back-only roster produced a ledger naming a seat the roster did not,
+    # and the app's ingest rolls the WHOLE session back on that reference (measured
+    # on the 07-11 recording: players {0,1,2,3,4,7} with a preflop `seat:5` fold;
+    # 0 sessions and 0 hands imported, three good hands lost with it).
+    #
+    # A persistent pill is participation evidence of the same kind as a persistent
+    # card_back and is held to the SAME two-state bar, so one misdetection still
+    # cannot conjure a phantom player.
+    pill_counts = Counter(seat for s in hand for seat in (s.get("pills") or {}))
+    players = sorted({seat for seat, n in dealt_counts.items()
+                      if n >= 2 or seat in opening}
+                     | {seat for seat, n in pill_counts.items() if n >= 2})
     if not players:
         players = sorted(dealt_counts)
     positions = _positions(players, dealer_seat)
@@ -875,22 +1613,44 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
 
     player_rows = []
     for seat in players:
-        series = _stack_series(hand, seat)
         player_rows.append({
             "seat": seat,
             "position": positions.get(seat, ""),
             "player_name": player_name[seat],
-            "starting_stack": series[0] if series else None,
+            "starting_stack": _observed_starting_stack(hand, seat),
+            # WHY it is None, when the reader refused it. `starting_stack` already
+            # refuses to guess (note 12); this says so out loud, so an unknown
+            # starting stack is distinguishable from a seat whose box was simply
+            # not detected on the hand's first state.
+            "starting_stack_unknown": _observed_starting_stack_unknown(hand, seat),
             "is_hero": seat == 0,
             "shown_cards": shown_cards.get(seat),
         })
 
     actions = _reconstruct_actions(hand, positions, player_name)
 
+    # UNKNOWN money reaching the ledger. Two shapes, both fatal to "complete":
+    #   * a money action the spine PROVED happened but could not SIZE, and
+    #   * a transition whose stack delta was unmeasurable because a read was
+    #     refused, so no action could be derived from it at all.
+    # Neither is visible in `amounts_unknown`, which counts crops, not ledger
+    # entries: a hand can have many unread crops and a sound ledger, or one unread
+    # crop sitting exactly on the transition that carried the money.
+    # Computed HERE, before the pot estimators, because `contrib` must consult it:
+    # it used to be computed after them, so the contribution estimator voted in
+    # the pot consensus with a null-amount action in the very ledger it was
+    # summing, and 6 of the 10 development hands carrying an unknown in their
+    # ledger published `reconciled: true`.
+    unmeasured_transitions = sum(len(s.get("unmeasured_transitions") or []) for s in hand)
+    unknown_money_actions = sum(1 for a in actions
+                                if a["action_type"] in _MONEY_ACTIONS
+                                and a.get("amount") is None)
+    amounts_unknown_in_ledger = bool(unmeasured_transitions or unknown_money_actions)
+
     # per-street end pot (last stable pot at each board count) + final pot.
     # Only states up to the settlement (pot swept to the winner) count: after it
     # the display is already showing the next deal's antes/blinds.
-    settle = _settle_index(hand)
+    settle = _settle_index(hand, set(players))
     settled_states = hand[: settle + 1]
     street_pot: dict[str, float] = {}
     for s in settled_states:
@@ -924,8 +1684,34 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
     contributed = 0.0
     winner_seat, win_gain = None, 0.0
     hero_bb_won = None
+    # Estimators whose inputs carry a REFUSED read abstain; they are removed from
+    # the pot consensus below rather than voting with a hole in them.
+    #
+    # `contrib` starts holed whenever the MONEY LEDGER itself carries an unknown,
+    # not only when a stack SERIES does: an action of unknown size, or a
+    # transition nothing could measure, is money the contribution sum cannot see
+    # (a standing bet whose read was refused is debited from no stack and posted
+    # to no pot text). "AN ESTIMATOR WITH AN UNKNOWN INPUT IS REMOVED FROM THE
+    # CANDIDATE LIST" -- the consensus comment below states the rule; this makes
+    # the contribution estimator actually obey it.
+    contrib_holed = amounts_unknown_in_ledger
+    win_holed_by_seat: dict[int, bool] = {}
+    hero_net_holed = False
     for seat in players:
-        series = _stack_series(settled_states, seat) or _stack_series(hand, seat)
+        holed = _series_has_hole(settled_states, seat)
+        win_holed_by_seat[seat] = holed
+        if holed:
+            contrib_holed = True
+            if seat == 0:
+                hero_net_holed = True
+        series = _stack_series(settled_states, seat)
+        if not series and not holed:
+            # Widening the window to the WHOLE hand is only legitimate when the
+            # settled window genuinely observed nothing. When it observed a
+            # refusal, widening substitutes post-settlement states -- the next
+            # deal's antes and auto top-ups -- for a read the pixels declined to
+            # supply, which is a backfill from a different state.
+            series = _stack_series(hand, seat)
         if not series:
             continue
         low = min(series)
@@ -935,10 +1721,34 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         gain = series[-1] - low
         phantom = (seat in folded_seats and final_pot is not None
                    and gain > 1.5 * final_pot + 3.0)
+        # ...and the floor on the other side. A seat that swept the pot gained
+        # approximately the pot; a gain that is a small FRACTION of it is stack
+        # OCR jitter, not a sweep. The guard above only ever rejected gains that
+        # were too LARGE, so 0.5 BB of jitter between two consecutive reads on a
+        # 17.5 BB pot (0.03x) named a winner, published result="Villain wins" and
+        # -- through terminal_event -- promoted a recording-truncated hand to
+        # completion_status "complete" at confidence 1.0 with no warning.
+        if final_pot is not None and gain < _WIN_GAIN_MIN_POT_RATIO * final_pot:
+            phantom = True
         if not phantom and gain > win_gain + _EPS:
             win_gain, winner_seat = gain, seat
-        if seat == 0:
-            hero_bb_won = round(series[-1] - series[0], 2)
+        if seat == 0 and not hero_net_holed:
+            # Net over the hand, not over the observed window: chips already in
+            # front of the hero at the first sample left its displayed stack
+            # before the series began, so the raw delta cannot see them. See
+            # _committed_at_start.
+            #
+            # ABSTAINS on a holed series. `series[0]` is the first SURVIVING
+            # reading, so a refusal anywhere before it silently moves the baseline
+            # forward past chips the hero had already committed -- the same defect
+            # note 12 fixed for `starting_stack`, on the field a reviewer reads as
+            # the hand's bottom line. An unknown net is published as unknown.
+            # ... and abstains the same way when the COMMITTED half is unknown (a
+            # refused bet read inside the committed-scan window): the net cannot
+            # be computed from a lower bound.
+            hero_committed = _committed_at_start(hand, 0)
+            if hero_committed is not None:
+                hero_bb_won = round(series[-1] - series[0] - hero_committed, 2)
     contributed = round(contributed, 2)
 
     # Did the hero fold? Signals, strongest first: a hero fold pill, a
@@ -986,6 +1796,26 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
     # (stacks are pre-debited), so observed stack contributions reconcile
     # against the pot GROWTH from the first reading, not the whole pot.
     initial_pot = pots[0] if pots else None
+    # ... but `pots` silently SKIPS refused states, so when the pot read at the
+    # start of the window was REFUSED, pots[0] is a RE-BASED value from later in
+    # the hand -- money committed between the window start and the first
+    # surviving read is then counted twice (once inside pots[0], once in
+    # `contributed`), and the inflated sum can corroborate an equally inflated
+    # win estimate and outvote the correct pot text 2:1, publishing a wrong pot
+    # as reconciled with zero visible signal. A refused pot read at or before
+    # the first surviving one is therefore an UNKNOWN INPUT to the contribution
+    # estimator, and "AN ESTIMATOR WITH AN UNKNOWN INPUT IS REMOVED FROM THE
+    # CANDIDATE LIST, not down-weighted" (the consensus rule below). Refusals
+    # AFTER the first surviving read do not touch initial_pot and cost nothing.
+    for s in settled_states:
+        if s.get("pot_unknown"):
+            initial_pot_refused = True
+            break
+        if s["pot"] is not None:
+            initial_pot_refused = False
+            break
+    else:
+        initial_pot_refused = False
 
     # Three INDEPENDENT estimates of the final pot, each with a distinct failure
     # mode, so a wrong one is outvoted rather than trusted:
@@ -1000,9 +1830,21 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
     # estimates independently agree -- money conservation the single text read
     # can't fake. Two stack estimates agreeing against the text means the text
     # is the misread, so the text is correctly overridden.
+    #
+    # AN ESTIMATOR WITH AN UNKNOWN INPUT IS REMOVED FROM THE CANDIDATE LIST, not
+    # down-weighted. `contrib` sums stack differences across the settled window,
+    # so a refused read inside that window makes its sum wrong by an unmeasured
+    # amount while looking exactly like a clean one -- and it would then be one of
+    # the two "independent estimates that agree" that `reconciled` means. With
+    # fewer than two survivors `reconciled` is False and pot_not_reconciled fires,
+    # which is the correct, visible outcome.
     pot_text = final_pot
-    contrib_pot = round(initial_pot + contributed, 2) if initial_pot is not None else None
-    win_pot = round(win_gain, 2) if (winner_seat is not None and win_gain > _EPS) else None
+    contrib_pot = (round(initial_pot + contributed, 2)
+                   if (initial_pot is not None and not contrib_holed
+                       and not initial_pot_refused) else None)
+    win_pot = (round(win_gain, 2)
+               if (winner_seat is not None and win_gain > _EPS
+                   and not win_holed_by_seat.get(winner_seat, False)) else None)
     candidates = [(k, v) for k, v in
                   (("text", pot_text), ("contrib", contrib_pot), ("win", win_pot))
                   if v is not None]
@@ -1034,8 +1876,10 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
     # or a frozen end-of-recording frame the stack OCR misreads). Reporting it
     # would assert a winner we cannot stand behind. The reliable, coaching-
     # relevant fact is the hero fold; drop the unverifiable winner and record the
-    # villain resolution as unobserved. (A reconciled winner is kept: v01#1's
-    # real river sweep still reconciles via the contrib/win consensus.)
+    # villain resolution as unobserved. (A reconciled winner is kept: 13 of the
+    # 31 development hands are hero-folds whose villain sweep reconciles via the
+    # contrib/win consensus -- e.g. g0723a hand 3, seat 7 sweeping 135.8 -- and
+    # every one keeps its winner through this demotion.)
     if hero_folded and winner_seat is not None and not reconciled:
         winner_seat, win_gain = None, 0.0
         result = "Hero folds"
@@ -1046,7 +1890,55 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
 
     complete_cards = len(hero) == 2 and len(board) in {0, 3, 4, 5} and cards_unique
     complete = (bool(hero) and cards_unique and final_pot is not None and bool(actions)
-                and (winner_seat is not None or hero_fold_only))
+                and (winner_seat is not None or hero_fold_only)
+                # A hand carrying money of unknown size, or a transition nothing
+                # could measure, is not a COMPLETE record of what happened,
+                # whatever else holds. PLAN.md: "Mark an incomplete sequence
+                # non-authoritative."
+                and not amounts_unknown_in_ledger)
+
+    # Which terminal event the spine actually OBSERVED, for the app's completion
+    # evidence. Additive: no existing consumer reads this key. Anything the spine
+    # could not see stays "unobserved", which blocks study readiness downstream.
+    if winner_seat is not None and win_holed_by_seat.get(winner_seat, False):
+        # The sweep was read off a stack series with a refusal inside the settled
+        # window, so "this seat gained the pot" rests on a step nothing measured.
+        # A terminal event must not be PROMOTED off an unmeasured sweep -- naming
+        # a showdown or a fold-win here is what turns an unreadable frame into a
+        # completion claim downstream.
+        terminal_event = "unobserved"
+    elif winner_seat is not None:
+        # A showdown is two or more seats CONTESTING a COMPLETED board. Both halves
+        # were missing. `len(last["dealt_in"]) >= 2` alone is satisfied on nearly
+        # every hand, because assign_regions marks hero dealt-in whenever the hero's
+        # hole cards are visible and the client leaves a folded hero's cards on
+        # screen greyed out for the rest of the hand -- so a hero who folded preflop
+        # still counts. And the board was never consulted at all: 9 of the 21
+        # development hands claimed "showdown", 8 of them with fewer than 5 board
+        # cards and one with no board whatsoever. Seats whose last reconstructed
+        # action is a fold are excluded, which is what removes the folded hero.
+        #
+        # `last["dealt_in"]` cannot supply the count: on 19 of the 21 development
+        # hands the last state of the segment is already the NEXT deal, where every
+        # seat is dealt in and the board is empty, so the old test was true on
+        # essentially every hand with a winner. The action ledger is the witness --
+        # a seat whose last reconstructed action is a fold is out; a seat that never
+        # acted counts as live, which biases toward NOT asserting a fold.
+        contenders = [s for s in players if last_action.get(s) != "fold"]
+        if len(contenders) <= 1:
+            terminal_event = "fold_win"
+        elif len(board) == 5:
+            terminal_event = "showdown"
+        else:
+            # Two or more seats still contesting a pot that was swept on a board
+            # that never completed. Nobody shows down an incomplete board, so the
+            # later streets simply were not observed -- say so, rather than assert
+            # a fold that did not happen or a showdown that could not have.
+            terminal_event = "unobserved"
+    elif hero_fold_only:
+        terminal_event = "hero_fold"
+    else:
+        terminal_event = "unobserved"
 
     warnings: list[str] = []
     if len(hero) != 2:
@@ -1063,6 +1955,142 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         # hero_bb_won attribution below can't be trusted for this layout.
         warnings.append("hero_seat_mismatch")
 
+    # ---- reconstruction-correctness nets -------------------------------------
+    # Everything above warns about a value the spine could not COMPUTE. The four
+    # below warn about a reconstruction that computed cleanly and is still wrong:
+    # each corresponds to a real failure that produced a confident export with no
+    # warning at all.
+    side_pot = max((s["side_pot"] for s in hand if s.get("side_pot") is not None),
+                   default=None)
+    # A REFUSED side-pot read is a DETECTED second pot whose amount is unknown --
+    # not the same fact as "no side pot". `side_pot_unknown` was plumbed
+    # end-to-end (region_detections sets it on every state) and read by nothing,
+    # so a refusal on the side band silenced side_pot_unsupported -- a SPINE_FATAL
+    # code -- and the hand was indistinguishable from a single-pot hand. Latent on
+    # the development corpus (0 of 716 states carry it; the one side-pot recording
+    # reads both boxes), which is exactly why it needs consuming before the
+    # geometry that trips it arrives.
+    side_pot_refused = any(s.get("side_pot_unknown") for s in hand)
+    if side_pot is not None or side_pot_refused:
+        # The detector reads both pots correctly, but the spine models the pot as
+        # a single scalar and Hand.pot_size cannot hold a main/side pair. Rather
+        # than discard the side pot silently (which is what happened before, via
+        # a max-confidence pick between the two boxes), say so and let the hand be
+        # rejected. See PLAN.md: side pots are supported once held-out truth exists.
+        #
+        # KNOWN LIMIT, stated rather than papered over: this refusal rests entirely
+        # on the detector finding a second pot_text box, and on the one development
+        # recording that has a side pot those boxes score 0.382-0.758 -- mostly
+        # under 0.6. Suppress them (a higher detector threshold, an occlusion, a
+        # different render) and the same unrepresentable hand exports clean at
+        # confidence 1.0. The obvious corroborating evidence -- two seats all-in
+        # with a third still live -- is NOT usable as a substitute on this corpus:
+        # the side-pot recording yields only ONE all-in action, while two baseline
+        # hands show two all-in seats each and have no side pot. A rule built on
+        # either signal would be tuned against material that does not support it.
+        # Closing this needs a recording with both a measured side pot and a
+        # measured all-in ledger, which the development corpus does not contain.
+        warnings.append("side_pot_unsupported")
+    if any(s.get("board_row_missed") for s in hand):
+        # A community row was on screen and not one of its cards was zoned as
+        # board. An empty board is a legal value everywhere downstream, so without
+        # this the failure is invisible by construction.
+        #
+        # Neither the old `>= 3 states` run nor the old `and not board` conjunct
+        # survived measurement. State collapse compresses a hand to its DISTINCT
+        # states, and exported development hands hold a street for as few as one
+        # (g0711 hand 6 holds its river board for exactly 1 distinct state; g0723a
+        # hand 5 for 2), so a three-state run asked for more evidence than a river
+        # supplies. And `not board` silenced the net entirely on a hand whose flop
+        # WAS captured and whose later rows were all missed -- the exact shape a
+        # mid-hand zoning drift produces.
+        #
+        # A state's board_row_missed is a GEOMETRIC fact about the frame, not a
+        # numeric read, so it needs no run to be believed. Measured cost of firing
+        # on one state: 0 of 470 states across the five development recordings
+        # raise the flag at all.
+        warnings.append("board_zone_yield_zero")
+    for field, code in (("board_cards", "board_card_identity_split"),
+                        ("hero_cards", "hero_card_identity_split")):
+        if any(s.get(f"{field}_identity_split") for s in hand):
+            # The classifier read the SAME card slot two different ways while the
+            # card sat on the table. The debounce picks the majority and reports
+            # it as fact; measured on the 07-23 3.21 PM recording it picked wrong,
+            # and 'Js 6h 4c 8d' exported for a real Js 6h 4c 8h at confidence 1.0
+            # with tags [] -- a board with one heart standing in for a board with
+            # two, i.e. a different hand for every equity and texture conclusion.
+            # A contested identity is unknown, not a vote.
+            warnings.append(code)
+    if any(s.get("board_row_partial") for s in hand):
+        # The row was on screen and only PART of it was zoned board. Every
+        # surviving count is legal downstream, so this is exactly as silent as
+        # losing the whole row: a 5-card river board reported as a completed
+        # 4-card turn board, at confidence 1.0, with a showdown result asserted on
+        # a board missing its river card. Gated on one state for the same reason
+        # as board_zone_yield_zero above -- a river street does not supply three.
+        warnings.append("board_zone_yield_partial")
+    # NOTE: two sibling invariants -- "board empty while streets advanced" and
+    # "every action on one street of a multi-street hand" -- are checked in
+    # validate_yolo_card_timeline, NOT here. Inside the spine both halves of each
+    # pair derive from the same `board_cards` readings (`streets` from
+    # _street_events, the voted board from _vote_board, an action's street from
+    # the board high-water mark), so they cannot disagree and the checks would be
+    # dead code. Across the fields of an already-serialized hand -- a hand-edited
+    # timeline, a manual correction, a different producer -- they can, and that is
+    # where they belong.
+    pot_text_off_column = sum(s.get("pot_text_off_column", 0) for s in hand)
+    stack_conflicts = sum(s.get("stack_conflicts", 0) for s in hand)
+    hero_seat_confirmed = any(s.get("hero_seat_confirmed") for s in hand)
+    amounts_unknown_by_code: dict[str, int] = {}
+    for s in hand:
+        for code, n in (s.get("amounts_unknown_by_code") or {}).items():
+            amounts_unknown_by_code[code] = amounts_unknown_by_code.get(code, 0) + n
+    if amounts_unknown_in_ledger:
+        # The hand's MONEY LEDGER -- not merely its crops -- carries an unknown.
+        # Either an action whose size no evidence supplies, or a transition whose
+        # stack delta was unmeasurable. Both make every derived total (pot
+        # consensus, contributions, hero net) rest on a step nothing measured, so
+        # the hand must not be presented as an authoritative record of what
+        # happened. Fatal at the export gate; see SPINE_FATAL_CODES.
+        warnings.append("amounts_unknown_in_ledger")
+    if any(row.get("starting_stack_unknown") for row in player_rows):
+        # A seat's starting stack was REFUSED (as opposed to a box that was never
+        # detected). Accounting downstream rejects a None starting stack
+        # outright, so the hand can never become an authoritative money record --
+        # yet the fact used to travel only as CompletionEvidence.extra
+        # (cv_starting_stack_unknown), which nothing read, and the hand exported
+        # as completion_status "complete" with warning_codes=[] and then failed
+        # PERMANENTLY at the accounting layer with no clearing action. Same
+        # class of unknown as amounts_unknown_in_ledger; same fatal treatment.
+        warnings.append("starting_stack_unknown")
+    ledger_hits = _stack_ledger_violations(settled_states[:-1], players)
+    if ledger_hits:
+        # A stack that multiplies before the pot is awarded is arithmetically
+        # impossible, so every number derived from that seat's ledger -- its
+        # contribution, its action sizes, and the hero net computed from them --
+        # rests on a read that cannot be true.
+        warnings.append("stack_ledger_incoherent")
+    residual = _contribution_residual({"pot": final_pot, "actions": actions})
+    if residual is not None and -residual > (_uncalled_shove_headroom(actions)
+                                             + _CONTRIBUTION_RESIDUAL_SLACK_BB):
+        # Chip conservation. See _contribution_residual: with incremental amount
+        # semantics the action ledger cannot sum ABOVE the pot, so a negative
+        # residual says the reconstruction booked money the pot does not contain.
+        # The one legal source of one -- an over-shove refunded before the sweep --
+        # is measured and subtracted, so this fires only on money that has no
+        # explanation (the duplicate-action defect, at -3.0 with zero headroom).
+        warnings.append("contributions_exceed_pot")
+    if _result_contradicts_hero_net(result, hero_bb_won):
+        # Two fields off the same stack ledger, published together and never
+        # compared: "Villain wins" alongside hero_bb_won=+65.2.
+        warnings.append("result_contradicts_hero_net")
+    unanchored_cards = sum(s.get("unanchored_cards", 0) for s in hand)
+    anchor_missing_states = sum(1 for s in hand if not s.get("anchor_ok", True))
+    if unanchored_cards:
+        # Cards were detected and then dropped because no table transform could be
+        # fitted. Failing closed is correct, but the record is now incomplete.
+        warnings.append("anchor_unavailable")
+
     return {
         "hand_number": hand_number,
         "t_start": hand[0]["time_s"],
@@ -1074,11 +2102,30 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         "players": player_rows,
         "streets": streets,
         "actions": actions,
+        # "pot" keeps its exact meaning: the MAIN pot scalar. "side_pot" is
+        # additive -- every existing consumer (thresholds, export, validation)
+        # reads a value whose semantics never changed.
         "pot": final_pot,
+        "side_pot": side_pot,
         "pot_text_dropped": pot_text_dropped,
+        "pot_text_off_column": pot_text_off_column,
+        "stack_conflicts": stack_conflicts,
+        "hero_seat_confirmed": hero_seat_confirmed,
+        "pot_collapses_repaired": sum(s.get("pot_collapses_repaired", 0) for s in hand),
+        "amounts_unknown": sum(s.get("amounts_unknown", 0) for s in hand),
+        # Per-reason breakdown of the count above. "18 unread amounts" cannot tell
+        # a systematic reader failure on one region from scattered occlusions.
+        "amounts_unknown_by_code": amounts_unknown_by_code,
+        # Transitions whose money movement nothing could measure, and money
+        # actions the spine proved happened but could not size.
+        "unmeasured_transitions": unmeasured_transitions,
+        "unknown_money_actions": unknown_money_actions,
+        "settle_scan_skipped": sum(1 for s in hand if s.get("settle_scan_skipped")),
+        "anchor_missing_states": anchor_missing_states,
         "winner_seat": winner_seat,
         "win_gain": round(win_gain, 2),
         "result": result,
+        "terminal_event": terminal_event,
         "hero_folded": hero_folded,
         "hero_bb_won": hero_bb_won,
         "contributed_est": contributed,
@@ -1093,6 +2140,31 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Top-level build
 # --------------------------------------------------------------------------- #
+def _layout_profile(frames: list[rd.Frame]) -> str:
+    """The render geometry this session was reconstructed from, as a fact on the
+    record: "<W>x<H>" of the modal frame, plus "-unsupported" when it is outside
+    the calibrated range.
+
+    ``layout_profile`` reaches the app through completion evidence and was read at
+    export from timeline metadata that NOTHING in cv_lab ever set, so it was always
+    the empty string -- the pipeline had no representation at all of "this client
+    renders smaller than anything the readers were calibrated on". The seat anchors
+    and the OCR templates are both calibrated artefacts; a geometry outside their
+    range is a fact a reviewer is entitled to see, not something to infer from a
+    downstream symptom.
+
+    "Supported" is expressed in the SMALLER dimension because that is what scales
+    the HUD glyphs: the smallest calibrated client is 1272x896, and the OCR sweep
+    holds down to 0.75x of its glyph height (see ocr_readers._MIN_CALIBRATED_RUN_H).
+    """
+    sizes = [(f.width, f.height) for f in frames if f.width and f.height]
+    if not sizes:
+        return ""
+    w, h = _mode(sizes)
+    supported = w >= _MIN_CALIBRATED_WIDTH and h >= _MIN_CALIBRATED_HEIGHT
+    return f"{w}x{h}" if supported else f"{w}x{h}-unsupported"
+
+
 def build_hand_timeline(frames: list[rd.Frame]) -> dict[str, Any]:
     states, events = build_states(frames)
     hands = [reconstruct(hand, i) for i, hand in enumerate(_segment(states), start=1)]
@@ -1100,6 +2172,7 @@ def build_hand_timeline(frames: list[rd.Frame]) -> dict[str, Any]:
         "metadata": {
             "source": "yolo_region_detections",
             "classes": rd.CLASSES,
+            "layout_profile": _layout_profile(frames),
             "notes": [
                 "Offline completed-session reconstruction from 8-class region detections.",
                 "Seats assigned via per-class anchors learned from the labeled boxes.",

@@ -5,6 +5,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from poker_tracker.persistence.completion import BoundaryEvidence, CompletionEvidence
 from poker_tracker.persistence.models import Hand, ProcessingJob, Session, VideoRecord
 
 
@@ -144,6 +145,130 @@ def build_job_rows(
         for job in jobs
         if job.id is not None
     ]
+
+
+def completion_evidence_rows(
+    evidence: CompletionEvidence,
+) -> tuple[tuple[str, str], ...]:
+    """The reconstruction evidence, as label/value pairs a promotion gate can show.
+
+    The confirmation checkbox reads "I have read the evidence above and confirm
+    this hand is correct", and until this existed there was no evidence above it:
+    the pipeline wrote the boundaries, the terminal event, the boundary
+    confidence, the source timestamps and frames, the layout profile and the
+    pipeline/model versions into ``completion_evidence``, the store persisted
+    them, the exporter round-tripped them and ``study_confirmation_key`` digested
+    them -- and not one of them was ever rendered. The only thing drawn above the
+    box on an otherwise-clean hand was the sentence saying the box was unticked,
+    so Phase 1's final control asked the operator to attest to something the
+    product had never shown them.
+
+    Pure and total: every field degrades to a printable string, because the
+    parser never raises and an unreadable blob must still render as the little it
+    could recover rather than break the page that gates the promotion.
+    """
+
+    def boundary(label: str, value: BoundaryEvidence) -> tuple[str, str] | None:
+        if not value.kind and value.timestamp_s is None and not value.frame_ref:
+            return None
+        parts = [value.kind or "unknown"]
+        if value.timestamp_s is not None:
+            parts.append(f"at {value.timestamp_s:g}s")
+        if value.confidence is not None:
+            parts.append(f"confidence {value.confidence:g}")
+        if value.frame_ref:
+            parts.append(value.frame_ref)
+        if value.codes:
+            parts.append(", ".join(value.codes))
+        return (label, " · ".join(parts))
+
+    def flag(value: bool | None) -> str:
+        return "Unknown" if value is None else ("Yes" if value else "No")
+
+    rows: list[tuple[str, str]] = [
+        (
+            "Evidence version",
+            f"{evidence.evidence_version}"
+            + ("" if evidence.is_known else " (not readable by this build)"),
+        ),
+        ("Starts mid-hand", flag(evidence.partial_start)),
+        ("Ends mid-hand", flag(evidence.partial_end)),
+        ("Terminal event", evidence.terminal_event or "Not recorded"),
+        (
+            "Boundary confidence",
+            "Not recorded"
+            if evidence.boundary_confidence is None
+            else f"{evidence.boundary_confidence:g}",
+        ),
+    ]
+    span = [
+        f"{value:g}s"
+        for value in (
+            evidence.first_source_timestamp_s,
+            evidence.last_source_timestamp_s,
+        )
+        if value is not None
+    ]
+    rows.append(("Source timestamps", " → ".join(span) if span else "Not recorded"))
+    for row in (
+        boundary("Preceding boundary", evidence.preceding_boundary),
+        boundary("Following boundary", evidence.following_boundary),
+    ):
+        if row is not None:
+            rows.append(row)
+    rows.append(
+        (
+            "Source frames",
+            f"{len(evidence.source_frames)} · {', '.join(evidence.source_frames)}"
+            if evidence.source_frames
+            else "None recorded",
+        )
+    )
+    rows.append(
+        (
+            "Table layout",
+            f"{evidence.layout_profile or 'Profile not recorded'} · "
+            f"{'supported' if evidence.layout_supported else 'not confirmed'} · "
+            f"{evidence.table_size if evidence.table_size is not None else '?'} seats",
+        )
+    )
+    rows.append(("Pipeline version", evidence.pipeline_version or "Not recorded"))
+    rows.append(
+        (
+            "Model versions",
+            ", ".join(f"{name}={value}" for name, value in sorted(evidence.model_versions.items()))
+            or "Not recorded",
+        )
+    )
+    if evidence.warning_codes:
+        rows.append(("Warning codes", ", ".join(evidence.warning_codes)))
+    if evidence.rejection_codes:
+        rows.append(("Rejection codes", ", ".join(evidence.rejection_codes)))
+    if evidence.acknowledged_codes:
+        rows.append(("Acknowledged codes", ", ".join(evidence.acknowledged_codes)))
+    if evidence.declared_settlement_codes:
+        # A third kind of statement again, and the reason it is drawn on its own
+        # row: this is what the OPERATOR declared, where the warning codes above
+        # are what the PIPELINE could not prove. Filing it with the warnings made
+        # the evidence panel present a rake the operator typed as a finding of the
+        # reconstruction.
+        rows.append(
+            (
+                "Declared settlement inputs",
+                ", ".join(evidence.declared_settlement_codes),
+            )
+        )
+    if evidence.confirmed_assumption_codes:
+        # Rendered separately because it is a different kind of statement: an
+        # acknowledged code says "I accept this pipeline note", and this says
+        # "I assert these specific unobserved chips were taken or added".
+        rows.append(
+            (
+                "Confirmed settlement assumptions",
+                ", ".join(evidence.confirmed_assumption_codes),
+            )
+        )
+    return tuple(rows)
 
 
 def confidence_label(score: float | None) -> str:

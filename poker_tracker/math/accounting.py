@@ -12,7 +12,7 @@ from silently inventing outcomes.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
 from typing import Literal, Protocol
@@ -36,6 +36,12 @@ _BETTING_COMMITMENT_KINDS = _COMMITMENT_KINDS - {"ante"}
 _NON_COMMITMENT_KINDS = {"fold", "check", "show", "win"}
 _FLOP_STREETS = {"flop", "turn", "river", "showdown"}
 _ZERO = Decimal("0")
+# The coarsest denomination a chopped pot may be divided at. A whole chip is the
+# indivisible unit a real table deals in; anything above it is a claim about the
+# room that the hand's own action line cannot demonstrate, and it was exactly
+# that claim -- taken verbatim from a declared field -- that let "Chip unit"
+# redirect a chop. See _split_granularity.
+_MAX_SPLIT_QUANTUM = Decimal("1")
 
 
 class LedgerError(ValueError):
@@ -376,6 +382,11 @@ def build_hand_ledger(
     rake_by_pot = _allocate_rake(raw_pots, rake_total, unit)
     payouts = {name: _ZERO for name in player_order}
     rendered_pots: list[PotLayer] = []
+    # Derived from the observed action line only. `unit` -- the declared "Chip
+    # unit" -- is deliberately NOT passed and neither is anything computed from
+    # it: it rounds the rake and nothing else, so the granularity a chopped pot
+    # is divided at is the same at every declared value, at every rake rate.
+    split_unit = _split_granularity(settled_contributions.values(), dead)
 
     for index, pot in enumerate(raw_pots):
         pot_winners = winner_map.get(index, ())
@@ -386,7 +397,7 @@ def build_hand_ledger(
                 net_amount,
                 pot_winners,
                 payouts,
-                unit=unit,
+                unit=split_unit,
                 odd_order=odd_order,
             )
         rendered_pots.append(
@@ -700,22 +711,117 @@ def _compute_rake(
 
 
 def _allocate_rake(pots: Sequence[dict], total: Decimal, unit: Decimal) -> list[Decimal]:
+    """Spread one rake total across the pot layers, never past a layer's own size.
+
+    Every non-final share used to be rounded DOWN to the declared unit and the
+    whole leftover charged to the LAST pot with no cap at that pot's amount, so
+    an ordinary hand under an ordinary policy could rake a pot beyond what it
+    contained: a 149.25 main pot and a 0.50 side pot at 5% capped at 5 with a
+    whole-chip drop took 4 from the main pot and charged the leftover 1 to a pot
+    of 0.50, giving that layer ``net_amount = -0.50`` and paying its winner minus
+    half a chip. ``is_balanced`` stayed True because the negative preserved
+    ``paid + rake == gross``, so a hand whose side-pot winner also won the main
+    pot certified as authoritative and study-ready, and a hand whose pots had
+    different winners became permanently unreconcilable: the derived payout was
+    negative, ``SettlementEntry.amount`` is ``ge=0`` so the operator could not
+    declare it, and ACCOUNTING_NOT_AUTHORITATIVE named a save that could never
+    clear it.
+
+    Each share is therefore capped at its own pot, and the rounding leftover is
+    offered to the layers in order, each taking only what it still has room for.
+    ``_validate_rake`` bounds the rate at one and ``_compute_rake`` caps the
+    total at the gross, so the leftover always finds room and the loop always
+    settles at zero.
+    """
     if not pots:
         return []
-    if total == 0:
+    if total <= 0:
         return [_ZERO for _ in pots]
     gross = sum((pot["amount"] for pot in pots), _ZERO)
     allocated: list[Decimal] = []
     remaining = total
-    for index, pot in enumerate(pots):
-        if index == len(pots) - 1:
-            share = remaining
-        else:
-            share = _round_down(total * pot["amount"] / gross, unit)
-            share = min(share, remaining)
+    for pot in pots:
+        share = _round_down(total * pot["amount"] / gross, unit)
+        share = min(share, remaining, pot["amount"])
         allocated.append(share)
         remaining -= share
+    for index, pot in enumerate(pots):
+        if remaining <= 0:
+            break
+        take = min(pot["amount"] - allocated[index], remaining)
+        if take > 0:
+            allocated[index] += take
+            remaining -= take
     return allocated
+
+
+def _split_granularity(
+    contributions: Iterable[Decimal], dead_money: Decimal
+) -> Decimal:
+    """The finest denomination the hand's own numbers are written in.
+
+    ``rake_rounding_unit`` is a DECLARED operator field ("Chip unit" in the
+    settlement editor, and a verbatim value in an import payload) with no upper
+    bound. Its documented job is rounding the rake, which is a real room rule --
+    a house that drops whole dollars against a 0.50 blind is ordinary. Its
+    undocumented second job was to be the granularity a CHOPPED pot was divided
+    at: ``_split_pot`` rounds each winner's share DOWN to the unit and gives
+    every leftover chip to the front of ``odd_chip_order``, so with the rake rate
+    at zero -- where neither declared-chips disclosure fires and no correction is
+    recorded -- one number in the settlement editor moved the derived hero result
+    and made a fabricated ``hands.hero_bb_won`` reconcile exactly.
+
+    Round 8 bounded the declared unit by the greatest common divisor of the
+    observed contributions and claimed that removed the dial. It did not. Every
+    DIVISOR of that gcd was still reachable, and divisors do not agree once the
+    pot is anything but two equal halves: on three seats contributing 8 each and
+    a two-way chop of 24, units 0.01/1/2/4 pay 12/12 while 3, 5 and 8 pay 16/8.
+    The bound was also the wrong direction. The gcd is an UPPER bound on the
+    denomination in play -- every amount is a whole multiple of the real chip, so
+    the real chip DIVIDES the gcd and may be far finer -- and splitting at an
+    upper bound maximises the redistribution, because rounding the base share
+    down sheds up to a whole unit from every winner before the round-robin hands
+    those chips back from the front of the order.
+
+    So the split granularity is now derived from evidence alone -- the settled
+    contributions and the declared dead money, never the declared unit and never
+    anything computed from it -- and it is the FINEST signal those amounts carry,
+    not the coarsest. Concretely it is the smallest decimal place any observed
+    amount is written in, capped at one whole chip. That is deliberately the
+    conservative direction. A denomination cannot be established from above: three
+    seats each committing 8 share a factor of 8 and demonstrate nothing about
+    8-chips, whereas an amount of 49.75 does demonstrate that hundredths exist.
+    Choosing the finest evidence keeps every derived chop as close to an even one
+    as the hand allows, so the most any granularity can move a seat is under one
+    chip -- against half the pot, which is what the declared unit could move.
+
+    The odd chip survives, because it is real: chips are indivisible, so a
+    21-chip pot chopped two ways is genuinely pushed 11/10, and deriving
+    10.5/10.5 would raise a false blocker against an honest declared award. What
+    it can no longer be is a dial -- the deviation from an even chop is now under
+    one chip on every hand, and pinned by the hand's own amounts rather than
+    chosen by an operator. ``_split_pot`` always distributes the full amount, so
+    no granularity can change the gross, the rake, or chip conservation; only who
+    receives an odd chip, and that is decided by the audited ``odd_chip_order``.
+    """
+    quantum = _MAX_SPLIT_QUANTUM
+    for amount in (*contributions, dead_money):
+        if amount <= 0:
+            continue
+        exponent = amount.normalize().as_tuple().exponent
+        if not isinstance(exponent, int):
+            # 'n', 'N' or 'F' -- a non-finite Decimal. `_decimal` already refuses
+            # those on the way in, so this is unreachable defence that keeps the
+            # helper total rather than raising from inside the split.
+            continue
+        # normalize() first, so an amount that arrived as "5.0" and one that
+        # arrived as "5" describe the same denomination. Without it the split of
+        # one hand depended on whether its amounts reached the ledger as ints or
+        # as floats.
+        candidate = Decimal(1).scaleb(exponent)
+        if candidate < quantum:
+            quantum = candidate
+    return quantum
 
 
 def _split_pot(

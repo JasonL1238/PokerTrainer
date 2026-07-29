@@ -1,6 +1,13 @@
 import pytest
 from pydantic import ValidationError
 
+from poker_tracker.persistence.completion import (
+    EVIDENCE_SCHEMA_VERSION,
+    CompletionEvidence,
+    acknowledge_codes,
+    dump_completion_evidence,
+    parse_completion_evidence,
+)
 from poker_tracker.persistence.db import SCHEMA_VERSION, PokerDatabase
 from poker_tracker.persistence.models import (
     Action,
@@ -328,4 +335,465 @@ def test_init_db_refuses_newer_schema_version() -> None:
     with pytest.raises(RuntimeError, match="newer"):
         db.init_db()
 
+    db.close()
+
+
+def _v12_hands_table_columns() -> list[str]:
+    """The exact hands columns a schema-12 database holds, in order."""
+    return [
+        "id",
+        "session_id",
+        "hand_number",
+        "game_type",
+        "blinds_antes",
+        "table_size",
+        "effective_stack",
+        "hero_position",
+        "hero_cards",
+        "board_cards",
+        "pot_size",
+        "result",
+        "hero_bb_won",
+        "review_status",
+        "confidence_score",
+        "source_type",
+        "tags",
+        "notes",
+        "created_at",
+    ]
+
+
+def test_fresh_schema_has_completion_columns() -> None:
+    db = make_db()
+
+    columns = {row["name"] for row in db._execute("PRAGMA table_info(hands)").fetchall()}
+
+    assert {"completion_status", "completion_evidence"} <= columns
+    db.close()
+
+
+def test_fresh_and_migrated_hands_schema_are_identical(tmp_path) -> None:
+    def signature(database: PokerDatabase) -> list[tuple]:
+        return [
+            (row["name"], row["type"], row["notnull"], row["dflt_value"])
+            for row in database._execute("PRAGMA table_info(hands)").fetchall()
+        ]
+
+    fresh = make_db()
+    expected = signature(fresh)
+    fresh.close()
+
+    path = tmp_path / "legacy.sqlite3"
+    legacy = PokerDatabase(path)
+    legacy.init_db()
+    legacy._execute("ALTER TABLE hands DROP COLUMN completion_status")
+    legacy._execute("ALTER TABLE hands DROP COLUMN completion_evidence")
+    legacy._execute("UPDATE schema_metadata SET value = '12' WHERE key = 'schema_version'")
+    legacy._commit()
+    assert [row[0] for row in signature(legacy)] == _v12_hands_table_columns()
+    legacy.close()
+
+    migrated = PokerDatabase(path)
+    migrated.init_db()
+
+    assert signature(migrated) == expected
+    migrated.close()
+
+
+def test_update_hand_status_rejects_unknown_review_status() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Status"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+
+    with pytest.raises(ValueError, match="Unknown review status"):
+        db.update_hand_status(hand.id, "approved")
+
+    assert db.fetch_hand(hand.id).review_status == "unreviewed"
+    db.close()
+
+
+@pytest.mark.parametrize("completion_status", ["uncertain", "partial"])
+def test_update_hand_status_refuses_reviewed_for_unproven_hand(completion_status: str) -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Unproven"))
+    hand = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=1,
+            source_type="cv_import",
+            completion_status=completion_status,
+        )
+    )
+
+    with pytest.raises(ValueError, match="cannot be marked reviewed"):
+        db.update_hand_status(hand.id, "reviewed")
+
+    assert db.fetch_hand(hand.id).review_status != "reviewed"
+    db.update_hand_status(hand.id, "needs_correction")
+    assert db.fetch_hand(hand.id).review_status == "needs_correction"
+    db.close()
+
+
+def test_update_hand_status_refuses_reviewed_with_open_issue() -> None:
+    from poker_tracker.persistence.models import HandIssue
+
+    db = make_db()
+    session = db.create_session(Session(name="Open issue"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+    db.create_hand_issue(
+        HandIssue(
+            hand_id=hand.id,
+            issue_types=["pot_or_result"],
+            description="Pot does not match the recording.",
+        )
+    )
+
+    with pytest.raises(ValueError, match="open debugging issue"):
+        db.update_hand_status(hand.id, "reviewed")
+
+    db.close()
+
+
+@pytest.mark.parametrize("source_type", ["cv_import", "corrected_cv"])
+def test_update_hand_status_refuses_reviewed_for_a_reconstructed_not_applicable_hand(
+    source_type: str,
+) -> None:
+    """'not_applicable' exempts a hand from every completion blocker.
+
+    import_session already rejects that pair as a laundering vector; create_hand
+    accepts it, so the store floor must refuse the promotion too.
+    """
+    db = make_db()
+    session = db.create_session(Session(name="Laundering"))
+    hand = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=1,
+            source_type=source_type,
+            completion_status="not_applicable",
+        )
+    )
+
+    with pytest.raises(ValueError, match="not_applicable"):
+        db.update_hand_status(hand.id, "reviewed")
+
+    assert db.fetch_hand(hand.id).review_status != "reviewed"
+    # A non-promoting status change is still allowed on the same row.
+    db.update_hand_status(hand.id, "needs_correction")
+    assert db.fetch_hand(hand.id).review_status == "needs_correction"
+    db.close()
+
+
+def test_update_hand_status_allows_reviewed_for_manual_hand() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Manual"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+
+    db.update_hand_status(hand.id, "reviewed")
+
+    saved = db.fetch_hand(hand.id)
+    assert saved.review_status == "reviewed"
+    assert saved.completion_status == "not_applicable"
+    db.close()
+
+
+def test_create_hand_persists_completion_status_and_evidence() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Completion"))
+    evidence = dump_completion_evidence(
+        CompletionEvidence(
+            evidence_version=EVIDENCE_SCHEMA_VERSION,
+            partial_start=False,
+            partial_end=False,
+            terminal_event="showdown",
+            boundary_confidence=0.9,
+            source_frames=("frames/a.jpg",),
+        )
+    )
+    hand = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=1,
+            source_type="cv_import",
+            completion_status="complete",
+            completion_evidence=evidence,
+        )
+    )
+
+    saved = db.fetch_hand(hand.id)
+    assert saved.completion_status == "complete"
+    assert saved.completion_evidence["source_frames"] == ["frames/a.jpg"]
+    assert parse_completion_evidence(saved.completion_evidence).is_known is True
+    db.close()
+
+
+def test_cv_hand_without_declared_completion_defaults_to_uncertain() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Default"))
+
+    hand = db.create_hand(
+        Hand(session_id=session.id, hand_number=1, source_type="cv_import")
+    )
+
+    assert hand.completion_status == "uncertain"
+    assert db.fetch_hand(hand.id).completion_status == "uncertain"
+    db.close()
+
+
+def test_fetch_hand_parses_corrupt_completion_evidence_as_empty() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Corrupt"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+    db._execute(
+        "UPDATE hands SET completion_evidence = ? WHERE id = ?",
+        ("{not valid json", hand.id),
+    )
+    db._commit()
+
+    saved = db.fetch_hand(hand.id)
+
+    assert saved.completion_evidence == {}
+    assert parse_completion_evidence(saved.completion_evidence).is_known is False
+    db.close()
+
+
+def _uncertain_cv_hand(db: PokerDatabase, session_id: int) -> Hand:
+    evidence = dump_completion_evidence(
+        CompletionEvidence(
+            evidence_version=EVIDENCE_SCHEMA_VERSION,
+            partial_start=False,
+            partial_end=False,
+            terminal_event="showdown",
+            boundary_confidence=0.9,
+            warning_codes=("pot_not_reconciled",),
+        )
+    )
+    return db.create_hand(
+        Hand(
+            session_id=session_id,
+            hand_number=1,
+            source_type="cv_import",
+            completion_status="uncertain",
+            completion_evidence=evidence,
+        )
+    )
+
+
+def test_update_hand_completion_promotes_uncertain_to_complete_on_acknowledgement() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Acknowledge"))
+    hand = _uncertain_cv_hand(db, session.id)
+    evidence = acknowledge_codes(
+        parse_completion_evidence(hand.completion_evidence), ["pot_not_reconciled"]
+    )
+
+    updated = db.update_hand_completion(
+        hand.id,
+        completion_evidence=dump_completion_evidence(evidence),
+        notes="Reviewed the recording; the pot is right.",
+    )
+
+    assert updated.completion_status == "complete"
+    assert db.fetch_hand(hand.id).completion_status == "complete"
+    db.close()
+
+
+def test_update_hand_completion_never_promotes_a_partial_hand() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Partial"))
+    truncated = dump_completion_evidence(
+        CompletionEvidence(
+            evidence_version=EVIDENCE_SCHEMA_VERSION,
+            partial_start=False,
+            partial_end=True,
+            terminal_event="showdown",
+            boundary_confidence=0.9,
+            warning_codes=("truncated_recording",),
+        )
+    )
+    hand = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=1,
+            source_type="cv_import",
+            completion_status="partial",
+            completion_evidence=truncated,
+        )
+    )
+    accepted = acknowledge_codes(
+        parse_completion_evidence(truncated), ["truncated_recording"]
+    )
+
+    updated = db.update_hand_completion(
+        hand.id, completion_evidence=dump_completion_evidence(accepted)
+    )
+
+    assert updated.completion_status == "partial"
+    with pytest.raises(ValueError, match="cannot be marked reviewed"):
+        db.update_hand_status(hand.id, "reviewed")
+    db.close()
+
+
+def test_update_hand_completion_records_a_flat_correction() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Audit"))
+    hand = _uncertain_cv_hand(db, session.id)
+    evidence = acknowledge_codes(
+        parse_completion_evidence(hand.completion_evidence), ["pot_not_reconciled"]
+    )
+
+    db.update_hand_completion(
+        hand.id,
+        completion_evidence=dump_completion_evidence(evidence),
+        notes="Accepted after re-watching.",
+    )
+
+    correction = db.fetch_hand_corrections(hand.id)[0]
+    assert correction.correction_type == "hand_facts"
+    assert correction.before_state == {
+        "completion_status": "uncertain",
+        "acknowledged_codes": "",
+    }
+    assert correction.after_state == {
+        "completion_status": "complete",
+        "acknowledged_codes": "pot_not_reconciled",
+    }
+    assert correction.notes == "Accepted after re-watching."
+    db.close()
+
+
+def test_update_hand_completion_does_not_restale_coaching_or_solver_evidence() -> None:
+    from poker_tracker.persistence.models import CoachingResponse
+
+    db = make_db()
+    session = db.create_session(Session(name="No restale"))
+    hand = _uncertain_cv_hand(db, session.id)
+    db.create_coaching_response(
+        CoachingResponse(
+            provider_name="test",
+            model_name="fixture",
+            raw_prompt="prompt",
+            raw_response="response",
+            review_type="hand",
+            hand_id=hand.id,
+            session_id=session.id,
+        )
+    )
+    evidence = acknowledge_codes(
+        parse_completion_evidence(hand.completion_evidence), ["pot_not_reconciled"]
+    )
+
+    db.update_hand_completion(
+        hand.id, completion_evidence=dump_completion_evidence(evidence)
+    )
+
+    assert not any(
+        review.is_stale for review in db.fetch_coaching_reviews_by_hand(hand.id)
+    )
+    db.close()
+
+
+def test_correcting_facts_demotes_a_complete_hand_to_uncertain() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Demote"))
+    hand = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=1,
+            source_type="cv_import",
+            completion_status="complete",
+            hero_cards="Ah Kd",
+        )
+    )
+
+    db.update_hand_facts(hand.model_copy(update={"hero_cards": "Ah Qd"}))
+
+    assert db.fetch_hand(hand.id).completion_status == "uncertain"
+    db.close()
+
+
+def test_correcting_facts_leaves_a_partial_hand_partial() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Sticky"))
+    hand = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=1,
+            source_type="cv_import",
+            completion_status="partial",
+            hero_cards="Ah Kd",
+        )
+    )
+
+    db.update_hand_facts(hand.model_copy(update={"hero_cards": "Ah Qd"}))
+
+    assert db.fetch_hand(hand.id).completion_status == "partial"
+    db.close()
+
+
+def test_correcting_facts_leaves_a_manual_hand_not_applicable() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Manual facts"))
+    hand = db.create_hand(
+        Hand(session_id=session.id, hand_number=1, hero_cards="Ah Kd")
+    )
+
+    db.update_hand_facts(hand.model_copy(update={"hero_cards": "Ah Qd"}))
+
+    assert db.fetch_hand(hand.id).completion_status == "not_applicable"
+    db.close()
+
+
+def test_flagging_for_debugging_demotes_completion() -> None:
+    from poker_tracker.persistence.models import HandIssue
+
+    db = make_db()
+    session = db.create_session(Session(name="Flag"))
+    hand = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=1,
+            source_type="cv_import",
+            completion_status="complete",
+        )
+    )
+    partial = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=2,
+            source_type="cv_import",
+            completion_status="partial",
+        )
+    )
+
+    for target in (hand, partial):
+        db.create_hand_issue(
+            HandIssue(
+                hand_id=target.id,
+                issue_types=["hand_boundary"],
+                description="Boundary looks wrong.",
+            )
+        )
+
+    assert db.fetch_hand(hand.id).completion_status == "uncertain"
+    assert db.fetch_hand(hand.id).review_status == "needs_correction"
+    assert db.fetch_hand(partial.id).completion_status == "partial"
+    db.close()
+
+
+def test_accounting_evidence_update_demotes_a_complete_hand() -> None:
+    db = make_db()
+    session = db.create_session(Session(name="Accounting demote"))
+    hand = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=1,
+            source_type="cv_import",
+            completion_status="complete",
+        )
+    )
+
+    db.update_hand_accounting_evidence(hand.id, pot_size=42, hero_bb_won=7)
+
+    assert db.fetch_hand(hand.id).completion_status == "uncertain"
     db.close()

@@ -1,6 +1,7 @@
 import csv
 from pathlib import Path
 
+from cv_lab.scripts.pipeline.build_yolo_card_timeline import _zone_for_box
 from cv_lab.scripts.training.mine_yolo_card_hard_examples import mine_hard_examples
 
 
@@ -152,3 +153,38 @@ def test_mine_hard_examples_flags_one_frame_label_flicker(tmp_path):
 
     rows = _read_report(dataset / "hard_examples" / "hard_examples.csv")
     assert "state_flicker" in rows["images/train/f1.jpg"]["issue_types"].split(";")
+
+
+def test_zoning_finds_the_board_at_an_aspect_ratio_the_legacy_rectangles_lose():
+    """The miner decides which frames enter the labeling queue, so its zoning is
+    not neutral. It used to bucket cards with build_yolo_card_timeline._zone_for_box
+    -- the legacy raw normalized rectangles, whose board window requires
+    0.36 <= cy <= 0.55. On the 06-21 recording (aspect ratio 1.750) the real
+    community row sits at cy 0.335-0.338, so 1 of 1152 card detections was zoned
+    board: the miner would call every community card "other" and mis-prioritise
+    exactly the geometry that was broken.
+
+    The community-row shape test needs no anchor and no rectangle. It measures the
+    row's span in units of the row's OWN median card width, a ratio in which the
+    frame's scale cancels."""
+    from cv_lab.scripts.training.mine_yolo_card_hard_examples import _zones_for_cards
+
+    # A five-card board at the AR-1.750 row (cy 0.337) plus hero's pair below it.
+    board = [(0.36 + 0.055 * i, 0.337, 0.045) for i in range(5)]
+    hero = [(0.47, 0.86, 0.045), (0.53, 0.86, 0.045)]
+    zones = _zones_for_cards(board + hero)
+
+    assert zones[:5] == ["board"] * 5
+    assert zones[5:] == ["hero", "hero"]
+
+    # The legacy rectangles, on the same points, lose the whole row.
+    assert [_zone_for_box(cx, cy) for cx, cy, _w in board] != ["board"] * 5
+
+
+def test_a_lone_board_card_still_reaches_partial_board_count():
+    """Negative control for the fallback that was kept on purpose: a community row
+    needs three cards, so a frame showing one or two has no shape to test -- and
+    that is exactly the case partial_board_count exists to surface."""
+    from cv_lab.scripts.training.mine_yolo_card_hard_examples import _zones_for_cards
+
+    assert _zones_for_cards([(0.415, 0.485, 0.07)]) == ["board"]

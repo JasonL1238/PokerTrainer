@@ -27,9 +27,30 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from cv_lab.scripts.pipeline.build_yolo_card_timeline import _zone_for_box  # noqa: E402
+from cv_lab.scripts.pipeline import region_detections as rd  # noqa: E402
+from cv_lab.scripts.pipeline.landmark_anchor import zone_for_ref  # noqa: E402
 
 _TOL_S = 0.5  # fixture frame time vs. decoded video frame time, seconds
+
+
+def _hero_boxes(fx: dict) -> list[dict]:
+    """The fixture frame's hero-zone face_card detections, zoned the same way the
+    spine zones them: through the fitted table anchor, never a fixed window.
+    Returns [] when the frame cannot be anchored, so no card is ever guessed
+    into the hero zone (a mis-zoned card would carry a bogus fold signal)."""
+    frame = rd.frames_from_fixture([fx])[0]
+    anchor = rd.anchor_for_frame(frame)
+    if anchor is None:
+        return []
+    out = []
+    for det in fx.get("detections", []):
+        if det.get("cls") != "face_card":
+            continue
+        x0, y0, x1, y1 = det["xyxy"]
+        rx, ry = anchor.to_ref((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        if zone_for_ref(rx, ry) == "hero":
+            out.append(det)
+    return out
 
 
 def main() -> None:
@@ -64,13 +85,8 @@ def main() -> None:
             img = frame.to_ndarray(format="bgr24")
             h, w = img.shape[:2]
             for fx in by_time[targets[ti]]:
-                for det in fx.get("detections", []):
-                    if det.get("cls") != "face_card":
-                        continue
+                for det in _hero_boxes(fx):
                     x0, y0, x1, y1 = det["xyxy"]
-                    cx, cy = (x0 + x1) / 2.0 / w, (y0 + y1) / 2.0 / h
-                    if _zone_for_box(cx, cy) != "hero":
-                        continue
                     xi0, yi0 = max(int(round(x0)), 0), max(int(round(y0)), 0)
                     xi1, yi1 = min(int(round(x1)), w), min(int(round(y1)), h)
                     if xi1 <= xi0 or yi1 <= yi0:

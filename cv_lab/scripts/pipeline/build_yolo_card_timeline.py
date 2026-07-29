@@ -45,10 +45,13 @@ def _image_size(dataset: Path, rel_image: str) -> tuple[int, int]:
 
 
 def _zone_for_box(cx: float, cy: float) -> str:
-    """Coarse zones for the current ClubWPT table view, in normalized coords.
+    """LEGACY, UNANCHORED. Only the card-only CSV builder below (and the offline
+    hard-example miner that reports on the same CSVs) uses this.
 
-    These are intentionally broad and should be replaced by a learned/anchored
-    seat+card-zone model when more views are added.
+    The reconstruction spine anchors via ``landmark_anchor.zone_for_ref``; do NOT
+    call this from region_detections -- these raw normalized rectangles lose 100%
+    of the board at aspect ratio 1.750, where the community row renders at cy
+    0.335-0.338 and the board window here starts at 0.36.
     """
     if 0.40 <= cx <= 0.58 and cy >= 0.64:
         return "hero"

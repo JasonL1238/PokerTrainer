@@ -25,7 +25,15 @@ cv_lab/datasets/
 cv_lab/frames/
 cv_lab/hand01/
 cv_lab/harvest/
-cv_lab/models/
+# (pattern is `dir/*`, not `dir/`, so the negation below is reachable -- git
+# never descends into a directory excluded as a whole)
+cv_lab/models/*
+# EXCEPT the OCR template bank. It is 21 KB of averaged glyph vectors, not a
+# regenerable-from-the-repo artifact: rebuilding it needs the source recordings.
+# While it was ignored, 8 of the 9 real-crop OCR regression tests skipped on any
+# clean checkout, in CI and in the Docker build -- so every decimal / truncation
+# defect they pin was unprotected everywhere except the calibrating machine.
+!cv_lab/models/ocr_templates.npz
 cv_lab/results/
 cv_lab/runs/
 cv_lab/logs/

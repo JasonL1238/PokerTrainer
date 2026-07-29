@@ -1,0 +1,678 @@
+[
+ {
+  "time_s": 0.0,
+  "image": "t000000.00",
+  "stage": "preflop",
+  "hero_cards": [
+   "Ah",
+   "9c"
+  ],
+  "board_cards": [],
+  "other_cards": [],
+  "villain_cards": {},
+  "hero_dim": false,
+  "pot": 891.0,
+  "dealt_in": [
+   0,
+   4,
+   5
+  ],
+  "stacks": {
+   "0": 75.9,
+   "5": 0.0,
+   "4": 158.0,
+   "7": 78.3,
+   "1": 79.8,
+   "3": 79.8,
+   "6": 79.3,
+   "2": 79.8
+  },
+  "bets": {},
+  "pills": {
+   "5": "check",
+   "4": "call",
+   "7": "fold",
+   "1": "fold",
+   "3": "fold",
+   "6": "fold",
+   "2": "fold"
+  },
+  "dealer_seat": 6,
+  "active_seat": 0,
+  "hero_seat_mismatch": false,
+  "missing": null,
+  "state_index": 0
+ },
+ {
+  "time_s": 3.0,
+  "image": "t000003.00",
+  "stage": "preflop",
+  "hero_cards": [
+   "Ah",
+   "9c"
+  ],
+  "board_cards": [],
+  "other_cards": [],
+  "villain_cards": {},
+  "hero_dim": false,
+  "pot": 165.0,
+  "dealt_in": [
+   0,
+   4,
+   5
+  ],
+  "stacks": {
+   "5": 0.0,
+   "1": 79.8,
+   "4": 158.0,
+   "6": 79.3,
+   "7": 78.3,
+   "0": 0.0,
+   "3": 79.8,
+   "2": 79.8
+  },
+  "bets": {},
+  "pills": {
+   "5": "check",
+   "1": "fold",
+   "6": "fold",
+   "7": "fold",
+   "0": "check",
+   "3": "fold",
+   "2": "fold"
+  },
+  "dealer_seat": 6,
+  "active_seat": 4,
+  "hero_seat_mismatch": false,
+  "missing": null,
+  "state_index": 1
+ },
+ {
+  "time_s": 5.0,
+  "image": "t000005.00",
+  "stage": "preflop",
+  "hero_cards": [
+   "Ah",
+   "9c"
+  ],
+  "board_cards": [],
+  "other_cards": [],
+  "villain_cards": {},
+  "hero_dim": false,
+  "pot": 24.09,
+  "dealt_in": [
+   0,
+   4,
+   5
+  ],
+  "stacks": {
+   "4": 82.1,
+   "5": 0.0,
+   "6": 79.3,
+   "7": 78.3,
+   "3": 79.8,
+   "1": 79.8,
+   "0": 0.0,
+   "2": 79.8
+  },
+  "bets": {},
+  "pills": {
+   "4": "call",
+   "5": "check",
+   "6": "fold",
+   "7": "fold",
+   "3": "fold",
+   "1": "fold",
+   "0": "check",
+   "2": "fold"
+  },
+  "dealer_seat": 6,
+  "active_seat": null,
+  "hero_seat_mismatch": false,
+  "missing": null,
+  "state_index": 2
+ },
+ {
+  "time_s": 6.0,
+  "image": "t000006.00",
+  "stage": "preflop",
+  "hero_cards": [
+   "Ah",
+   "9c"
+  ],
+  "board_cards": [],
+  "other_cards": [],
+  "villain_cards": {
+   "5": [
+    "2s",
+    "Qd"
+   ],
+   "4": [
+    "Tc",
+    "3c"
+   ]
+  },
+  "hero_dim": false,
+  "pot": 24.09,
+  "dealt_in": [
+   0
+  ],
+  "stacks": {
+   "1": 79.8,
+   "0": 0.0,
+   "3": 79.8,
+   "6": 79.3,
+   "7": 78.3,
+   "5": 0.0,
+   "2": 79.8,
+   "4": 82.1
+  },
+  "bets": {},
+  "pills": {
+   "1": "fold",
+   "0": "check",
+   "3": "fold",
+   "6": "fold",
+   "7": "fold",
+   "5": "fold",
+   "2": "fold"
+  },
+  "dealer_seat": 6,
+  "active_seat": null,
+  "hero_seat_mismatch": false,
+  "missing": null,
+  "state_index": 3
+ },
+ {
+  "time_s": 7.0,
+  "image": "t000007.00",
+  "stage": "preflop",
+  "hero_cards": [
+   "Ah",
+   "9c"
+  ],
+  "board_cards": [],
+  "other_cards": [],
+  "villain_cards": {
+   "5": [
+    "2s",
+    "Qd"
+   ],
+   "4": [
+    "Tc",
+    "3c"
+   ]
+  },
+  "hero_dim": false,
+  "pot": 24.09,
+  "dealt_in": [
+   0
+  ],
+  "stacks": {
+   "0": 0.0,
+   "6": 79.3,
+   "3": 79.8,
+   "5": 0.0,
+   "2": 79.8,
+   "7": 78.3,
+   "1": 79.8,
+   "4": 82.1
+  },
+  "bets": {
+   "0": 0.2
+  },
+  "pills": {
+   "0": "check",
+   "6": "fold",
+   "3": "fold",
+   "5": "fold",
+   "2": "fold",
+   "7": "fold",
+   "1": "fold"
+  },
+  "dealer_seat": 6,
+  "active_seat": null,
+  "hero_seat_mismatch": false,
+  "missing": null,
+  "state_index": 4
+ },
+ {
+  "time_s": 8.0,
+  "image": "t000008.00",
+  "stage": "flop",
+  "hero_cards": [
+   "Ah",
+   "9c"
+  ],
+  "board_cards": [
+   "4s",
+   "5h",
+   "Ts"
+  ],
+  "other_cards": [],
+  "villain_cards": {
+   "4": [
+    "Tc",
+    "3c"
+   ],
+   "5": [
+    "2s",
+    "Qd"
+   ]
+  },
+  "hero_dim": false,
+  "pot": 24.09,
+  "dealt_in": [
+   0
+  ],
+  "stacks": {
+   "0": 0.0,
+   "6": 79.3,
+   "3": 79.8,
+   "5": 0.0,
+   "2": 79.8,
+   "7": 78.3,
+   "1": 79.8,
+   "4": 82.1
+  },
+  "bets": {},
+  "pills": {
+   "0": "check",
+   "6": "fold",
+   "3": "fold",
+   "5": "fold",
+   "2": "fold",
+   "7": "fold",
+   "1": "fold"
+  },
+  "dealer_seat": 6,
+  "active_seat": null,
+  "hero_seat_mismatch": false,
+  "missing": null,
+  "state_index": 5
+ },
+ {
+  "time_s": 10.0,
+  "image": "t000010.00",
+  "stage": "turn",
+  "hero_cards": [
+   "Ah",
+   "9c"
+  ],
+  "board_cards": [
+   "4s",
+   "5h",
+   "Ts",
+   "9s"
+  ],
+  "other_cards": [],
+  "villain_cards": {
+   "4": [
+    "Tc",
+    "3c"
+   ],
+   "5": [
+    "2s",
+    "Qd"
+   ]
+  },
+  "hero_dim": false,
+  "pot": 24.09,
+  "dealt_in": [
+   0
+  ],
+  "stacks": {
+   "0": 0.0,
+   "3": 79.8,
+   "1": 79.8,
+   "6": 79.3,
+   "7": 78.3,
+   "5": 0.0,
+   "2": 79.8,
+   "4": 82.1
+  },
+  "bets": {},
+  "pills": {
+   "0": "check",
+   "3": "fold",
+   "1": "fold",
+   "6": "fold",
+   "7": "fold",
+   "5": "fold",
+   "2": "fold"
+  },
+  "dealer_seat": 6,
+  "active_seat": null,
+  "hero_seat_mismatch": false,
+  "missing": null,
+  "state_index": 6
+ },
+ {
+  "time_s": 12.0,
+  "image": "t000012.00",
+  "stage": "river",
+  "hero_cards": [
+   "Ah",
+   "9c"
+  ],
+  "board_cards": [
+   "4s",
+   "5h",
+   "Ts",
+   "9s",
+   "7c"
+  ],
+  "other_cards": [],
+  "villain_cards": {
+   "4": [
+    "Tc",
+    "3c"
+   ],
+   "5": [
+    "2s",
+    "Qd"
+   ]
+  },
+  "hero_dim": false,
+  "pot": 24.09,
+  "dealt_in": [
+   0
+  ],
+  "stacks": {
+   "0": 0.0,
+   "6": 79.3,
+   "3": 79.8,
+   "7": 78.3,
+   "1": 79.8,
+   "5": 0.0,
+   "4": 82.1,
+   "2": 79.8
+  },
+  "bets": {},
+  "pills": {
+   "0": "check",
+   "6": "fold",
+   "3": "fold",
+   "7": "fold",
+   "1": "fold",
+   "5": "fold",
+   "2": "fold"
+  },
+  "dealer_seat": 6,
+  "active_seat": null,
+  "hero_seat_mismatch": false,
+  "missing": null,
+  "state_index": 7
+ },
+ {
+  "time_s": 14.0,
+  "image": "t000014.00",
+  "stage": "river",
+  "hero_cards": [
+   "Ah",
+   "9c"
+  ],
+  "board_cards": [
+   "4s",
+   "5h",
+   "Ts",
+   "9s",
+   "7c"
+  ],
+  "other_cards": [],
+  "villain_cards": {
+   "4": [
+    "Tc",
+    "3c"
+   ],
+   "5": [
+    "2s",
+    "Qd"
+   ]
+  },
+  "hero_dim": false,
+  "pot": 24.09,
+  "dealt_in": [
+   0
+  ],
+  "stacks": {
+   "6": 79.3,
+   "3": 79.8,
+   "7": 78.3,
+   "4": 323.0,
+   "2": 79.8,
+   "1": 79.8
+  },
+  "bets": {
+   "0": 0.2
+  },
+  "pills": {
+   "7": "fold",
+   "1": "fold",
+   "5": "fold"
+  },
+  "dealer_seat": 6,
+  "active_seat": null,
+  "hero_seat_mismatch": false,
+  "missing": null,
+  "state_index": 8
+ },
+ {
+  "time_s": 15.0,
+  "image": "t000015.00",
+  "stage": "river",
+  "hero_cards": [
+   "Ah",
+   "9c"
+  ],
+  "board_cards": [
+   "4s",
+   "5h",
+   "Ts",
+   "9s",
+   "7c"
+  ],
+  "other_cards": [],
+  "villain_cards": {
+   "4": [
+    "Tc",
+    "3c"
+   ],
+   "5": [
+    "2s",
+    "Qd"
+   ]
+  },
+  "hero_dim": false,
+  "pot": 24.09,
+  "dealt_in": [
+   0
+  ],
+  "stacks": {
+   "6": 79.3,
+   "3": 79.8,
+   "7": 78.3,
+   "4": 323.0,
+   "2": 79.8,
+   "1": 79.8
+  },
+  "bets": {
+   "0": 0.2
+  },
+  "pills": {
+   "7": "fold",
+   "4": "raise",
+   "1": "fold",
+   "5": "fold"
+  },
+  "dealer_seat": 6,
+  "active_seat": null,
+  "hero_seat_mismatch": false,
+  "missing": null,
+  "state_index": 9
+ },
+ {
+  "time_s": 16.0,
+  "image": "t000016.00",
+  "stage": "river",
+  "hero_cards": [
+   "Ah",
+   "9c"
+  ],
+  "board_cards": [
+   "4s",
+   "5h",
+   "Ts",
+   "9s",
+   "7c"
+  ],
+  "other_cards": [],
+  "villain_cards": {
+   "4": [
+    "Tc",
+    "3c"
+   ],
+   "5": [
+    "2s",
+    "Qd"
+   ]
+  },
+  "hero_dim": false,
+  "pot": 24.09,
+  "dealt_in": [
+   0
+  ],
+  "stacks": {
+   "6": 79.3,
+   "3": 79.8,
+   "7": 78.3,
+   "4": 323.0,
+   "2": 79.8,
+   "1": 79.8
+  },
+  "bets": {
+   "0": 0.2
+  },
+  "pills": {
+   "7": "fold",
+   "4": "raise",
+   "1": "fold",
+   "5": "fold"
+  },
+  "dealer_seat": 6,
+  "active_seat": null,
+  "hero_seat_mismatch": false,
+  "missing": null,
+  "state_index": 10
+ },
+ {
+  "time_s": 17.0,
+  "image": "t000017.00",
+  "stage": "preflop",
+  "hero_cards": [],
+  "board_cards": [],
+  "other_cards": [],
+  "villain_cards": {},
+  "hero_dim": false,
+  "pot": null,
+  "dealt_in": [],
+  "stacks": {
+   "6": 79.3,
+   "3": 79.8,
+   "7": 78.3,
+   "2": 79.8,
+   "1": 79.8,
+   "4": 323.0
+  },
+  "bets": {},
+  "pills": {
+   "7": "fold",
+   "1": "fold",
+   "5": "fold"
+  },
+  "dealer_seat": 6,
+  "active_seat": null,
+  "hero_seat_mismatch": false,
+  "missing": null,
+  "state_index": 11
+ },
+ {
+  "time_s": 18.0,
+  "image": "t000018.00",
+  "stage": "preflop",
+  "hero_cards": [],
+  "board_cards": [],
+  "other_cards": [],
+  "villain_cards": {},
+  "hero_dim": false,
+  "pot": null,
+  "dealt_in": [],
+  "stacks": {
+   "6": 79.3,
+   "3": 79.8,
+   "7": 78.3,
+   "2": 79.8,
+   "1": 79.8,
+   "4": 323.0
+  },
+  "bets": {},
+  "pills": {
+   "7": "fold",
+   "1": "fold"
+  },
+  "dealer_seat": 6,
+  "active_seat": null,
+  "hero_seat_mismatch": false,
+  "missing": null,
+  "state_index": 12
+ },
+ {
+  "time_s": 20.0,
+  "image": "t000020.00",
+  "stage": "preflop",
+  "hero_cards": [],
+  "board_cards": [],
+  "other_cards": [],
+  "villain_cards": {},
+  "hero_dim": false,
+  "pot": 1.0,
+  "dealt_in": [],
+  "stacks": {
+   "3": 79.7,
+   "1": 78.7,
+   "4": 322.9,
+   "7": 78.2,
+   "6": 79.2,
+   "2": 797.0
+  },
+  "bets": {},
+  "pills": {
+   "7": "fold"
+  },
+  "dealer_seat": 7,
+  "active_seat": null,
+  "hero_seat_mismatch": false,
+  "missing": null,
+  "state_index": 13
+ },
+ {
+  "time_s": 21.0,
+  "image": "t000021.00",
+  "stage": "preflop",
+  "hero_cards": [],
+  "board_cards": [],
+  "other_cards": [],
+  "villain_cards": {},
+  "hero_dim": false,
+  "pot": null,
+  "dealt_in": [],
+  "stacks": {},
+  "bets": {},
+  "pills": {},
+  "dealer_seat": null,
+  "active_seat": null,
+  "hero_seat_mismatch": false,
+  "missing": null,
+  "state_index": 14
+ }
+]

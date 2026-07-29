@@ -39,7 +39,7 @@ def _coaching(hand_id: int, session_id: int) -> CoachingResponse:
 def test_current_schema_contains_audit_and_staleness_fields() -> None:
     db = _db()
 
-    assert db.schema_version() == SCHEMA_VERSION == 12
+    assert db.schema_version() == SCHEMA_VERSION == 13
     tables = {
         row["name"]
         for row in db._execute(
@@ -212,7 +212,12 @@ def test_action_correction_types_and_export_round_trip_are_retained() -> None:
     imported_coaching = target.fetch_coaching_reviews_by_hand(imported_hand.id)
     assert len(imported_coaching) == 1
     assert imported_coaching[0].provider_name == "fixture"
-    assert imported_coaching[0].is_stale is False
+    # Retained coaching survives the round trip, and arrives stale: it describes
+    # the hand, ledger and winners of the database that produced it, and nothing
+    # here can verify that claim against rows with different ids. The text is
+    # kept so it can be re-run, not represented as current.
+    assert imported_coaching[0].is_stale is True
+    assert imported_coaching[0].stale_reason
 
     source.close()
     target.close()

@@ -8,6 +8,7 @@ from poker_tracker.math.study_math import mean_confidence_interval
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import Hand
 from poker_tracker.services.hand_accounting import reconcile_persisted_hand
+from poker_tracker.services.study_readiness import accounting_is_established
 
 AGGRESSIVE_ACTIONS = {"bet", "raise", "all-in"}
 PASSIVE_ACTIONS = {"check", "call"}
@@ -51,7 +52,16 @@ def compute_session_stats(db: PokerDatabase, session_id: int) -> SessionStats:
                 accounting = reconcile_persisted_hand(db, hand.id)
             except LedgerError:
                 accounting = None
-            if accounting is not None and accounting.is_authoritative:
+            # `accounting_is_established`, not `is_authoritative`. This
+            # substitution decides the session Total, the win rate, bb/100 and
+            # its confidence interval, the biggest-winner and biggest-loser
+            # lists, and `reconciled_result_count`. A hand whose reported result
+            # exists only because of an unanswered operator declaration was
+            # counted here as a reconciled fact: a declared 90% rake turned a
+            # recorded NULL into -32 BB and a -3200 bb/100 win rate on a hand
+            # Study refuses for exactly that reason.
+            if accounting_is_established(hand, accounting):
+                assert accounting is not None
                 hero = next(
                     (
                         player

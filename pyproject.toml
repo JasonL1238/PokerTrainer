@@ -14,6 +14,11 @@ ignore = ["E501"]
 python_version = "3.11"
 check_untyped_defs = true
 files = [
+    "poker_tracker/math/analytics.py",
+    "poker_tracker/persistence/completion.py",
+    "poker_tracker/services/hand_accounting.py",
+    "poker_tracker/services/study_readiness.py",
+    "poker_tracker/solver/eligibility.py",
     "poker_tracker/ui/auth.py",
     "poker_tracker/ui/components.py",
     "poker_tracker/ui/navigation.py",

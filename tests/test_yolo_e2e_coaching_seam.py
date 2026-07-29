@@ -62,12 +62,21 @@ def _spine_timeline() -> dict:
                     {"street": "flop", "action_index": 2, "seat": 5, "position": "BTN",
                      "player_name": "Villain", "action_type": "bet", "amount": 4.0,
                      "pot_before": 6.5, "stack_before": 96.5},
-                    {"street": "turn", "action_index": 1, "seat": 0, "position": "SB",
+                    {"street": "flop", "action_index": 3, "seat": 0, "position": "SB",
                      "player_name": "Hero", "action_type": "call", "amount": 4.0,
+                     "pot_before": 10.5, "stack_before": 96.5},
+                    {"street": "turn", "action_index": 1, "seat": 0, "position": "SB",
+                     "player_name": "Hero", "action_type": "check", "amount": None,
+                     "pot_before": 14.5, "stack_before": 92.5},
+                    {"street": "turn", "action_index": 2, "seat": 5, "position": "BTN",
+                     "player_name": "Villain", "action_type": "check", "amount": None,
                      "pot_before": 14.5, "stack_before": 92.5},
                     {"street": "river", "action_index": 1, "seat": 0, "position": "SB",
                      "player_name": "Hero", "action_type": "bet", "amount": 12.0,
-                     "pot_before": 18.5, "stack_before": 88.5},
+                     "pot_before": 14.5, "stack_before": 92.5},
+                    {"street": "river", "action_index": 2, "seat": 5, "position": "BTN",
+                     "player_name": "Villain", "action_type": "call", "amount": 12.0,
+                     "pot_before": 26.5, "stack_before": 92.5},
                 ],
                 "pot": 42.5,
                 "winner_seat": 0,
@@ -125,7 +134,7 @@ def test_yolo_reconstruction_to_coaching_prompt_seam(tmp_path) -> None:
     assert len(players) == 2
     assert sum(1 for p in players if p.is_hero) == 1
     assert {p.player_name for p in players} == {"Hero", "Villain"}
-    assert len(actions) == 6
+    assert len(actions) == 9
     assert {a.action_type for a in actions} == {"raise", "call", "check", "bet"}
     assert {a.street for a in actions} == {"preflop", "flop", "turn", "river"}
 

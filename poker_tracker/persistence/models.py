@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -37,6 +37,7 @@ ForcedBetType = Literal[
 ReviewStatus = Literal["unreviewed", "reviewed", "needs_correction"]
 FrameReviewStatus = Literal["unreviewed", "correct", "incorrect"]
 SourceType = Literal["manual", "cv_import", "corrected_cv"]
+CompletionStatus = Literal["complete", "partial", "uncertain", "not_applicable"]
 ReviewType = Literal["hand", "session"]
 SafetyMode = Literal["post_session_only"]
 CorrectionType = Literal[
@@ -45,6 +46,10 @@ CorrectionType = Literal[
     "action_create",
     "action_update",
     "action_delete",
+    # Re-declaring who took a pot is a source-fact correction like any other: the
+    # declared winner is the sole input the derived payouts, and therefore the
+    # hero-result cross-check, are computed from.
+    "settlement_award_update",
 ]
 HandIssueStatus = Literal["open", "resolved"]
 HandIssueType = Literal[
@@ -98,9 +103,35 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-class Session(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class PersistedModel(BaseModel):
+    """The validating boundary every stored record passes through.
 
+    ``allow_inf_nan=False`` is set HERE, once, rather than per field: NaN and
+    +/-Infinity are not measurements, they cannot be written to RFC 8259 JSON
+    (``json.dumps`` emits bare tokens no standards-compliant consumer can read,
+    so one ``dead_money=Infinity`` landed by a hostile import payload made the
+    whole session export unparseable), and a per-field constraint list is
+    exactly the enumerated-list decay that let ``ge=0`` admit ``inf`` while
+    every merely out-of-range value was refused. A float field added to any
+    model below inherits the refusal without anyone remembering this class
+    exists — the same reason ``completion._as_float_or_none`` refuses non-finite
+    evidence floats.
+    """
+
+    model_config = ConfigDict(from_attributes=True, allow_inf_nan=False)
+
+    # Set only by the persistence layer's read-time degradation when a stored
+    # row holds column values this build cannot validate (``db._salvaged_row``).
+    # Excluded from every dump for the same reason ``derived_result_substituted``
+    # is: it is a derivation about the CURRENT row, so no export, payload, or
+    # database row can persist or forge it, and the stored response shape is
+    # unchanged. Consumers that grant authority (the accounting cross-check)
+    # treat a non-empty value as an issue, so a degraded row can only ever add
+    # blockers, never clear one.
+    unreadable_columns: tuple[str, ...] = Field(default=(), exclude=True)
+
+
+class Session(PersistedModel):
     id: int | None = None
     name: str = Field(min_length=1)
     date_played: date = Field(default_factory=date.today)
@@ -110,8 +141,7 @@ class Session(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
-class Hand(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class Hand(PersistedModel):
 
     id: int | None = None
     session_id: int
@@ -132,6 +162,35 @@ class Hand(BaseModel):
     tags: list[str] = Field(default_factory=list)
     notes: str = ""
     created_at: datetime = Field(default_factory=utc_now)
+    completion_status: CompletionStatus = "not_applicable"
+    # Deliberately an open mapping rather than a nested model: unknown keys from a
+    # newer producer must survive a round trip instead of being dropped by
+    # extra="ignore", and a corrupt blob must never raise into the UI.
+    completion_evidence: dict[str, object] = Field(default_factory=dict)
+    # Set only by the READ-TIME display substitution that replaces `hero_bb_won`
+    # with the derived ledger result on an authoritative hand, so a writer can
+    # refuse an object whose "observation" is actually a derivation. Excluded from
+    # every dump, so no export, payload, or database row can carry or forge it,
+    # and the stored response shape is unchanged.
+    #
+    # It exists because a display copy is otherwise indistinguishable from a
+    # stored hand: one reached the 'Correct hand facts' form, and saving an
+    # unrelated field on that form persisted the derived result into the observed
+    # column. Fixing the one call site fixes one call site; refusing the object at
+    # the writer covers every present and future one.
+    derived_result_substituted: bool = Field(default=False, exclude=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def default_completion_status(cls, data: Any) -> Any:
+        """A reconstructed hand with no declared completion is unproven, not exempt."""
+        if isinstance(data, dict) and not data.get("completion_status"):
+            data = dict(data)
+            source = data.get("source_type") or "manual"
+            data["completion_status"] = (
+                "not_applicable" if source == "manual" else "uncertain"
+            )
+        return data
 
     @field_validator("hero_cards")
     @classmethod
@@ -158,8 +217,7 @@ class Hand(BaseModel):
         return self
 
 
-class HandPlayer(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class HandPlayer(PersistedModel):
 
     id: int | None = None
     hand_id: int
@@ -172,8 +230,7 @@ class HandPlayer(BaseModel):
     notes: str = ""
 
 
-class Action(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class Action(PersistedModel):
 
     id: int | None = None
     hand_id: int
@@ -199,10 +256,8 @@ class Action(BaseModel):
         return value
 
 
-class HandSettlement(BaseModel):
+class HandSettlement(PersistedModel):
     """Persisted assumptions and reconciliation summary for a completed hand."""
-
-    model_config = ConfigDict(from_attributes=True)
 
     hand_id: int
     status: SettlementStatus = "unsettled"
@@ -220,10 +275,8 @@ class HandSettlement(BaseModel):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
-class SettlementEntry(BaseModel):
+class SettlementEntry(PersistedModel):
     """A declared pot award or explicit uncalled-chip refund."""
-
-    model_config = ConfigDict(from_attributes=True)
 
     id: int | None = None
     hand_id: int
@@ -243,8 +296,7 @@ class SettlementEntry(BaseModel):
         return self
 
 
-class HandReview(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class HandReview(PersistedModel):
 
     id: int | None = None
     hand_id: int
@@ -260,10 +312,8 @@ class HandReview(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
-class HandCorrection(BaseModel):
+class HandCorrection(PersistedModel):
     """Auditable before/after evidence retained from post-session correction."""
-
-    model_config = ConfigDict(from_attributes=True)
 
     id: int | None = None
     hand_id: int
@@ -274,10 +324,8 @@ class HandCorrection(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
-class HandIssue(BaseModel):
+class HandIssue(PersistedModel):
     """A saved debug-later report with an immutable evidence snapshot."""
-
-    model_config = ConfigDict(from_attributes=True)
 
     id: int | None = None
     hand_id: int
@@ -307,8 +355,7 @@ class CoachingRequest(BaseModel):
     safety_mode: SafetyMode = "post_session_only"
 
 
-class CoachingResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class CoachingResponse(PersistedModel):
 
     id: int | None = None
     provider_name: str
@@ -325,10 +372,8 @@ class CoachingResponse(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
-class SolverRangeProfile(BaseModel):
+class SolverRangeProfile(PersistedModel):
     """Reusable user-owned range input for post-session solver work."""
-
-    model_config = ConfigDict(from_attributes=True)
 
     id: int | None = None
     name: str = Field(min_length=1, max_length=120)
@@ -344,10 +389,8 @@ class SolverRangeProfile(BaseModel):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
-class SolverRun(BaseModel):
+class SolverRun(PersistedModel):
     """Durable metadata for one external postflop solve."""
-
-    model_config = ConfigDict(from_attributes=True)
 
     id: int | None = None
     hand_id: int
@@ -373,8 +416,7 @@ class SolverRun(BaseModel):
     completed_at: datetime | None = None
 
 
-class VideoRecord(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class VideoRecord(PersistedModel):
 
     id: int | None = None
     session_id: int | None = None
@@ -390,8 +432,7 @@ class VideoRecord(BaseModel):
     notes: str = ""
 
 
-class ProcessingJob(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class ProcessingJob(PersistedModel):
 
     id: int | None = None
     job_type: JobType
@@ -407,8 +448,7 @@ class ProcessingJob(BaseModel):
     completed_at: datetime | None = None
 
 
-class ExtractedFrame(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class ExtractedFrame(PersistedModel):
 
     id: int | None = None
     video_id: int
@@ -419,10 +459,8 @@ class ExtractedFrame(BaseModel):
     created_at: datetime = Field(default_factory=utc_now)
 
 
-class ReconstructionFrameReview(BaseModel):
+class ReconstructionFrameReview(PersistedModel):
     """Human verdict for one source frame used by a reconstructed hand."""
-
-    model_config = ConfigDict(from_attributes=True)
 
     id: int | None = None
     job_id: int
@@ -436,8 +474,7 @@ class ReconstructionFrameReview(BaseModel):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
-class ROIProfile(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class ROIProfile(PersistedModel):
 
     id: int | None = None
     name: str = Field(min_length=1)
@@ -451,8 +488,7 @@ class ROIProfile(BaseModel):
     is_active: bool = False
 
 
-class ROIRegion(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class ROIRegion(PersistedModel):
 
     id: int | None = None
     profile_id: int
@@ -470,8 +506,7 @@ class ROIRegion(BaseModel):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
-class ROICropResult(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+class ROICropResult(PersistedModel):
 
     roi_key: str
     roi_type: ROIType

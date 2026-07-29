@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 import subprocess
 import sys
 import time
@@ -12,16 +11,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from cv_lab.scripts.pipeline.export_yolo_card_hands_for_app import export_timeline
+from poker_tracker.persistence.backup import BACKUP_KEEP_COUNT, backup_database
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.import_export import import_hands_into_session, import_session
 from poker_tracker.ui.jobs import mark_completed, mark_failed, update_progress
-from poker_tracker.ui.video_storage import BACKUPS_DIR, ensure_data_directories
+from poker_tracker.ui.video_storage import ensure_data_directories
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PIPELINE_SCRIPT = REPO_ROOT / "cv_lab" / "scripts" / "pipeline" / "run_two_model_pipeline.py"
 DEFAULT_TIMEOUT_SECONDS = 60 * 60
 HEARTBEAT_INTERVAL_SECONDS = 2
-BACKUP_KEEP_COUNT = 5
+
+# backup_database now lives in the persistence package so db.py can snapshot
+# before a migration; re-exported here because callers and tests import it from
+# this module.
+__all__ = ["BACKUP_KEEP_COUNT", "backup_database", "run_job", "main"]
 
 
 def run_job(
@@ -106,25 +110,6 @@ def run_job(
     finally:
         progress_path.unlink(missing_ok=True)
         db.close()
-
-
-def backup_database(db_path: Path, backup_dir: Path = BACKUPS_DIR) -> Path:
-    """Create a SQLite-consistent snapshot and retain the newest five."""
-    if str(db_path) == ":memory:":
-        raise ValueError("Cannot back up an in-memory database.")
-    backup_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    destination = backup_dir / f"poker_tracker_{stamp}.sqlite3"
-    with sqlite3.connect(str(db_path)) as source, sqlite3.connect(str(destination)) as target:
-        source.backup(target)
-    backups = sorted(
-        backup_dir.glob("poker_tracker_*.sqlite3"),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )
-    for old in backups[BACKUP_KEEP_COUNT:]:
-        old.unlink(missing_ok=True)
-    return destination
 
 
 def _run_pipeline(

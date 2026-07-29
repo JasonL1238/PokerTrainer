@@ -9,10 +9,80 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 VALID_BOARD_COUNTS = {0, 3, 4, 5}
 STREET_ORDER = {0: 0, 3: 1, 4: 2, 5: 3}
+# Reconstruction-spine warning codes that must BLOCK export, mirrored into the
+# validator report below. The export gate reads validator warnings only, so a
+# spine warning that is not mirrored here is latent: it lowers the confidence
+# score and lands in the notes string, but the hand still exports. That was true
+# of hero_seat_mismatch, which exported at exactly 0.80 -- not < 0.8, so it did
+# not even earn the LOW_CONFIDENCE tag.
+SPINE_FATAL_CODES = frozenset({
+    "board_zone_yield_zero",
+    "board_zone_yield_partial",
+    "board_empty_but_streets_advanced",
+    "actions_collapsed_to_one_street",
+    # Retained as GATE VOCABULARY although the spine no longer produces it: its
+    # producer (`_reject_stack_outliers`, a sibling-median magnitude net) is
+    # deleted, but a timeline built by an earlier build, hand-edited, or produced
+    # elsewhere can still carry the code, and an unrecognised code fails closed
+    # into rejection_codes with no name attached. The failure it described -- a
+    # dropped decimal -- is now refused at the reader, where the evidence is.
+    "amount_scale_implausible",
+    "side_pot_unsupported",
+    "hero_seat_mismatch",
+    "anchor_unavailable",
+    "stack_ledger_incoherent",
+    # Chip conservation: the action ledger sums ABOVE the pot by more than any
+    # uncalled shove could explain, so the record books money the pot does not
+    # contain (the measured cause was one raise emitted twice, from the stack
+    # delta and then again from the bet_text delta).
+    "contributions_exceed_pot",
+    # The published result and the hero's net disagree in sign -- e.g. "Villain
+    # wins" alongside hero_bb_won=+65.2. Two fields off the same stack ledger.
+    "result_contradicts_hero_net",
+    # The hand's MONEY LEDGER carries an UNKNOWN: a money action the spine proved
+    # happened but could not size, or a transition whose stack delta was
+    # unmeasurable because the reader refused a read. PLAN.md requires an
+    # incomplete sequence to be marked non-authoritative, and this is the code
+    # that does it -- routed through _split_source_codes into rejection_codes,
+    # which makes derive_completion_status return "uncertain".
+    "amounts_unknown_in_ledger",
+    # A player row whose starting stack the reader REFUSED. Accounting rejects a
+    # None starting stack outright (LedgerError), so the hand can never become
+    # an authoritative money record; before this code existed the fact travelled
+    # only as CompletionEvidence.extra and the hand exported as "complete", then
+    # dead-ended downstream with no clearing action.
+    "starting_stack_unknown",
+})
+# Every warning code build_yolo_hand_timeline.reconstruct (or the exporter's
+# manual-correction path) can emit. A spine warning OUTSIDE this set is a code
+# this build cannot assess at all, so it is mirrored as fatal rather than
+# ignored. Without that arm the export gate -- which reads this report and
+# nothing else -- failed OPEN on an unrecognised code while the same exported
+# record listed it under rejection_codes.
+RECOGNISED_SPINE_CODES = SPINE_FATAL_CODES | frozenset({
+    # The card classifier read one board/hero slot two different ways while the
+    # card sat on the table; the debounce absorbs the excursion and publishes the
+    # majority as fact. Measured over the five development recordings, 4 of 21
+    # hands carry such a contest and ONE of them is confirmed wrong on the pixels
+    # ('Js 6h 4c 8d' exported for a real 'Js 6h 4c 8h'); the other three settle on
+    # the reading the frames actually show. Deliberately NOT fatal: discarding
+    # three good hands to hold one bad one is the wrong trade at a 1-in-4 hit
+    # rate. It is severe enough (0.35) to put the hand under LOW_CONFIDENCE and
+    # into review, which is the signal that was missing entirely.
+    "board_card_identity_split",
+    "hero_card_identity_split",
+    "hero_cards_not_two",
+    "invalid_board_count",
+    "duplicate_visible_cards",
+    "pot_not_reconciled",
+    "pot_text_dropped",
+    "manual_hand_correction",
+})
 # Action-street ordering for reconstructed hands (spine output).
 ACTION_STREET_ORDER = {"preflop": 0, "flop": 1, "turn": 2, "river": 3, "showdown": 4}
 
@@ -281,6 +351,144 @@ def _hand_summary_warnings(hand: dict[str, Any]) -> list[dict[str, Any]]:
     return warnings
 
 
+def _further_betting_was_possible(hand: dict[str, Any], actions: list[Any]) -> bool:
+    """Could anyone still have acted after the last observed street?
+
+    A hand in which every action lands on one street is only suspicious if the
+    later streets HAD a betting round to miss. When all but one player is folded
+    or all-in, the board runs out with no action possible and one-street action is
+    the correct reconstruction -- a preflop all-in three-way pot is the ordinary
+    case, not a defect. Without this test the collapse check rejects every
+    preflop all-in hand.
+    """
+    folded: set[Any] = set()
+    all_in: set[Any] = set()
+    seats: set[Any] = set()
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        seat = action.get("seat", action.get("player_key"))
+        seats.add(seat)
+        if action.get("action_type") == "fold":
+            folded.add(seat)
+        elif action.get("action_type") == "all-in":
+            all_in.add(seat)
+    players = hand.get("players")
+    if isinstance(players, list) and players:
+        seats |= {p.get("seat") for p in players if isinstance(p, dict)}
+    return len(seats - folded - all_in) >= 2
+
+
+def _betting_round_reopened(actions: list[Any]) -> list[dict[str, Any]]:
+    """Action-sequence evidence that a street label covers MORE than one betting
+    round -- i.e. a street boundary the reconstruction never recorded.
+
+    Two structural impossibilities, both threshold-free:
+
+    * a pill-derived ``bet`` after a ``bet``/``raise``/``all-in`` already went in
+      on that street. Facing a bet the client shows RAISE, never BET, so a second
+      BET pill on one street means the client had started a new street;
+    * a ``check`` by a seat that already paid into that street. Calling the
+      current bet closes the action to you; it reopens only if someone raises,
+      and then you are facing a bet and cannot check.
+
+    Returns one entry per violation (empty when the sequence is consistent).
+    """
+    aggressed: set[Any] = set()
+    paid: set[tuple[Any, Any]] = set()
+    hits: list[dict[str, Any]] = []
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        street = action.get("street")
+        seat = action.get("seat", action.get("player_key"))
+        kind = action.get("action_type")
+        if kind == "bet" and street in aggressed:
+            hits.append({"reason": "bet_after_aggression", "street": street, "seat": seat,
+                         "action_index": action.get("action_index")})
+        elif kind == "check" and (street, seat) in paid:
+            hits.append({"reason": "check_after_paying_in", "street": street, "seat": seat,
+                         "action_index": action.get("action_index")})
+        if kind in {"bet", "raise", "all-in"}:
+            aggressed.add(street)
+        if kind in {"bet", "raise", "all-in", "call"}:
+            paid.add((street, seat))
+    return hits
+
+
+def _action_sequence_illegal(actions: list[Any]) -> list[dict[str, Any]]:
+    """Sequences that no poker client can produce, whatever the board looks like.
+
+    This is the check that was missing from the REACHABLE path.
+    ``_betting_round_reopened`` above is gated behind ``board_is_empty``, which
+    makes it dead code on every hand that has a board -- and 5 of the 15 hands
+    reconstructed from the development corpus carry sequences that contradict
+    themselves, every one exported at confidence 1.0 with no warning and three of
+    them at completion_status "complete".
+
+    Each rule is a physical impossibility, threshold-free, and evaluated only over
+    fields the exporter already publishes:
+
+    * a seat acts again after going all-in -- it has no chips left to act with;
+    * a seat folds immediately after its own call with no intervening aggression
+      -- a call closes the action to you, and it reopens only if someone raises;
+    * a seat checks while facing an unmatched bet on that street;
+    * a seat CALLS on a post-preflop street before anyone has bet on it -- there
+      is nothing to call. (Preflop is exempt: the blinds are a standing bet.)
+      This is the shape the green CALL/BET pill ambiguity took when the colour
+      fallback forced it to "call": 5 of the 21 hands reconstructed from the
+      development corpus carried one, every one with spine warnings=[] and no
+      validator code. It is fixed at the source in region_detections, and this
+      is the permanent net under it -- a mislabelled aggressive action does not
+      just publish the wrong word, it makes the spine drop the folds that follow.
+
+    The two rules of ``_betting_round_reopened`` are deliberately NOT repeated
+    here: they support the stronger "a street boundary was missed" claim, which
+    this file only has the measurement to make on an empty board.
+    """
+    hits: list[dict[str, Any]] = []
+    all_in: set[Any] = set()
+    aggressor: dict[Any, Any] = {}            # street -> seat of the last aggressor
+    aggressions: dict[Any, int] = {}          # street -> count of bet/raise/all-in
+    committed: set[tuple[Any, Any]] = set()   # (street, seat) put chips in this street
+    called_at: dict[tuple[Any, Any], int] = {}  # aggression count when this seat called
+
+    def hit(reason: str, action: dict[str, Any]) -> None:
+        hits.append({"reason": reason, "street": action.get("street"),
+                     "seat": action.get("seat", action.get("player_key")),
+                     "action_index": action.get("action_index")})
+
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        street = action.get("street")
+        seat = action.get("seat", action.get("player_key"))
+        kind = action.get("action_type")
+        key = (street, seat)
+        if seat in all_in:
+            hit("acts_after_all_in", action)
+        elif kind == "fold" and key in called_at \
+                and called_at[key] == aggressions.get(street, 0):
+            # Nobody has aggressed since this seat's own call, so there is nothing
+            # left for it to fold to.
+            hit("fold_after_own_call", action)
+        elif kind == "check" and street in aggressor \
+                and aggressor[street] != seat and key not in committed:
+            hit("check_facing_a_bet", action)
+        elif kind == "call" and street != "preflop" and street not in aggressor:
+            hit("call_with_nothing_to_call", action)
+        if kind in {"bet", "raise", "all-in"}:
+            aggressor[street] = seat
+            aggressions[street] = aggressions.get(street, 0) + 1
+        if kind in {"bet", "raise", "all-in", "call"}:
+            committed.add(key)
+        if kind == "call":
+            called_at[key] = aggressions.get(street, 0)
+        if kind == "all-in":
+            all_in.add(seat)
+    return hits
+
+
 def _hand_reconstruction_warnings(hand: dict[str, Any]) -> list[dict[str, Any]]:
     """Warnings for the spine's extended fields (players / actions / pot / winner).
 
@@ -293,8 +501,73 @@ def _hand_reconstruction_warnings(hand: dict[str, Any]) -> list[dict[str, Any]]:
 
     context = {"hand_number": hand.get("hand_number"), "time_s": hand.get("t_start"), "image": None}
 
-    # Per-street pot must not shrink across streets.
+    # Mirror the spine's own fatal reconstruction warnings so the export gate,
+    # which reads this report and nothing else, actually rejects them.
+    for code in hand.get("warnings", []) or []:
+        if code in SPINE_FATAL_CODES:
+            warnings.append(_warn(
+                code, f"reconstruction spine raised {code}", **context,
+            ))
+        elif code not in RECOGNISED_SPINE_CODES:
+            warnings.append(_warn(
+                code, f"reconstruction spine raised unrecognised code {code}", **context,
+            ))
+
+    # A hand whose streets advanced past preflop must have a board. An empty board
+    # is a legal card count everywhere else in this file (VALID_BOARD_COUNTS
+    # contains 0), which is exactly why a hand that lost its whole community row
+    # exported clean: nothing anywhere contradicted board_cards="" on a hand whose
+    # own street summary listed a flop, a turn and a river.
     streets = hand.get("streets")
+    board_is_empty = not _cards(hand.get("board") or [])
+    if isinstance(streets, list) and board_is_empty:
+        named = {s.get("street") for s in streets if isinstance(s, dict) and s.get("street")}
+        if len(named) > 1:
+            warnings.append(_warn(
+                "board_empty_but_streets_advanced",
+                "hand summary has no board but reports more than one street",
+                streets=sorted(named), **context,
+            ))
+
+    # Second, INDEPENDENT trigger for the same fact, read off the ACTIONS.
+    #
+    # The street summary above is derived from the same board readings as `board`
+    # itself, so when the community row is lost the two collapse together and the
+    # check cannot fire on the failure it was written for. Measured: the real AR
+    # 1.750 hand exported with board_cards='', streets=['preflop'] and 13 actions
+    # all labelled preflop -- and scored 1.0 with no warning anywhere.
+    #
+    # The action sequence is an independent witness, because with no board there
+    # can only ever have been ONE betting round; more than one is impossible
+    # rather than merely unusual. Over 164 reconstructed hands from 13 recordings
+    # -- 19 of them legitimate empty-board preflop folds -- this fires 0 times; on
+    # the real destroyed hand it fires 4 times.
+    #
+    # The board_is_empty guard is load-bearing, not decoration: without it the
+    # same evidence also fires on 13 of those 164 hands whose board and streets
+    # are complete, where an extra within-street betting round is a much weaker
+    # claim that this file has no measurement to support.
+    reopened = (_betting_round_reopened(hand["actions"])
+                if board_is_empty and isinstance(hand.get("actions"), list) else [])
+    if reopened:
+        warnings.append(_warn(
+            "board_empty_but_streets_advanced",
+            "hand has no board but its actions span more than one betting round",
+            evidence=reopened[:4], **context,
+        ))
+
+    # Action-sequence legality, on the REACHABLE path this time: the check above
+    # only runs on an empty board, so it is dead code on every hand that has one.
+    illegal = (_action_sequence_illegal(hand["actions"])
+               if isinstance(hand.get("actions"), list) else [])
+    if illegal:
+        warnings.append(_warn(
+            "action_sequence_illegal",
+            "hand contains an action sequence no client can produce",
+            evidence=illegal[:4], **context,
+        ))
+
+    # Per-street pot must not shrink across streets.
     if isinstance(streets, list):
         prev_pot: float | None = None
         for street in streets:
@@ -312,6 +585,18 @@ def _hand_reconstruction_warnings(hand: dict[str, Any]) -> list[dict[str, Any]]:
 
     # Actions must not move to an earlier street.
     actions = hand.get("actions")
+    if isinstance(actions, list) and actions and isinstance(streets, list):
+        named = {s.get("street") for s in streets if isinstance(s, dict) and s.get("street")}
+        acted = {a.get("street") for a in actions if isinstance(a, dict) and a.get("street")}
+        if len(named) > 1 and len(acted) == 1 and _further_betting_was_possible(hand, actions):
+            # Every action of a multi-street hand landed on one street: the street
+            # attribution collapsed. Observed for real as 13 actions all labelled
+            # preflop on a four-street showdown, with no warning anywhere.
+            warnings.append(_warn(
+                "actions_collapsed_to_one_street",
+                "every action is on one street but the hand reports several",
+                streets=sorted(named), action_street=sorted(acted)[0], **context,
+            ))
     if isinstance(actions, list):
         prev_order: int | None = None
         for action in actions:
@@ -353,11 +638,65 @@ def _hand_reconstruction_warnings(hand: dict[str, Any]) -> list[dict[str, Any]]:
     return warnings
 
 
-def _confidence_score(warning_count: int, checked_states: int) -> float:
-    if checked_states <= 0:
-        return 0.0
-    score = 1.0 - (warning_count / max(checked_states * 3, 1))
-    return round(max(0.0, min(1.0, score)), 3)
+# Severity per warning code: the fraction of a hand's trustworthiness the fact
+# destroys. A fact that makes the reconstruction WRONG (rather than merely
+# incomplete) is >= 0.5, so any one of them alone puts the hand under the 0.8
+# LOW_CONFIDENCE line.
+WARNING_SEVERITY: dict[str, float] = {
+    "board_zone_yield_zero": 0.60,
+    "board_zone_yield_partial": 0.60,
+    "board_empty_but_streets_advanced": 0.60,
+    "side_pot_unsupported": 0.60,
+    "actions_collapsed_to_one_street": 0.50,
+    "amount_scale_implausible": 0.50,
+    # Money of unknown size in the ledger. 0.50 is the "the reconstruction is
+    # WRONG rather than merely incomplete" band: _split_source_codes routes any
+    # code at or above _REJECTION_SEVERITY into rejection_codes, which is what
+    # blocks the promotion to completion_status "complete".
+    "amounts_unknown_in_ledger": 0.50,
+    # An unknown starting stack is the same class of ledger unknown: every
+    # derived money fact for that seat (effective stack, SPR, contributions)
+    # rests on a number the reader declined to supply, and accounting fails
+    # closed on it permanently. >= 0.5 routes it into rejection_codes.
+    "starting_stack_unknown": 0.50,
+    # The hand's own action list contradicts itself, so every derived number
+    # (pot, contributions, hero net) rests on a sequence that never happened.
+    "action_sequence_illegal": 0.50,
+    "stack_ledger_incoherent": 0.50,
+    "anchor_unavailable": 0.40,
+    "reconciliation_failed": 0.35,
+    # See RECOGNISED_SPINE_CODES: 1 of the 4 contested hands measured on the
+    # development corpus has a confirmed-wrong card. 0.35 lands a contested hand
+    # at 0.65 -- tagged LOW_CONFIDENCE and held for review, not shipped as fact.
+    "board_card_identity_split": 0.35,
+    "hero_card_identity_split": 0.35,
+    "hero_seat_mismatch": 0.30,
+    "board_regression": 0.30,
+    "street_order_issue": 0.30,
+    "invalid_board_count": 0.30,
+    "invalid_hero_count": 0.30,
+    "duplicate_visible_cards": 0.30,
+    "pot_regression": 0.25,
+    "action_street_invalid": 0.25,
+    "action_street_order": 0.25,
+    "position_issue": 0.20,
+    "missing_label": 0.10,
+}
+UNKNOWN_WARNING_SEVERITY = 0.20
+
+
+def _confidence_score(warnings: list[dict[str, Any]]) -> float:
+    """Severity-weighted confidence in the RECONSTRUCTION.
+
+    The previous form was a warning DENSITY -- ``1 - warnings / (3 * states)`` --
+    which made a hand's score depend on how many frames it happened to span. Two
+    fatal warnings over 61 checked states scored 0.989 on a session in which every
+    board had been destroyed. Warning counts do not divide by frame count; a fact
+    that invalidates a hand invalidates it however long the hand was.
+    """
+    return round(max(0.0, 1.0 - sum(
+        WARNING_SEVERITY.get(w.get("code"), UNKNOWN_WARNING_SEVERITY) for w in warnings
+    )), 3)
 
 
 def validate_timeline(timeline: dict[str, Any]) -> dict[str, Any]:
@@ -403,10 +742,11 @@ def validate_timeline(timeline: dict[str, Any]) -> dict[str, Any]:
             "t_end": hand.get("t_end"),
             "checked_states": len(hand_states),
             "warning_count": len(warnings),
-            "confidence_score": _confidence_score(len(warnings), max(len(hand_states), 1)),
+            "confidence_score": _confidence_score(warnings),
             "warnings": warnings,
         })
 
+    hand_scores = [report["confidence_score"] for report in reports]
     return {
         "summary": {
             "malformed": False,
@@ -414,7 +754,14 @@ def validate_timeline(timeline: dict[str, Any]) -> dict[str, Any]:
             "checked_states": checked_states,
             "warning_hands": sum(1 for report in reports if report["warning_count"]),
             "total_warnings": total_warnings,
-            "confidence_score": _confidence_score(total_warnings, max(checked_states, 1)),
+            # A session is only as trustworthy as its WORST hand. Averaging (which
+            # the density form effectively did across the whole timeline) is what
+            # let a session containing destroyed boards report 0.989. Reported for
+            # operators; never used as a gate -- the gate is per hand.
+            "confidence_score": round(min(hand_scores), 3) if hand_scores else 0.0,
+            "median_hand_confidence": (
+                round(median(hand_scores), 3) if hand_scores else 0.0
+            ),
         },
         "hands": reports,
     }

@@ -18,26 +18,21 @@ import cv2
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
+# DEVELOPMENT recordings ONLY. This table used to map v01-v04 and v06-v07 as
+# well -- the validation and locked-test recordings -- and this script decoded
+# them with av/cv2 to build a gallery, in direct violation of the corpus split
+# (they are NEVER-OPEN until their gates run). Those entries are deleted, not
+# commented out: any tool that needs a gallery frame from a held-out recording
+# is a tool that must not run before the locked evaluation does. Do not add
+# them back.
 VIDEO_GLOB = {
     "v00": "*clubwpt_session_01*",
-    "v01": "*2026-07-09*1.35.44*",
-    "v02": "*2026-07-09*6.00.13*",
-    "v03": "*2026-07-10*8.06.40*",
-    "v04": "*2026-07-10*8.45.21*",
     "v05": "*2026-07-11*12.45.27*",
-    "v06": "*2026-07-16*3.49.00*",
-    "v07": "*2026-07-16*4.00.45*",
 }
 
 SELECTION = {
     "v00": [7, 8, 9],
-    "v01": [6, 7, 9],
-    "v02": [6, 7, 13],
-    "v03": [2, 9, 22],
-    "v04": [2, 3, 12],
     "v05": [1, 29, 32, 44, 45],
-    "v06": [1, 7],
-    "v07": [2, 5],
 }
 
 MAX_FRAMES_PER_HAND = 6

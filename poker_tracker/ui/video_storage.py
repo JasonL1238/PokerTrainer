@@ -7,6 +7,13 @@ import uuid
 from pathlib import Path
 from typing import BinaryIO
 
+# NOTE: there is deliberately no BACKUPS_DIR here. It used to be defined in this
+# module as well as in poker_tracker.persistence.backup, and the two copies drifted
+# silently: redirecting this one -- the historical location, and the obvious place
+# to monkeypatch -- redirected no backup at all, because backup_database resolves
+# poker_tracker.persistence.backup.BACKUPS_DIR at call time. That module owns the
+# value; import it from there, and patch it there.
+
 # Anchored to the project root so the app behaves the same regardless of the
 # working directory it is launched from.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -16,7 +23,6 @@ FRAMES_DIR = DATA_DIR / "frames"
 EXPORTS_DIR = DATA_DIR / "exports"
 ROI_PREVIEWS_DIR = DATA_DIR / "roi_previews"
 CV_TIMELINES_DIR = DATA_DIR / "cv_timelines"
-BACKUPS_DIR = DATA_DIR / "backups"
 JOB_LOGS_DIR = DATA_DIR / "job_logs"
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi"}
 

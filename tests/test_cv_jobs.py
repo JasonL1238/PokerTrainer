@@ -241,3 +241,11 @@ def test_read_pipeline_progress_handles_live_snapshot_and_startup_race(
         encoding="utf-8",
     )
     assert run_cv_job._read_pipeline_progress(progress_path) == (20, 20, "frames")
+
+
+def test_backup_helper_is_reexported_from_run_cv_job() -> None:
+    """db.py owns the migration snapshot now; the CV worker import must keep working."""
+    from poker_tracker.persistence import backup as backup_module
+
+    assert backup_database is backup_module.backup_database
+    assert BACKUP_KEEP_COUNT == backup_module.BACKUP_KEEP_COUNT
