@@ -17,12 +17,19 @@ the way it does.
 - `13` is the final Phase 5 measurement across all five development geometries,
   with the before/after numbers, the one read that regressed, and an explicit
   list of what the phase does not establish.
-- `14` is the latest note: the Option A reader contract (a value only when
-  provably unambiguous, else a named UNKNOWN) and the round-1 adversarial
-  repair — occlusion/clipping/missing-digit defences, downstream UNKNOWN
-  integrity, the mutation-testing kills, and the corrected coverage figures
-  (9 of 31 hands over six development recordings), superseding note 13's
-  11-of-21 and the stale PLAN.md paragraph.
+- `14` records the Option A reader contract (a value only when provably
+  unambiguous, else a named UNKNOWN) and the round-1 adversarial repair —
+  occlusion/clipping/missing-digit defences, downstream UNKNOWN integrity, the
+  mutation-testing kills, and the corrected coverage figures (9 of 31 hands over
+  six development recordings), superseding note 13's 11-of-21 and the stale
+  PLAN.md paragraph.
+- `15` is the latest note: adversarial repair round 2 against the Option A
+  contract. Nine of fifteen findings were already closed and were re-verified;
+  the three real ones were an unpinned P1, a sign check that enumerated two of
+  four result values, and an unpinned row-band split. It also records the
+  ablation audit of all nineteen acceptance-path predicates, a false positive
+  disproved in an adversary's own evidence, and the fact that the round moved no
+  coverage at all.
 
 Status and TODO statements in an earlier finding are historical and may be
 completed or superseded by a later finding. Use the repository root `PLAN.md`

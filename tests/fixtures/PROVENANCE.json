@@ -236,6 +236,20 @@
    "was_before_fix": 0.0,
    "defect": "wide occluder: the repo's own chip-sprite fixture (bet_chip_sprite_no_text.png, 1.6x run height) pasted over the leading digits of a real '343.60 BB' crop leaves three unexplained mask fragments beyond the 0.28*run_h adjacency window, and the surviving trailing '0' shipped as a confident 0.0 -- which the spine books as an all-in. P2's far arm now polices glyph-scale row ink at any distance (unexplained_ink_in_numeral). Round-2 adversary A, attack D.",
    "source": "optA g0723b t=138 stack_text_21 ('343.60 BB', 1272x896) + tests/fixtures/ocr/bet_chip_sprite_no_text.png"
+  },
+  "stack_212_90_timer_badge_at_2062x1178.png": {
+   "true": 212.9,
+   "current_read": null,
+   "was_before_fix": 12.0,
+   "defect": "P1 (suffix_not_bb) was the largest refusal class in the corpus and was pinned by NO test: ablating it to `if False and ...` left the whole owned CV suite green while 218 of 219 suffix_not_bb refusals came back as confident values. This crop is the strongest of them -- the seat panel carries the stack ('212.90 BB') AND a circular action-timer badge reading '12', the badge's 2-digit run wins the read, and a timer carries no 'BB' because it is not an amount. With P1 disabled the reader ships a confident 12.0 at score 0.796, a 17.7x under-read of a real stack (the same crop and the same 12.0 recorded in note 12 under the old ranking key). Round-2 adversary C finding; crop and defect both production-real.",
+   "expected": "unknown, suffix_not_bb",
+   "source": "Screen Recording 2026-06-21 12.41.17 AM (2062x1178, development), stack_text, t=177.0"
+  },
+  "stack_124_80_name_row_above_at_2138x1402.png": {
+   "true": 124.8,
+   "defect": "none -- this crop is the pin for the 0.6*max_h ROW-BAND SPLIT, the other acceptance-path mechanic round-2 mutation found unpinned (collapsing every glyph into one band survived all 280 tests). Its top edge carries the tail of the player's NAME row above the value; with the split disabled the name's glyphs become ink on the numeral's own row and P2 refuses. Corpus direction of that mutant over all 18,006 retained development crops: 236 value->UNKNOWN, 0 UNKNOWN->value, 0 value->different -- coverage-only, which is why the finding is not release-blocking.",
+   "expected": "124.8, dot",
+   "source": "clubwpt_session_01.mov (2138x1402, development -- 228 of its frames are in the region detector's training manifest), stack_text, t=2.0"
   }
  }
 }

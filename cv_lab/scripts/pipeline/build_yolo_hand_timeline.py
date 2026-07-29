@@ -257,6 +257,25 @@ def _uncalled_shove_headroom(actions: Iterable[dict[str, Any]]) -> float:
     return round(headroom, 2)
 
 
+# The sign a published `result` FORBIDS the hero's net from taking. Stated as a
+# table over the CLOSED vocabulary the producer emits (see the winner_seat /
+# hero_folded branch: "Hero wins", "Villain wins", "Hero folds", "") so that the
+# check covers the space instead of enumerating two of its members.
+#
+# "" is absent deliberately and is not an oversight: an unresolved hand asserts
+# nothing about who won, so no net contradicts it. "Hero folds" IS a claim -- a
+# hero who folded forfeits what it committed and cannot come out ahead. (A hero
+# who bets everyone off the pot is winner_seat == 0, i.e. "Hero wins"; the fold
+# branch is only reached when the hero itself surrendered.) Its omission is the
+# round-2 finding: the check could not fire on a folded hero with a positive net,
+# which is the same two-fields-off-one-ledger contradiction as the other two.
+_RESULT_FORBIDS_NET_SIGN = {
+    "Hero wins": -1,      # a hero who won the pot cannot net negative
+    "Villain wins": +1,   # a hero who lost the pot cannot net positive
+    "Hero folds": +1,     # a hero who folded cannot net positive
+}
+
+
 def _result_contradicts_hero_net(result: str, hero_bb_won: float | None) -> bool:
     """True when the published result and the hero's net disagree in SIGN.
 
@@ -264,14 +283,18 @@ def _result_contradicts_hero_net(result: str, hero_bb_won: float | None) -> bool
     result="Villain wins" alongside hero_bb_won=+65.2 (the hero had in fact bet
     both opponents off the turn). Zero is not a contradiction -- a hero who folded
     for free, or whose net is unobserved, nets 0 under either result.
+
+    Latent on the development corpus in the "Hero folds" direction: all 5 folded
+    hands net -0.5, 0.0, or unknown. It is covered because the 0.5 BB read jitter
+    that motivated _WIN_GAIN_MIN_POT_RATIO is enough to make a folded hero's net
+    read positive, and there was no check to catch it.
     """
     if hero_bb_won is None or abs(hero_bb_won) <= _EPS:
         return False
-    if result == "Hero wins":
-        return hero_bb_won < 0
-    if result == "Villain wins":
-        return hero_bb_won > 0
-    return False
+    forbidden = _RESULT_FORBIDS_NET_SIGN.get(result)
+    if forbidden is None:
+        return False
+    return hero_bb_won > 0 if forbidden > 0 else hero_bb_won < 0
 
 
 def _frame_state(frame: rd.Frame, session_anchor: rd.TableAnchor | None = None) -> dict[str, Any]:

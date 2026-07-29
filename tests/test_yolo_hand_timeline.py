@@ -800,6 +800,38 @@ def test_result_and_hero_net_must_agree_in_sign():
     assert _result_contradicts_hero_net("", 65.2) is False
 
 
+def test_a_folded_hero_cannot_net_positive():
+    """The THIRD result value, which the sign check did not cover (round 2).
+
+    `result` comes from a closed vocabulary -- "Hero wins", "Villain wins",
+    "Hero folds", "" -- and the check enumerated two of the four, so a hand
+    claiming the hero FOLDED while crediting it a positive net could not raise
+    result_contradicts_hero_net. A hero who folds forfeits what it committed; the
+    case where the hero takes the pot uncontested is winner_seat == 0, i.e.
+    "Hero wins", so the fold branch is only reached when the hero surrendered and
+    a positive net there is the same self-contradiction the other two catch.
+
+    Latent on the corpus, deliberately pinned anyway: all 5 development
+    "Hero folds" hands net -0.5, 0.0 or unknown, so nothing here would have
+    caught the omission by running the pipeline."""
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import (
+        _RESULT_FORBIDS_NET_SIGN,
+        _result_contradicts_hero_net,
+    )
+
+    assert _result_contradicts_hero_net("Hero folds", 65.2) is True
+    assert _result_contradicts_hero_net("Hero folds", 0.5) is True
+    # The legal directions for a folded hero: a loss, a free fold, an unread net.
+    assert _result_contradicts_hero_net("Hero folds", -12.0) is False
+    assert _result_contradicts_hero_net("Hero folds", 0.0) is False
+    assert _result_contradicts_hero_net("Hero folds", None) is False
+    # Every result the spine can PUBLISH is either in the table or is the empty
+    # "unresolved" token. A new result value added to the producer without a rule
+    # here would silently get no sign check at all, which is how "Hero folds"
+    # went uncovered.
+    assert set(_RESULT_FORBIDS_NET_SIGN) == {"Hero wins", "Villain wins", "Hero folds"}
+
+
 def test_the_spine_names_no_reader_token_it_does_not_own():
     """SUPERSEDES test_the_stack_outlier_nets_vocabulary_tracks_the_readers,
     which SUPERSEDED test_stack_outlier_net_is_not_disabled_by_an_INFERRED_decimal.

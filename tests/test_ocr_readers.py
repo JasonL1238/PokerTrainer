@@ -397,6 +397,7 @@ def _compose(
     dots: list[tuple[int, int, int]] | None = None,
     specks: list[tuple[int, int, int, float]] | None = None,
     suffix: bool = True,
+    suffix_chars: str = "BB",
 ):
     """Lay out `digits` with exact pixel gaps, then a word space and the "BB"
     suffix; `dot` is (gap_index, w, h), drawn on the digit baseline. `dots` draws
@@ -410,10 +411,16 @@ def _compose(
     The suffix is rendered by default because the reader requires it. The word
     space is 0.60 of glyph height, inside the measured 0.55-and-up band that
     separates "POT:" and "BB" from the value, and comfortably outside the 0.28
-    letter spacing that defines the numeral."""
+    letter spacing that defines the numeral.
+
+    `suffix=False` renders the numeral with NO terminator, and `suffix_chars`
+    renders a MALFORMED one ("8B", "B"). Both are P1's own condition, which is
+    otherwise unreachable synthetically: every other synthetic crop here renders
+    the well-formed "BB" precisely because the reader requires it, so nothing
+    exercised the refusal itself."""
     bitmaps = [_digit_bitmap(c, scale) for c in digits]
     height = max(b.shape[0] for b in bitmaps)
-    caps = [_digit_bitmap("B", scale), _digit_bitmap("B", scale)] if suffix else []
+    caps = [_digit_bitmap(c, scale) for c in suffix_chars] if suffix else []
     word = round(0.60 * height)
     kern = max(1, round(0.10 * height))
     tail = word + sum(b.shape[1] for b in caps) + kern * len(caps) if caps else 0
@@ -560,10 +567,116 @@ def test_a_malformed_bb_suffix_makes_the_read_unknown(production_bank) -> None:
     assert detail.value is None, "a crop with no legible numeral must not ship 1.0"
     # This crop used to fall through to P1 (suffix "3B"). With the policed set
     # completed, the sprite fragments AROUND the '1' are unexplained ink and P2
-    # fires first -- an earlier, stronger refusal of the same crop. P1's own
-    # firing is pinned by test_bb_suffix_is_never_absorbed_into_the_numeral and
-    # by the 221 suffix_not_bb refusals in the corpus census.
+    # fires first -- an earlier, stronger refusal of the same crop, so this test
+    # does NOT exercise P1 at all.
+    #
+    # An earlier version of this comment claimed "P1's own firing is pinned by
+    # test_bb_suffix_is_never_absorbed_into_the_numeral and by the 221
+    # suffix_not_bb refusals in the corpus census". Both halves were false. That
+    # test only asserts the caps are not absorbed INTO the run (its crop's value
+    # stays unknown by a different route), a corpus census is not a test, and
+    # ablating P1 to `if False and ...` left the whole owned CV suite GREEN while
+    # 218 of the 219 suffix_not_bb refusals came back as confident values. P1's
+    # own firing is pinned by the two tests directly below.
     assert detail.decimal_source == "unexplained_ink_in_numeral"
+
+
+def test_p1_refuses_the_timer_badge_that_outscores_the_stack(production_bank) -> None:
+    """P1's own firing, on the real crop that proves it is load-bearing.
+
+    Round-2 adversary C ablated P1 to `if False and suffix[:2] != ["B", "B"]:`
+    and the entire owned CV suite stayed green (280 passed) while 218 of the 219
+    suffix_not_bb refusals in the retained development crops came back as
+    confident values. This is the strongest of them, and the reason the whole
+    predicate exists.
+
+    The crop is a g0621 seat panel (2062x1178) carrying TWO numerals: the stack,
+    which the screen renders "212.90 BB", and a circular action-timer badge
+    reading "12" over the player's avatar. The badge's run is the one the reader
+    wins with -- note 12 recorded the same crop shipping a confident 12.0 back
+    when run completeness was a ranking key rather than a refusal -- and the
+    badge carries no "BB", because a timer is not an amount. So P1 is the
+    predicate that separates "a number on the felt" from "the number this HUD
+    element is for", and with it disabled the reader publishes a 17.7x
+    under-read of a real stack at score 0.796.
+
+    Verified to fail first against the ablated form: with P1 off this crop reads
+    12.0 and the first assertion below fails."""
+    detail = production_bank.read_number_detail(
+        cv2.imread(str(FIXTURES / "stack_212_90_timer_badge_at_2062x1178.png"))
+    )
+    assert detail.value is None, "a numeral with no BB terminator is not proven"
+    assert detail.value != 12.0, "the timer badge must never ship as the stack"
+    assert detail.decimal_source == "suffix_not_bb", (
+        "P1 must be the predicate that refuses this crop; if another one now "
+        "fires first, P1 is once again pinned by nothing")
+
+
+def test_p1_fires_on_every_malformed_terminator(scaled_digit_templates) -> None:
+    """P1 as a FAMILY, stated structurally rather than on one frozen crop.
+
+    The three instances below are the ways a terminator can be malformed while
+    the numeral itself stays clean -- no suffix at all (occluded, or clipped away
+    by a tight detector box), one cap instead of two, and a second cap the bank
+    reads as an '8'. Each was constructed for this test and each was verified
+    against the ablated predicate: with P1 off, all three return a confident
+    312.0.
+
+    Two neighbouring cases are deliberately NOT asserted here, because a test
+    that claims a predicate fires where a different one actually fires is how
+    P1 came to be unpinned in the first place:
+      * "8B"  -- P2 fires first (the leading cap is not a proven affix), an
+                 earlier and stronger refusal of the same crop;
+      * "88"  -- P1 fires here, but the ablated reader is caught downstream by
+                 integer_over_decimal_band, so the case cannot kill the mutant.
+    Both are recorded rather than asserted."""
+    bank = TemplateOCR(dict(scaled_digit_templates), {})
+    for label, kwargs in (
+        ("no terminator", {"suffix": False}),
+        ("one cap", {"suffix_chars": "B"}),
+        ("second cap reads as a digit", {"suffix_chars": "B8"}),
+    ):
+        detail = bank.read_number_detail(_compose("312", 0.9, [3, 3], **kwargs))
+        assert detail.value is None, f"{label}: shipped {detail.value}"
+        assert detail.decimal_source == "suffix_not_bb", f"{label}: {detail!r}"
+    # Negative control: the same numeral WITH a well-formed suffix reads. Without
+    # this, setting P1 to refuse unconditionally would also pass the loop above.
+    ok = bank.read_number_detail(_compose("312", 0.9, [3, 3]))
+    assert ok.value == 312.0
+    assert ok.decimal_source == "integer"
+
+
+def test_the_row_band_split_keeps_a_name_row_out_of_the_numeral(production_bank) -> None:
+    """The 0.6*max_h row-band split, the other acceptance-path mechanic that
+    round-2 mutation found pinned by nothing (`> 9999 * max_h`, i.e. one single
+    band, survived all 280 tests).
+
+    A stack box routinely includes the player's NAME on the row above the value,
+    and the reader separates them by y-centre before it looks for digit runs. Fold
+    the two rows into one band and the name's glyphs become ink on the numeral's
+    own row, so P2 refuses: measured over all 18,006 retained development crops,
+    the single-band mutant turns 236 values into UNKNOWN and produces 0
+    UNKNOWN->value and 0 value->different reads.
+
+    That direction is why this finding is not release-blocking -- the mutant only
+    destroys coverage, it never fabricates a number, which is exactly the trade
+    this phase accepts. It is pinned anyway, because "unpinned but currently
+    harmless" is the state P1 was in.
+
+    The fixture is a real cwpt01 seat panel (2138x1402) whose top edge carries the
+    tail of the name row above "124.80 BB". The structural assertion below is what
+    keeps the test honest: if a future fixture swap left only ONE row of glyphs,
+    the read would still be 124.80 and the test would pass while exercising
+    nothing."""
+    img = cv2.imread(str(FIXTURES / "stack_124_80_name_row_above_at_2138x1402.png"))
+    comps = segment_glyphs(binarize_text(img), min_area=2, min_h_px=1)
+    max_h = max(c.h for c in comps)
+    tall = sorted(c.y + c.h / 2.0 for c in comps if c.h >= 0.55 * max_h)
+    assert any(b - a > 0.6 * max_h for a, b in zip(tall, tall[1:], strict=False)), (
+        "this fixture must carry two glyph ROWS, or it does not exercise the split")
+    detail = production_bank.read_number_detail(img)
+    assert detail.value == 124.8, "the name row must not reach the numeral's row"
+    assert detail.decimal_source == "dot"
 
 
 def test_a_sprite_fragment_above_the_calibrated_band_is_unknown(production_bank) -> None:
@@ -1172,6 +1285,10 @@ def test_no_frozen_fixture_reads_a_wrong_value_at_any_render_size(
         # Round-2 wide-occluder composite: the screen renders 343.60 BB under
         # the sprite; 0.0 (or anything else) must never ship.
         "stack_343_60_sprite_far_fragments_at_1272x896.png": 343.6,
+        # Round-2 predicate pins: a real stack whose only defect is a missing
+        # "BB" (the timer badge wins the run), and a real two-row stack panel.
+        "stack_212_90_timer_badge_at_2062x1178.png": 212.9,
+        "stack_124_80_name_row_above_at_2138x1402.png": 124.8,
     }
     assert set(truth) == {p.name for p in FIXTURES.glob("*.png")}, (
         "every frozen OCR fixture must carry a transcribed truth value here; a "
