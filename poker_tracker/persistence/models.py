@@ -120,6 +120,45 @@ class PersistedModel(BaseModel):
 
     model_config = ConfigDict(from_attributes=True, allow_inf_nan=False)
 
+    @model_validator(mode="after")
+    def _normalize_naive_datetimes(self) -> PersistedModel:
+        """Every stored timestamp is timezone-aware UTC, whoever supplied it.
+
+        Set HERE, once, for the same reason ``allow_inf_nan=False`` is: the
+        alternative is a per-comparison guard list, and that list is what decayed.
+        This product writes ``datetime.now(UTC)`` everywhere, but a timestamp does
+        not have to come from this product's writers -- a hand-edited column, a
+        row written by an older build, an import payload's ISO-8601 string with no
+        offset, a CV timeline -- and ``datetime.fromisoformat`` faithfully returns
+        a NAIVE datetime for a naive string, which the models then accepted.
+
+        A naive and an aware datetime cannot be compared at all, so ONE such value
+        raised ``TypeError: can't compare offset-naive and offset-aware
+        datetimes`` out of ``study_readiness._coaching_blockers``' ``max(stale)``
+        and out of ``_solver_blockers``, taking the Study page down for that hand
+        and Insights down for the ENTIRE database (it loops readiness over every
+        hand). That is the one failure mode a readiness surface must not have: its
+        whole contract, shared with ``parse_completion_evidence`` ("nothing in this
+        module raises") and with ``db._salvaged_row``, is to degrade and BLOCK, not
+        to throw.
+
+        Normalising at the model boundary fixes every comparison at once -- the
+        two blockers, every ``sorted(..., key=created_at)``, every ``newest`` --
+        rather than the two the reproduction happened to name. A naive timestamp
+        is read as UTC because that is what this product's writers store and what
+        an offset-less export of them means; nothing is dropped, and no ordering
+        between two already-aware values changes.
+        """
+        naive = {
+            name: value.replace(tzinfo=UTC)
+            for name, value in self.__dict__.items()
+            if isinstance(value, datetime) and value.tzinfo is None
+        }
+        if naive:
+            for name, value in naive.items():
+                object.__setattr__(self, name, value)
+        return self
+
     # Set only by the persistence layer's read-time degradation when a stored
     # row holds column values this build cannot validate (``db._salvaged_row``).
     # Excluded from every dump for the same reason ``derived_result_substituted``

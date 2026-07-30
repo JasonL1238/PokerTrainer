@@ -172,8 +172,10 @@ hand reviewed is routed through one guarded writer. Both exit-gate bullets below
 are satisfied and re-verified against the code that exists.
 
 What is **not** satisfied is this plan's own stopping rule (see "Repetition and
-stopping rule"). Nine adversarial rounds have been run against Phase 1 and every
-one of them produced at least one valid blocking finding — including, in round 9,
+stopping rule"). Fifteen adversarial rounds have been run against Phase 1 and
+every one of them produced at least one valid blocking finding. Rounds 10 through
+15 are recorded in their own sections below; the summary that follows covers
+rounds 7 through 9 — including, in round 9,
 three independent demonstrations that round 8's chip-denomination fix closed only
 the exact hand shape it was demonstrated on, so as soon as more seats contributed
 than won, the same declared field still doubled the derived hero result and landed
@@ -561,8 +563,156 @@ family plus the constructed instances, and the two import tests that pinned "a
 manual hand's declared review status is never rewritten by the import" now pin
 the opposite — that sentence described the defect.
 
-Every repair above is a code change, so the counter stays at **0 of 2** and
-round 14 is the first round eligible to count once no further change lands.
+Every repair above is a code change, so the counter stays at **0 of 2**.
+
+### Round 14, and what it found
+
+Round 14 has run. It found no hole in the dependence rule itself for a fourth
+consecutive round. What it found, again, was enumerated-list decay AROUND the
+rules, in six families, each repaired as a family with several independent
+instances pinned rather than the one shape demonstrated:
+
+1. **Row readers raised instead of degrading** (high). `_hand_from_row` guarded
+   four columns by hand while `table_size = 99` in the fifth raised a
+   `ValidationError` out of `fetch_hands_by_session` and took the entire
+   application down on load; `_action_from_row` and its siblings were not
+   guarded at all. Every reader now salvages column-by-column through one helper
+   (`db._salvaged_row`) driven by the model's own field set, and every
+   degradation is conservative: it can only ever add blockers. The columns it had
+   to give up are recorded under `UNREADABLE_HAND_COLUMNS_KEY` and reported by a
+   new `UNREADABLE_HAND_COLUMNS` blocker.
+2. **`update_hand_completion` took the caller's blob as the base** (high).
+   Pinning three code channels from the stored row left every OTHER field
+   caller-writable: a blob manufactured the pipeline's boundary observations and
+   promoted an unprovable hand, and a blob that dropped the
+   `imported_from_payload` stamp walked an imported hand into the manual
+   exemption. The merge is inverted — the stored evidence is the base and the
+   caller may only ADD codes.
+3. **The promotion gate deny-listed values instead of allow-listing them**
+   (high). Any unrecognised `terminal_event` counted as observed, and any finite
+   `boundary_confidence` — including 0.0 and 42.0 — counted as a measurement.
+   Both are allow-lists now (`OBSERVED_TERMINAL_EVENTS`, a 0..1 range).
+4. **Non-finite floats passed the validating boundary** (medium). `ge=0` admits
+   `inf`, so a hostile payload landed `dead_money=Infinity` and the session
+   export stopped being RFC 8259 JSON. `PersistedModel` sets
+   `allow_inf_nan=False` once, for every float field of every persisted model.
+5. **The raw attestation writer trusted a shape-valid code** (high). A forged
+   `declared_settlement_dependence:...` string was recorded, evicted the
+   operator's genuine attestation for the same input, and filed an audit row for
+   an attestation nobody made. `db.acknowledge_accounting_assumption` now
+   re-measures and refuses a code naming no current dependence, failing closed
+   when the measurement cannot be taken.
+6. **The dependence tolerance was unpinned** (medium). Widening
+   `_FLOAT_TOLERANCE` from 1e-9 to 1e-6 survived the whole suite.
+
+The regressions live in `tests/test_phase1_adversarial_round14.py` (20 tests).
+Every repair is a code change, so the counter stays at **0 of 2**.
+
+### Round 15, and what it found
+
+Round 15 has run, with three adversaries (accounting/assumption bypass;
+readiness bypass outside accounting; mutation testing and honesty). The
+dependence rule's core held for a fifth consecutive round. Twenty-two findings
+were reported and twenty-one reproduced; they collapse into eight families, each
+repaired at the general case with a sweep of independent instances:
+
+1. **A SQL predicate classified a row that a reader reclassifies** (high, four
+   reported instances, six found). `discard_stale_coaching` filtered
+   `WHERE is_stale = 1` while `_coaching_response_from_row` answers
+   `bool(is_stale)`, so a stored `2`, `-1` or `'yes'` raised
+   STALE_COACHING_EVIDENCE, drew the control the blocker names, matched nothing,
+   and flashed "Discarded 0 stale coaching review(s)." as a SUCCESS — a
+   permanently unstudyable hand. `resolve_hand_issue` had the mirror image:
+   `_hand_issue_from_row` forces `status='open'` on a row it cannot fully read,
+   the writer filtered `AND status = 'open'`, and the blocker's own clearing form
+   answered "Open hand issue not found." `update_hand_status`'s documented
+   unbypassable floor and `fetch_hand_issues`' status filter were blind to the
+   same row, so the store ACCEPTED a `reviewed` promotion readiness refuses and
+   the unresolved-issue inbox did not list it. `_validate_single_hero` accepted a
+   second hero, and `fetch_cached_solver_run` served a run the reader calls
+   `stale` as a cache hit. Every site now selects candidates by identity and
+   classifies through the reader;
+   `test_no_sql_predicate_classifies_a_row_the_reader_reclassifies` fails on a
+   new raw-column predicate, with an allow-list of the seven places where the
+   column, not the verdict, is the right subject.
+2. **Two stored timestamps could be incomparable** (high). `fromisoformat`
+   returns a NAIVE datetime for an offset-less string, and one such value made
+   `max(stale)` raise `TypeError` out of `_coaching_blockers`, taking the Study
+   page down for that hand and Insights down for the ENTIRE database.
+   `PersistedModel` normalises every naive datetime field to UTC, so every
+   comparison in the product is fixed rather than the two demonstrated.
+3. **An attestation travelled in the payload carrying its evidence** (high). One
+   JSON field flipped a debugging issue to `resolved`, in a state
+   `resolve_hand_issue` refuses to create, and cleared OPEN_DEBUGGING_ISSUE.
+   Imported issues land `open`, exactly as imported coaching lands stale and a
+   declared `reviewed` is floored; the exporting database's resolution notes are
+   carried into the reopened issue's description so nothing is lost.
+4. **A read-time degradation marker was laundered by a round trip** (medium).
+   The card marker was restored from round 5; `UNREADABLE_HAND_COLUMNS`, added in
+   round 14, had no equivalent, so an ordinary export/import was a third,
+   undocumented clearing action that repairs by discarding — including for the
+   columns the blocker says cannot be repaired at all. Restoration is keyed on
+   `DERIVED_EVIDENCE_KEYS` and on the table's own PRAGMA columns, and round 8's
+   "a marker may not overwrite a readable column" guard is generalised from the
+   two card columns to every column.
+5. **Two degradations on one row reached opposite `review_status` verdicts**
+   (medium). `_degraded_hand` forced `needs_correction`; `_degrade_unreadable_cards`
+   — which blanks the columns that ARE the study material — did not, so a hand
+   hand-edited to a two-card board counted as `reviewed` in
+   `compute_session_stats`, in the Insights "Unresolved" KPI and in every list
+   row while Study refused it. One `_demote_degraded_hand` step keyed on "does
+   this hand carry ANY read-time marker?" now applies the contract, which also
+   fixes the writer-side instance (`restore_unreadable_columns`) with no second
+   guard.
+6. **A consumer prescribed an acknowledgement for a pipeline REJECTION**
+   (medium). `_source_warning_blockers` was repaired for this in round 13 and
+   `_layout_blockers` was not, so three blockers on the same page said
+   contradictory things about one code and the operator was told the
+   unperformable one was the fix. The split is now
+   `CompletionEvidence.unresolved_warning_codes` /
+   `unresolved_rejection_codes`, and the mixed property's readers are enforced.
+7. **A derived figure was written into an observed-fact column** (high). The
+   settlement editor's "Replace observed final pot/result with the derived ledger
+   values" was gated on `reconciled.ledger.is_settled`, strictly weaker than
+   `accounting_is_established`. On a reconstructed hand recording nothing with a
+   declared 25% rake it wrote the declaration-derived +20 into
+   `hands.hero_bb_won` — the honest result is +40 — and because Study correctly
+   refused the hand, `compute_session_stats` fell back to `hands.hero_bb_won` and
+   published the fabrication as an OBSERVED result. On a hand with genuine
+   observations it replaced `pot_size` 80 and `hero_bb_won` +40 with 155 and
+   +115. The gate now lives in `services.settlement_sync`, the db writer refuses
+   again on its own single-pass measurement when nothing is attested, and
+   `test_no_ui_call_site_writes_the_recorded_pot_or_hero_result` fails on a new
+   UI call site. This is PLAN.md:679 ("Distinguish observed facts from
+   user-entered settlement assumptions") violated literally, and the repair is
+   scoped so no tenth call site can reopen it.
+8. **`AssumptionDependence.describe()` stated every direction backwards**
+   (medium). The deltas are declared-minus-neutral, which is right for the CODE,
+   and the sentence's subject is the REMOVAL, so 5 of 6 printed terms on a
+   50%-rake hand were inverted — in the blocker detail, in the caption above
+   "Confirm this assumption", and in the line handed to the coaching provider. An
+   operator applying the blocker's own clearing action would have gone and edited
+   correct data. Repaired in `describe()` and not in `_ledger_deltas`, which
+   would have lapsed every stored attestation for a display defect.
+
+Beside the families, round 15's mutation adversary demonstrated eight behaviours
+surviving the whole suite with no killing test — both coaching gates, the
+measured movement inside `describe()`, three declared fields of the attestation
+fingerprint (`rake_rounding_unit`, `no_flop_no_drop`, the declared award amount),
+the producer of `derived_result_substituted`, the cross-check's
+"No persisted settlement assumptions or awards." issue, and the `unbuildable`
+measure label — and four documentation claims nothing enforced: this file's
+missing round-14 record and stale verification table, README's false "no value
+you type in `Chip unit` changes a derived payout", a comment crediting
+`_declared_chips_taken` with a dual reconciliation it does not perform, a comment
+citing a test that does not exist, and an understated cost ceiling (a fold win
+costs five extra ledger builds, not four). All are pinned or corrected, and each
+mutant was re-run against its regression and observed to be killed.
+
+The regressions live in `tests/test_phase1_adversarial_round15.py` (90 tests),
+grouped by family. Every repair above is a code change, so the counter stays at
+**0 of 2** and round 16 is the first round eligible to count once no further
+change lands.
 
 **What remains before Phase 1 may be counted toward the release claim** — and
 nothing below is optional:
@@ -570,18 +720,18 @@ nothing below is optional:
 1. Two consecutive adversarial rounds, each with fresh agents and varied attack
    prompts, reporting zero critical, zero high, zero release-blocking medium, and
    zero unresolved safety/data-loss/stale-evidence/silent-acceptance findings.
-   Rounds 10 through 13 have been run and all four produced blocking findings;
-   their repairs land here, so the counter is at 0 and round 14 is the first
+   Rounds 10 through 15 have been run and all six produced blocking findings;
+   their repairs land here, so the counter is at 0 and round 16 is the first
    round eligible to count.
 2. No code, schema, dependency, or release-configuration change between those two
-   rounds. The round-13 repairs land *before* round 14 starts.
+   rounds. The round-15 repairs land *before* round 16 starts.
 3. The exit-gate bullets below stay satisfied through both rounds; they are
    re-derived from the code each round, not carried forward. Where this document
    states which call sites exist, the statement is now backed by a test rather
    than by a reading - round 11's medium was this file recording a repair as
    complete while six consumers still read the old predicate.
 
-Thirteen rounds have each broken a mechanism the previous round's document
+Fifteen rounds have each broken a mechanism the previous round's document
 claimed was closed, twice in the same place (the chip denomination, rounds 8 and
 9; the accounting tolerance, rounds 4 through 7). Round 10 broke the
 *surroundings* of a mechanism whose core it could not break. Round 11 broke the
@@ -594,15 +744,30 @@ core intact for a third time and broke the SCOPE it is gated on: the manual
 exemption was decided by two strings a payload or a hand-edited row could write,
 and round 10's own closing argument ("neither of them may claim an exemption
 that rests on being entered here") had been enforced on exactly one of its
-consumers.
+consumers. Round 14 found the core intact for a fourth time and broke the
+READERS around it — a single unreadable column took the whole application down
+on load, and the evidence writer took the caller's blob as its base. Round 15
+found the core intact for a fifth time and broke the SQL beneath it: five
+predicates classified rows in the column's space while every blocker, list and
+gate read the model, so a clearing action reported success while clearing
+nothing and a store-level floor was blind to the row it is the floor for. It also
+found the one place the whole dependence rule can be circumvented without
+touching the rule — writing the derived figure into the observed-fact column the
+rule's own fallback reads.
 
-That is the thirteenth consecutive round to find a real blocking defect, and the
-prior on a clean round 14 should be set accordingly. The recurring lesson of
-rounds 10 through 13 is that a repair stated as an argument but applied to an
+That is the fifteenth consecutive round to find a real blocking defect, and the
+prior on a clean round 16 should be set accordingly. The recurring lesson of
+rounds 10 through 15 is that a repair stated as an argument but applied to an
 enumerated list of consumers decays into the next round's finding; the round-13
 repairs are therefore scoped on shared predicates (`claims_reconstruction`,
 `requires_user_confirmation`) rather than on the call sites that were
-demonstrated.
+demonstrated, and the round-15 repairs go one step further — where a family
+cannot be collapsed into a single predicate, the SET of legitimate call sites is
+now asserted by a test that fails when a new one appears
+(`test_no_sql_predicate_classifies_a_row_the_reader_reclassifies`,
+`test_no_consumer_prescribes_an_action_from_unresolved_codes`,
+`test_no_ui_call_site_writes_the_recorded_pot_or_hero_result`, joining
+`test_no_consumer_decides_on_is_authoritative_alone`).
 
 The current `review_status` is not enough to distinguish “the hand ended,” “the
 pipeline reconstructed enough evidence,” “the ledger balances,” and “the hand
@@ -820,6 +985,23 @@ measured dependence this hand still owes an answer for — rather than
 uses (`unattested_assumption_dependence`), so the gate and the blocker cannot
 drift: an attested declaration and a hand exempt from attestation are both
 answered, and answering re-publishes the figure everywhere at once.
+
+Writing a derived figure INTO an observed-fact column takes the same gate, and
+that is round 15's finding. "Every surface that publishes a derived figure" was
+read as every surface that *renders* one; the settlement editor's "Replace
+observed final pot/result with the derived ledger values" writes one into
+`hands.pot_size` and `hands.hero_bb_won`, which is the strongest form of
+publishing there is — those columns are the independent evidence the cross-check
+compares against, they are exported as observed facts, and
+`math.analytics.compute_session_stats` falls back to `hands.hero_bb_won`
+precisely when the derived figure is refused, so an unattested declaration
+written there is republished as an OBSERVED result on the hand Study is refusing.
+The write now goes through `services.settlement_sync`, which takes
+`accounting_is_established` and refuses by name otherwise;
+`db.update_hand_accounting_evidence` refuses again on its own single-pass
+`_declared_chips_taken` measurement when the hand owes an attestation and carries
+none; and `test_no_ui_call_site_writes_the_recorded_pot_or_hero_result` fails if
+any module outside that service calls the writer.
 
 That list of consumers is enforced rather than written down.
 `test_no_consumer_decides_on_is_authoritative_alone` walks the AST of `app.py`
@@ -1583,18 +1765,26 @@ protect. The consequence is recorded under "Known non-blocking gaps".
 
 ### Verification record
 
-Re-run after the round-13 repairs, on the working tree, macOS 24.6.0
-(darwin/arm64). The concurrent Phase 5 workflow was actively editing
-`cv_lab/scripts/pipeline/ocr_readers.py`, `tests/test_ocr_readers.py` and
-`tests/test_yolo_card_hard_examples.py` DURING these runs, so the full-suite
-count drifted (1318 → 1325 → 1326) and individual runs caught that file
-mid-edit; the last full run, taken after its edits settled, is recorded below,
-and every run with the two in-flight CV files excluded was green throughout
-(`1260 passed`), which covers every Phase 1 file:
+Re-run after the round-15 repairs, on the working tree, macOS 24.6.0
+(darwin/arm64). Re-derived from the code, not carried forward: the previous
+revision of this table recorded `1326 passed` while the tree produced `1412`,
+because the round-14 repairs and their 20 regressions landed without this
+section being re-run — which is round 15's own finding about this document, and
+the reason the count below was taken from a fresh run rather than edited.
+
+As in round 13, a concurrent Phase 5 workflow was editing
+`cv_lab/scripts/pipeline/ocr_readers.py` DURING these runs (107 lines added
+mid-session, uncommitted), so `tests/test_ocr_readers.py` drifted run to run and a
+later run caught it mid-edit with 3 failures in that file alone. The count below
+is from the run taken before those edits landed; the run with that one in-flight
+CV file excluded is green throughout (`1435 passed`), and it covers every Phase 1
+file. Round-16 eligibility requires the whole tree green at the moment the
+counting rounds run, which is a Phase 5 close-out condition, not a Phase 1 one.
 
 | Command | Result |
 | --- | --- |
-| `python -m pytest -q` | `1326 passed, 1 skipped` |
+| `python -m pytest -q` | `1502 passed, 1 skipped` |
+| `python -m pytest -q --ignore=tests/test_ocr_readers.py` | `1435 passed` |
 | `python -m ruff check .` | `All checks passed!` |
 | `python -m mypy` | `Success: no issues found in 11 source files` |
 | `git diff --check` | no output, exit 0 |
@@ -1616,14 +1806,14 @@ unchanged, no table added or dropped; the real file was SHA-256-hashed before an
 after and is byte-identical. Reading its version stamp still leaves `-shm`/`-wal`
 sidecars beside it, which is the documented gap below, not a write to the database.
 
-The suite grew from the 442 tests of the Phase 0 baseline to 1326. That count
+The suite grew from the 442 tests of the Phase 0 baseline to 1502. That count
 includes the CV suites, which a concurrent Phase 5 workflow is editing, so the
 number will drift; the Phase 1 files in it are `test_study_readiness*.py`,
 `test_completion_evidence.py`, `test_schema_v13_migration_paths.py`,
 `test_phase1_readiness_bypass.py`, `test_review_promotion_surfaces_ui.py`,
 `test_phase1_assumption_dependence.py`,
 `test_phase1_declared_inputs_and_consumers.py` and
-`test_phase1_adversarial_round2.py` … `round13.py`, and
+`test_phase1_adversarial_round2.py` … `round15.py`, and
 `test_operator_state_isolation.py`. The single skip
 is `tests/test_ocr_readers.py::test_without_chip_template_chip_would_join_run`,
 a negative control that documents why the chip affix exists; it skips when the
@@ -1647,15 +1837,37 @@ not type-checked at all.
 Recorded here rather than fixed, with no effect on correctness, safety, data
 integrity, or the release claim:
 
-- The dependence rule costs a read up to four ledger builds on a hand declaring
-  a rake, dead money and pot awards (measured 429.7us against 163.0us for the
-  pre-rule shape, a factor of 2.64), and `math.analytics.compute_session_stats`
+- The dependence rule costs a read up to four extra ledger builds on a SHOWDOWN
+  hand declaring a rake, dead money and pot awards, and five on a FOLD WIN, where
+  `_forced_winners` fires and a second neutral pass is built against the forced
+  winners — the commonest hand shape there is. (The measured 429.7us against
+  163.0us for the pre-rule shape, a factor of 2.64, was taken on the showdown
+  shape. A previous revision of this entry stated the ceiling as four for every
+  shape; the ceiling is now derived from a build counter in
+  `test_the_documented_dependence_cost_ceiling_is_the_measured_one` rather than
+  from prose.) `math.analytics.compute_session_stats`
   calls `reconcile_persisted_hand` once per hand with no cache, so the Insights
   page pays that multiple on every hand of a session. The per-render
   `AccountingCache` in `app.py` does not reach it. It is a hot-path caching
   question rather than a correctness one — every figure it produces is the same
   figure — and it belongs with the other performance work rather than in the
   Phase 1 gate.
+- The `payout` term of a measured dependence is an unsigned magnitude — the
+  largest absolute per-seat change — while its four siblings (`gross`, `rake`,
+  `net`, `hero`) are signed differences of a single figure. Two seats' payouts can
+  move in opposite directions under one declaration, so there is no single
+  direction to state, and the term also collapses a per-seat vector into one
+  scalar, so which seat moved is not recorded in the acknowledgement code.
+  `describe()` now words it as the magnitude it is ("the largest payout for any
+  seat by N chips"), so the display defect — the same rendered token meaning
+  "40 lower" under a rake and "75 higher" under dead money — is fixed. The
+  information-content limit is not, and is recorded rather than repaired: making
+  the term a signed per-seat vector would change every dependence code and lapse
+  every stored attestation, which is a conservative failure but not one worth
+  taking for a low-severity display property. A round-15 sweep of 69,156 states
+  found zero code-set collisions covering different figures, because the signed
+  `hero` term and the awards fingerprint pin the payout distribution
+  independently, so there is no known attestation-inheritance consequence.
 - `app.show_saved_hands` is currently unreferenced. It is routed through
   `guarded_update_hand_status` and covered by
   `tests/test_review_promotion_surfaces_ui.py`, and it holds the only

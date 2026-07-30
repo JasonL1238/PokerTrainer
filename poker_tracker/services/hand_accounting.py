@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import blake2s
 from math import isclose
@@ -80,6 +81,18 @@ _FLOAT_TOLERANCE = 1e-9
 # until the operator attests to that specific measurement of that specific
 # declaration.
 
+# Delta terms that are MAGNITUDES rather than signed movements, with the wording
+# that says so. ``_ledger_deltas`` measures the payout term as the largest
+# absolute per-seat change, because two seats' payouts can move in opposite
+# directions under one declaration and there is no single direction to state; the
+# other four terms are signed differences of a single figure. Rendering all five
+# through one signed formatter made the same token mean opposite things.
+_UNSIGNED_DELTA_TERMS: dict[str, Callable[[float], str]] = {
+    "payout": lambda value: (
+        f"the largest payout for any seat by {abs(value):g} chips"
+    ),
+}
+
 
 @dataclass(frozen=True)
 class AssumptionDependence:
@@ -99,8 +112,38 @@ class AssumptionDependence:
     code: str  # stable, quantity-bearing acknowledgement key
 
     def describe(self) -> str:
+        """The sentence the operator is asked to attest to, in the direction it states.
+
+        ``deltas`` are DECLARED minus NEUTRAL, which is the right convention for
+        the acknowledgement code -- that is what makes the code an attestation to a
+        quantity -- but this sentence's subject is the REMOVAL of the declaration,
+        so every signed term has to be negated to render it. It was not, and 5 of
+        the 6 terms on a 50%-rake hand were printed backwards: the operator was told
+        that withdrawing a rake which destroys 40 chips of their result would cost
+        them 40 more, and the same string is the ACCOUNTING_ASSUMPTION_DEPENDENT
+        blocker detail, the caption directly above 'Confirm this assumption', and a
+        line handed to the coaching provider on an attested, study-ready hand. An
+        operator who read it carefully and applied its own clearing action ("if the
+        chips did not move that way, correct the declared winner, the rake policy or
+        the dead money instead") would have gone and edited correct data.
+
+        The repair is here and NOT in ``_ledger_deltas``: the delta values are
+        embedded verbatim in the dependence code, so negating them there would lapse
+        every stored attestation for a display defect.
+
+        ``payout`` is deliberately not rendered as a signed movement.
+        ``_ledger_deltas`` measures it as the largest ABSOLUTE change over all
+        seats, because different seats can move in opposite directions and there is
+        no single direction to state; printed through the signed formatter it always
+        read "+", so a declared rake taking 40 off the hero's payout and 75 chips of
+        declared dead money adding 75 to it printed the same token with opposite
+        meanings. It is now worded as the magnitude it is.
+        """
         movement = ", ".join(
-            f"{name} {_format_chips(value)}" for name, value in self.deltas
+            _UNSIGNED_DELTA_TERMS[name](value)
+            if name in _UNSIGNED_DELTA_TERMS
+            else f"{name} {_format_chips(-value)}"
+            for name, value in self.deltas
         )
         head = (
             f"{self.input_name} is declared as {self.declared} (neutral: "
@@ -501,7 +544,15 @@ def _cross_check(records: _HandRecords, declaration: _Declaration) -> _CrossChec
     )
     issues = [*ledger.warnings, *ledger.legality_issues, *_unreadable_row_issues(records)]
     # One tolerance, and it is float-representation noise. Nothing here is
-    # compared at anything wider: see _no_settlement_field_may_widen_a_gate.
+    # compared at anything wider, and no settlement field may widen it. Pinned by
+    # round14::test_the_dependence_tolerance_is_the_float_noise_floor (the constant
+    # itself), round4::test_an_imported_settlement_cannot_set_its_own_reconciliation_tolerance
+    # and round5::test_rake_rate_and_chip_unit_together_cannot_widen_the_pot_check /
+    # ::test_an_imported_settlement_cannot_set_its_own_tolerance_with_two_fields (no
+    # payload can set it). The pointer here used to name
+    # `_no_settlement_field_may_widen_a_gate`, a test that does not exist under that
+    # or any name, so a maintainer following it could not tell whether the invariant
+    # was covered at all.
     if settlement is None:
         issues.append("No persisted settlement assumptions or awards.")
     else:
@@ -686,10 +737,18 @@ def _derive_assumption_dependence(
     because both passes would be the same call. Nothing here asks which fields
     are suspicious.
 
-    Cost: zero extra ledger builds on a hand that declared nothing -- no rake, no
-    dead money and no awards, which is every freshly reconstructed hand before
-    anyone opens the Accounting reconciliation panel -- one on a hand whose only
-    declaration is its awards, and up to four on a hand declaring all three.
+    Cost, in extra ledger builds beyond the baseline pass, measured rather than
+    reasoned about (``test_the_documented_dependence_cost_ceiling_is_the_measured
+    _one``): zero on a hand that declared nothing -- no settlement row, no awards,
+    which is every freshly reconstructed hand before anyone opens the Accounting
+    reconciliation panel -- one on a SHOWDOWN hand whose only declaration is its
+    awards, four on a showdown hand declaring all three, and one more in each case
+    on a FOLD WIN, where ``_forced_winners`` fires and a second neutral pass is
+    built against the forced winners: two, and five.
+
+    The ceiling used to be stated as "up to four", which understated the commonest
+    hand shape there is. It is now derived from a counter in the test rather than
+    from this sentence, so it cannot drift again.
     """
 
     declared = records.declaration

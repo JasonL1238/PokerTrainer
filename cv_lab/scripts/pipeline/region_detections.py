@@ -184,6 +184,7 @@ def read_card_label(det: Detection) -> str | None:
 # contract boundary and must stay importable without cv2/numpy).
 AMOUNT_UNREADABLE_ATTR = "unparseable_amount"      # attr present but not a number
 AMOUNT_STACK_BOXES_DISAGREE = "stack_boxes_disagree"  # two stack_text boxes, one seat
+AMOUNT_BET_BOXES_DISAGREE = "bet_boxes_disagree"      # two bet_text boxes, one seat
 AMOUNT_POT_ZERO_IMPOSSIBLE = "pot_zero_impossible"    # see _frame_state / note 10
 AMOUNT_READER_UNAVAILABLE = "reader_unavailable"      # no template bank calibrated
 # An amount box carrying no value and no reason -- the fixture path, where no read
@@ -556,8 +557,10 @@ def assign_regions(frame: Frame, *, anchor: TableAnchor | None = None) -> dict[s
     villain_dets: dict[int, list[tuple[float, Detection]]] = {}
     pot_candidates: list[Detection] = []
     pot_off_column = 0
-    stack_conflicts = 0
-    seen_stacks: dict[int, list[float | None]] = {}
+    seat_conflicts = {"stack_text": 0, "bet_text": 0}
+    # (class, seat) -> [(value, refusal code, box confidence, attr source), ...]
+    seen_seat_amounts: dict[tuple[str, int], list[tuple[float | None, str | None,
+                                                        float, str | None]]] = {}
     seats: dict[int, dict[str, Any]] = {}
     # Nearest card-anchor seat for each card in the STRICT hero zone ("other"-zone
     # strays like villain showdown reveals don't vote). The spine's hero identity
@@ -570,6 +573,74 @@ def assign_regions(frame: Frame, *, anchor: TableAnchor | None = None) -> dict[s
                 "bet": None, "bet_unknown": None, "pill_action": None,
                 "dealer": False, "turn": False}
         )
+
+    def resolve_seat_amounts() -> None:
+        """Resolve every seated money box into one reading per (class, seat).
+
+        ONE RULE FOR BOTH SEATED MONEY CHANNELS, because there is one problem.
+        Two boxes of the same class can resolve to one seat, and until this was
+        shared the two channels handled that differently: stack_text called it a
+        conflict and published UNKNOWN, while bet_text was a bare
+        `seat(i)["bet"] = value` -- last-write-wins, decided by the order the
+        detector happened to list its boxes.
+
+        Measured on the six development recordings, 65 frames carry a bet_text
+        seat conflict (g0621 59, g0723a 3, g0711 2, g0723b 1) and in ALL 65 the
+        winner under list order is NOT the highest-confidence box. Both failure
+        directions were real and both reached the ledger: at g0723b t=0 a
+        conf-0.49 box containing only a chip sprite (refused: no_digit_run)
+        overwrote a conf-0.942 box reading a plainly legible "24 BB", flipping
+        hand 1's `preflop/0/raise` between amount=24.0 and amount=None -- i.e.
+        toggling the input to the fatal `amounts_unknown_in_ledger` code; and at
+        g0621 t=116 two different seats' bets collided on one seat and published
+        a confident 0.5 over a legible "15 BB" with no counter and no code.
+
+        Two contradictory readings of one seat are a conflict, and PLAN.md is
+        explicit that an absent amount is unknown, not a guess. A positive
+        REFUSAL is one of the contradicting readings: it must not be erased by a
+        second box, and it must not erase a legible one either -- which is why
+        `None` participates in the comparison rather than being skipped.
+
+        RESOLVING AFTER the detection loop rather than inside it is what makes
+        the result a function of the box SET instead of its order. Writing each
+        box as it arrived meant the seat carried an interim answer, `amounts
+        unknown` was tallied once per box against a growing history, and a
+        three-box seat produced a different count in each direction (measured:
+        3 of g0723a's 361 frames).
+        """
+        for (cls, i), boxes in sorted(seen_seat_amounts.items()):
+            distinct = {("none" if b[0] is None else round(b[0], 2)) for b in boxes}
+            if len(distinct) > 1:
+                seat_conflicts[cls] += len(boxes) - 1
+                # The conflict gets its OWN code and never masks the reader's.
+                # `stack_sources[i] = ... else "conflict"` used to overwrite the
+                # refusal reason with the word "conflict", so a seat whose box
+                # the reader had positively refused became indistinguishable
+                # from a seat whose two boxes disagreed.
+                value, code = None, (AMOUNT_STACK_BOXES_DISAGREE
+                                     if cls == "stack_text"
+                                     else AMOUNT_BET_BOXES_DISAGREE)
+                source = None
+            else:
+                # Every box agrees. WHICH refusal reason (or which read's
+                # provenance) is published was still decided by detector order
+                # when a seat had more than one box -- measured at g0723b t=0
+                # seat 0, `no_digit_run` as detected and
+                # `unexplained_ink_in_numeral` reversed. The value is the same
+                # either way; the reason is diagnostic, so it comes from the box
+                # the detector was most confident about, with the payload itself
+                # as a deterministic tiebreak.
+                best = max(boxes, key=lambda b: (b[2], str(b[1]), str(b[3])))
+                value, code, _, source = best
+            if cls == "stack_text":
+                seat(i)["stack"] = value
+                seat(i)["stack_unknown"] = code
+                stack_sources[i] = source if value is not None else None
+            else:
+                seat(i)["bet"] = value
+                seat(i)["bet_unknown"] = code
+            if value is None:
+                note_unknown(code or AMOUNT_UNSPECIFIED)
 
     for det in frame.detections:
         if det.cls not in CLASS_SET:
@@ -598,46 +669,25 @@ def assign_regions(frame: Frame, *, anchor: TableAnchor | None = None) -> dict[s
             i = _nearest_seat(cx, cy, det.cls)
             if det.cls == "card_back":
                 seat(i)["card_back"] = True
-            elif det.cls == "stack_text":
+            elif det.cls in ("stack_text", "bet_text"):
+                # Two boxes of one class can map to one seat (measured: 3 of 1309
+                # frames on stack_text across the 5 development geometries, all 3
+                # DISAGREEING, and 65 frames on bet_text). Collected here and
+                # resolved once per seat below -- see resolve_seat_amounts.
                 kind, payload = amount_state(det)
-                value = payload if kind == AMOUNT_VALUE else None
-                code = payload if kind == AMOUNT_UNKNOWN else None
-                # Two stack_text boxes can map to one seat (measured: 3 of 1309
-                # frames across the 5 development geometries, and all 3 DISAGREE).
-                # `seat(i)["stack"] = value` made it last-write-wins, so an
-                # unreadable second box silently destroyed a good first read and
-                # a 15.8x disagreement resolved by iteration order. Two
-                # contradictory readings of one seat are a conflict, and PLAN.md
-                # is explicit that an absent amount is unknown, not a guess.
-                prior = seen_stacks.setdefault(i, [])
-                prior.append(value)
-                if len({("none" if v is None else round(v, 2)) for v in prior}) > 1:
-                    stack_conflicts += 1
-                    value = None
-                    # The conflict gets its OWN code and never masks the reader's.
-                    # `stack_sources[i] = ... else "conflict"` used to overwrite
-                    # the refusal reason with the word "conflict", so a seat whose
-                    # box the reader had positively refused became
-                    # indistinguishable from a seat whose two boxes disagreed.
-                    code = AMOUNT_STACK_BOXES_DISAGREE
-                seat(i)["stack"] = value
-                seat(i)["stack_unknown"] = code
-                stack_sources[i] = det.attr_source if value is not None else None
-                if value is None:
-                    note_unknown(code or AMOUNT_UNSPECIFIED)
-            elif det.cls == "bet_text":
-                kind, payload = amount_state(det)
-                value = payload if kind == AMOUNT_VALUE else None
-                seat(i)["bet"] = value
-                seat(i)["bet_unknown"] = payload if kind == AMOUNT_UNKNOWN else None
-                if value is None:
-                    note_unknown(payload if kind == AMOUNT_UNKNOWN else AMOUNT_UNSPECIFIED)
+                seen_seat_amounts.setdefault((det.cls, i), []).append(
+                    (payload if kind == AMOUNT_VALUE else None,
+                     payload if kind == AMOUNT_UNKNOWN else None,
+                     det.conf, det.attr_source))
+                seat(i)  # the seat exists even if every box refuses
             elif det.cls == "action_pill":
                 seat(i)["_pill_det"] = det  # resolved after dealt-in is known
             elif det.cls == "dealer_button":
                 seat(i)["dealer"] = True
             elif det.cls == "active_turn_indicator":
                 seat(i)["turn"] = True
+
+    resolve_seat_amounts()
 
     hero_cards = [c for c in (read_card_label(d) for _, d in sorted(hero_dets)) if c][:2]
     board_cards = [c for c in (read_card_label(d) for _, d in sorted(board_dets)) if c][:5]
@@ -772,7 +822,8 @@ def assign_regions(frame: Frame, *, anchor: TableAnchor | None = None) -> dict[s
         "hero_seat_confirmed": hero_seat_confirmed,
         "hero_seat_votes": len(hero_zone_seat_votes),
         "pot_text_off_column": pot_off_column,
-        "stack_conflicts": stack_conflicts,
+        "stack_conflicts": seat_conflicts["stack_text"],
+        "bet_conflicts": seat_conflicts["bet_text"],
         "anchor_ok": anchor is not None,
         "anchor_resid": None if anchor is None else round(anchor.resid, 5),
         "anchor_source": None if anchor is None else anchor.source,

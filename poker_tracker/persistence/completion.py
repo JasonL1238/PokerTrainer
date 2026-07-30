@@ -38,8 +38,13 @@ UNREADABLE_CARDS_KEY = "unreadable_card_columns"
 UNREADABLE_HAND_COLUMNS_KEY = "unreadable_hand_columns"
 
 # Every read-time annotation, so ``strip_derived_evidence_markers`` cannot fall
-# behind when the next one is added.
-_DERIVED_EVIDENCE_KEYS = frozenset({UNREADABLE_CARDS_KEY, UNREADABLE_HAND_COLUMNS_KEY})
+# behind when the next one is added. Public, because three separate rules are
+# keyed on "does this hand carry a read-time degradation marker?" rather than on
+# which one: no writer may persist any of them
+# (``strip_derived_evidence_markers``), any of them demotes ``review_status``
+# (``db._demote_degraded_hand``), and import restores the raw columns any of them
+# names (``import_export._recorded_unreadable_columns``).
+DERIVED_EVIDENCE_KEYS = frozenset({UNREADABLE_CARDS_KEY, UNREADABLE_HAND_COLUMNS_KEY})
 
 # The closed vocabulary of terminal events the pipeline can OBSERVE. This is an
 # allow-list on purpose: ``derive_completion_status`` used to deny-list two
@@ -238,6 +243,14 @@ class CompletionEvidence:
         Every rejection code is permanently unresolved: ``acknowledge_codes``
         refuses to accept one, so a rejection can only disappear by the pipeline
         producing new evidence without it.
+
+        This mixes the two kinds, and a consumer that tells the operator what to DO
+        about a code must not: an Acknowledge button clears a warning and is neither
+        drawn nor honoured for a rejection. Say what a code IS with
+        ``unresolved_warning_codes`` / ``unresolved_rejection_codes``; use this one
+        only to count or to ask "is anything outstanding?".
+        ``test_no_consumer_prescribes_an_action_from_unresolved_codes`` enforces
+        that split.
         """
         acknowledged = set(self.acknowledged_codes)
         return tuple(
@@ -245,6 +258,24 @@ class CompletionEvidence:
             for code in (*self.warning_codes, *self.rejection_codes)
             if code not in acknowledged
         )
+
+    @property
+    def unresolved_rejection_codes(self) -> tuple[str, ...]:
+        """Outstanding codes that are pipeline REFUSALS, which nothing can accept.
+
+        A rejection cannot be acknowledged (``acknowledge_codes`` drops it) and
+        ``app.show_source_warning_controls`` draws no Acknowledge button for one, so
+        any blocker that names Acknowledge for a rejection is naming an action the
+        product cannot perform.
+        """
+        rejected = set(self.rejection_codes)
+        return tuple(code for code in self.unresolved_codes if code in rejected)
+
+    @property
+    def unresolved_warning_codes(self) -> tuple[str, ...]:
+        """Outstanding codes the operator CAN accept in the Source warnings panel."""
+        rejected = set(self.rejection_codes)
+        return tuple(code for code in self.unresolved_codes if code not in rejected)
 
 
 _RECOGNIZED_KEYS = frozenset(
@@ -310,7 +341,7 @@ def strip_derived_evidence_markers(value: object) -> dict[str, object]:
     return {
         str(key): item
         for key, item in value.items()
-        if str(key) not in _DERIVED_EVIDENCE_KEYS
+        if str(key) not in DERIVED_EVIDENCE_KEYS
     }
 
 

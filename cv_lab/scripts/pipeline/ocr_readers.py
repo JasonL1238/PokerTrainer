@@ -52,7 +52,24 @@ def binarize_text(crop_bgr: np.ndarray, v_min: int = 150, s_max: int = 90) -> np
     """Isolate near-white text (high value, low saturation) -> uint8 {0,255} mask.
 
     Drops the green chip icon, coloured pill fills, and dark backgrounds, keeping
-    the white glyph strokes shared by pot/stack/bet/pill text."""
+    the white glyph strokes shared by pot/stack/bet/pill text.
+
+    `v_min` / `s_max` ARE ABSOLUTE PHOTOMETRIC THRESHOLDS and they gate every
+    predicate in read_number_detail's contract, which is why they are disclosed
+    here rather than left as bare defaults. They are neither structural nor a
+    ratio of two like-scaled quantities, so they are a SECOND domain precondition
+    on the template bank alongside P7's render band: the bank is calibrated for
+    the ClubWPT client's own near-white HUD text as captured by a screen
+    recorder, and a recording graded, tone-mapped or re-encoded away from that is
+    outside its calibration.
+    Measured direction of the exposure over 1,736 value-producing crops x 11
+    monotone photometric transforms (gains 0.75-1.30, gammas 0.8-1.25) = 19,096
+    reads: CONFIDENT WRONG 0, in every cell. The reader fails CLOSED and the cost
+    is coverage, steeply and monotonically in distance from the calibrated
+    render: 17 refusals at gain 0.95, 95 at 1.05, 1,090 at 1.15, 1,215 at 1.30,
+    1,104 at gamma 0.8. Retained unchanged and disclosed: the failure direction
+    is the intended one, and there is no ratio available that could express an
+    absolute brightness precondition."""
     if crop_bgr.size == 0:
         return np.zeros((0, 0), np.uint8)
     hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
@@ -342,6 +359,65 @@ _MIN_CALIBRATED_RUN_H = 12
 # a confident 7.0 for a stack the screen renders as 1131.90 BB.
 _MAX_CALIBRATED_RUN_H = 32
 
+# --------------------------------------------------------------------------- #
+# THE SEGMENTATION MECHANICS' OWN RATIOS. These four were inline literals with no
+# name and no measurement, one of them (0.78) numerically equal to
+# _AFFIX_MAX_REL_H five lines under a comment asserting that constant was
+# "retained NOWHERE ELSE" -- true of the name, false of the value. They are named
+# and tabulated here so a future change to one does not silently need to be
+# mirrored in an anonymous twin. All four are ratios against a height measured in
+# the same crop, so render scale cancels. Populations below are the 17,334
+# value-producing crops of the six development recordings unless stated.
+# --------------------------------------------------------------------------- #
+
+# Row-band membership: a component at least this tall (relative to the crop's
+# tallest) is a candidate glyph -- a digit or a same-height letter. Measured
+# h/max_h over all 156,946 components: this floor sits INSIDE a populated region
+# (21,072 components land in [0.45, 0.65)), so it is not a gap in the data and is
+# not presented as one. It is a bound on what can join a digit RUN, and a
+# component below it is not thereby ignored: it stays visible to P2 as policed
+# ink (_policed_ink adds every component overlapping the numeral's row) and to
+# P5 as a separator candidate.
+_BAND_MIN_REL_H = 0.55
+
+# The separator-candidate bucket: short AND narrow relative to the crop's
+# tallest component. Measured over the 36,963 bucket members on decimal-reading
+# crops, h/max_h tops out at 0.4762 and w/max_h at 0.5455, i.e. both bounds sit
+# at their own measured extremum and neither is approached by a real decimal
+# point (a located separator measures 0.0769-0.2381 of RUN height; see
+# _DOT_MIN_BASELINE_POS). Widening either bound admits glyph-scale ink into the
+# population P5 splits on, which is the dot-forgery direction.
+_SHORT_MAX_REL_H = 0.5
+_SHORT_MAX_REL_W = 0.55
+
+# Row-band split: consecutive glyph y-centres further apart than this are
+# different TEXT ROWS (a stack box can carry the player's name above the value).
+# Measured over 96,234 consecutive pairs in the value-producing crops, split by
+# vertical overlap: within one row the y-centre scatter never exceeds 0.3182 of
+# max_h, and two genuine text rows are never closer than 1.0 (the two pairs
+# between those figures, at 0.50 and 0.52, are a bet pill's chip icon against
+# its digits, not a second text row). 0.6 is 1.89x the widest measured
+# within-row scatter and 0.6x the tightest measured row separation, i.e. it sits
+# in an empty window three times wider than either margin.
+_ROW_BAND_MAX_REL_GAP = 0.6
+
+# Digit-height floor inside a row band: a glyph shorter than this fraction of its
+# band cannot join the digit run. Measured h/band_h over the 70,463 glyphs
+# actually ACCEPTED into a winning run: min 0.8462, p1 0.9091, median 1.0000 --
+# so the floor clears the smallest real digit by 0.066 of band height. The
+# population it excludes is real: 1,674 glyphs the bank labels a digit at
+# >= min_score sit outside a winning run with h/band_h as low as 0.6923, and a
+# digit CLIPPED or OCCLUDED is short precisely because it is cut (that is what
+# makes it a fragment rather than a value).
+#
+# It is the numerical complement of _AFFIX_MAX_REL_H over glyph height, and that
+# is a coincidence of two independently measured populations, not a shared
+# constant: this floor is the bottom of the accepted-digit distribution, that one
+# is the top of the "BB" cap distribution on five of six recordings. Changing
+# either does NOT imply changing the other, which is exactly why both now have
+# names.
+_MIN_DIGIT_REL_H = 0.78
+
 # A decimal point sits ON the digit run's baseline. Measured over 9088 real
 # decimal reads, the dot's centre lands at 0.846-0.958 of the run band height
 # (0 = the digits' tops, 1 = their baseline); not one is below 0.75. The old test
@@ -397,6 +473,20 @@ def _bridged_gap(g: Glyph, x0: float, x1: float, shorts: Sequence[Glyph]) -> flo
     clipped seat panel) -> 60.0 for three consecutive samples on the BASELINE
     2054x1470 recording. Bridging the dot puts the same two cases at 0.08-0.17 of
     run_h, i.e. unambiguously inside the numeral.
+
+    WHAT IS *NOT* BRIDGED, stated because the near arm's scope is easy to
+    misread: only the numeral's own baseline separator candidates. An OCCLUDER
+    lying between `g` and the run is NOT bridged, so its own width counts toward
+    the measured gap and a component screened by one reads as "far". That is
+    deliberate — the near arm's question is "does this sit within the numeral's
+    letter spacing", and a component a digit's width away from the run does not,
+    whatever is in between. The screened component is covered by P2's FAR arm
+    (_unanchored_row_ink), which polices glyph-scale ink anywhere on the row.
+    Measured: subtracting every occupied span here instead, so that an occluder
+    is bridged too, changes 0 of 18,006 native development reads and 0 of
+    187,261 real-sprite occlusion variants -- the far arm already refuses every
+    case it would newly catch, and inert machinery behind a load-bearing comment
+    is exactly what this file is trying to stop carrying.
     """
     if g.x < x0:
         return _largest_hole(g.x + g.w, x0, shorts)
@@ -616,14 +706,28 @@ def _unanchored_row_ink(run: list[tuple], policed: Sequence[Glyph],
       * lying in the transitive closure, under the numeral's own letter-spacing
         gap (_RUN_ADJACENCY_GAP, no new constant), of an ANCHOR: an accepted run
         glyph, a proven affix, a separator candidate, or a glyph the bank matches
-        at >= min_score under ANY label. That is what a rendered word IS -- a
+        at >= min_score as a NON-DIGIT. That is what a rendered word IS -- a
         chain of glyphs at letter spacing -- and it explains the colon dots
         (chained to the confident 'T' beside them) and the chip sprite's ragged
         pieces (chained to its confidently-matched core) without explaining an
         isolated occluder fragment, which chains to nothing.
 
-    Measured cost on the six development recordings: 66 of 17,459 value reads
-    (0.38%) refuse -- every one carrying glyph-scale ink on the numeral's row
+    A CONFIDENTLY-CLASSIFIED DIGIT IS NOT AN EXPLANATION, and admitting one was
+    a hole big enough to ship a 170x under-read. `confident` used to mean "the
+    bank matched it under ANY label", so a full-height glyph the bank read as
+    '3' at 0.952, sitting on the numeral's own row outside the winning run, was
+    its own explanation -- and it further laundered the occlusion sliver beside
+    it into the chain. Measured on the real chip sprite laid over one interior
+    digit: "392.30 BB" shipped 2.30 at score 0.933 and "249.30 BB" shipped 9.30
+    at 0.911. A digit outside the winning run is the DEFINITION of a numeral the
+    read has fragmented (P3 already refuses when two runs tie for longest), so
+    it is the one label that can never anchor. The 'O' of "POT:" -- which the
+    bank does label '0' -- keeps its explanation by chaining to the 'P' and 'T'
+    beside it at 2-3px, well inside the letter-spacing window.
+
+    Measured cost of the whole arm on the six development recordings: 125 of
+    17,393 value reads (0.72%) refuse -- 66 before the digit-anchor repair and
+    59 added by it -- every one carrying glyph-scale ink on the numeral's row
     that the bank cannot name, which is exactly the ambiguity (an occluded or
     severed glyph) this arm exists to refuse. Confident-anchor membership does
     NOT weaken the near arm: a confident full-height 'B' inside the adjacency
@@ -710,13 +814,17 @@ class TemplateOCR:
         THE CONTRACT. A value is returned only when every condition below holds.
         In every other case the answer is UNKNOWN with a refusal code. Lower
         coverage is an accepted outcome; a confident wrong number is not. Each
-        condition is either structural or a ratio of two quantities carrying the
-        same scale factor -- except P7, which is a domain precondition on the
-        template bank and is stated as such.
+        condition below is either structural or a ratio of two quantities carrying
+        the same scale factor -- with TWO stated exceptions, both domain
+        preconditions on the template bank rather than claims about the pixels:
+        P7 (the calibrated render band) and `binarize_text`'s absolute
+        `v_min` / `s_max` photometric gate, which runs upstream of every
+        condition here and is documented at that function.
 
         P1  the numeral is TERMINATED BY "BB". The glyphs of the winning run's own
-            row band lying to its right, ignoring any glyph the bank labels 'c'
-            (chip), begin with exactly B, B. ClubWPT renders `<numeral> BB` on all
+            row band lying to its right begin with exactly B, B, and the only
+            thing that may follow them is the chip icon. ClubWPT renders
+            `<numeral> BB` on all
             three numeric classes, and the suffix butts against the value at
             0.07-0.27 of run height -- inside the letter spacing -- so it is where
             truncation and occlusion strike, and it is the only token whose
@@ -742,15 +850,18 @@ class TemplateOCR:
             severed a leading digit without leaving a fragment. Unconditional:
             no ink inside the crop can prove what lies beyond its edge.
 
-        P5  the decimal is PROVEN, not assumed. (a) every baseline separator
-            candidate inside the run reconciles, and all of them to the SAME
-            split -- one non-reconcilable or two disagreeing candidates refuse;
-            and (b) once the located separator (if any) is subtracted, every
-            remaining inter-digit hole is below _DECIMAL_BAND_MIN_GAP -- a
-            digit-sized hole with or without a dot beside it refuses.
+        P5  the decimal is PROVEN, not assumed. (a) there is AT MOST ONE baseline
+            separator candidate inside the run -- the client renders one
+            separator, so a second candidate is unexplained ink, not a second
+            opinion -- and it reconciles; and (b) once the located separator (if
+            any) is subtracted, every remaining inter-digit hole is below
+            _DECIMAL_BAND_MIN_GAP -- a digit-sized hole with or without a dot
+            beside it refuses.
 
-        P6  NO LEADING ZERO without a located separator: the client never renders a
-            leading zero on an integer, so "050" is a "0.50" whose dot was lost.
+        P6  A LEADING ZERO ONLY EVER PRECEDES THE SEPARATOR: the client renders no
+            leading zero on an integer part longer than one digit, so "050" is a
+            "0.50" whose dot was lost and "05.50" is a numeral whose leading digit
+            was destroyed.
 
         P7  the run height lies in the bank's CALIBRATED BAND.
 
@@ -778,8 +889,11 @@ class TemplateOCR:
         if not comps:
             return AmountRead(None, "", 0.0, "no_digit_run", 0)
         max_h = max(c.h for c in comps)
-        tall = [c for c in comps if c.h >= 0.55 * max_h]        # digits + same-height letters
-        dots = [c for c in comps if c.h < 0.5 * max_h and c.w <= 0.55 * max_h]  # ., colon, specks
+        tall = [c for c in comps
+                if c.h >= _BAND_MIN_REL_H * max_h]              # digits + same-height letters
+        dots = [c for c in comps
+                if c.h < _SHORT_MAX_REL_H * max_h
+                and c.w <= _SHORT_MAX_REL_W * max_h]            # ., colon, specks
         if not tall:
             return AmountRead(None, "", 0.0, "no_digit_run", 0)
 
@@ -789,7 +903,7 @@ class TemplateOCR:
         tall.sort(key=lambda g: g.y + g.h / 2.0)
         bands: list[list[Glyph]] = [[tall[0]]]
         for prev, g in zip(tall, tall[1:], strict=False):
-            if (g.y + g.h / 2.0) - (prev.y + prev.h / 2.0) > 0.6 * max_h:
+            if (g.y + g.h / 2.0) - (prev.y + prev.h / 2.0) > _ROW_BAND_MAX_REL_GAP * max_h:
                 bands.append([])
             bands[-1].append(g)
 
@@ -807,19 +921,27 @@ class TemplateOCR:
             # silences it on the geometries where the caps render at full digit
             # height. A glyph whose best match is a DIGIT is never the suffix.
             #
-            # _AFFIX_MAX_REL_H is retained here and NOWHERE ELSE. FAILING it is
+            # _AFFIX_MAX_REL_H is retained here and NOWHERE ELSE -- and, since a
+            # previous form of this comment implied more than it should, its
+            # numerical twin has a name of its own: the digit-height floor two
+            # lines below is _MIN_DIGIT_REL_H, independently measured, and the
+            # two are not one constant. FAILING _AFFIX_MAX_REL_H is
             # refusal-only -- the glyph is no longer routed into a digit-only
             # re-read; it is unexplained ink and the read is UNKNOWN. PASSING it
             # is value-ADMITTING: membership in `named` exempts the glyph from
             # P2, and 57 development reads hold their value only through that
             # exemption (see the constant's own comment).
+            # Candidate affixes only -- POSITION is applied once the numeral's
+            # right edge is known, because a terminator by definition follows
+            # the value (see the `named` narrowing below).
             named = frozenset(id(g) for g, ch, sc in labeled
                               if sc >= min_score and not ch.isdigit()
                               and g.h < _AFFIX_MAX_REL_H * band_h)
             runs: list[list[tuple]] = [[]]
             for item in labeled:
                 g, ch, sc = item
-                if (ch.isdigit() and sc >= min_score and g.h >= 0.78 * band_h
+                if (ch.isdigit() and sc >= min_score
+                        and g.h >= _MIN_DIGIT_REL_H * band_h
                         and g.w <= _MAX_DIGIT_ASPECT * g.h):
                     runs[-1].append(item)
                 elif runs[-1]:
@@ -868,11 +990,25 @@ class TemplateOCR:
         # 191.30, and the read shipped 91.3).
         # Measured on the six development recordings by shifting every crop's left
         # edge inward 1..60px (which leaves the on-screen number unchanged): the
-        # old boundary-touch test alone allowed 60982 confident wrong values, and
-        # right/top/bottom clipping produced zero -- the right is defended by P1
-        # (the suffix goes first) and a vertical cut degrades every glyph's
-        # template score at once. The margin is refusal-only and reuses the P2
-        # constant; there is no new threshold here.
+        # old boundary-touch test alone allowed 60982 confident wrong values. The
+        # margin is refusal-only and reuses the P2 constant; there is no new
+        # threshold here.
+        #
+        # ALL FIVE CLAUSES ARE LOAD-BEARING, and a previous form of this comment
+        # said otherwise: it claimed "right/top/bottom clipping produced zero --
+        # the right is defended by P1 and a vertical cut degrades every glyph's
+        # template score at once", which credited the wrong mechanism. Disabling
+        # only the four boundary-TOUCH clauses (keeping the margin clause, and
+        # keeping every other predicate) leaves the 18,006 native reads
+        # byte-identical -- so no pipeline run can notice -- while producing 83
+        # confident wrong values over a 92,624-read four-direction clip sweep: 23
+        # on top clipping, 60 on bottom (162.4 -> 102.4 at 20px, 232.2 -> 90.0 at
+        # 26px, 394.4 -> 304.4 at 25px), every one a stack_text read. Right
+        # clipping is indeed zero even with the touch test off, but the vertical
+        # directions are defended by these clauses and by nothing else.
+        # `test_clip_family_never_yields_a_different_value` now sweeps all four
+        # sides (its predecessor's docstring claimed "every side" while its body
+        # only sliced columns) and pins the vertical arms on frozen crops.
         crop_h, crop_w = crop_bgr.shape[0], crop_bgr.shape[1]
         if (x0 <= 0 or x1 >= crop_w - 1 or run_y0 <= 0 or run_y1 >= crop_h - 1
                 or x0 < _RUN_ADJACENCY_GAP * run_h):
@@ -899,6 +1035,21 @@ class TemplateOCR:
         # real located-dot read in the corpus keeps its value by construction.
         # No new constant: this is the SAME band the integer branch refuses
         # from, applied to the object whose existence defines the band.
+        #
+        # FOUR CLAUSES ON THIS PATH CANNOT BE PINNED BY ANY TEST, and that is a
+        # measured property, not an oversight: the strictly-inside test below
+        # (`x0 < centre < x1`), the `dots` bucket's width bound, `_reconcilable`'s
+        # `0 < split` lower bound, and P1's chip-skip are each subsumed by a later
+        # predicate on every input reachable today. Ablating each one
+        # independently leaves the owned CV suite green AND leaves all 18,006
+        # native reads plus a 14,400-read scale/clip sweep byte-identical, so no
+        # regression can fail against them. They are retained because each is the
+        # PRIMARY statement of a rule the docstrings rely on (a decimal left of
+        # the first digit means the integer part is missing; a split must leave
+        # digits on both sides), and a subsumption that holds today is not a
+        # specification. Note 15's claim that all nineteen acceptance-path
+        # predicates are killed by a regression is corrected in note 16 on this
+        # point: nineteen are, these four cannot be.
         band_span = max(1.0, float(run_y1 - run_y0))
         sep_dots = [d for d in dots
                     if x0 < (d.x + d.w / 2.0) < x1
@@ -907,6 +1058,37 @@ class TemplateOCR:
                     and _host_gap(d.x + d.w / 2.0, gx)
                     >= _DECIMAL_BAND_MIN_GAP * run_h]
 
+        # ---- LOCATE THE TERMINATOR TOKEN -------------------------------------- #
+        # P1 tests it and P2 uses its right edge, so it is located once, here,
+        # before either. The terminator is the maximal run of band glyphs
+        # starting immediately right of the numeral and held together by the
+        # numeral's own letter spacing (_RUN_ADJACENCY_GAP -- no new constant):
+        # that is what a rendered TOKEN is. Everything past the first word-space
+        # break is a different token -- on this client, the chip icon.
+        #
+        # Locating the token instead of slicing `suffix[:2]` is what closes two
+        # severed-digit holes at once. The old form deleted every glyph the bank
+        # labelled 'c' and then inspected two survivors, so a trailing digit
+        # clipped at the top -- which scores as the chip template -- vanished
+        # before the test: shaving 4 rows off the '8' of the frozen "218 BB" crop
+        # left ['c','B','B'], filtered to ['B','B'], and shipped a confident 21.0
+        # for a 218 BB starting stack. And a trailing digit that scores as 'B'
+        # left ['B','B','B'], which `suffix[:2]` accepted. Both are now a
+        # three-glyph (or wrong-first-glyph) terminator token and both refuse.
+        # Cost on the 18,006-crop development corpus: 0 -- the 43 reads whose
+        # third right-hand glyph is the chip icon MISLABELLED as a digit keep
+        # their value, because the chip sits a word space away and is not part
+        # of the token.
+        label = {id(g): ch for g, ch, _ in labeled}
+        accepted = {id(g) for g, _, _ in run}
+        right_of_run = [g for g in band if g.x >= x1 and id(g) not in accepted]
+        terminator: list[Glyph] = []
+        for g in right_of_run:
+            if terminator and _xspan_gap(terminator[-1], g) > _RUN_ADJACENCY_GAP * run_h:
+                break
+            terminator.append(g)
+        term_x1 = terminator[-1].x + terminator[-1].w if terminator else x1
+
         # ---- P2: no unexplained ink on the numeral's row ---------------------- #
         # Two arms, both refusal-only. NEAR: ink within the numeral's own letter
         # spacing that is not a proven affix or separator candidate
@@ -914,27 +1096,54 @@ class TemplateOCR:
         # that no anchored chain explains (_unanchored_row_ink) -- distance used
         # to be an exemption, and a wide occluder's fragments beyond the
         # adjacency window were invisible to every predicate.
+        # THE AFFIX EXEMPTION IS POSITIONAL. `named` is the one thing that can
+        # silence P2 on a glyph, and it exists for exactly one object: the "BB"
+        # terminator, which the client renders AFTER the value. Granting it to a
+        # glyph left of, or inside, the numeral hands the exemption to whatever
+        # the bank happens to label a non-digit there -- and an occluded digit is
+        # precisely that. Measured with the real chip sprite over the lower rows
+        # of one digit: the occluded '9' of "190.10 BB" dropped below the digit
+        # floor, was labelled 'c' (chip) at 0.649, entered `named`, exempted
+        # itself from P2's near arm, and then ANCHORED the severed leading digits
+        # in the far arm -- shipping 0.10 at score 0.946 for a 190.1 BB stack,
+        # and "POT: 30 BB" as a confident 0.0. Restricting the exemption to the
+        # located terminator token costs 0 reads on the 18,006-crop development
+        # corpus: no legitimate affix has ever been anywhere else.
+        term_ids = {id(g) for g in terminator}
+        named = frozenset(i for i in named if i in term_ids)
         policed = _policed_ink(run, band, comps)
         sep_ids = frozenset(id(d) for d in sep_dots)
         if _run_is_truncated(run, policed, dots, named, sep_ids):
             return AmountRead(None, digits, score, "unexplained_ink_in_numeral", n)
-        conf_by_id = {id(g): sc for g, _, sc in labeled}
+        # Anchors for the far arm's chain. A confident NON-DIGIT explains itself
+        # ("POT:", "BB", the chip icon); a confident DIGIT outside the winning
+        # run does not -- it is a fragment of the numeral the read failed to
+        # keep whole. See _unanchored_row_ink.
+        #
+        # The one place the digit label carries no such warning is BEYOND THE
+        # TERMINATOR: the client renders `<numeral> BB`, so nothing right of the
+        # "BB" token can be a digit of the numeral, whatever the bank calls it.
+        # The chip icon lands there and its pale annulus scores as '0' at reduced
+        # render size on 43 development reads (the frozen "19.50 BB" bet crop
+        # among them). Granting those glyphs an anchor cannot launder a numeral
+        # fragment, because P1 below refuses unless the token really is "BB".
+        conf_by_id = {id(g): (ch, sc) for g, ch, sc in labeled}
         confident: set[int] = set()
         for g in policed:
-            sc = conf_by_id.get(id(g))
-            if sc is None:
-                _, sc = self.classify_digit(g.mask)
-            if sc >= min_score:
+            got = conf_by_id.get(id(g))
+            if got is None:
+                got = self.classify_digit(g.mask)
+            ch, sc = got
+            if sc >= min_score and (not ch.isdigit() or g.x >= term_x1):
                 confident.add(id(g))
         if _unanchored_row_ink(run, policed, named, sep_ids, frozenset(confident)):
             return AmountRead(None, digits, score, "unexplained_ink_in_numeral", n)
 
-        # ---- P1: the numeral is terminated by a well-formed "BB" suffix ------- #
-        label = {id(g): ch for g, ch, _ in labeled}
-        accepted = {id(g) for g, _, _ in run}
-        suffix = [label[id(g)] for g in band
-                  if g.x >= x1 and id(g) not in accepted and label[id(g)] != "c"]
-        if suffix[:2] != ["B", "B"]:
+        # ---- P1: the numeral is terminated by a well-formed "BB" token -------- #
+        # The whole token, located above, must be exactly two glyphs and both
+        # must be 'B'. No filtering, no prefix slice: see the terminator's own
+        # comment for the two severed-digit holes those two shortcuts opened.
+        if [label[id(g)] for g in terminator] != ["B", "B"]:
             return AmountRead(None, digits, score, "suffix_not_bb", n)
 
         # ---- P5: the decimal is proven, not assumed --------------------------- #
@@ -947,17 +1156,27 @@ class TemplateOCR:
             return 0 < split < n and n - split <= _MAX_FRACTIONAL_DIGITS
 
         split_at: int | None = None
+        if len(sep_dots) > 1:
+            # THE CLIENT RENDERS AT MOST ONE SEPARATOR, so a second candidate is
+            # not a second opinion about where the decimal is -- it is ink the
+            # read cannot explain, and one of the two is not a decimal point.
+            # Requiring uniqueness rather than agreement costs 0 of the 18,006
+            # development crops (no value-producing crop carries two candidates),
+            # and it closes a real fabrication: an occluder that both widens an
+            # inter-digit gap into the decimal band AND scatters two baseline
+            # specks into it gets a split from one speck while the pair jointly
+            # fills the hole, so P5(b)'s remainder test sees nothing. Measured on
+            # the real chip sprite over "POT: 39.50 BB": a confident 3.50.
+            return AmountRead(None, digits, score, "separator_unreconciled", n)
         if sep_dots:
-            # EVERY candidate must reconcile, and all of them to the SAME split.
-            # This replaces a widest-gap-first ordering that broke at the first
-            # reconcilable candidate: under that loop two candidates reconciling
-            # to different values were resolved by a ranking key ("widest gap
-            # wins") instead of refused, and a non-reconcilable candidate behind
-            # the winner was never examined at all -- while the docstring claimed
-            # "no other candidate was discarded". Measured over all 18006 native
-            # reads, no value-producing crop carries two candidates, so the
-            # stricter predicate costs nothing and the spec and the code now say
-            # the same thing.
+            # The candidate must reconcile. This replaces a widest-gap-first
+            # ordering that broke at the first reconcilable candidate: under that
+            # loop two candidates reconciling to different values were resolved
+            # by a ranking key ("widest gap wins") instead of refused, and a
+            # non-reconcilable candidate behind the winner was never examined at
+            # all -- while the docstring claimed "no other candidate was
+            # discarded". The loop is kept in agreement form so the predicate
+            # stays correct if the uniqueness rule above is ever revisited.
             splits: set[int] = set()
             for d in sep_dots:
                 # Split at the separator's REAL position, not blindly at the last
@@ -1003,8 +1222,17 @@ class TemplateOCR:
             # _INTRA_NUMERAL_MAX_GAP.
             return AmountRead(None, digits, score, "unexplained_gap_in_numeral", n)
 
-        # ---- P6: no leading zero without a located separator ------------------ #
-        if split_at is None and n > 1 and digits[0] == "0":
+        # ---- P6: a leading zero only ever precedes the separator -------------- #
+        # The client never renders a leading zero on an integer part longer than
+        # one digit: every legitimate leading-zero read in the corpus is "0.50"
+        # (635) or "0.2" (13), i.e. split_at == 1 in 648 of 648. So "050" is a
+        # "0.50" whose dot was lost, and "05.50" is a "95.50" whose leading digit
+        # was occluded into a '0' -- measured: the real chip sprite over the
+        # bottom rows of the '9' of a 95.50 BB stack re-labels it '0' at 0.570
+        # and, with the real decimal still located at position 2, shipped a
+        # confident 5.5. Testing the separator's POSITION rather than merely its
+        # existence costs 0 of the 18,006 development crops.
+        if n > 1 and digits[0] == "0" and split_at != 1:
             return AmountRead(None, digits, score, "leading_zero_no_dot", n)
 
         raw = f"{digits[:split_at]}.{digits[split_at:]}" if split_at is not None else digits

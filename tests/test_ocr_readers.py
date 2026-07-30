@@ -581,35 +581,183 @@ def test_a_malformed_bb_suffix_makes_the_read_unknown(production_bank) -> None:
     assert detail.decimal_source == "unexplained_ink_in_numeral"
 
 
-def test_p1_refuses_the_timer_badge_that_outscores_the_stack(production_bank) -> None:
-    """P1's own firing, on the real crop that proves it is load-bearing.
+def test_the_timer_badge_never_ships_as_the_stack(production_bank) -> None:
+    """The real crop that carries TWO numerals, and the reader wins with the
+    wrong one.
 
-    Round-2 adversary C ablated P1 to `if False and suffix[:2] != ["B", "B"]:`
-    and the entire owned CV suite stayed green (280 passed) while 218 of the 219
-    suffix_not_bb refusals in the retained development crops came back as
-    confident values. This is the strongest of them, and the reason the whole
-    predicate exists.
+    A g0621 seat panel (2062x1178) showing the stack the screen renders
+    "212.90 BB" plus a circular action-timer badge reading "12" over the
+    player's avatar. The badge's 2-digit run is the one P3 selects, because the
+    stack's own glyphs are barely half its height and never enter the band.
+    Note 12 recorded this crop shipping a confident 12.0 -- a 17.7x under-read of
+    a real stack -- back when run completeness was a ranking key.
 
-    The crop is a g0621 seat panel (2062x1178) carrying TWO numerals: the stack,
-    which the screen renders "212.90 BB", and a circular action-timer badge
-    reading "12" over the player's avatar. The badge's run is the one the reader
-    wins with -- note 12 recorded the same crop shipping a confident 12.0 back
-    when run completeness was a ranking key rather than a refusal -- and the
-    badge carries no "BB", because a timer is not an amount. So P1 is the
-    predicate that separates "a number on the felt" from "the number this HUD
-    element is for", and with it disabled the reader publishes a 17.7x
-    under-read of a real stack at score 0.796.
-
-    Verified to fail first against the ablated form: with P1 off this crop reads
-    12.0 and the first assertion below fails."""
-    detail = production_bank.read_number_detail(
-        cv2.imread(str(FIXTURES / "stack_212_90_timer_badge_at_2062x1178.png"))
-    )
-    assert detail.value is None, "a numeral with no BB terminator is not proven"
+    ATTRIBUTION MOVED IN THE ROUND-3 REPAIR, and the assertion moved with it
+    rather than being softened. Until the repair, P1 was the refusing predicate:
+    a timer carries no "BB". P2's far arm now fires first, because the stack's
+    own digits sit on the badge's row as glyph-scale ink and a confidently
+    classified DIGIT outside the winning run is no longer accepted as its own
+    explanation (see _unanchored_row_ink). The crop is still refused, still never
+    ships 12.0, and the predicate that refuses it is named exactly -- if a third
+    one starts firing here, this assertion says so. P1's own killing tests are
+    `test_p1_fires_on_every_malformed_terminator` (synthetic family) and
+    `test_p1_refuses_a_digit_the_chip_template_swallowed` (real crop, and a
+    genuine confident-wrong)."""
+    img = cv2.imread(str(FIXTURES / "stack_212_90_timer_badge_at_2062x1178.png"))
+    detail = production_bank.read_number_detail(img)
+    assert detail.value is None, "a crop carrying two numerals is not proven"
     assert detail.value != 12.0, "the timer badge must never ship as the stack"
-    assert detail.decimal_source == "suffix_not_bb", (
-        "P1 must be the predicate that refuses this crop; if another one now "
-        "fires first, P1 is once again pinned by nothing")
+    assert detail.decimal_source == "unexplained_ink_in_numeral", (
+        "name the predicate that actually refuses this crop; claiming a "
+        "predicate fires where a different one does is how P1 came to be "
+        f"unpinned in the first place (got {detail.decimal_source})")
+    # Structural: the fixture must still carry a SECOND numeral, or the test is
+    # exercising nothing. The badge's digits and the stack's digits differ in
+    # height by more than the band floor.
+    comps = segment_glyphs(binarize_text(img), min_area=2, min_h_px=1)
+    max_h = max(c.h for c in comps)
+    tall = [c for c in comps if c.h >= 0.55 * max_h]
+    short_digits = [c for c in comps
+                    if 0.3 * max_h <= c.h < 0.55 * max_h
+                    and production_bank.classify_digit(c.mask)[0].isdigit()]
+    assert len(tall) == 2, "the badge's own 2-digit run must be the only tall run"
+    assert len(short_digits) >= 4, "the stack's digits must still be in the crop"
+
+
+def test_p1_refuses_a_digit_the_chip_template_swallowed(production_bank) -> None:
+    """P1 on a REAL crop, and on a genuine confident-wrong read.
+
+    P1 used to inspect `suffix[:2]` of a list from which every glyph the bank
+    labelled 'c' had ALREADY been deleted. Two severed digits were invisible at
+    once, and this fixture is the first: shaving four rows off the top of the '8'
+    of the frozen "218 BB" stack -- any occluder clipping the top of the last
+    digit -- drops it to 0.667 of band height, where the bank scores it as the
+    chip template at 0.576. The chip filter then removed it from the suffix
+    entirely, leaving ['B','B'], which passed, and the reader shipped a confident
+    21.0 for a 218 BB starting stack. The parent crop already refuses; the shaved
+    one carries strictly LESS information, so it could not honestly become
+    provable.
+
+    P1 now tests the located terminator TOKEN -- the maximal letter-spacing chain
+    of band glyphs starting right of the numeral -- unfiltered and in full. Here
+    that token is ['c'] and the read is UNKNOWN.
+
+    Verified to fail first against the shipped predicate: with the pre-repair P1
+    this crop returns 21.0 at score 0.772."""
+    detail = production_bank.read_number_detail(
+        cv2.imread(str(FIXTURES / "stack_218_top_shaved_at_1272x896.png"))
+    )
+    assert detail.value is None, f"shaved 218 shipped {detail.value!r}"
+    assert detail.value != 21.0
+    assert detail.decimal_source == "suffix_not_bb", detail
+
+
+def test_a_digit_outside_the_run_never_explains_itself(production_bank) -> None:
+    """P2's far arm: a confidently classified DIGIT is not an anchor.
+
+    `confident` used to mean "the bank matched this glyph at >= min_score under
+    ANY label", so a full-height glyph the bank read as '3' at 0.952, sitting on
+    the numeral's own row outside the winning run, anchored itself -- and then
+    laundered the 14px occlusion sliver beside it into the same chain under the
+    adjacency window. The fixture is a real 2062x1178 seat panel rendering
+    "392.30 BB" with the production chip sprite laid over one interior digit as a
+    full-height 8px strip; the shipped reader returned 2.30 at score 0.933, a
+    170x under-read.
+
+    A digit outside the winning run is the definition of a numeral the read has
+    fragmented, so it is the one label that can never anchor. The 'O' of "POT:",
+    which the bank also labels '0', keeps its explanation by chaining to the 'P'
+    and 'T' beside it -- pinned by the negative control below, which must keep
+    reading its pot."""
+    detail = production_bank.read_number_detail(
+        cv2.imread(str(FIXTURES / "stack_392_30_digit_severed_by_sprite_at_2062x1178.png"))
+    )
+    assert detail.value is None, f"severed 392.30 shipped {detail.value!r}"
+    assert detail.value != 2.3
+    assert detail.decimal_source == "unexplained_ink_in_numeral", detail
+    # Negative control: a "POT:" prefix whose 'O' the bank labels a digit still
+    # reads, because it chains to the confident 'P' and 'T' at letter spacing.
+    ok = production_bank.read_number_detail(cv2.imread(str(FIXTURES / "pot_165_integer.png")))
+    assert ok.value == 165.0, ok
+    # Negative control: the chip icon, whose annulus scores as '0' at reduced
+    # render size, sits BEYOND the "BB" token and must keep anchoring itself.
+    chip = production_bank.read_number_detail(cv2.imread(str(FIXTURES / "bet_19_50_at_1272x896.png")))
+    assert chip.value == 19.5, chip
+
+
+def test_the_affix_exemption_is_denied_left_of_the_numeral(production_bank) -> None:
+    """P2: `named` is the only thing that can silence P2 on a glyph, and it
+    exists for one object -- the "BB" terminator, which follows the value.
+
+    Granted by height and label alone, anywhere in the band, it went to an
+    occluded DIGIT instead. The fixture is a real 2722x1832 seat panel rendering
+    "190.10 BB" with the production chip sprite over the lower 12 rows of the
+    '9': the occluded digit drops below the digit floor, scores as the chip
+    template 'c' at 0.649, and used to enter `named` -- where it exempted itself
+    from P2's near arm AND anchored the severed leading digits in the far arm.
+    Shipped: 0.10 at score 0.946, a 1901x under-read, and 0.1 BB is all-in
+    territory the spine reads as a positive fact.
+
+    Verified to fail first: with the exemption granted band-wide this crop reads
+    0.1."""
+    detail = production_bank.read_number_detail(
+        cv2.imread(str(FIXTURES / "stack_190_10_digit_occluded_into_affix_at_2722x1832.png"))
+    )
+    assert detail.value is None, f"occluded 190.10 shipped {detail.value!r}"
+    assert detail.value != 0.1
+    assert detail.decimal_source == "unexplained_ink_in_numeral", detail
+    # Negative control: the exemption must still admit a real terminator, or the
+    # narrowing is indistinguishable from deleting `named` altogether.
+    ok = production_bank.read_number_detail(
+        cv2.imread(str(FIXTURES / "stack_198_suffix_named_at_2054x1470.png")))
+    assert ok.value == 198.0, ok
+
+
+def test_a_second_separator_candidate_is_unexplained_ink(production_bank) -> None:
+    """P5(a): the client renders AT MOST ONE separator.
+
+    Requiring only that multiple candidates AGREE left an occluder free to both
+    widen an inter-digit gap into the decimal band and scatter two baseline
+    fragments into it: one fragment supplies the split, and the PAIR jointly
+    fills the hole so P5(b)'s remainder test sees nothing. The fixture is a real
+    1272x896 "POT: 39.50 BB" with the production chip sprite over the '9';
+    shipped 3.50 at score 0.852.
+
+    Costs 0 of the 18,006 development crops -- no value-producing crop carries
+    two candidates -- and the negative control below keeps the one-candidate path
+    honest."""
+    detail = production_bank.read_number_detail(
+        cv2.imread(str(FIXTURES / "pot_39_50_two_forged_separators_at_1272x896.png"))
+    )
+    assert detail.value is None, f"two-candidate crop shipped {detail.value!r}"
+    assert detail.value != 3.5
+    assert detail.decimal_source == "separator_unreconciled", detail
+    ok = production_bank.read_number_detail(cv2.imread(str(FIXTURES / "stack_343_60_at_1272x896.png")))
+    assert ok.value == 343.6 and ok.decimal_source == "dot", ok
+
+
+def test_a_leading_zero_is_only_ever_the_whole_integer_part(production_bank) -> None:
+    """P6 tests the separator's POSITION, not merely its existence.
+
+    "no leading zero UNLESS a separator was located" let "05.50" through, and an
+    occluder makes that shape easily: the fixture is a real 2138x1402 seat panel
+    rendering "95.50 BB" with the production chip sprite over the bottom 7 rows
+    of the '9', which then classifies as '0' at 0.570. With the real decimal
+    still located at position 2 the reader shipped a confident 5.5 for a 95.5 BB
+    stack.
+
+    The client renders a leading zero only as the WHOLE integer part: all 648
+    leading-zero reads in the development corpus are "0.50" (635) or "0.2" (13),
+    i.e. split_at == 1 in 648 of 648. Cost of testing the position: 0 reads."""
+    detail = production_bank.read_number_detail(
+        cv2.imread(str(FIXTURES / "stack_95_50_leading_digit_occluded_at_2138x1402.png"))
+    )
+    assert detail.value is None, f"05.50 shipped {detail.value!r}"
+    assert detail.value != 5.5
+    assert detail.decimal_source == "leading_zero_no_dot", detail
+    # Negative control: the legitimate leading zero -- the whole integer part.
+    ok = production_bank.read_number_detail(cv2.imread(str(FIXTURES / "bet_0_50_at_2054x1470.png")))
+    assert ok.value == 0.5 and ok.decimal_source == "dot", ok
 
 
 def test_p1_fires_on_every_malformed_terminator(scaled_digit_templates) -> None:
@@ -629,12 +777,22 @@ def test_p1_fires_on_every_malformed_terminator(scaled_digit_templates) -> None:
                  earlier and stronger refusal of the same crop;
       * "88"  -- P1 fires here, but the ablated reader is caught downstream by
                  integer_over_decimal_band, so the case cannot kill the mutant.
-    Both are recorded rather than asserted."""
+      * "8BB" -- a digit at the FRONT of the terminator token. Synthetically the
+                 stray '8' is full-height and confidently a digit, so it joins
+                 the run itself ("3128") and P2 fires; the real-crop form of this
+                 case, where the severed digit scores as the CHIP template and so
+                 breaks the run, is asserted in
+                 test_p1_refuses_a_digit_the_chip_template_swallowed.
+    All three are recorded rather than asserted."""
     bank = TemplateOCR(dict(scaled_digit_templates), {})
     for label, kwargs in (
         ("no terminator", {"suffix": False}),
         ("one cap", {"suffix_chars": "B"}),
         ("second cap reads as a digit", {"suffix_chars": "B8"}),
+        # Round-3 addition. A terminator TOKEN of three glyphs is the shape a
+        # trailing digit misread as 'B' produces, and `suffix[:2]` accepted it:
+        # 16 real development crops already render a "BBB" suffix.
+        ("three caps", {"suffix_chars": "BBB"}),
     ):
         detail = bank.read_number_detail(_compose("312", 0.9, [3, 3], **kwargs))
         assert detail.value is None, f"{label}: shipped {detail.value}"
@@ -1289,6 +1447,17 @@ def test_no_frozen_fixture_reads_a_wrong_value_at_any_render_size(
         # "BB" (the timer badge wins the run), and a real two-row stack panel.
         "stack_212_90_timer_badge_at_2062x1178.png": 212.9,
         "stack_124_80_name_row_above_at_2138x1402.png": 124.8,
+        # Round-3 repair. Five occlusion composites built from real development
+        # crops with the production chip sprite (see PROVENANCE for the exact
+        # boxes); each shipped the wrong number before its predicate was
+        # repaired, and the truth column is what the screen renders underneath.
+        # Plus one unmodified control, the top-clip killer for P4's touch arm.
+        "stack_392_30_digit_severed_by_sprite_at_2062x1178.png": 392.3,
+        "stack_190_10_digit_occluded_into_affix_at_2722x1832.png": 190.1,
+        "stack_218_top_shaved_at_1272x896.png": 218.0,
+        "pot_39_50_two_forged_separators_at_1272x896.png": 39.5,
+        "stack_95_50_leading_digit_occluded_at_2138x1402.png": 95.5,
+        "stack_162_40_at_2138x1402.png": 162.4,
     }
     assert set(truth) == {p.name for p in FIXTURES.glob("*.png")}, (
         "every frozen OCR fixture must carry a transcribed truth value here; a "
@@ -1449,30 +1618,49 @@ def test_real_crop_sprite_occluded_pot_is_unknown(production_bank) -> None:
     assert detail.decimal_source == "unexplained_ink_in_numeral"
 
 
-def test_left_clip_family_never_yields_a_different_value(production_bank) -> None:
-    """THE FAMILY, not the instance: shifting a crop's left edge inward removes
+def test_clip_family_never_yields_a_different_value(production_bank) -> None:
+    """THE FAMILY, on ALL FOUR SIDES: shifting any crop edge inward removes
     information while the number on screen is unchanged, so every clipped read
     must return the native value or UNKNOWN. Before the repair, 9628 of 17469
     value-producing corpus crops had at least one confident-wrong left-clipped
     read (60982 wrong values; 4313 of them exactly 100x). After it: zero, over
-    every crop, every side, 60 depths. This pins four fixture crops across three
-    geometries and additionally requires P4's margin arm to actually FIRE --
-    `run_clipped` appeared 0 times in 18006 native reads, so without this
-    assertion the whole predicate could be deleted suite-green (it was, in
-    mutation P4-clip)."""
-    saw_run_clipped = False
+    every crop, every side, 60 depths.
+
+    ITS PREDECESSOR CLAIMED "every side" AND SLICED ONLY COLUMNS. That gap left
+    P4's four boundary-TOUCH clauses -- `x0 <= 0`, `x1 >= crop_w - 1`,
+    `run_y0 <= 0`, `run_y1 >= crop_h - 1` -- pinned by nothing: only the margin
+    clause and the predicate as a whole had ever been ablated. With the four
+    touch clauses disabled and the margin clause kept, the entire owned CV suite
+    stays green AND all 18,006 native reads are byte-identical, so no pipeline
+    run could notice, while a 92,624-read four-direction clip sweep produces 83
+    confident wrong values -- 23 on top clipping, 60 on bottom, every one a
+    stack_text read (162.4 -> 102.4 at 20px, 232.2 -> 90.0 at 26px,
+    394.4 -> 304.4 at 25px). Two of the fixtures below are here specifically to
+    kill that mutant in the vertical directions, and the assertions at the end
+    require each direction's refusal to be OBSERVED rather than assumed."""
+    saw_run_clipped = {"left": False, "right": False, "top": False, "bottom": False}
     for name in ("stack_314_90_at_1272x896.png", "bet_19_50_at_1272x896.png",
-                 "pot_240_9_one_decimal.png", "bet_0_50_at_2054x1470.png"):
+                 "pot_240_9_one_decimal.png", "bet_0_50_at_2054x1470.png",
+                 # bottom-clip killer: 197.0 -> 107.0 at 20px with the touch
+                 # clauses off. top-clip killer: 162.4 -> 102.4 at 20px.
+                 "stack_197_at_2054x1470.png", "stack_162_40_at_2138x1402.png"):
         img = cv2.imread(str(FIXTURES / name))
         assert img is not None, name
         native = production_bank.read_number_detail(img).value
         assert native is not None, f"{name} must read at native crop"
-        for k in range(1, min(46, img.shape[1] - 6)):
-            detail = production_bank.read_number_detail(img[:, k:])
-            assert detail.value is None or detail.value == native, (
-                f"{name} clipped {k}px read {detail.value!r} (native {native!r})")
-            saw_run_clipped |= detail.decimal_source == "run_clipped"
-    assert saw_run_clipped, "P4 (boundary/margin) never fired across the family"
+        h, w = img.shape[:2]
+        for k in range(1, 46):
+            for side, sub in (("left", img[:, k:]), ("right", img[:, : w - k]),
+                              ("top", img[k:, :]), ("bottom", img[: h - k, :])):
+                if sub.shape[0] < 3 or sub.shape[1] < 3:
+                    continue
+                detail = production_bank.read_number_detail(sub)
+                assert detail.value is None or detail.value == native, (
+                    f"{name} {side}-clipped {k}px read {detail.value!r} "
+                    f"(native {native!r})")
+                saw_run_clipped[side] |= detail.decimal_source == "run_clipped"
+    for side, seen in saw_run_clipped.items():
+        assert seen, f"P4 never fired on the {side} edge across the family"
 
 
 def test_interior_digit_paint_out_is_unknown(production_bank) -> None:

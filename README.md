@@ -147,15 +147,38 @@ arrives through import is stamped as imported and attests to its own declared
 assumptions in the database it lands in — the same reason import never lands a
 `reviewed` status and never carries your acknowledgements across.
 
+The settlement editor's **Replace observed final pot/result with the derived
+ledger values** rewrites `pot_size` and `hero_bb_won` — the hand's *observed*
+summary — from the reconciled ledger. It is offered because a freshly
+reconstructed hand often records neither, and once you have verified the action
+line and the winners the ledger is the best record there is. It is refused while
+the reconciliation is not established: an unbalanced or illegal ledger, or a
+declared settlement input you have not confirmed. Confirm the assumption (or
+correct the declaration) and save again, and it writes; otherwise the settlement
+is saved and the recorded pot and result are left exactly as they were, with the
+reason named. A derived figure that rests on an unconfirmed declaration must not
+become an observation, because the recorded pair is the independent evidence the
+cross-check compares the ledger against.
+
 The settlement editor's **Chip unit** rounds the rake and nothing else. It is a
 room rule — a house that drops whole dollars against a 0.50 blind is ordinary —
 and it no longer decides the granularity a chopped pot is divided at. That
 granularity is derived from the hand's own amounts: the finest decimal place any
 observed contribution or declared dead-money figure is written in, capped at one
 whole chip. Indivisible chips are still real, so a 21-chip pot chopped two ways is
-still pushed 11/10 in the audited `Order` column's order, but no value you type in
-`Chip unit` changes a derived payout, and a rake share is never charged to a pot
-beyond what that pot holds.
+still pushed 11/10 in the audited `Order` column's order, and a rake share is
+never charged to a pot beyond what that pot holds.
+
+What you type in `Chip unit` **does** change derived payouts, because rounding the
+rake changes the net pot every payout is drawn from. On an 80-chip pot at a
+declared 50% rake, a unit of 1 charges 40 and pays the winner 40; a unit of 3
+charges 39 and pays 41; a unit of 81 charges nothing and pays 80. Read it as
+carefully as the rake rate itself before you press **Confirm this assumption** —
+it is a declared settlement input like any other, it is measured like one, and a
+value that moves chips is named and blocks the hand until you attest to the
+movement. (A previous revision of this paragraph said no value you type here
+changes a derived payout. That was false, and false about the one field two
+adversarial rounds landed critical findings on.)
 
 If the cause is not known yet, use **Flag this hand for future debugging**.
 PokerTrainer saves the issue categories, description, and a snapshot of the
@@ -193,18 +216,27 @@ hand's players, actions, or settlement returns a reviewed hand to
 
 JSON export version 5 carries correction, issue, coaching, and completion history
 through backup/import workflows. Import still accepts versions 1-4 and gives them
-safe conservative defaults. Importing a session preserves a manual hand's review
-status but always lands a reconstructed hand as `needs_correction`: your
-confirmation that a reconstructed hand is correct is deliberately per-render and
+safe conservative defaults. Importing a session lands every hand as
+`needs_correction`, whatever review status and whatever `source_type` the payload
+declares: your confirmation that a hand is correct is deliberately per-render and
 never persisted, so it cannot travel in a file, and the importing operator has not
-yet seen the evidence. For the same reason, source-warning acknowledgements do not
-travel either: a v5 export of a hand whose warnings you accepted re-imports with
-those warnings unaccepted, so the importing operator accepts them themselves. The
-codes are preserved in full — only your attestation to them is dropped. Retained
-coaching travels the same way: the text of every saved review is imported in full
-and marked *stale*, because a review describes the hand, ledger and winners of the
-database that wrote it and nothing in the importing database can verify that claim.
-Re-run coaching there to make it current. Schema
+yet seen the evidence. (A genuine manual export loses its `reviewed` label too,
+because it is byte-identical to a forgery of one, and the label is one tick and
+one save away for the operator who now vouches for it. The v13 migration is
+different: it keeps manual review statuses, because a migrated database is your
+own data rather than somebody's JSON.) For the same reason, source-warning
+acknowledgements do not travel either: a v5 export of a hand whose warnings you
+accepted re-imports with those warnings unaccepted, so the importing operator
+accepts them themselves. The codes are preserved in full — only your attestation
+to them is dropped. Settlement-assumption confirmations are reset for the same
+reason, and the dependence is simply re-measured and asked again. A debugging
+issue you resolved re-imports **open**, with your resolution notes carried into
+its description as history: resolving is an assertion that somebody looked at the
+hand and fixed the thing, and the importing operator has looked at nothing.
+Retained coaching travels the same way: the text of every saved review is imported
+in full and marked *stale*, because a review describes the hand, ledger and winners
+of the database that wrote it and nothing in the importing database can verify that
+claim. Re-run coaching there to make it current. Schema
 version 13 is additive: v10 added correction
 history and review staleness, v11 added solver records, v12 added the debugging
 issue queue, and v13 adds explicit hand completion

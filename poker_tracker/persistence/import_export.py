@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from poker_tracker.persistence.completion import (
+    DERIVED_EVIDENCE_KEYS,
     IMPORTED_HAND_KEY,
-    UNREADABLE_CARDS_KEY,
     derive_completion_status,
     parse_completion_evidence,
     strip_derived_evidence_markers,
@@ -114,12 +114,12 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
         hand_data = dict(hand_payload["hand"])
         hand_data.pop("id", None)
         hand_data["session_id"] = 0
-        # Captured BEFORE the marker is stripped. It is the only surviving record
-        # of a card column the exporting database could not read, and without it
-        # INVALID_HERO_OR_BOARD_CARDS is a consumer whose producer -- the corrupt
-        # column, which the exporter has already blanked -- disappears across the
-        # round trip.
-        unreadable = _recorded_unreadable_cards(hand_data.get("completion_evidence"))
+        # Captured BEFORE the markers are stripped. They are the only surviving
+        # record of a column the exporting database could not read, and without
+        # them INVALID_HERO_OR_BOARD_CARDS and UNREADABLE_HAND_COLUMNS are
+        # consumers whose producer -- the corrupt column, which the exporter has
+        # already degraded to a fallback -- disappears across the round trip.
+        unreadable = _recorded_unreadable_columns(hand_data.get("completion_evidence"))
         _apply_completion_import_defaults(hand_data)
         hand = Hand(**hand_data)
 
@@ -184,6 +184,7 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
             imported = dict(issue_data)
             imported.pop("id", None)
             imported["hand_id"] = 0
+            _mark_imported_issue_unresolved(imported)
             issues.append(HandIssue(**imported))
 
         validated_hands.append(
@@ -230,7 +231,7 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
             if saved_hand.id is None:
                 raise RuntimeError("Imported hand did not receive an id.")
             if unreadable:
-                db.restore_unreadable_card_columns(saved_hand.id, unreadable)
+                db.restore_unreadable_columns(saved_hand.id, unreadable)
             for player in players:
                 db.create_hand_player(player.model_copy(update={"hand_id": saved_hand.id}))
             for action in actions:
@@ -340,6 +341,52 @@ def _mark_imported_analysis_stale(review_data: dict[str, Any]) -> None:
     review_data["is_stale"] = True
     if not str(review_data.get("stale_reason") or "").strip():
         review_data["stale_reason"] = IMPORTED_ANALYSIS_STALE_REASON
+
+
+IMPORTED_ISSUE_REOPEN_NOTE = (
+    "Reopened on import; the resolution was recorded in another database. "
+    "Previously recorded resolution: "
+)
+
+
+def _mark_imported_issue_unresolved(issue_data: dict[str, Any]) -> None:
+    """Land every imported debugging issue OPEN, whatever the payload declared.
+
+    Exactly the rule ``_mark_imported_analysis_stale`` applies to coaching, that
+    ``_enforce_review_status_floor`` applies to ``reviewed``, and that
+    ``_apply_completion_import_defaults`` applies to ``acknowledged_codes``,
+    ``confirmed_assumption_codes`` and the declared ``completion_status``: an
+    assertion about evidence cannot travel in the payload that carries the
+    evidence. A resolution says "somebody looked at this hand and fixed the thing"
+    -- ``resolve_hand_issue`` demands notes for exactly that reason -- and the
+    importing operator has looked at nothing.
+
+    Changing one JSON field from ``"open"`` to ``"resolved"`` cleared
+    OPEN_DEBUGGING_ISSUE, landed the hand study-ready with an empty blocker tuple,
+    and let ``db.update_hand_status`` promote it to ``reviewed`` -- in a state
+    ``resolve_hand_issue`` refuses to create, because the same edit left
+    ``resolution_notes`` empty and ``resolved_at`` null. Requiring those two
+    fields instead would only have moved the forgery two fields along; the
+    resolution is not verifiable here at any level of detail.
+
+    Nothing is discarded. The description, the issue types and the immutable
+    evidence snapshot travel unchanged, and any resolution notes the exporting
+    database recorded are carried into the reopened issue's description, so the
+    importing operator can re-resolve it knowing what was done before.
+    """
+    if issue_data.get("status") == "open":
+        issue_data["resolution_notes"] = ""
+        issue_data["resolved_at"] = None
+        return
+    issue_data["status"] = "open"
+    issue_data["resolved_at"] = None
+    notes = str(issue_data.pop("resolution_notes", "") or "").strip()
+    issue_data["resolution_notes"] = ""
+    if notes:
+        description = str(issue_data.get("description") or "").strip()
+        issue_data["description"] = (
+            f"{description}\n\n{IMPORTED_ISSUE_REOPEN_NOTE}{notes}".strip()
+        )
 
 
 def _enforce_review_status_floor(
@@ -486,14 +533,28 @@ def _apply_completion_import_defaults(hand_data: dict[str, Any]) -> None:
         hand_data["review_status"] = "needs_correction"
 
 
-def _recorded_unreadable_cards(evidence: object) -> dict[str, object]:
-    """What the exporting database recorded under UNREADABLE_CARDS_KEY, if anything."""
+def _recorded_unreadable_columns(evidence: object) -> dict[str, object]:
+    """Every column the exporting database recorded as unreadable, from EVERY marker.
+
+    Keyed on ``DERIVED_EVIDENCE_KEYS`` rather than on ``UNREADABLE_CARDS_KEY``
+    alone. The card marker was restored from round 5 and the hand-column marker,
+    added in rounds 12-13, was not, so an ordinary export/import round trip
+    stripped UNREADABLE_HAND_COLUMNS, destroyed the recorded values, recorded no
+    correction, and landed the hand study-ready with an empty blocker tuple --
+    while the card half of the same mechanism survived intact. Reading the marker
+    SET means a marker added later is restored without anyone editing this
+    function.
+    """
     if not isinstance(evidence, dict):
         return {}
-    recorded = evidence.get(UNREADABLE_CARDS_KEY)
-    if not isinstance(recorded, dict):
-        return {}
-    return {str(key): value for key, value in recorded.items()}
+    columns: dict[str, object] = {}
+    for key in sorted(DERIVED_EVIDENCE_KEYS):
+        recorded = evidence.get(key)
+        if not isinstance(recorded, dict):
+            continue
+        for column, value in recorded.items():
+            columns.setdefault(str(column), value)
+    return columns
 
 
 def _dump_model(model: Any) -> dict[str, Any]:

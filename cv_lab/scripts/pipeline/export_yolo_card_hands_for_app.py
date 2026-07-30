@@ -263,6 +263,11 @@ def _confidence_for_hand(
     # carrying none:
     #   stack_conflicts             a seat's two stack_text boxes CONTRADICTED each
     #                               other, so its stack was discarded to unknown;
+    #   bet_conflicts               the same fact on the BET channel, which until
+    #                               the round-3 repair had no conflict rule at all
+    #                               and resolved two boxes by detector list order
+    #                               (65 development frames, and in all 65 the
+    #                               winner was not the highest-confidence box);
     #   stack_outlier_checks_skipped  a frame had too few stack reads for the
     #                               sibling-median net (a LEGACY field: the spine
     #                               no longer produces it, but a timeline built by
@@ -278,7 +283,8 @@ def _confidence_for_hand(
     #                               t_end were chosen from a scan with known blind
     #                               spots (g0723a hand 5 exported with SIX skipped
     #                               transitions at confidence 1.0, tags []).
-    if any(hand.get(key) for key in ("stack_conflicts", "stack_outlier_checks_skipped",
+    if any(hand.get(key) for key in ("stack_conflicts", "bet_conflicts",
+                                     "stack_outlier_checks_skipped",
                                      "pot_text_off_column", "settle_scan_skipped")):
         confidence = min(confidence, LOW_CONFIDENCE_AT)
     # A transition nothing could measure, or a money action of unknown size. The
@@ -438,6 +444,7 @@ def _completion_evidence_for_hand(
             # "checked and clean". All three used to be indistinguishable.
             "cv_pot_text_off_column": hand.get("pot_text_off_column", 0),
             "cv_stack_conflicts": hand.get("stack_conflicts", 0),
+            "cv_bet_conflicts": hand.get("bet_conflicts", 0),
             # PASS-THROUGH of whatever the timeline carries. The spine no longer
             # produces `stack_outlier_checks_skipped` (its net is deleted), but a
             # timeline built by an earlier build still does, and this exporter's

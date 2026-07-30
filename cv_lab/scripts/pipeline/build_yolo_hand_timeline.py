@@ -381,6 +381,7 @@ def _frame_state(frame: rd.Frame, session_anchor: rd.TableAnchor | None = None) 
         "hero_seat_confirmed": view.get("hero_seat_confirmed", False),
         "pot_text_off_column": view.get("pot_text_off_column", 0),
         "stack_conflicts": view.get("stack_conflicts", 0),
+        "bet_conflicts": view.get("bet_conflicts", 0),
         # Anchor health. Deliberately NOT part of _signature: a residual that
         # drifts by a thousandth between frames must not create a distinct state.
         "anchor_ok": view.get("anchor_ok", False),
@@ -900,7 +901,25 @@ def _committed_at_start(hand: list[dict[str, Any]], seat: int) -> float | None:
             continue  # no stack read: skip -- neither proof nor reading
         if abs(stack - start) > _EPS:
             break  # the stack moved: the window is over
-        if (state.get("bets_unknown") or {}).get(seat):
+        bet_code = (state.get("bets_unknown") or {}).get(seat)
+        if bet_code == rd.AMOUNT_BET_BOXES_DISAGREE:
+            # A BOX CONFLICT IS A DISAGREEING READING, not an unreadable one, and
+            # the two are answered differently. The constancy argument tolerates
+            # a reader refusal because the standing bet cannot have changed while
+            # the stack is constant, so any successful read in the window
+            # measures it. A conflict says something stronger: two boxes resolved
+            # to this seat and read DIFFERENT numbers, so either the standing bet
+            # is not what the window's other reads say or the anchors
+            # misattributed a neighbouring seat's box -- and the third bullet
+            # above already holds that a window with disagreeing readings returns
+            # UNKNOWN. Measured: g0621 hand 3, seat 3 reads 0.5 nine times and
+            # then carries a conflict between a "15 BB" box (conf 0.967) and a
+            # "0.50 BB" box (conf 0.937); before the bet channel had a conflict
+            # rule at all, detector list order published 6.0 there and the
+            # disagreement clause below fired. Falling back to 0.5 because the
+            # contradiction now arrives as a code would silently un-flag the hand.
+            return None
+        if bet_code:
             saw_refusal = True
         bet = state["bets"].get(seat)
         if bet is not None:
@@ -2063,6 +2082,7 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
     # where they belong.
     pot_text_off_column = sum(s.get("pot_text_off_column", 0) for s in hand)
     stack_conflicts = sum(s.get("stack_conflicts", 0) for s in hand)
+    bet_conflicts = sum(s.get("bet_conflicts", 0) for s in hand)
     hero_seat_confirmed = any(s.get("hero_seat_confirmed") for s in hand)
     amounts_unknown_by_code: dict[str, int] = {}
     for s in hand:
@@ -2133,6 +2153,7 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         "pot_text_dropped": pot_text_dropped,
         "pot_text_off_column": pot_text_off_column,
         "stack_conflicts": stack_conflicts,
+        "bet_conflicts": bet_conflicts,
         "hero_seat_confirmed": hero_seat_confirmed,
         "pot_collapses_repaired": sum(s.get("pot_collapses_repaired", 0) for s in hand),
         "amounts_unknown": sum(s.get("amounts_unknown", 0) for s in hand),

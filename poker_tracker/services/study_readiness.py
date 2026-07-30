@@ -654,6 +654,18 @@ def _layout_blockers(hand: Hand, evidence: CompletionEvidence) -> list[StudyBloc
     cannot perform" rule exists to prevent, and it read as "this hand is beyond
     repair" to an operator holding the fix.
 
+    ``hero_seat_mismatch`` is only an acknowledgeable warning when the pipeline
+    raised it AS a warning. The same code can arrive in ``rejection_codes``, where
+    nothing can accept it -- ``acknowledge_codes`` drops it and ``app.py`` draws no
+    Acknowledge button -- and keying this line on ``unresolved_codes``, which mixes
+    both kinds, printed "Accept hero_seat_mismatch with Acknowledge" next to
+    COMPLETION_NOT_COMPLETE and UNRESOLVED_SOURCE_WARNING on the same page, both
+    correctly saying a rejection cannot be acknowledged or corrected away. That
+    was ``_source_warning_blockers``' repaired defect surviving in a second
+    consumer, which is why the split now lives on ``CompletionEvidence`` and is
+    enforced (``test_no_consumer_prescribes_an_action_from_unresolved_codes``)
+    rather than applied one consumer at a time.
+
     The recorded table size is also compared against the evidence's, which
     nothing did: the two columns could disagree outright -- a hand recording 9
     seats against evidence for 6 -- and the gate was satisfied by any typed
@@ -684,12 +696,18 @@ def _layout_blockers(hand: Hand, evidence: CompletionEvidence) -> list[StudyBloc
             "table size in Correct hand facts to the seat count the recording "
             "shows, or re-run the reconstruction if the evidence is the wrong one."
         )
-    if "hero_seat_mismatch" in evidence.unresolved_codes:
+    if "hero_seat_mismatch" in evidence.unresolved_warning_codes:
         detail.append("hero_seat_mismatch")
         actions.append(
             "Accept hero_seat_mismatch with Acknowledge in the Source warnings "
             "panel, which records it as an auditable correction, or re-run the "
             "reconstruction to remove it."
+        )
+    elif "hero_seat_mismatch" in evidence.unresolved_rejection_codes:
+        detail.append("hero_seat_mismatch (rejected)")
+        actions.append(
+            "The pipeline REJECTED hero_seat_mismatch, which is a refusal rather "
+            f"than a note you can accept: {_RECONSTRUCTION_ACTION}"
         )
     if not detail:
         return []
@@ -863,9 +881,8 @@ def _source_warning_blockers(evidence: CompletionEvidence) -> list[StudyBlocker]
     unresolved = evidence.unresolved_codes
     if not unresolved:
         return []
-    rejected = set(evidence.rejection_codes)
-    rejections = tuple(code for code in unresolved if code in rejected)
-    warnings = tuple(code for code in unresolved if code not in rejected)
+    rejections = evidence.unresolved_rejection_codes
+    warnings = evidence.unresolved_warning_codes
 
     reasons: list[str] = []
     actions: list[str] = []

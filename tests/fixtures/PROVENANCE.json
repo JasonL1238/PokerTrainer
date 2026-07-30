@@ -150,7 +150,7 @@
    "defect": "the trailing fractional '0' of 'POT: 212.50 BB' scores 0.861 as the chip affix 'c' against 0.846 as '0' and sits 2px from the run, so the run-completeness net declared the whole numeral a fragment and the pot read UNKNOWN for 8 consecutive samples -- the entire settlement window of an exported hand. 42 previously-correct reads were lost this way across the corpus",
    "source": "Screen Recording 2026-07-23 3.21.47 PM (2054x1470), t=265.0, pot_text, box [934.8, 522.1, 1219.2, 593.4]"
   },
-  "_corpus_note": "Every fixture here comes from a DEVELOPMENT recording. The 5 development recordings are 06-21 12.41.17 AM, 07-11 12.45.27 PM, 07-15 10.16.07 PM, 07-23 3.21.47 PM and 07-23 3.33.54 PM. No locked-test or validation recording is named by any fixture, test or measurement harness in this repo.",
+  "_corpus_note": "Every fixture here comes from a DEVELOPMENT recording. The 6 development recordings are 06-21 12.41.17 AM, 07-11 12.45.27 PM, 07-15 10.16.07 PM, 07-23 3.21.47 PM, 07-23 3.33.54 PM and clubwpt_session_01.mov (2138x1402). An earlier form of this note declared only the first five while fixtures in this same file cited clubwpt_session_01.mov as their source, so an auditor working from the header alone would have read those fixtures as undeclared. clubwpt_session_01.mov IS development material -- 228 of its frames are in the region detector's training manifest, cv_lab/datasets/yolo_cards_autolabel_v1/manifest.csv -- and is named here so the declared set and the cited sources agree. No locked-test or validation recording is named by any fixture, test or measurement harness in this repo.",
   "bet_18_30_suffix_absorbed_1399x986.png": {
    "true": 18.3,
    "current_read": 1830.88,
@@ -250,6 +250,42 @@
    "defect": "none -- this crop is the pin for the 0.6*max_h ROW-BAND SPLIT, the other acceptance-path mechanic round-2 mutation found unpinned (collapsing every glyph into one band survived all 280 tests). Its top edge carries the tail of the player's NAME row above the value; with the split disabled the name's glyphs become ink on the numeral's own row and P2 refuses. Corpus direction of that mutant over all 18,006 retained development crops: 236 value->UNKNOWN, 0 UNKNOWN->value, 0 value->different -- coverage-only, which is why the finding is not release-blocking.",
    "expected": "124.8, dot",
    "source": "clubwpt_session_01.mov (2138x1402, development -- 228 of its frames are in the region detector's training manifest), stack_text, t=2.0"
+  },
+  "stack_392_30_digit_severed_by_sprite_at_2062x1178.png": {
+   "true": 392.3,
+   "current_read": 2.3,
+   "defect": "P2's far arm treated a confidently-classified DIGIT as its own explanation: the severed leading '3' (bank '3' at 0.952, on the numeral's own row, outside the winning run) anchored itself and chained in the 14px occlusion sliver beside it, so the surviving '2','3','0' shipped 2.30 at score 0.933 -- a 170x under-read",
+   "source": "Screen Recording 2026-06-21 12.41.17 AM (2062x1178), t=180.0, stack_text box 11, with tests/fixtures/ocr/bet_chip_sprite_no_text.png resized into a full-height 8px-wide vertical strip at x=63 (a card or panel edge sliding over one interior digit)"
+  },
+  "stack_190_10_digit_occluded_into_affix_at_2722x1832.png": {
+   "true": 190.1,
+   "current_read": 0.1,
+   "defect": "the `named` affix exemption was granted by height and label alone, anywhere in the band: the occluded '9' dropped below the digit floor, scored as the chip template 'c' at 0.649, entered `named`, exempted itself from P2's near arm and then anchored the severed leading digits in the far arm -- shipping 0.10 at score 0.946, a 1901x under-read of a stack, in all-in territory the spine reads as a positive fact",
+   "source": "Screen Recording 2026-07-11 12.45.27 PM (2722x1832), t=209.0, stack_text box 08, with bet_chip_sprite_no_text.png resized over the lower 12 rows of the '9' (box x=77 y=49 w=19 h=12)"
+  },
+  "stack_218_top_shaved_at_1272x896.png": {
+   "true": 218.0,
+   "current_read": 21.0,
+   "defect": "P1 inspected only suffix[:2] of a list from which every glyph the bank labelled 'c' had already been deleted. Shaving the top of the '8' makes it score as the chip template, so it was deleted from the suffix, leaving ['B','B'], which passed -- a 10.4x under-read of a starting stack, from a crop carrying strictly LESS information than the parent fixture (which already refuses)",
+   "source": "tests/fixtures/ocr/stack_218_at_1272x896.png (Screen Recording 2026-07-23 3.33.54 PM, 1272x896, t=130.0) with rows 11-14 of columns 48-55 painted in the crop's own panel background (the median of its 200 darkest pixels)"
+  },
+  "pot_39_50_two_forged_separators_at_1272x896.png": {
+   "true": 39.5,
+   "current_read": 3.5,
+   "defect": "an occluder that WIDENS an inter-digit gap into the decimal band and scatters two baseline fragments into it: one fragment supplied the split and the pair jointly filled the hole, so P5(b)'s remainder test saw nothing and 3.50 shipped at score 0.852. P5(a) required only that multiple candidates AGREE; the client renders at most one separator, so a second candidate is unexplained ink",
+   "source": "Screen Recording 2026-07-23 3.33.54 PM (1272x896), t=4.0, pot_text box 19, with bet_chip_sprite_no_text.png resized over the '9' (box x=88 y=12 w=9 h=10)"
+  },
+  "stack_95_50_leading_digit_occluded_at_2138x1402.png": {
+   "true": 95.5,
+   "current_read": 5.5,
+   "defect": "P6 refused a leading zero only when NO separator was located. Occluding the bottom of the '9' re-classifies it as '0' at 0.570, and with the real decimal still located at position 2 the run '0','5','5','0' read '05.50' = 5.5. The client renders a leading zero only as the whole integer part ('0.50' / '0.2' -- 648 of 648 corpus cases split at 1), so the separator's POSITION is the test",
+   "source": "clubwpt_session_01.mov (2138x1402), t=521.0, stack_text box 08, with bet_chip_sprite_no_text.png resized over the bottom 7 rows of the '9' (box x=36 y=42 w=15 h=7)"
+  },
+  "stack_162_40_at_2138x1402.png": {
+   "true": 162.4,
+   "current_read": 162.4,
+   "defect": "not a defect crop -- the unmodified control for the four-side clip family. P4's four boundary-TOUCH clauses were pinned by nothing: with them disabled the whole suite stayed green and the 18,006 native reads were byte-identical, while a 92,624-read clip sweep produced 83 confident wrong values (23 top, 60 bottom). This crop reads 102.4 at a 20px TOP clip with those clauses off",
+   "source": "clubwpt_session_01.mov (2138x1402), t=218.0, stack_text box 16, unmodified"
   }
  }
 }

@@ -86,6 +86,10 @@ from poker_tracker.services.hand_accounting import (
     persist_reconciliation,
     reconcile_persisted_hand,
 )
+from poker_tracker.services.settlement_sync import (
+    SettlementSyncRefused,
+    sync_recorded_figures_from_ledger,
+)
 from poker_tracker.services.study_readiness import (
     BlockerCategory,
     StudyReadiness,
@@ -2372,26 +2376,29 @@ def show_accounting_editor(
                     "warnings": [],
                 }
             )
+            sync_refusal: str | None = None
             with db.transaction():
                 db.upsert_hand_settlement(configured)
                 db.replace_settlement_entries(hand.id, saved_entries)
                 reconciled = persist_reconciliation(db, hand.id)
-                if sync_observed and reconciled.ledger.is_settled:
-                    hero = next((player for player in players if player.is_hero), None)
-                    hero_result = (
-                        None if hero is None else reconciled.ledger.net_results.get(hero.player_key)
-                    )
-                    db.update_hand_accounting_evidence(
-                        hand.id,
-                        pot_size=reconciled.ledger.gross_pot,
-                        hero_bb_won=hero_result,
-                    )
-                    reconciled = persist_reconciliation(db, hand.id)
-            if reconciled.is_authoritative:
+                if sync_observed:
+                    # The precondition is NOT `ledger.is_settled`. Replacing an
+                    # observed-fact column with a derived figure is publishing that
+                    # figure as an observation, so it takes the same gate every
+                    # other consumer of a derived figure takes, and the gate lives
+                    # in the service rather than here.
+                    try:
+                        reconciled = sync_recorded_figures_from_ledger(db, hand.id)
+                    except SettlementSyncRefused as exc:
+                        sync_refusal = str(exc)
+            if sync_refusal is not None:
+                st.error(f"Saved the settlement, but did not replace the record: {sync_refusal}")
+            elif reconciled.is_authoritative:
                 flash("Hand accounting reconciled and balanced.")
             else:
                 flash("Accounting saved with issues that still need correction.")
-            st.rerun()
+            if sync_refusal is None:
+                st.rerun()
         except (LedgerError, ValidationError, ValueError) as exc:
             st.error(f"Could not reconcile accounting: {exc}")
 

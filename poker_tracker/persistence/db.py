@@ -6,6 +6,7 @@ import os
 import sqlite3
 import threading
 import time
+from ast import literal_eval
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
@@ -23,6 +24,7 @@ from poker_tracker.math.cards import CardParseError, parse_visible_cards
 from poker_tracker.persistence import backup as backup_module
 from poker_tracker.persistence.backup import backup_database
 from poker_tracker.persistence.completion import (
+    DERIVED_EVIDENCE_KEYS,
     UNREADABLE_CARDS_KEY,
     UNREADABLE_HAND_COLUMNS_KEY,
     confirm_assumption,
@@ -121,6 +123,69 @@ UNREADABLE_SETTLEMENT_PREFIX = "Stored settlement columns could not be read:"
 # active-run query and by delete_solver_run's refusal. They used to disagree about
 # 'cancelling'.
 _LIVE_SOLVER_STATUSES: tuple[str, ...] = ("queued", "running", "cancelling")
+
+# The ``hands`` columns an IMPORT owns rather than the payload, and therefore the
+# only columns ``restore_unreadable_columns`` will not write back. The completion
+# trio is re-derived by ``_apply_completion_import_defaults`` and floored by
+# ``_enforce_review_status_floor``; ``completion_evidence`` is the channel the
+# unreadable-column marker itself travels in, so restoring it would persist the
+# derivation the marker exists to keep derived; ``id``, ``session_id`` and
+# ``created_at`` are the importing database's own identity and row-creation record,
+# and a timestamp column is never at a restorable fallback anyway (the reader's
+# degradation stamps a real time), so a marker naming one is reported by
+# UNREADABLE_HAND_COLUMNS in the exporting database and re-derived here.
+_EVIDENCE_OWNED_COLUMNS = frozenset(
+    {
+        "id",
+        "session_id",
+        "created_at",
+        "review_status",
+        "completion_status",
+        "source_type",
+        "completion_evidence",
+    }
+)
+
+# The stored forms of the model defaults every restorable ``hands`` column falls
+# back to when the reader has to give it up. A restore only overwrites one of
+# these, which is the round-8 guard ("a marker may not replace a readable card
+# column") stated once for every column instead of once for the two card ones.
+# ``test_every_restorable_hand_column_degrades_into_a_restorable_fallback`` walks
+# ``Hand.model_fields`` and fails if a column is added whose default is not in
+# here, so the restore cannot silently start skipping a column.
+_RESTORABLE_FALLBACKS: tuple[str, ...] = ("", "[]")
+
+# One rule, referenced from every site that used to break it.
+#
+# _MODEL_SPACE_CLASSIFICATION: no SQL predicate may classify a row that a
+# ``_*_from_row`` reader reclassifies.
+#
+# Several readers in this module deliberately answer a different question from
+# the raw column, always in the conservative direction: ``_hand_issue_from_row``
+# forces ``status='open'`` on a row it cannot fully read, ``_review_from_row``
+# and ``_coaching_response_from_row`` force ``is_stale=True``,
+# ``_solver_run_from_row`` degrades ``completed`` to ``stale``,
+# ``_hand_player_from_row`` decides heroism with ``bool(...)``, and
+# ``_degraded_hand`` forces ``review_status='needs_correction'``. Readiness,
+# the blockers, and every list view read the MODEL.
+#
+# A ``WHERE is_stale = 1`` / ``WHERE status = 'open'`` / ``WHERE is_hero = 1``
+# predicate answers in the COLUMN's space instead, and the two spaces disagree on
+# exactly the rows the readers exist for. The consequences were symmetric and
+# both bad: a blocker whose named clearing action matched nothing and reported
+# success anyway (``discard_stale_coaching`` on ``is_stale = 2``,
+# ``resolve_hand_issue`` on ``status='in_progress'``), and a store-level floor
+# blind to the very row it is the floor for (``update_hand_status``,
+# ``_validate_single_hero``, ``fetch_cached_solver_run``).
+#
+# The fix is not a cleverer SQL predicate — SQLite's storage classes cannot
+# express Python truthiness, so any translation is one more enumerated list to
+# fall behind. Every site below selects its candidate rows by IDENTITY
+# (``hand_id``, ``input_hash``, ``id``) and then classifies them through the
+# same reader every consumer uses, so the writer clears exactly what the reader
+# calls stale and the floor sees exactly what the blocker sees.
+# ``test_no_sql_predicate_classifies_a_row_the_reader_reclassifies`` fails on a
+# new raw-column classification predicate, so the family cannot grow back.
 
 
 def _readable_schema_version(connection: sqlite3.Connection) -> int | None:
@@ -965,6 +1030,9 @@ class PokerDatabase:
         see single-table facts. Accounting, coaching, solver, and per-render user
         confirmation are enforced at the UI choke point, because hand_accounting
         imports db.py and the layering must not invert.
+
+        The open-issue half asks ``fetch_hand_issues``, not a SQL
+        ``status = 'open'`` subquery. See ``_MODEL_SPACE_CLASSIFICATION``.
         """
         if review_status not in get_args(ReviewStatus):
             raise ValueError(f"Unknown review status: {review_status!r}")
@@ -974,11 +1042,7 @@ class PokerDatabase:
                 SELECT
                     h.completion_status AS completion_status,
                     h.completion_evidence AS completion_evidence,
-                    h.source_type AS source_type,
-                    EXISTS(
-                        SELECT 1 FROM hand_issues
-                        WHERE hand_id = h.id AND status = 'open'
-                    ) AS has_open_issue
+                    h.source_type AS source_type
                 FROM hands AS h
                 WHERE h.id = ?
                 """,
@@ -986,6 +1050,10 @@ class PokerDatabase:
             ).fetchone()
             if row is None:
                 raise ValueError("Hand not found.")
+            has_open_issue = any(
+                issue.status == "open"
+                for issue in self.fetch_hand_issues(hand_id=hand_id)
+            )
             if row["completion_status"] not in {"complete", "not_applicable"}:
                 raise ValueError(
                     f"Hand {hand_id} is {row['completion_status']}; a partial or uncertain "
@@ -1030,7 +1098,7 @@ class PokerDatabase:
                     f"Hand {hand_id} declares source {row['source_type']!r} with "
                     "completion status 'not_applicable' and cannot be marked reviewed."
                 )
-            if row["has_open_issue"]:
+            if has_open_issue:
                 raise ValueError(
                     f"Hand {hand_id} has an open debugging issue and cannot be marked reviewed."
                 )
@@ -1043,30 +1111,70 @@ class PokerDatabase:
     def restore_unreadable_card_columns(
         self, hand_id: int, recorded: dict[str, object]
     ) -> None:
-        """Write an unreadable card column back verbatim, so a round trip is faithful.
+        """The card-column entry point, kept: it is one case of the general rule."""
+        self.restore_unreadable_columns(hand_id, recorded)
 
-        ``_hand_from_row`` blanks a card column it cannot read and records what it
-        held under ``UNREADABLE_CARDS_KEY``. The exporter therefore emits a blank
-        column, and the importer strips the marker (it is a derivation, and
-        persisting it made INVALID_HERO_OR_BOARD_CARDS permanent). Between them a
-        board that "could not be read" silently became a hand with "no board
-        recorded" -- a legitimate, unblocked state for a preflop hand -- and the
-        text that proved the corruption was gone from the database entirely.
+    def restore_unreadable_columns(
+        self, hand_id: int, recorded: dict[str, object]
+    ) -> None:
+        """Write back ANY unreadable hand column verbatim, so a round trip is faithful.
 
-        Restoring the recorded text puts the PRODUCER of the blocker back, so the
-        importing database derives it for itself, exactly as the exporting one
-        did, and correcting the column still clears it. The value bypasses the
-        model deliberately -- ``Hand`` refuses it, which is why it was blanked --
-        and it is written only into a column the payload left empty, so it can
-        only ever add a blocker, never remove one.
+        ``_hand_from_row`` degrades a column it cannot read to a conservative
+        fallback and records what it held: card columns under
+        ``UNREADABLE_CARDS_KEY``, everything else under
+        ``UNREADABLE_HAND_COLUMNS_KEY``. The exporter therefore emits the fallback,
+        and the importer strips the marker (it is a derivation about the current
+        row, and persisting it made the blocker permanent). Between them the
+        blocker's PRODUCER disappeared and the text that proved the corruption was
+        gone from both databases: an ordinary export/import round trip became an
+        undocumented third clearing action that repairs by discarding -- including
+        for the two columns UNREADABLE_HAND_COLUMNS says "cannot be repaired in the
+        product".
+
+        The card half was repaired in round 5 for the two card columns by name.
+        UNREADABLE_HAND_COLUMNS arrived later with no equivalent, which is the
+        enumerated-list decay this method now avoids: the columns to restore are
+        read off the MARKER, intersected with the ``hands`` table's own PRAGMA
+        column list, so a column added to the schema later and a marker added to
+        ``DERIVED_EVIDENCE_KEYS`` later are both covered.
+
+        ``_EVIDENCE_OWNED_COLUMNS`` is excluded, and it is the only list here: those
+        are the columns the IMPORT owns rather than the payload
+        (``_apply_completion_import_defaults`` re-derives the completion status and
+        stamps the imported marker, ``_enforce_review_status_floor`` sets the review
+        status), and ``completion_evidence`` is the channel the marker itself travels
+        in -- restoring it would persist the derivation this whole mechanism exists
+        to keep derived.
+
+        Values bypass the model deliberately -- ``Hand`` refuses them, which is why
+        they were degraded -- so this can only ever ADD a blocker. The recorded text
+        is a ``repr``, which is what makes a stored ``'42.0'`` distinguishable from
+        a stored ``42.0`` in the blocker's detail; ``literal_eval`` is the exact
+        inverse for every primitive SQLite can hold, and a value it cannot invert is
+        skipped rather than guessed at.
+
+        The round-8 guard is kept and generalised the same way: a column is only
+        written when it currently holds the fallback the degradation leaves behind
+        (``_RESTORABLE_FALLBACKS``), so a marker cannot replace a hand's real hero
+        and board cards -- the source facts every card gate derives from -- with a
+        payload's marker text.
         """
-        for column in ("hero_cards", "board_cards"):
-            value = recorded.get(column)
-            if not isinstance(value, str) or not value.strip():
+        if not recorded:
+            return
+        columns = {
+            str(row["name"])
+            for row in self._execute("PRAGMA table_info(hands)").fetchall()
+        } - _EVIDENCE_OWNED_COLUMNS
+        for column, raw in recorded.items():
+            if str(column) not in columns:
+                continue
+            value = _recorded_column_value(raw)
+            if value is None:
                 continue
             self._execute(
-                f"UPDATE hands SET {column} = ? WHERE id = ? AND {column} = ''",
-                (value, hand_id),
+                f"UPDATE hands SET {column} = ? "  # noqa: S608
+                f"WHERE id = ? AND ({column} IS NULL OR {column} IN (?, ?))",
+                (value, hand_id, *_RESTORABLE_FALLBACKS),
             )
         self._commit()
 
@@ -1422,14 +1530,19 @@ class PokerDatabase:
         hand_id: int | None = None,
         status: str | None = None,
     ) -> list[HandIssue]:
+        """Hand issues, filtered in the MODEL's space.
+
+        The ``status`` filter is applied to ``_hand_issue_from_row``'s verdict,
+        not to the column: a row this build cannot fully read is forced to
+        ``open``, and ``fetch_hand_issues(status="open")`` has to return it or the
+        queue that lists open issues disagrees with the blocker that counts them.
+        See ``_MODEL_SPACE_CLASSIFICATION``.
+        """
         clauses: list[str] = []
         params: list[object] = []
         if hand_id is not None:
             clauses.append("hand_id = ?")
             params.append(hand_id)
-        if status is not None:
-            clauses.append("status = ?")
-            params.append(status)
         where = "" if not clauses else "WHERE " + " AND ".join(clauses)
         rows = self._execute(
             f"""
@@ -1439,22 +1552,39 @@ class PokerDatabase:
             """,
             tuple(params),
         ).fetchall()
-        return [_hand_issue_from_row(row) for row in rows]
+        issues = [_hand_issue_from_row(row) for row in rows]
+        if status is None:
+            return issues
+        return [issue for issue in issues if issue.status == status]
 
     def resolve_hand_issue(
         self, issue_id: int, *, resolution_notes: str
     ) -> HandIssue:
+        """Resolve the issue OPEN_DEBUGGING_ISSUE names, in the MODEL's space.
+
+        The open-ness test goes through ``_hand_issue_from_row``, which forces
+        ``open`` on a row it cannot fully read. A ``WHERE status = 'open'`` clause
+        answered in the column's space instead, so a stored ``'in_progress'``
+        raised the blocker, drew this form, and then refused the submission with
+        "Open hand issue not found." — the blocker's own clearing action rejecting
+        the row it was drawn for. See ``_MODEL_SPACE_CLASSIFICATION``.
+        """
         notes = resolution_notes.strip()
         if not notes:
             raise ValueError("Resolution notes are required.")
         now = datetime.now(UTC)
         with self.transaction():
+            row = self._execute(
+                "SELECT * FROM hand_issues WHERE id = ?", (issue_id,)
+            ).fetchone()
+            if row is None or _hand_issue_from_row(row).status != "open":
+                raise ValueError("Open hand issue not found.")
             cursor = self._execute(
                 """
                 UPDATE hand_issues
                 SET status = 'resolved', resolution_notes = ?,
                     updated_at = ?, resolved_at = ?
-                WHERE id = ? AND status = 'open'
+                WHERE id = ?
                 """,
                 (
                     notes,
@@ -1607,9 +1737,56 @@ class PokerDatabase:
         pot_size: float | None,
         hero_bb_won: float | None,
     ) -> None:
+        """Rewrite the recorded pot and hero result -- the hand's OBSERVED summary.
+
+        The authoritative gate lives in
+        ``services.settlement_sync.sync_recorded_figures_from_ledger``, which is the
+        only caller: it refuses unless ``accounting_is_established`` holds, and this
+        module cannot ask that question without inverting the layering
+        (``hand_accounting`` imports ``db``).
+
+        What db.py CAN measure is ``_declared_chips_taken`` -- does this hand's
+        stored settlement declaration actually move chips? -- and it refuses on that
+        alone when the hand has attested to nothing, which is the defence in depth
+        the round-10 lesson asks for: "fixing the call site fixes one call site".
+        Any figure derived under a chip-moving declaration that nobody has confirmed
+        is refused here whatever the caller believes, so a second writer added later
+        cannot re-open the hole. Once an attestation exists, the narrower question
+        this layer can ask is answered and the service-layer gate is the one that
+        decides.
+        """
         stored = self.fetch_hand(hand_id)
         if stored is None:
             raise ValueError("Hand not found.")
+        settlement = self.fetch_hand_settlement(hand_id)
+        declared = (
+            {}
+            if settlement is None
+            else self._declared_chips_taken(settlement)
+        )
+        if any(abs(float(amount)) > 0 for amount in declared.values()):
+            evidence = parse_completion_evidence(stored.completion_evidence)
+            # The manual-hand exemption applies here for the same reason it applies
+            # to the blocker: on a hand this operator entered in this database a
+            # declared ante or room rake is their own observation, and no
+            # attestation control is drawn for it anywhere in the product.
+            owes_attestation = requires_assumption_attestation(
+                source_type=stored.source_type,
+                completion_status=stored.completion_status,
+                evidence=evidence,
+            )
+            if owes_attestation and not evidence.confirmed_assumption_codes:
+                moved = ", ".join(
+                    f"{name} {float(amount):g}"
+                    for name, amount in sorted(declared.items())
+                    if abs(float(amount)) > 0
+                )
+                raise ValueError(
+                    "Refusing to record a derived pot or hero result on a hand "
+                    f"whose settlement declaration moves chips ({moved}) and which "
+                    "has attested to none of them; confirm the assumption in Study "
+                    "→ Summary → Accounting reconciliation first."
+                )
         before_state = {
             "pot_size": stored.pot_size,
             "hero_bb_won": stored.hero_bb_won,
@@ -1787,18 +1964,22 @@ class PokerDatabase:
         *,
         exclude_player_id: int | None,
     ) -> None:
+        """Refuse a second hero, deciding heroism the way the reader decides it.
+
+        ``_hand_player_from_row`` answers ``bool(is_hero)``, so a stored ``2``
+        reads as the hero while a ``WHERE is_hero = 1`` guard did not see it and
+        accepted a second one. See ``_MODEL_SPACE_CLASSIFICATION``.
+        """
         if not is_hero:
             return
-        row = self._execute(
+        rows = self._execute(
             """
-            SELECT id FROM hand_players
-            WHERE hand_id = ? AND is_hero = 1
-              AND (? IS NULL OR id != ?)
-            LIMIT 1
+            SELECT * FROM hand_players
+            WHERE hand_id = ? AND (? IS NULL OR id != ?)
             """,
             (hand_id, exclude_player_id, exclude_player_id),
-        ).fetchone()
-        if row is not None:
+        ).fetchall()
+        if any(_hand_player_from_row(row).is_hero for row in rows):
             raise ValueError("A hand can have only one Hero player.")
 
     def create_action(self, action: Action) -> Action:
@@ -2593,11 +2774,18 @@ class PokerDatabase:
             ),
         )
         # Both disclosures below are raised by MEASUREMENT, not by a list of
-        # suspicious fields. `_declared_chips_taken` derives the hand's ledger
-        # under the stored policy and again under a neutral one and reports how
-        # many chips each declaration actually moves; the code is written exactly
-        # when that number is non-zero, and the attestation is bound to the
-        # number rather than to the policy tuple.
+        # suspicious fields. `_declared_chips_taken` derives the hand's ledger ONCE,
+        # under the stored policy, and reports the chips that policy removes plus
+        # the dead money it declares; the code is written exactly when one of those
+        # numbers is non-zero, and the attestation is bound to the number rather
+        # than to the policy tuple. It is deliberately NOT the dependence rule's
+        # dual reconciliation -- there is no neutral pass here and no comparison,
+        # because this method is called from `upsert_hand_settlement`, before the
+        # hand's award rows may exist, so its input set is strictly smaller
+        # (`_declared_chips_taken`: "Winners are deliberately not fetched"). This
+        # comment used to credit it with the neutral pass, contradicting both the
+        # code below it and PLAN.md; the measurement it actually takes is pinned by
+        # `test_the_writer_side_audit_takes_a_single_pass_measurement`.
         #
         # Enumerating fields is what failed for eight rounds. `rake_rate > 0`
         # over-disclosed (a zero cap, or no-flop-no-drop on a hand with no board,
@@ -2849,11 +3037,31 @@ class PokerDatabase:
         reviews are never touched: a review that still describes the hand as it is
         now is not stale evidence presented as current, and deleting it would
         throw away the only coaching the hand has.
+
+        Staleness is decided by the same readers the blocker reads
+        (``bool(is_stale)``), never by ``WHERE is_stale = 1``: a stored ``2``,
+        ``-1`` or ``'yes'`` reads stale, raised the blocker, drew this control, and
+        then matched no row — so the product flashed "Discarded 0 stale coaching
+        review(s)." as a SUCCESS and re-rendered the identical blocker, with no
+        other control able to clear it. See ``_MODEL_SPACE_CLASSIFICATION``.
         """
         deleted = 0
-        for table in ("coaching_reviews", "hand_reviews"):
+        for table, reader in (
+            ("coaching_reviews", _coaching_response_from_row),
+            ("hand_reviews", _review_from_row),
+        ):
+            rows = self._execute(
+                f"SELECT * FROM {table} WHERE hand_id = ?", (hand_id,)  # noqa: S608
+            ).fetchall()
+            stale_ids = [
+                row["id"] for row in rows if reader(row).is_stale and row["id"] is not None
+            ]
+            if not stale_ids:
+                continue
+            placeholders = ", ".join("?" for _ in stale_ids)
             cursor = self._execute(
-                f"DELETE FROM {table} WHERE hand_id = ? AND is_stale = 1", (hand_id,)
+                f"DELETE FROM {table} WHERE id IN ({placeholders})",  # noqa: S608
+                tuple(stale_ids),
             )
             deleted += cursor.rowcount or 0
         self._commit()
@@ -3081,16 +3289,27 @@ class PokerDatabase:
         self._commit()
 
     def fetch_cached_solver_run(self, input_hash: str) -> SolverRun | None:
-        row = self._execute(
+        """The newest run this build reads as ``completed`` for these inputs.
+
+        ``_solver_run_from_row`` degrades a run to ``stale`` when any of its
+        columns is unreadable, precisely so a result nobody can inspect is not
+        presented as study evidence. A ``WHERE status = 'completed'`` predicate
+        answered in the column's space instead and handed such a run back as a
+        cache hit. See ``_MODEL_SPACE_CLASSIFICATION``.
+        """
+        rows = self._execute(
             """
             SELECT * FROM solver_runs
-            WHERE input_hash = ? AND status = 'completed'
+            WHERE input_hash = ?
             ORDER BY completed_at DESC, id DESC
-            LIMIT 1
             """,
             (input_hash,),
-        ).fetchone()
-        return None if row is None else _solver_run_from_row(row)
+        ).fetchall()
+        for row in rows:
+            run = _solver_run_from_row(row)
+            if run.status == "completed":
+                return run
+        return None
 
     def fetch_active_solver_runs(self) -> list[SolverRun]:
         placeholders = ", ".join("?" for _ in _LIVE_SOLVER_STATUSES)
@@ -4001,6 +4220,43 @@ def _coerced_int(value: object, default: int) -> int:
         return default
 
 
+def _recorded_column_value(raw: object) -> str | float | int | None:
+    """Invert what a degradation marker recorded, or None when it cannot be inverted.
+
+    ``_degrade_unreadable_cards`` records the raw string; ``_degraded_hand``
+    records ``repr(value)`` so the blocker's detail can tell a stored ``'42.0'``
+    from a stored ``42.0``. ``literal_eval`` is the exact inverse of ``repr`` for
+    every primitive SQLite can hold, and the plain-string case falls through to
+    itself, so one function reads both markers.
+
+    A value that is neither -- a repr of something this build has no literal for,
+    a nested structure -- is skipped. Skipping loses the round trip's fidelity for
+    that column; guessing would write a value nobody recorded.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int | float):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    try:
+        value = literal_eval(text)
+    except (ValueError, SyntaxError, MemoryError, TypeError):
+        return raw
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int | float | str):
+        return value
+    if value is None:
+        return None
+    return raw
+
+
 def _salvaged_row(
     model_cls: type[_ModelT],
     data: dict[str, Any],
@@ -4120,9 +4376,40 @@ def _hand_from_row(row: sqlite3.Row) -> Hand:
         data["completion_status"] = "uncertain"
     _degrade_unreadable_cards(data)
     try:
-        return Hand(**{**data, "created_at": _parse_datetime(data["created_at"])})
+        hand = Hand(**{**data, "created_at": _parse_datetime(data["created_at"])})
     except (ValidationError, TypeError, ValueError):
-        return _degraded_hand(data)
+        hand = _degraded_hand(data)
+    return _demote_degraded_hand(hand)
+
+
+def _demote_degraded_hand(hand: Hand) -> Hand:
+    """One place applies the degradation contract to ``review_status``.
+
+    The contract is stated in ``_degraded_hand``: "a hand whose stored facts
+    cannot be read was not reviewed in the state it is being shown in, and this
+    reader's contract is that degradation can only ever add study-readiness
+    blockers". It was applied by ``_degraded_hand`` and by nothing else, so the
+    two degradations on the same row reached opposite verdicts: a hand whose
+    ``confidence_score`` could not be read reported ``needs_correction``, while a
+    hand whose BOARD could not be read -- the columns that ARE the study material,
+    and the ones ``_degrade_unreadable_cards`` blanks -- read ``review_status``
+    back verbatim. A ``reviewed`` hand hand-edited to a two-card board therefore
+    counted as reviewed in ``analytics.compute_session_stats``, in the Insights
+    "Unresolved" KPI and in every list row, while the Study page refused it with
+    INVALID_HERO_OR_BOARD_CARDS. ``restore_unreadable_card_columns`` -- which
+    writes such a column back deliberately, so an import derives the blocker for
+    itself -- had the same gap from the writer side.
+
+    Keying the demotion on "does this hand carry ANY read-time degradation
+    marker?" rather than on which degradation produced it means the two are one
+    rule, and a third marker added to ``DERIVED_EVIDENCE_KEYS`` inherits it
+    without anyone remembering this function exists.
+    """
+    if not any(key in hand.completion_evidence for key in DERIVED_EVIDENCE_KEYS):
+        return hand
+    if hand.review_status == "needs_correction":
+        return hand
+    return hand.model_copy(update={"review_status": "needs_correction"})
 
 
 def _degraded_hand(data: dict[str, Any]) -> Hand:
