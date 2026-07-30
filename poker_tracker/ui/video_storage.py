@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
+import tempfile
 import uuid
 from pathlib import Path
 from typing import BinaryIO
@@ -78,11 +78,46 @@ def save_video_file(
     source: BinaryIO,
     original_filename: str,
     videos_dir: Path = VIDEOS_DIR,
+    *,
+    max_bytes: int | None = None,
 ) -> Path:
-    """Save an uploaded completed-session video to local disk."""
+    """Atomically save an uploaded completed-session video to local disk.
+
+    Prefer ``poker_tracker.ui.video_ingest.ingest_uploaded_video`` when the
+    caller also needs playable-media validation before scheduling CV.
+    """
     destination = unique_stored_video_path(original_filename, videos_dir)
-    with destination.open("wb") as output:
-        shutil.copyfileobj(source, output)
+    if destination.exists() or destination.is_symlink():
+        raise ValueError(f"Destination already exists: {destination}")
+
+    fd, temp_name = tempfile.mkstemp(
+        prefix=".upload_",
+        suffix=destination.suffix.lower() or ".part",
+        dir=str(destination.parent),
+    )
+    temp_path: Path | None = Path(temp_name)
+    written = 0
+    try:
+        with os.fdopen(fd, "wb") as output:
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if max_bytes is not None and written > max_bytes:
+                    raise ValueError(
+                        f"Video exceeds maximum size of {max_bytes} bytes."
+                    )
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if written < 1:
+            raise ValueError("Video file is empty.")
+        os.replace(temp_path, destination)
+        temp_path = None
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
     return destination
 
 

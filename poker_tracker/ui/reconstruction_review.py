@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -200,6 +201,107 @@ def history_impacts(
             }
         )
     return impacts
+
+
+def hand_frame_progress(
+    hand: dict[str, Any],
+    reviews_by_image: dict[str, Any],
+    *,
+    countable_images: list[str] | None = None,
+) -> dict[str, int]:
+    """Count navigable frames vs permanently saved verdicts for one timeline hand.
+
+    ``countable_images`` should be the same image list the UI can open (typically
+    from ``states_for_hand``). Falling back to ``source_images`` alone can disagree
+    with the frame carousel when the timeline is inconsistent.
+    """
+    images = (
+        list(countable_images)
+        if countable_images is not None
+        else [str(image) for image in (hand.get("source_images") or [])]
+    )
+    total = len(images)
+    reviewed = 0
+    flagged = 0
+    for image in images:
+        review = reviews_by_image.get(image)
+        if review is None:
+            continue
+        status = _review_status(review)
+        if status in {"correct", "incorrect"}:
+            reviewed += 1
+        if status == "incorrect":
+            flagged += 1
+    return {
+        "total": total,
+        "reviewed": reviewed,
+        "remaining": max(0, total - reviewed),
+        "flagged": flagged,
+    }
+
+
+def hand_validation_label(
+    hand: dict[str, Any],
+    reviews_by_image: dict[str, Any],
+    *,
+    countable_images: list[str] | None = None,
+) -> str:
+    """Dropdown label that shows permanent partial-progress for a timeline hand."""
+    number = int(hand.get("hand_number", 0))
+    hero = " ".join(hand.get("hero") or []) or "cards unknown"
+    progress = hand_frame_progress(
+        hand, reviews_by_image, countable_images=countable_images
+    )
+    total = progress["total"]
+    reviewed = progress["reviewed"]
+    flagged = progress["flagged"]
+    if total == 0:
+        return f"Hand #{number} · {hero} · no retained frames"
+    if reviewed == 0:
+        status = "not started"
+    elif reviewed < total:
+        status = "in progress"
+    else:
+        status = "done"
+    flag_bit = f" · {flagged} flagged" if flagged else ""
+    return (
+        f"Hand #{number} · {hero} · {reviewed}/{total} validated "
+        f"({status}){flag_bit}"
+    )
+
+
+def first_unreviewed_frame_index(
+    states: list[dict[str, Any]],
+    reviews_by_image: dict[str, Any],
+) -> int:
+    """Resume point: first frame without a correct/incorrect verdict, else last."""
+    if not states:
+        return 0
+    for index, state in enumerate(states):
+        image = str(state.get("image") or "")
+        status = _review_status(reviews_by_image.get(image))
+        if status not in {"correct", "incorrect"}:
+            return index
+    return len(states) - 1
+
+
+def _review_status(review: Any) -> str | None:
+    if review is None:
+        return None
+    status = getattr(review, "status", None)
+    if status is None and isinstance(review, dict):
+        status = review.get("status")
+    return str(status) if status is not None else None
+
+
+def job_id_from_hand_notes(notes: str | None) -> int | None:
+    """Parse ``job_<id>_timeline`` out of CV draft notes when present."""
+    if not notes:
+        return None
+    match = re.search(r"job_(\d+)_timeline", notes)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def _cards(cards: Any) -> str:

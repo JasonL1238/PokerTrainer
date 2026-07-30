@@ -13,7 +13,12 @@ from pathlib import Path
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import ProcessingJob
 from poker_tracker.ui.jobs import mark_failed
-from poker_tracker.ui.video_storage import JOB_LOGS_DIR, ensure_data_directories
+from poker_tracker.ui.video_ingest import (
+    assert_stored_video_matches_record,
+    require_playable_video,
+    resolve_stored_video_path,
+)
+from poker_tracker.ui.video_storage import JOB_LOGS_DIR, VIDEOS_DIR, ensure_data_directories
 
 DEFAULT_STALE_AFTER = timedelta(minutes=15)
 
@@ -30,11 +35,24 @@ def start_cv_job(
     target_session_id: int | None = None,
 ) -> ProcessingJob:
     """Queue and detach one full offline reconstruction job."""
-    path = Path(video_path)
-    if not path.is_file():
-        raise ValueError(f"Video file not found: {path}")
     if not session_name.strip():
         raise ValueError("Session name is required.")
+
+    video = db.fetch_video(video_id)
+    if video is None:
+        raise ValueError(f"Video #{video_id} was not found.")
+    path = resolve_stored_video_path(
+        video_path,
+        stored_path=video.stored_path,
+        videos_dir=VIDEOS_DIR,
+    )
+    expected_hash = (video.content_sha256 or "").strip() or None
+    assert_stored_video_matches_record(
+        path,
+        expected_size_bytes=video.file_size_bytes,
+        expected_sha256=expected_hash,
+    )
+    require_playable_video(path)
 
     with db.transaction(immediate=True):
         active = db.fetch_active_jobs()

@@ -159,7 +159,11 @@ from poker_tracker.ui.poker_visuals import (
 )
 from poker_tracker.ui.reconstruction_review import (
     ISSUE_GUIDANCE,
+    first_unreviewed_frame_index,
+    hand_frame_progress,
+    hand_validation_label,
     history_impacts,
+    job_id_from_hand_notes,
     load_timeline_for_job,
     observed_facts,
     states_for_hand,
@@ -178,10 +182,9 @@ from poker_tracker.ui.session_library import (
     filter_sessions,
 )
 from poker_tracker.ui.ui_theme import brand_header, inject_theme
-from poker_tracker.ui.video_metadata import extract_video_metadata
+from poker_tracker.ui.video_ingest import ingest_uploaded_video
 from poker_tracker.ui.video_storage import (
     ensure_data_directories,
-    save_video_file,
     validate_video_extension,
 )
 from poker_tracker.ui.view_models import (
@@ -1065,7 +1068,7 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
     if requested not in available_ids:
         session_hands = [hand for hand in all_hands if session and hand.session_id == session.id]
         requested = (session_hands or all_hands)[0].id
-        st.session_state["study_hand_id"] = requested
+        _set_study_hand_id(requested)
     hand = next(item for item in all_hands if item.id == requested)
     hand_session = next(item for item in sessions if item.id == hand.session_id)
     ordered = sorted(
@@ -1130,6 +1133,7 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
                 hand_issues,
                 is_reconstructed,
                 completion_evidence,
+                ordered_hands=ordered,
             )
         with analyze_tab:
             render_study_analysis(
@@ -1160,36 +1164,47 @@ def render_study_hand_navigation(
     active_index = next(index for index, item in enumerate(ordered) if item.id == hand.id)
     hand_ids = [item.id for item in ordered if item.id is not None]
     hands_by_id = {item.id: item for item in ordered if item.id is not None}
+    # Never force ``study_hand_picker`` from ``hand.id`` here. Streamlit writes the
+    # operator's dropdown choice into that key before this function runs; clobbering
+    # it snaps the selection back and blocks ``study_hand_id`` from updating.
+    # Arrows / external openers keep both keys in sync via ``_set_study_hand_id``.
+    if "study_hand_picker" not in st.session_state:
+        st.session_state["study_hand_picker"] = hand.id
     with st.container(key="study_hand_navigation"):
-        previous_col, chooser_col, next_col = st.columns([0.45, 3.1, 0.45])
-        if previous_col.button(
-            "←",
-            key=f"study_previous_{hand.id}",
+        previous_col, chooser_col, next_col = st.columns([0.7, 2.6, 0.7])
+        previous_col.button(
+            "← Prev",
+            key="study_previous_hand",
             disabled=active_index == 0,
             help="Previous hand",
             width="stretch",
-        ):
-            st.session_state["study_hand_id"] = ordered[active_index - 1].id
-            st.rerun()
+            on_click=_set_study_hand_id,
+            args=(ordered[active_index - 1].id if active_index > 0 else hand.id,),
+        )
         selected_id = chooser_col.selectbox(
             "Choose a completed hand",
             hand_ids,
             index=active_index,
             format_func=lambda hand_id: study_hand_label(hands_by_id[hand_id]),
-            key=f"study_hand_picker_{hand.id}",
+            key="study_hand_picker",
         )
         if selected_id != hand.id:
             st.session_state["study_hand_id"] = selected_id
             st.rerun()
-        if next_col.button(
-            "→",
-            key=f"study_next_{hand.id}",
-            disabled=active_index == len(ordered) - 1,
+        next_col.button(
+            "Next →",
+            key="study_next_hand",
+            disabled=active_index >= len(ordered) - 1,
             help="Next hand",
             width="stretch",
-        ):
-            st.session_state["study_hand_id"] = ordered[active_index + 1].id
-            st.rerun()
+            type="primary",
+            on_click=_set_study_hand_id,
+            args=(
+                ordered[active_index + 1].id
+                if active_index < len(ordered) - 1
+                else hand.id,
+            ),
+        )
         st.caption(
             f"{active_index + 1} of {len(ordered)} · {session.name} · "
             f"{hand.source_type.replace('_', ' ').title()} · "
@@ -1198,6 +1213,56 @@ def render_study_hand_navigation(
         st.caption(
             f"Reconstruction confidence · {confidence_label(hand.confidence_score)}"
         )
+
+
+def _set_study_hand_id(hand_id: int | None) -> None:
+    """Arrow callbacks update both the page hand and the stable picker widget."""
+    if hand_id is None:
+        return
+    st.session_state["study_hand_id"] = hand_id
+    st.session_state["study_hand_picker"] = hand_id
+
+
+def render_study_hand_advance(
+    ordered: list[Hand],
+    hand: Hand,
+    *,
+    ready: bool,
+) -> None:
+    """After confirm, offer an obvious next-hand control without forcing the dropdown."""
+
+    if len(ordered) < 2 or hand.id is None:
+        return
+    active_index = next(index for index, item in enumerate(ordered) if item.id == hand.id)
+    has_prev = active_index > 0
+    has_next = active_index < len(ordered) - 1
+    if not has_prev and not has_next:
+        return
+    label = (
+        "This hand is ready. Move on when you want."
+        if ready
+        else "Switch hands any time — progress on this hand stays saved."
+    )
+    st.markdown("#### Next hand")
+    st.caption(label)
+    prev_col, next_col = st.columns(2)
+    prev_col.button(
+        "← Previous hand",
+        key="study_advance_previous",
+        disabled=not has_prev,
+        width="stretch",
+        on_click=_set_study_hand_id,
+        args=(ordered[active_index - 1].id if has_prev else hand.id,),
+    )
+    next_col.button(
+        "Next hand →",
+        key="study_advance_next",
+        disabled=not has_next,
+        width="stretch",
+        type="primary",
+        on_click=_set_study_hand_id,
+        args=(ordered[active_index + 1].id if has_next else hand.id,),
+    )
 
 
 def render_study_replay(
@@ -1424,6 +1489,7 @@ def render_study_fix_and_confirm(
     hand_issues: list[HandIssue],
     is_reconstructed: bool,
     completion_evidence: CompletionEvidence,
+    ordered_hands: list[Hand] | None = None,
 ) -> None:
     """Present blocker resolution first and keep technical editors opt-in."""
 
@@ -1457,6 +1523,7 @@ def render_study_fix_and_confirm(
         if is_reconstructed:
             show_reconstruction_evidence(hand, completion_evidence)
             show_source_warning_controls(db, hand, completion_evidence)
+            _offer_frame_validation_link(db, hand)
         if hand_requires_user_confirmation(hand):
             st.checkbox(
                 "I have read the evidence above and confirm this hand is correct",
@@ -1481,6 +1548,12 @@ def render_study_fix_and_confirm(
                 if guarded_update_hand_status(db, hand, readiness, status):
                     flash("Review status updated.")
                     st.rerun()
+        if ordered_hands is not None:
+            render_study_hand_advance(
+                ordered_hands,
+                hand,
+                ready=readiness.is_ready,
+            )
         show_hand_issue_controls(db, hand, hand_issues)
 
     with tools_col:
@@ -3128,7 +3201,7 @@ def _open_hand_for_study(hand: Hand) -> None:
     if hand.id is None:
         return
     _activate_session(hand.session_id)
-    st.session_state["study_hand_id"] = hand.id
+    _set_study_hand_id(hand.id)
     navigate_to(Page.STUDY)
 
 
@@ -3341,28 +3414,33 @@ def _save_video_upload(
         try:
             validate_video_extension(uploaded.name)
             uploaded.seek(0)
-            stored_path = save_video_file(uploaded, uploaded.name)
-            metadata = extract_video_metadata(stored_path)
-            saved = db.create_video(
-                VideoRecord(
-                    session_id=session.id,
-                    original_filename=uploaded.name,
-                    stored_path=str(stored_path),
-                    file_size_bytes=stored_path.stat().st_size,
-                    duration_seconds=metadata.duration_seconds,
-                    fps=metadata.fps,
-                    width=metadata.width,
-                    height=metadata.height,
-                    frame_count=metadata.frame_count,
-                    notes=notes.strip(),
+            ingested = ingest_uploaded_video(uploaded, uploaded.name)
+            metadata = ingested.metadata
+            try:
+                saved = db.create_video(
+                    VideoRecord(
+                        session_id=session.id,
+                        original_filename=uploaded.name,
+                        stored_path=str(ingested.path),
+                        file_size_bytes=ingested.file_size_bytes,
+                        content_sha256=ingested.content_sha256,
+                        duration_seconds=metadata.duration_seconds,
+                        fps=metadata.fps,
+                        width=metadata.width,
+                        height=metadata.height,
+                        frame_count=metadata.frame_count,
+                        notes=notes.strip(),
+                    )
                 )
-            )
-            if metadata.error:
-                st.warning(metadata.error)
+            except Exception:
+                ingested.path.unlink(missing_ok=True)
+                raise
             flash(f"Added {saved.original_filename} to {session.name}.")
             st.rerun()
         except ValueError as exc:
             st.error(str(exc))
+        except Exception as exc:
+            st.error(f"Could not save video: {exc}")
 
 
 def show_session_videos(db: PokerDatabase, session: Session) -> None:
@@ -5429,9 +5507,15 @@ def show_cv_reconstruction(db: PokerDatabase, video: VideoRecord) -> None:
             _show_live_cv_job_status(db, video.id)
         else:
             _render_cv_job_status(latest)
-        if latest.status == "completed":
-            st.success("Reconstruction is complete. Validate its frame evidence below.")
-            show_reconstruction_evidence_review(db, latest)
+        completed_jobs = [job for job in latest_jobs if job.status == "completed"]
+        if completed_jobs:
+            st.success(
+                "Reconstruction finished. Frame labels save permanently — validate "
+                "part of a hand now and resume the rest any time from this page."
+            )
+            review_job = _choose_frame_review_job(db, video.id, completed_jobs)
+            if review_job is not None:
+                show_reconstruction_evidence_review(db, review_job)
     else:
         st.caption("No reconstruction has been run for this source video.")
 
@@ -5460,6 +5544,115 @@ def _show_live_cv_job_status(db: PokerDatabase, video_id: int) -> None:
         st.rerun()
     _render_cv_job_status(latest)
     st.caption("Updating automatically — you can leave this page open.")
+
+
+def _job_id_from_hand_notes(notes: str | None) -> int | None:
+    """Parse ``job_<id>_timeline`` out of CV draft notes when present."""
+    return job_id_from_hand_notes(notes)
+
+
+def _offer_frame_validation_link(db: PokerDatabase, hand: Hand) -> None:
+    """Study can jump to Import frame review without hunting the sidebar path."""
+    if hand.session_id is None:
+        return
+    videos = db.fetch_videos(session_id=hand.session_id)
+    if not videos:
+        st.caption(
+            "Frame validation lives on Import once a recording is attached to this session."
+        )
+        return
+    job_id = _job_id_from_hand_notes(hand.notes)
+    preferred = videos[0]
+    matched_job = False
+    if job_id is not None:
+        for video in videos:
+            jobs = [
+                job
+                for job in db.fetch_jobs_by_video(video.id)
+                if job.job_type == "cv_reconstruction" and job.id == job_id
+            ]
+            if jobs:
+                preferred = video
+                matched_job = True
+                break
+    if not matched_job and len(videos) > 1:
+        # Prefer a recording that already has reconstruction evidence rather than
+        # silently opening the newest upload in a multi-video session.
+        scored = []
+        for video in videos:
+            completed = [
+                job
+                for job in db.fetch_jobs_by_video(video.id)
+                if job.job_type == "cv_reconstruction" and job.status == "completed"
+            ]
+            labels = sum(
+                len(db.fetch_reconstruction_frame_reviews(job.id))
+                for job in completed
+                if job.id is not None
+            )
+            scored.append((labels, len(completed), video.id or 0, video))
+        scored.sort(reverse=True)
+        preferred = scored[0][3]
+        if scored[0][0] == 0 and scored[0][1] == 0:
+            st.caption(
+                "This session has multiple recordings; opening the newest one. "
+                "Pick the correct video on Import if needed."
+            )
+    if st.button(
+        "Open frame validation on Import",
+        key=f"study_open_frame_validation_{hand.id}",
+        width="stretch",
+        help="Jump to the saved frame labels for this session's recording.",
+    ):
+        _activate_session(hand.session_id)
+        st.session_state["video_context_id"] = preferred.id
+        if matched_job and job_id is not None and preferred.id is not None:
+            st.session_state[f"cv_review_job_{preferred.id}"] = job_id
+        navigate_to(Page.IMPORT)
+        flash("Opened Import frame validation. Progress is already saved per job.")
+        st.rerun()
+
+
+def _choose_frame_review_job(db: PokerDatabase, video_id: int, completed_jobs: list):
+    """Pick a review job without hiding older partial progress behind a fresh empty job."""
+    if not completed_jobs:
+        return None
+    by_id = {job.id: job for job in completed_jobs if job.id is not None}
+    if not by_id:
+        return completed_jobs[0]
+    counts = {
+        job_id: len(db.fetch_reconstruction_frame_reviews(job_id)) for job_id in by_id
+    }
+    preferred_id = max(by_id, key=lambda job_id: (counts.get(job_id, 0), job_id))
+    newest_id = completed_jobs[0].id
+    if (
+        preferred_id != newest_id
+        and counts.get(preferred_id, 0) > 0
+        and counts.get(newest_id, 0) == 0
+    ):
+        st.warning(
+            f"Newest job #{newest_id} has no frame labels yet. Showing job "
+            f"#{preferred_id} which still has {counts.get(preferred_id, 0)} saved "
+            "label(s). Choose another job below if you meant the newest run."
+        )
+    if len(completed_jobs) == 1:
+        return completed_jobs[0]
+
+    job_key = f"cv_review_job_{video_id}"
+    job_ids = [job.id for job in completed_jobs if job.id is not None]
+    if st.session_state.get(job_key) not in job_ids:
+        st.session_state[job_key] = preferred_id
+    selected_id = st.selectbox(
+        "Reconstruction job to resume validating",
+        job_ids,
+        format_func=lambda job_id: (
+            f"Job #{job_id} · {counts.get(job_id, 0)} saved labels · "
+            f"{((by_id[job_id].completed_at or by_id[job_id].created_at).strftime('%Y-%m-%d %H:%M') if (by_id[job_id].completed_at or by_id[job_id].created_at) else 'unknown time')} · "
+            f"{by_id[job_id].message or by_id[job_id].status}"
+        ),
+        key=job_key,
+    )
+    return by_id[selected_id]
 
 
 def _render_cv_job_status(job) -> None:
@@ -5502,58 +5695,206 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
 
     st.markdown("#### Frame evidence review")
     st.caption(
-        "Validate the hand where it was assembled: each retained frame is paired with "
-        "the exact history facts it created."
+        "Validate one frame at a time. Every verdict is saved permanently to this "
+        "job — stop anytime and return here later to change or continue."
     )
     st.caption(
-        "Your verdict is saved to this job's audit record. Correct frames count as "
-        "verified evidence; flagged frames enter the improvement queue below. "
-        "Validation does not silently rewrite the hand or retrain a model."
+        "You do not need to finish every hand in the video now. Partial progress is "
+        "kept. Validation does not rewrite imported hands or retrain a model."
     )
     reviews = db.fetch_reconstruction_frame_reviews(job.id)
     review_lookup = {(review.hand_number, review.source_image): review for review in reviews}
-    total_frames = sum(len(hand.get("source_images") or []) for hand in hands)
-    correct = sum(review.status == "correct" for review in reviews)
-    incorrect = sum(review.status == "incorrect" for review in reviews)
-    summary = st.columns(4)
-    summary[0].metric("Hands", len(hands))
-    summary[1].metric("Used frames", total_frames)
-    summary[2].metric("Validated", f"{correct + incorrect}/{total_frames}")
-    summary[3].metric("Needs improvement", incorrect)
+    hand_numbers = [int(hand.get("hand_number", 0)) for hand in hands]
+    reviews_by_hand_image = {
+        number: {
+            review.source_image: review
+            for review in reviews
+            if review.hand_number == number
+        }
+        for number in hand_numbers
+    }
+    navigable_images_by_hand = {
+        int(hand.get("hand_number", 0)): [
+            str(state.get("image") or "")
+            for state in states_for_hand(timeline, hand)
+            if state.get("image")
+        ]
+        for hand in hands
+    }
+    total_frames = sum(len(images) for images in navigable_images_by_hand.values())
+    # Job summary must use the same navigable image set as the per-hand table.
+    # Counting every DB row inflated Validated / Needs improvement when orphan
+    # reviews outlived dropped timeline frames.
+    correct = 0
+    incorrect = 0
+    for number, images in navigable_images_by_hand.items():
+        hand_reviews = reviews_by_hand_image.get(number, {})
+        for image in images:
+            review = hand_reviews.get(image)
+            if review is None:
+                continue
+            if review.status == "correct":
+                correct += 1
+            elif review.status == "incorrect":
+                incorrect += 1
+    reviewed_frames = correct + incorrect
+    summary_container = st.container(key=f"evidence_summary_{job.id}")
+    with summary_container:
+        summary = st.columns(4)
+        summary[0].metric("Hands", len(hands))
+        summary[1].metric("Used frames", total_frames)
+        summary[2].metric("Validated", f"{reviewed_frames}/{total_frames}")
+        summary[3].metric("Needs improvement", incorrect)
 
-    hand_labels = {}
+    progress_rows = []
     for hand in hands:
         number = int(hand.get("hand_number", 0))
-        count = len(hand.get("source_images") or [])
-        hero = " ".join(hand.get("hero") or []) or "cards unknown"
-        hand_labels[number] = f"Hand #{number} · {hero} · {count} source frames"
-    selected_hand_number = st.selectbox(
-        "Hand to validate",
-        list(hand_labels),
-        format_func=lambda number: hand_labels[number],
-        key=f"evidence_hand_{job.id}",
+        progress = hand_frame_progress(
+            hand,
+            reviews_by_hand_image.get(number, {}),
+            countable_images=navigable_images_by_hand.get(number, []),
+        )
+        progress_rows.append(
+            {
+                "Hand": f"#{number}",
+                "Hero": " ".join(hand.get("hero") or []) or "cards unknown",
+                "Validated": f"{progress['reviewed']}/{progress['total']}",
+                "Remaining": progress["remaining"],
+                "Flagged": progress["flagged"],
+            }
+        )
+    with st.expander("Saved progress by hand · resume anytime", expanded=reviewed_frames > 0):
+        st.dataframe(progress_rows, hide_index=True, width="stretch")
+        st.caption(
+            "Leaving this page is safe. Re-open Import → this video → this job to "
+            "continue or edit earlier labels."
+        )
+
+    hand_labels = {
+        int(hand.get("hand_number", 0)): hand_validation_label(
+            hand,
+            reviews_by_hand_image.get(int(hand.get("hand_number", 0)), {}),
+            countable_images=navigable_images_by_hand.get(
+                int(hand.get("hand_number", 0)), []
+            ),
+        )
+        for hand in hands
+    }
+    selected_key = f"evidence_hand_{job.id}"
+    pending_key = f"evidence_hand_pending_{job.id}"
+    if pending_key in st.session_state:
+        st.session_state[selected_key] = st.session_state.pop(pending_key)
+    if selected_key not in st.session_state:
+        # Prefer the first hand that still has unreviewed frames.
+        resume_hand = next(
+            (
+                int(hand.get("hand_number", 0))
+                for hand in hands
+                if hand_frame_progress(
+                    hand,
+                    reviews_by_hand_image.get(int(hand.get("hand_number", 0)), {}),
+                    countable_images=navigable_images_by_hand.get(
+                        int(hand.get("hand_number", 0)), []
+                    ),
+                )["remaining"]
+                > 0
+            ),
+            hand_numbers[0],
+        )
+        st.session_state[selected_key] = resume_hand
+
+    active_hand_index = (
+        hand_numbers.index(st.session_state[selected_key])
+        if st.session_state.get(selected_key) in hand_numbers
+        else 0
     )
+    prev_hand_col, chooser_col, next_hand_col = st.columns([0.7, 2.6, 0.7])
+    prev_hand_col.button(
+        "← Hand",
+        key=f"evidence_prev_hand_{job.id}",
+        disabled=active_hand_index == 0,
+        width="stretch",
+        help="Previous timeline hand",
+        on_click=_queue_evidence_hand,
+        args=(
+            pending_key,
+            hand_numbers[active_hand_index - 1] if active_hand_index else hand_numbers[0],
+            f"evidence_cursor_{job.id}_{hand_numbers[active_hand_index - 1] if active_hand_index else hand_numbers[0]}",
+        ),
+    )
+    selected_hand_number = chooser_col.selectbox(
+        "Hand to validate",
+        hand_numbers,
+        format_func=lambda number: hand_labels[number],
+        key=selected_key,
+    )
+    next_hand_col.button(
+        "Hand →",
+        key=f"evidence_next_hand_{job.id}",
+        disabled=active_hand_index >= len(hand_numbers) - 1,
+        width="stretch",
+        type="primary",
+        help="Next timeline hand",
+        on_click=_queue_evidence_hand,
+        args=(
+            pending_key,
+            hand_numbers[active_hand_index + 1]
+            if active_hand_index < len(hand_numbers) - 1
+            else hand_numbers[-1],
+            f"evidence_cursor_{job.id}_{hand_numbers[active_hand_index + 1] if active_hand_index < len(hand_numbers) - 1 else hand_numbers[-1]}",
+        ),
+    )
+
     hand = next(item for item in hands if int(item.get("hand_number", 0)) == selected_hand_number)
     states = states_for_hand(timeline, hand)
     if not states:
         st.warning("No retained source states could be matched to this hand.")
         return
 
+    hand_reviews = reviews_by_hand_image.get(selected_hand_number, {})
+    saved_by_image = {}
+    for frame in states:
+        image = str(frame.get("image") or "")
+        review = review_lookup.get((selected_hand_number, frame.get("image")))
+        if review is not None:
+            saved_by_image[image] = review
     cursor_key = f"evidence_cursor_{job.id}_{selected_hand_number}"
-    st.session_state[cursor_key] = min(int(st.session_state.get(cursor_key, 0)), len(states) - 1)
+    if cursor_key not in st.session_state:
+        st.session_state[cursor_key] = first_unreviewed_frame_index(states, saved_by_image)
+    st.session_state[cursor_key] = min(
+        int(st.session_state.get(cursor_key, 0)), len(states) - 1
+    )
     cursor = st.session_state[cursor_key]
     state = states[cursor]
     current_review = review_lookup.get((selected_hand_number, state["image"]))
-
-    previous_col, position_col, next_col = st.columns([1, 3, 1])
-    previous_col.button(
-        "← Previous",
-        key=f"evidence_prev_{job.id}_{selected_hand_number}",
-        disabled=cursor == 0,
-        width="stretch",
-        on_click=_move_evidence_cursor,
-        args=(cursor_key, -1, len(states)),
+    hand_progress = hand_frame_progress(
+        hand,
+        hand_reviews,
+        countable_images=navigable_images_by_hand.get(selected_hand_number, []),
     )
+
+    resume_col, done_col = st.columns([1.2, 1])
+    if resume_col.button(
+        "Jump to first unreviewed frame",
+        key=f"evidence_resume_{job.id}_{selected_hand_number}",
+        disabled=hand_progress["remaining"] == 0,
+        width="stretch",
+    ):
+        st.session_state[cursor_key] = first_unreviewed_frame_index(states, saved_by_image)
+        st.rerun()
+    if hand_progress["remaining"] and current_review is not None and (
+        current_review.status in {"correct", "incorrect"}
+    ):
+        done_col.warning(
+            "This browser session left you on an already-labeled frame. "
+            "Saved progress is fine — click Jump to first unreviewed to resume grading."
+        )
+    else:
+        done_col.info(
+            f"Hand #{selected_hand_number}: {hand_progress['reviewed']}/"
+            f"{hand_progress['total']} saved. Done for now is fine — progress stays."
+        )
+
     verdict_label = (
         "✓ Correct"
         if current_review and current_review.status == "correct"
@@ -5561,20 +5902,45 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
         if current_review and current_review.status == "incorrect"
         else "Unreviewed"
     )
-    position_col.markdown(
-        f"<div class='pt-evidence-position'>Frame <strong>{cursor + 1}</strong> of "
-        f"<strong>{len(states)}</strong> · {float(state.get('time_s', 0)):.2f}s · "
-        f"{verdict_label}</div>",
-        unsafe_allow_html=True,
+    verdict_class = (
+        "is-correct"
+        if current_review and current_review.status == "correct"
+        else "is-incorrect"
+        if current_review and current_review.status == "incorrect"
+        else "is-unreviewed"
     )
-    next_col.button(
-        "Next →",
-        key=f"evidence_next_{job.id}_{selected_hand_number}",
-        disabled=cursor == len(states) - 1,
-        width="stretch",
-        on_click=_move_evidence_cursor,
-        args=(cursor_key, 1, len(states)),
+    navigation = st.container(
+        key=f"evidence_navigation_{job.id}_{selected_hand_number}"
     )
+    with navigation:
+        st.markdown(
+            (
+                "<div class='pt-evidence-position'>"
+                f"<span>Frame <strong>{cursor + 1}</strong> / "
+                f"<strong>{len(states)}</strong></span>"
+                f"<span>{float(state.get('time_s', 0)):.2f}s</span>"
+                f"<span class='pt-evidence-verdict {verdict_class}'>{verdict_label}</span>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+        previous_col, next_col = st.columns(2)
+        previous_col.button(
+            "← Previous",
+            key=f"evidence_prev_{job.id}_{selected_hand_number}",
+            disabled=cursor == 0,
+            width="stretch",
+            on_click=_move_evidence_cursor,
+            args=(cursor_key, -1, len(states)),
+        )
+        next_col.button(
+            "Next →",
+            key=f"evidence_next_{job.id}_{selected_hand_number}",
+            disabled=cursor == len(states) - 1,
+            width="stretch",
+            on_click=_move_evidence_cursor,
+            args=(cursor_key, 1, len(states)),
+        )
 
     comparison = st.container(key=f"evidence_comparison_{job.id}_{selected_hand_number}")
     with comparison:
@@ -5655,7 +6021,7 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
                         )
                     )
                     _move_evidence_cursor(cursor_key, 1, len(states))
-                    flash("Frame issue saved to the improvement queue.")
+                    flash("Frame issue saved. You can leave and resume later.")
                     st.rerun()
 
     flagged = [review for review in reviews if review.status == "incorrect"]
@@ -5674,6 +6040,50 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
                 hide_index=True,
                 width="stretch",
             )
+            st.caption("Open a flagged frame to change its label.")
+            for index, review in enumerate(flagged):
+                open_col, detail_col = st.columns([0.8, 2.4])
+                detail_col.caption(
+                    f"Hand #{review.hand_number} · {review.timestamp_seconds:.2f}s · "
+                    + (", ".join(review.issue_types) or "unspecified")
+                )
+                if open_col.button(
+                    "Open",
+                    key=f"evidence_open_flag_{job.id}_{index}",
+                    width="stretch",
+                ):
+                    target_hand = next(
+                        (
+                            item
+                            for item in hands
+                            if int(item.get("hand_number", 0)) == review.hand_number
+                        ),
+                        None,
+                    )
+                    target_states = (
+                        states_for_hand(timeline, target_hand)
+                        if target_hand is not None
+                        else []
+                    )
+                    target_cursor = next(
+                        (
+                            frame_index
+                            for frame_index, frame in enumerate(target_states)
+                            if str(frame.get("image") or "") == review.source_image
+                        ),
+                        None,
+                    )
+                    if target_cursor is None:
+                        flash(
+                            "That flagged frame is no longer in the retained timeline "
+                            "for this hand."
+                        )
+                    else:
+                        st.session_state[pending_key] = review.hand_number
+                        st.session_state[
+                            f"evidence_cursor_{job.id}_{review.hand_number}"
+                        ] = target_cursor
+                    st.rerun()
             counts: dict[str, int] = {}
             for review in flagged:
                 for issue in review.issue_types:
@@ -5689,6 +6099,18 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
 def _move_evidence_cursor(cursor_key: str, delta: int, frame_count: int) -> None:
     current = int(st.session_state.get(cursor_key, 0))
     st.session_state[cursor_key] = max(0, min(frame_count - 1, current + delta))
+
+
+def _queue_evidence_hand(
+    pending_key: str,
+    hand_number: int,
+    cursor_key: str | None = None,
+) -> None:
+    """Defer hand changes so the selectbox widget is not mutated after render."""
+    st.session_state[pending_key] = hand_number
+    # Clear the destination cursor so the hand resumes at first unreviewed.
+    if cursor_key is not None:
+        st.session_state.pop(cursor_key, None)
 
 
 def _mark_evidence_correct(
@@ -5709,7 +6131,7 @@ def _mark_evidence_correct(
         )
     )
     _move_evidence_cursor(cursor_key, 1, frame_count)
-    flash("Frame marked correct.")
+    flash("Frame marked correct. Progress is saved — stop anytime.")
 
 
 def show_legacy_frame_extraction(db: PokerDatabase, video: VideoRecord) -> None:

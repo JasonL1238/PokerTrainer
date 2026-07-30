@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "corpus_id": "clubwpt_v1",
+  "validation_root_env": "POKER_VALIDATION_ROOT",
+  "notes": [
+    "Private-beta ClubWPT corpus manifest (Phase 2).",
+    "Raw recordings stay under POKER_VALIDATION_ROOT and are never committed.",
+    "This checked-in manifest is intentionally incomplete for release counts;",
+    "python -m poker_tracker.validation must fail closed until Phase 2 minimums are met.",
+    "fixture_synthetic_hu_01 is schema plumbing only, not a scored ClubWPT case."
+  ],
+  "minimums": {
+    "sessions": 10,
+    "completed_hands": 100,
+    "partial_hands": 10,
+    "development_sessions": 5,
+    "validation_sessions": 2,
+    "locked_test_sessions": 3
+  },
+  "cases": [
+    {
+      "case_id": "fixture_synthetic_hu_01",
+      "split": "development",
+      "used_for_tuning": false,
+      "layout_profile": "synthetic_fixture",
+      "runtime_class": "fixture",
+      "counts_toward_release": false,
+      "coverage_tags": [
+        "hero_fold_preflop",
+        "flop_completion",
+        "turn_completion",
+        "river_completion",
+        "showdown",
+        "recording_start_mid_hand",
+        "supported_layout_profile"
+      ],
+      "recording": {
+        "logical_name": "fixture_synthetic_hu_01.mp4",
+        "sha256": null,
+        "bytes": null,
+        "duration_s": null,
+        "fps": null,
+        "width": null,
+        "height": null
+      },
+      "truth_relpath": "truth/fixture_synthetic_hu_01.json",
+      "truth_sha256": "80bba72d03fd418491eb9930572753c89b0cfab7949e136a6434453c71319534",
+      "model_allowlist": {}
+    }
+  ]
+}

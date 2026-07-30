@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirna
 
 import cv_lab.scripts.pipeline.region_detections as rd  # noqa: E402
 from cv_lab.scripts.pipeline.build_yolo_hand_timeline import build_hand_timeline  # noqa: E402
+from cv_lab.scripts.pipeline.classify_screen import classify as classify_screen  # noqa: E402
 from cv_lab.scripts.pipeline.card_classifier import (  # noqa: E402
     DEFAULT_CLS_WEIGHTS,
     CardClassifier,
@@ -220,10 +221,40 @@ def main() -> None:
     frames: list[rd.Frame] = []
     raw_dump: list[dict] = []
     n_cards = 0
+    n_nontable = 0
     for i, (t, img) in enumerate(_sample_times(container, stream, args.start, args.end, args.interval)):
+        screen_label, _anchor = classify_screen(img)
+        image_name = f"t{t:09.2f}"
+        h, w = int(img.shape[0]), int(img.shape[1])
+        if screen_label != "table":
+            # Tab-in-front / lobby / modal: keep the timestamp for coverage-gap
+            # detection, but do not invent detections from a non-table screen.
+            n_nontable += 1
+            frames.append(
+                rd.Frame(
+                    image=image_name,
+                    time_s=t,
+                    width=w,
+                    height=h,
+                    detections=[],
+                    video_frame=i,
+                    screen="nontable",
+                )
+            )
+            _write_progress(
+                progress_path,
+                current=i + 1,
+                total=total_samples,
+                stage="frames",
+            )
+            if args.dump_detections:
+                raw_dump.append({"t": t, "screen": "nontable", "detections": []})
+            if i % 10 == 0:
+                print(f"  frame {i:>4} t={t:7.2f}s  screen=nontable (skipped inference)")
+            continue
+
         rows = _detect_regions(detector, img, conf=args.conf, imgsz=args.imgsz, iou=args.iou,
                                device=args.device, dedupe_iou=args.dedupe_iou)
-        image_name = f"t{t:09.2f}"
         if args.frame_dir:
             image_path = Path(args.frame_dir).resolve() / f"{image_name}.jpg"
             _save_review_frame(img, image_path)
@@ -242,6 +273,7 @@ def main() -> None:
         if args.dump_detections:
             raw_dump.append({
                 "t": t,
+                "screen": "table",
                 "detections": [{"cls": d.cls, "conf": round(d.conf, 3),
                                 "xyxy": [round(v, 1) for v in d.xyxy], "attr": d.attr}
                                for d in frame.detections],
@@ -250,7 +282,10 @@ def main() -> None:
             print(f"  frame {i:>4} t={t:7.2f}s  regions={len(rows):>2}  named_cards={len(cards)}")
     container.close()
 
-    print(f"\nsampled {len(frames)} frames, {n_cards} named cards total")
+    print(
+        f"\nsampled {len(frames)} frames "
+        f"({n_nontable} nontable skipped), {n_cards} named cards total"
+    )
     print("building hand timeline via reconstruction spine...")
     _write_progress(
         progress_path,
@@ -282,6 +317,7 @@ def main() -> None:
         fixture = [{
             "image": f.image, "time_s": f.time_s, "width": f.width, "height": f.height,
             "video_frame": f.video_frame,
+            "screen": getattr(f, "screen", "table"),
             "detections": [{"cls": d.cls, "conf": round(d.conf, 4),
                             "xyxy": [round(v, 2) for v in d.xyxy], "attr": d.attr}
                            for d in f.detections],

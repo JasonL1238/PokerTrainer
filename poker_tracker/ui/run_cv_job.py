@@ -15,7 +15,12 @@ from poker_tracker.persistence.backup import BACKUP_KEEP_COUNT, backup_database
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.import_export import import_hands_into_session, import_session
 from poker_tracker.ui.jobs import mark_completed, mark_failed, update_progress
-from poker_tracker.ui.video_storage import ensure_data_directories
+from poker_tracker.ui.video_ingest import (
+    assert_stored_video_matches_record,
+    require_playable_video,
+    resolve_stored_video_path,
+)
+from poker_tracker.ui.video_storage import VIDEOS_DIR, ensure_data_directories
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PIPELINE_SCRIPT = REPO_ROOT / "cv_lab" / "scripts" / "pipeline" / "run_two_model_pipeline.py"
@@ -46,16 +51,31 @@ def run_job(
     frame_root = Path(paths.get("frames", timeline_path.parent / "frames"))
     deadline = time.monotonic() + timeout_seconds
     try:
-        if not video_path.is_file():
-            raise FileNotFoundError(f"Video file not found: {video_path}")
+        job = db.fetch_processing_job(job_id)
+        if job is None:
+            raise ValueError(f"Processing job #{job_id} was not found.")
+        video = db.fetch_video(job.video_id)
+        if video is None:
+            raise ValueError(f"Video #{job.video_id} was not found.")
+        path = resolve_stored_video_path(
+            video_path,
+            stored_path=video.stored_path,
+            videos_dir=VIDEOS_DIR,
+        )
+        expected_hash = (video.content_sha256 or "").strip() or None
+        assert_stored_video_matches_record(
+            path,
+            expected_size_bytes=video.file_size_bytes,
+            expected_sha256=expected_hash,
+        )
+        require_playable_video(path)
         _heartbeat(db, job_id, 3, "Loading reconstruction models")
-        video = db.fetch_video(db.fetch_processing_job(job_id).video_id)  # type: ignore[union-attr]
-        end_seconds = video.duration_seconds if video and video.duration_seconds else 86_400
+        end_seconds = video.duration_seconds if video.duration_seconds else 86_400
         command = [
             sys.executable,
             str(PIPELINE_SCRIPT),
             "--video",
-            str(video_path),
+            str(path),
             "--start",
             "0",
             "--end",

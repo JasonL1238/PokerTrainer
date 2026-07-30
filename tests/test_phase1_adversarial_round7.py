@@ -33,6 +33,7 @@ from poker_tracker.persistence.completion import (
 from poker_tracker.persistence.db import (
     DECLARED_DEAD_MONEY_CODE,
     DECLARED_RAKE_CODE,
+    SCHEMA_VERSION,
     PokerDatabase,
 )
 from poker_tracker.persistence.import_export import export_session, import_session
@@ -722,7 +723,7 @@ def test_concurrent_openers_all_start_against_one_database(tmp_path: Path) -> No
     outcomes = [process.communicate() for process in processes]
     for (out, err), process in zip(outcomes, processes, strict=True):
         assert process.returncode == 0, err
-        assert out.strip() == "13"
+        assert out.strip() == str(SCHEMA_VERSION)
 
 
 # ---------------------------------------------------------------------------
@@ -993,7 +994,7 @@ def test_a_genuine_pre_v13_database_still_migrates(tmp_path: Path) -> None:
 
     db = PokerDatabase(str(path), busy_timeout_ms=2000)
     db.init_db()
-    assert db.schema_version() == 13
+    assert db.schema_version() == SCHEMA_VERSION
     migrated = db.fetch_hand(1)
     assert migrated is not None
     assert migrated.completion_status == "uncertain"

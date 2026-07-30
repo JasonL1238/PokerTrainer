@@ -515,3 +515,22 @@ def test_amounts_unknown_in_ledger_is_a_spine_fatal_code():
     })
     assert "amounts_unknown_in_ledger" in _codes(report)
     assert report["hands"][0]["warning_count"] >= 1
+
+
+def test_mid_hand_coverage_gap_is_a_spine_fatal_code():
+    """Tab/lobby covering the table across a critical mid-hand change must block
+    export the same way an unmeasured money transition does."""
+    from cv_lab.scripts.eval.validate_yolo_card_timeline import (
+        SPINE_FATAL_CODES,
+        WARNING_SEVERITY,
+    )
+
+    assert "mid_hand_coverage_gap" in SPINE_FATAL_CODES
+    assert WARNING_SEVERITY["mid_hand_coverage_gap"] >= 0.5
+    report = validate_timeline({
+        "states": [_state(0.0, "a.jpg")],
+        "hands": [_spine_hand(warnings=["mid_hand_coverage_gap"],
+                              source_images=["a.jpg"])],
+    })
+    assert "mid_hand_coverage_gap" in _codes(report)
+    assert report["hands"][0]["warning_count"] >= 1

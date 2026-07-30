@@ -27,7 +27,7 @@ from poker_tracker.persistence.completion import (
     dump_completion_evidence,
     parse_completion_evidence,
 )
-from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.persistence.db import SCHEMA_VERSION, PokerDatabase
 from poker_tracker.persistence.import_export import export_session, import_session
 from poker_tracker.persistence.models import (
     Action,
@@ -529,7 +529,7 @@ def test_a_genuine_pre_versioning_database_still_migrates(tmp_path: Path) -> Non
 
     db = PokerDatabase(str(path))
     db.init_db()
-    assert db.schema_version() == 13
+    assert db.schema_version() == SCHEMA_VERSION
     db.close()
 
 

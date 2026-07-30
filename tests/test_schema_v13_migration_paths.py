@@ -434,8 +434,9 @@ def test_legacy_database_migrates_to_schema_13(
 
     migrated = _open(path)
 
-    assert migrated.schema_version() == SCHEMA_VERSION == 13
+    assert migrated.schema_version() == SCHEMA_VERSION
     assert {"completion_status", "completion_evidence"} <= set(_columns(migrated, "hands"))
+    assert "content_sha256" in _columns(migrated, "videos")
     rows = {
         row["hand_number"]: row
         for row in migrated._execute(
@@ -540,7 +541,7 @@ def test_pre_versioning_database_is_backfilled_and_classified(tmp_path: Path) ->
 
     migrated = _open(path)
 
-    assert migrated.schema_version() == 13
+    assert migrated.schema_version() == SCHEMA_VERSION
     # Hand 4 carries an unrecognized source_type, which the SourceType literal has
     # always refused, so the rows are read directly rather than through the model.
     rows = migrated._execute(
@@ -739,7 +740,7 @@ def test_failed_v13_migration_rolls_back_the_whole_legacy_chain(
 
     monkeypatch.undo()
     repaired = _open(path)
-    assert repaired.schema_version() == 13
+    assert repaired.schema_version() == SCHEMA_VERSION
     assert repaired.fetch_hand(1).completion_status == "not_applicable"
     assert repaired.fetch_hand(2).completion_status == "uncertain"
     repaired.close()
@@ -750,14 +751,18 @@ def test_failed_v13_migration_rolls_back_the_whole_legacy_chain(
 # --------------------------------------------------------------------------
 
 
-def test_a_schema_14_file_is_refused_and_left_untouched(
+def test_a_newer_schema_file_is_refused_and_left_untouched(
     tmp_path: Path, isolated_backup_dir: Path
 ) -> None:
     """An older build must refuse a newer database without altering or backing it up."""
     path = tmp_path / "future.sqlite3"
     seeded = _open(path)
     seeded.create_session(Session(name="Future"))
-    seeded._execute("UPDATE schema_metadata SET value = '14' WHERE key = 'schema_version'")
+    future_version = SCHEMA_VERSION + 1
+    seeded._execute(
+        "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
+        (str(future_version),),
+    )
     seeded._commit()
     seeded.close()
     before = path.read_bytes()
@@ -770,7 +775,7 @@ def test_a_schema_14_file_is_refused_and_left_untouched(
     assert path.read_bytes() == before
     assert list(isolated_backup_dir.glob("poker_tracker_*.sqlite3")) == []
     reopened = PokerDatabase(path)
-    assert reopened.schema_version() == 14
+    assert reopened.schema_version() == future_version
     reopened.close()
 
 

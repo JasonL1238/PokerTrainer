@@ -69,7 +69,7 @@ DEFAULT_DB_PATH = os.environ.get(
     "POKER_DB_PATH",
     str(Path(__file__).resolve().parent.parent.parent / "poker_tracker.db"),
 )
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 # A migration on a real database can outlast SQLite's 5s default, and a second
 # opener must wait for it rather than failing startup with "database is locked".
 BUSY_TIMEOUT_MS = int(os.environ.get("POKER_DB_BUSY_TIMEOUT_MS", "30000"))
@@ -795,6 +795,7 @@ class PokerDatabase:
                 original_filename TEXT NOT NULL,
                 stored_path TEXT NOT NULL,
                 file_size_bytes INTEGER NOT NULL,
+                content_sha256 TEXT NOT NULL DEFAULT '',
                 duration_seconds REAL,
                 fps REAL,
                 width INTEGER,
@@ -3329,15 +3330,17 @@ class PokerDatabase:
             """
             INSERT INTO videos (
                 session_id, original_filename, stored_path, file_size_bytes,
-                duration_seconds, fps, width, height, frame_count, uploaded_at, notes
+                content_sha256, duration_seconds, fps, width, height, frame_count,
+                uploaded_at, notes
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload["session_id"],
                 payload["original_filename"],
                 payload["stored_path"],
                 payload["file_size_bytes"],
+                payload.get("content_sha256") or "",
                 payload["duration_seconds"],
                 payload["fps"],
                 payload["width"],
@@ -4140,6 +4143,23 @@ def _migrate_to_v13(db: PokerDatabase) -> None:
     )
 
 
+def _migrate_to_v14(db: PokerDatabase) -> None:
+    """Persist content hashes for stored completed-session videos.
+
+    MIGRATION IMPACT (schema 13 -> 14)
+
+    Added:
+      - videos.content_sha256 TEXT NOT NULL DEFAULT ''
+
+    Existing video rows keep an empty hash. Size checks still apply; hash
+    enforcement activates only when a non-empty hash is present (new uploads
+    after this version). No video files are read, rewritten, or deleted. No
+    other tables are touched.
+    """
+
+    db._ensure_column("videos", "content_sha256", "TEXT NOT NULL DEFAULT ''")
+
+
 # Versioned migrations run in order and refuse databases written by newer apps.
 _MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {
     6: _migrate_to_v6,
@@ -4150,6 +4170,7 @@ _MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {
     11: _migrate_to_v11,
     12: _migrate_to_v12,
     13: _migrate_to_v13,
+    14: _migrate_to_v14,
 }
 
 

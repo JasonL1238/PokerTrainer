@@ -40,6 +40,10 @@ def test_math_workspace_has_compact_scoped_density() -> None:
 
 def test_evidence_review_stacks_at_narrow_widths() -> None:
     assert ".pt-evidence-impact" in _THEME_CSS
+    assert ".pt-evidence-position > span { white-space: nowrap; }" in _THEME_CSS
+    assert ".pt-evidence-verdict.is-correct" in _THEME_CSS
+    assert '[class*="st-key-evidence_navigation_"]' in _THEME_CSS
+    assert '[class*="st-key-evidence_summary_"]' in _THEME_CSS
     assert '[class*="st-key-evidence_comparison_"]' in _THEME_CSS
 
 

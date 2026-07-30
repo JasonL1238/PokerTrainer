@@ -707,6 +707,8 @@ def test_every_spine_fatal_code_actually_blocks_the_export():
         # never become authoritative; it used to export as "complete" and
         # dead-end downstream with no clearing action.
         "starting_stack_unknown",
+        # Tab/lobby covering the table across a critical mid-hand change.
+        "mid_hand_coverage_gap",
     ):
         payload = _export(_spine_hand(warnings=[code]))
         assert payload["cv_import_summary"]["exported_hands"] == 0, code

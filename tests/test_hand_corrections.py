@@ -39,7 +39,8 @@ def _coaching(hand_id: int, session_id: int) -> CoachingResponse:
 def test_current_schema_contains_audit_and_staleness_fields() -> None:
     db = _db()
 
-    assert db.schema_version() == SCHEMA_VERSION == 13
+    assert db.schema_version() == SCHEMA_VERSION
+    assert SCHEMA_VERSION >= 13
     tables = {
         row["name"]
         for row in db._execute(

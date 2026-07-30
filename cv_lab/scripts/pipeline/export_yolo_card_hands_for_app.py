@@ -428,6 +428,7 @@ def _completion_evidence_for_hand(
             # Money the ledger could not account for: transitions whose stack
             # delta was unmeasurable, and actions proved but not sized.
             "cv_unmeasured_transitions": hand.get("unmeasured_transitions", 0),
+            "cv_coverage_gaps": hand.get("coverage_gaps", 0),
             "cv_unknown_money_actions": hand.get("unknown_money_actions", 0),
             # Seats whose STARTING STACK the reader refused, as opposed to seats
             # whose box was simply absent. HandPlayer.starting_stack already

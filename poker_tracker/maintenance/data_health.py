@@ -62,6 +62,7 @@ _MINIMUM_SCHEMA: dict[str, set[str]] = {
 # stamped 13 without them is reported instead of silently passing.
 _VERSIONED_SCHEMA: tuple[tuple[int, str, frozenset[str]], ...] = (
     (13, "hands", frozenset({"completion_status", "completion_evidence"})),
+    (14, "videos", frozenset({"content_sha256"})),
 )
 
 

@@ -1721,3 +1721,103 @@ def test_contrib_estimator_abstains_when_the_first_pot_read_was_refused():
     assert refused["reconciled"] is False, (
         "one voter cannot reconcile: the refusal must be visible, not papered over")
     assert "pot_not_reconciled" in refused["warnings"]
+
+
+def test_brief_nontable_gap_without_state_change_still_completes():
+    """A tab flash that leaves board/stacks unchanged must stitch, not reject."""
+    fixture = _hand_fixture()
+    # Insert an explicit nontable sample between two identical-ledger states.
+    nontable = {
+        "image": "overlay.jpg",
+        "time_s": 4.5,
+        "width": W,
+        "height": H,
+        "screen": "nontable",
+        "detections": [],
+    }
+    # Place between the flop bet (t=4) and the call (t=5) without changing money.
+    fixture.insert(5, nontable)
+    hand = build_hand_timeline(rd.frames_from_fixture(fixture))["hands"][0]
+    assert hand["coverage_gaps"] == 0
+    assert "mid_hand_coverage_gap" not in hand["warnings"]
+    assert hand["complete"] is True
+
+
+def test_mid_hand_coverage_gap_does_not_invent_stack_delta_actions():
+    """Tab covers while a raise happens: recover either side, do not invent size."""
+    fixture = [
+        _frame(0.0, board=[], s0=100, s4=100, active=4),
+        _frame(1.0, board=[], s0=100, s4=97, pot=3, pill4="raise", active=0),
+        _frame(2.0, board=[], s0=97, s4=97, pot=6, pill0="call", pill4="raise", active=4),
+        # Nontable stretch while villain bets the flop off-camera.
+        {
+            "image": "tab.jpg",
+            "time_s": 3.0,
+            "width": W,
+            "height": H,
+            "screen": "nontable",
+            "detections": [],
+        },
+        {
+            "image": "tab2.jpg",
+            "time_s": 4.0,
+            "width": W,
+            "height": H,
+            "screen": "nontable",
+            "detections": [],
+        },
+        {
+            "image": "tab3.jpg",
+            "time_s": 5.0,
+            "width": W,
+            "height": H,
+            "screen": "nontable",
+            "detections": [],
+        },
+        # Table returns: flop is out and villain already put 10 more in.
+        _frame(6.0, board=FLOP, s0=97, s4=87, pot=16, pill4="bet", active=0),
+        _frame(7.0, board=FLOP, s0=87, s4=87, pot=26, pill0="call", pill4="bet", active=4),
+        _frame(8.0, board=TURN, s0=87, s4=87, pot=26, pill0="check", pill4="check", active=0),
+        _frame(9.0, board=RIVER, s0=87, s4=87, pot=26, pill0="check", pill4="check", active=0),
+        _frame(10.0, board=RIVER, s0=113, s4=87, pot=26, active=0),
+    ]
+    hand = build_hand_timeline(rd.frames_from_fixture(fixture))["hands"][0]
+    assert hand["coverage_gaps"] >= 1
+    assert "mid_hand_coverage_gap" in hand["warnings"]
+    assert hand["complete"] is False
+    # No fabricated sized action from the post-gap stack debit alone.
+    invented = [
+        a for a in hand["actions"]
+        if a["derivation"] == "stack_delta"
+        and a["street"] == "flop"
+        and a["seat"] == 4
+        and a.get("amount") == 10.0
+    ]
+    assert invented == [], f"invented flop raise across coverage gap: {invented}"
+    # Visible fresh pill after the gap may record the act with unknown size.
+    assert all(
+        a.get("amount") is None
+        for a in hand["actions"]
+        if a.get("derivation") == "amount_unknown"
+    )
+
+
+def test_time_jump_with_board_advance_is_a_coverage_gap_without_nontable_marker():
+    """Even without classify_screen markers, a long mid-hand hole with a board
+    jump is unobserved coverage -- not a silently complete multi-street hand."""
+    fixture = [
+        _frame(0.0, board=[], s0=100, s4=100, active=4),
+        _frame(1.0, board=[], s0=100, s4=97, pot=3, pill4="raise", active=0),
+        _frame(2.0, board=[], s0=97, s4=97, pot=6, pill0="call", pill4="raise", active=4),
+        # 8s hole (well above 2.5s threshold at 1s sampling) then flop appears.
+        _frame(10.0, board=FLOP, s0=97, s4=97, pot=6, active=0),
+        _frame(11.0, board=FLOP, s0=90, s4=97, pot=13, pill0="bet", active=4),
+        _frame(12.0, board=FLOP, s0=90, s4=90, pot=20, pill0="bet", pill4="call", active=0),
+        _frame(13.0, board=TURN, s0=90, s4=90, pot=20, pill0="check", pill4="check", active=0),
+        _frame(14.0, board=RIVER, s0=90, s4=90, pot=20, pill0="check", pill4="check", active=0),
+        _frame(15.0, board=RIVER, s0=110, s4=90, pot=20, active=0),
+    ]
+    hand = build_hand_timeline(rd.frames_from_fixture(fixture))["hands"][0]
+    assert hand["coverage_gaps"] >= 1
+    assert "mid_hand_coverage_gap" in hand["warnings"]
+    assert hand["complete"] is False

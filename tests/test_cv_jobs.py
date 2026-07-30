@@ -4,12 +4,15 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import cv2
+import numpy as np
 import pytest
 
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import ProcessingJob, VideoRecord
 from poker_tracker.ui import cv_jobs, run_cv_job
 from poker_tracker.ui.run_cv_job import BACKUP_KEEP_COUNT, backup_database
+from poker_tracker.ui.video_ingest import sha256_file
 
 
 def make_db(path: str = ":memory:") -> PokerDatabase:
@@ -18,22 +21,60 @@ def make_db(path: str = ":memory:") -> PokerDatabase:
     return db
 
 
-def add_video(db: PokerDatabase, path: Path) -> VideoRecord:
-    path.write_bytes(b"completed-session-video")
+def create_synthetic_video(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(
+        str(path),
+        cv2.VideoWriter_fourcc(*"MJPG"),
+        10.0,
+        (64, 48),
+    )
+    assert writer.isOpened()
+    for index in range(20):
+        frame = np.zeros((48, 64, 3), dtype=np.uint8)
+        frame[:, :] = (index * 10 % 255, index * 5 % 255, index * 20 % 255)
+        writer.write(frame)
+    writer.release()
+    return path
+
+
+def add_video(
+    db: PokerDatabase,
+    path: Path,
+    *,
+    playable: bool = False,
+    with_hash: bool = False,
+) -> VideoRecord:
+    if playable:
+        create_synthetic_video(path)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"completed-session-video")
+    digest = sha256_file(path) if with_hash else ""
     return db.create_video(
         VideoRecord(
             original_filename=path.name,
             stored_path=str(path),
             file_size_bytes=path.stat().st_size,
+            content_sha256=digest,
         )
     )
 
 
+@pytest.fixture
+def videos_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    root = tmp_path / "videos"
+    root.mkdir()
+    monkeypatch.setattr(cv_jobs, "VIDEOS_DIR", root)
+    monkeypatch.setattr(run_cv_job, "VIDEOS_DIR", root)
+    return root
+
+
 def test_start_cv_job_launches_detached_worker_and_enforces_single_job(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    videos_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = make_db()
-    video = add_video(db, tmp_path / "session.mp4")
+    video = add_video(db, videos_dir / "session.avi", playable=True, with_hash=True)
     captured: dict = {}
 
     def fake_popen(command, **kwargs):
@@ -42,7 +83,7 @@ def test_start_cv_job_launches_detached_worker_and_enforces_single_job(
         return SimpleNamespace(pid=43210)
 
     monkeypatch.setattr(cv_jobs.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(cv_jobs, "JOB_LOGS_DIR", tmp_path / "logs")
+    monkeypatch.setattr(cv_jobs, "JOB_LOGS_DIR", videos_dir.parent / "logs")
     monkeypatch.setattr(cv_jobs, "ensure_data_directories", lambda: {})
 
     job = cv_jobs.start_cv_job(db, video.id, video.stored_path, "Imported study")
@@ -56,6 +97,88 @@ def test_start_cv_job_launches_detached_worker_and_enforces_single_job(
 
     with pytest.raises(cv_jobs.CVJobAlreadyRunningError):
         cv_jobs.start_cv_job(db, video.id, video.stored_path, "Another")
+    db.close()
+
+
+def test_start_cv_job_rejects_size_mismatched_video(
+    videos_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = make_db()
+    video = add_video(db, videos_dir / "session.avi", playable=True, with_hash=True)
+    Path(video.stored_path).write_bytes(b"truncated")
+    monkeypatch.setattr(cv_jobs.subprocess, "Popen", lambda *a, **k: SimpleNamespace(pid=1))
+
+    with pytest.raises(ValueError, match="size mismatch"):
+        cv_jobs.start_cv_job(db, video.id, video.stored_path, "Imported study")
+
+    assert db.fetch_active_jobs() == []
+    db.close()
+
+
+def test_start_cv_job_rejects_hash_mismatched_same_size(videos_dir: Path) -> None:
+    db = make_db()
+    video = add_video(db, videos_dir / "session.avi", playable=True, with_hash=True)
+    path = Path(video.stored_path)
+    original = path.read_bytes()
+    # Same-size mutation: flip first byte.
+    mutated = bytes((original[0] ^ 0xFF,)) + original[1:]
+    assert len(mutated) == len(original)
+    path.write_bytes(mutated)
+
+    with pytest.raises(ValueError, match="hash mismatch"):
+        cv_jobs.start_cv_job(db, video.id, video.stored_path, "Imported study")
+
+    assert db.fetch_active_jobs() == []
+    db.close()
+
+
+def test_start_cv_job_rejects_path_not_matching_stored(videos_dir: Path) -> None:
+    db = make_db()
+    video = add_video(db, videos_dir / "session.avi", playable=True, with_hash=True)
+    other = create_synthetic_video(videos_dir / "other.avi")
+
+    with pytest.raises(ValueError, match="does not match"):
+        cv_jobs.start_cv_job(db, video.id, other, "Imported study")
+
+    assert db.fetch_active_jobs() == []
+    db.close()
+
+
+def test_start_cv_job_rejects_out_of_root_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    videos_root = tmp_path / "videos"
+    videos_root.mkdir()
+    monkeypatch.setattr(cv_jobs, "VIDEOS_DIR", videos_root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    db = make_db()
+    video = add_video(db, outside / "session.avi", playable=True, with_hash=True)
+
+    with pytest.raises(ValueError, match="outside video storage root"):
+        cv_jobs.start_cv_job(db, video.id, video.stored_path, "Imported study")
+
+    assert db.fetch_active_jobs() == []
+    db.close()
+
+
+def test_start_cv_job_rejects_corrupt_video(videos_dir: Path) -> None:
+    db = make_db()
+    path = videos_dir / "corrupt.mp4"
+    path.write_bytes(b"not-a-video")
+    video = db.create_video(
+        VideoRecord(
+            original_filename=path.name,
+            stored_path=str(path),
+            file_size_bytes=path.stat().st_size,
+            content_sha256=sha256_file(path),
+        )
+    )
+
+    with pytest.raises(ValueError):
+        cv_jobs.start_cv_job(db, video.id, video.stored_path, "Imported study")
+
+    assert db.fetch_active_jobs() == []
     db.close()
 
 
@@ -85,10 +208,10 @@ def test_reconcile_stuck_jobs_marks_dead_pid_failed(
 
 
 def test_cv_setup_failure_does_not_leave_queued_job(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    videos_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = make_db()
-    video = add_video(db, tmp_path / "session.mp4")
+    video = add_video(db, videos_dir / "session.avi", playable=True, with_hash=True)
     monkeypatch.setattr(
         cv_jobs,
         "ensure_data_directories",
@@ -181,19 +304,19 @@ def test_database_backup_is_consistent_and_rotates(tmp_path: Path) -> None:
 
 
 def test_worker_completes_import_and_records_backup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    videos_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    db_path = tmp_path / "tracker.sqlite3"
+    db_path = videos_dir.parent / "tracker.sqlite3"
     db = make_db(str(db_path))
-    video = add_video(db, tmp_path / "session.mp4")
+    video = add_video(db, videos_dir / "session.avi", playable=True, with_hash=True)
     job = db.create_processing_job(
         ProcessingJob(video_id=video.id, job_type="cv_reconstruction", status="running")
     )
     db.close()
     paths = {
-        "cv_timelines": tmp_path / "timelines",
-        "exports": tmp_path / "exports",
-        "backups": tmp_path / "backups",
+        "cv_timelines": videos_dir.parent / "timelines",
+        "exports": videos_dir.parent / "exports",
+        "backups": videos_dir.parent / "backups",
     }
     for path in paths.values():
         path.mkdir()

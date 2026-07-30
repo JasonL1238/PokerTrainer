@@ -51,6 +51,11 @@ SPINE_FATAL_CODES = frozenset({
     # that does it -- routed through _split_source_codes into rejection_codes,
     # which makes derive_completion_status return "uncertain".
     "amounts_unknown_in_ledger",
+    # Mid-hand stretch where the table was not visible (tab-in-front / lobby /
+    # modal) and board/pot/stacks/roster/dealer changed underneath. The spine
+    # recovers what is visible on either side and refuses to invent the hole;
+    # export must not promote the hand to complete.
+    "mid_hand_coverage_gap",
     # A player row whose starting stack the reader REFUSED. Accounting rejects a
     # None starting stack outright (LedgerError), so the hand can never become
     # an authoritative money record; before this code existed the fact travelled
@@ -654,6 +659,10 @@ WARNING_SEVERITY: dict[str, float] = {
     # code at or above _REJECTION_SEVERITY into rejection_codes, which is what
     # blocks the promotion to completion_status "complete".
     "amounts_unknown_in_ledger": 0.50,
+    # Tab/lobby covering the table across a critical mid-hand change. Same
+    # band as amounts_unknown_in_ledger: the reconstruction cannot claim the
+    # unobserved actions, so export routes this into rejection_codes.
+    "mid_hand_coverage_gap": 0.50,
     # An unknown starting stack is the same class of ledger unknown: every
     # derived money fact for that seat (effective stack, SPR, contributions)
     # rests on a number the reader declined to supply, and accounting fails

@@ -164,6 +164,10 @@ class Frame:
     height: int
     detections: list[Detection] = field(default_factory=list)
     video_frame: int = 0
+    # ``table`` = poker table visible; ``nontable`` = lobby / tab-in-front /
+    # modal / transition. Nontable frames are kept for coverage timing but are
+    # not inferred into stack/board/action state.
+    screen: str = "table"
 
 
 # --------------------------------------------------------------------------- #
@@ -854,6 +858,9 @@ def frames_from_fixture(data: Iterable[dict[str, Any]]) -> list[Frame]:
             )
             for d in row.get("detections", [])
         ]
+        screen = str(row.get("screen") or "table").strip().lower()
+        if screen not in {"table", "nontable"}:
+            screen = "table"
         frames.append(
             Frame(
                 image=str(row["image"]),
@@ -862,6 +869,7 @@ def frames_from_fixture(data: Iterable[dict[str, Any]]) -> list[Frame]:
                 height=int(row["height"]),
                 detections=dets,
                 video_frame=int(row.get("video_frame", 0)),
+                screen=screen,
             )
         )
     return frames
@@ -1016,5 +1024,12 @@ def frame_from_models(
                 attr_score=attr_score,
             )
         )
-    return Frame(image=image_name, time_s=time_s, width=w, height=h,
-                 detections=dets, video_frame=video_frame)
+    return Frame(
+        image=image_name,
+        time_s=time_s,
+        width=w,
+        height=h,
+        detections=dets,
+        video_frame=video_frame,
+        screen="table",
+    )

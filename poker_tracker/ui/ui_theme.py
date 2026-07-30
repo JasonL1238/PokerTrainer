@@ -325,10 +325,34 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
 
 /* Frame-to-history reconstruction audit */
 .pt-evidence-position {
-    min-height: 40px; display: grid; place-items: center; text-align: center;
+    min-height: 42px; display: flex; align-items: center; justify-content: center;
+    flex-wrap: wrap; gap: .4rem .75rem; padding: .5rem .75rem; text-align: center;
+    border: 1px solid var(--pt-border); border-radius: var(--pt-radius);
+    background: var(--pt-surface-soft);
     color: var(--pt-muted); font-family: var(--pt-font-mono); font-size: .72rem;
 }
+.pt-evidence-position > span { white-space: nowrap; }
 .pt-evidence-position strong { color: var(--pt-text); }
+.pt-evidence-verdict {
+    padding: .18rem .48rem; border: 1px solid var(--pt-border-strong);
+    border-radius: 999px; font-family: var(--pt-font-sans);
+    font-size: .62rem; font-weight: 760; letter-spacing: .025em;
+}
+.pt-evidence-verdict.is-correct {
+    border-color: rgba(53, 208, 127, .38); background: rgba(53, 208, 127, .1);
+    color: var(--pt-positive);
+}
+.pt-evidence-verdict.is-incorrect {
+    border-color: rgba(228, 95, 95, .38); background: rgba(228, 95, 95, .1);
+    color: var(--pt-negative);
+}
+.pt-evidence-verdict.is-unreviewed { color: var(--pt-muted); }
+[class*="st-key-evidence_navigation_"] [data-testid="stHorizontalBlock"] {
+    gap: var(--pt-space-2);
+}
+[class*="st-key-evidence_navigation_"] [data-testid="stButton"] {
+    margin-top: -.2rem;
+}
 .pt-evidence-impact {
     display: grid; gap: .28rem; margin-bottom: .55rem; padding: .72rem .8rem;
     border: 1px solid var(--pt-border); border-left: 2px solid var(--pt-accent);
@@ -356,6 +380,19 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
     .st-key-study_workspace > div > [data-testid="stHorizontalBlock"] > div {
         width: 100% !important; min-width: 100% !important; flex: 1 1 100% !important;
     }
+    [class*="st-key-evidence_summary_"] > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] {
+        flex-wrap: wrap;
+    }
+    [class*="st-key-evidence_summary_"] > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > div {
+        min-width: calc(50% - var(--pt-space-2)) !important;
+        flex: 1 1 calc(50% - var(--pt-space-2)) !important;
+    }
+    [class*="st-key-evidence_comparison_"] > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] {
+        flex-direction: column;
+    }
+    [class*="st-key-evidence_comparison_"] > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > div {
+        width: 100% !important; min-width: 100% !important; flex: 1 1 auto !important;
+    }
 }
 
 @media (max-width: 900px) {
@@ -378,11 +415,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
         min-width: min(100%, 210px) !important;
         flex: 1 1 30% !important;
     }
-    [class*="st-key-evidence_comparison_"] > div > [data-testid="stHorizontalBlock"] {
-        flex-direction: column;
-    }
-    [class*="st-key-evidence_comparison_"] > div > [data-testid="stHorizontalBlock"] > div {
-        width: 100% !important; min-width: 100% !important; flex: 1 1 auto !important;
+    .pt-evidence-position {
+        justify-content: space-between; padding-inline: .65rem;
     }
 }
 
@@ -445,6 +479,18 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
     .stTabs [data-baseweb="tab"] { min-height: 44px; padding-inline: .7rem; }
     [data-testid="stFileUploaderDropzone"] { padding-inline: .75rem; }
     [data-testid="stDataFrame"], [data-testid="stDataEditor"] { max-width: calc(100vw - 1.5rem); }
+    .pt-evidence-position { gap: .35rem .55rem; }
+    .pt-evidence-position > span:first-child { flex: 1 0 100%; }
+    [class*="st-key-evidence_navigation_"] [data-testid="stHorizontalBlock"] {
+        flex-direction: row !important; flex-wrap: nowrap !important;
+    }
+    [class*="st-key-evidence_navigation_"] [data-testid="stHorizontalBlock"] > div {
+        width: calc(50% - .25rem) !important; min-width: 0 !important;
+        flex: 1 1 calc(50% - .25rem) !important;
+    }
+    [class*="st-key-evidence_summary_"] > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > div {
+        width: 100% !important; min-width: 100% !important; flex: 1 1 100% !important;
+    }
     .st-key-math_primary_inputs [data-testid="stHorizontalBlock"],
     .st-key-math_secondary_inputs [data-testid="stHorizontalBlock"],
     .st-key-math_workspace [data-testid="stHorizontalBlock"]:has([data-testid="stMetric"]) {

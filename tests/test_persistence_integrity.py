@@ -555,7 +555,7 @@ def test_failed_migration_rolls_back_without_partial_schema(
 
     monkeypatch.undo()
     repaired = _make_db(path)
-    assert repaired.schema_version() == 13
+    assert repaired.schema_version() == SCHEMA_VERSION
     repaired.close()
 
 

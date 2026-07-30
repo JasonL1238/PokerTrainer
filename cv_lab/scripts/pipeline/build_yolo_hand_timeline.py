@@ -105,6 +105,13 @@ _CONTRIBUTION_RESIDUAL_SLACK_BB = 1.0
 # The +1.0 BB slack absorbs read jitter without admitting any measured defect
 # (the smallest is a full order of magnitude).
 _STACK_RISE_SLACK_BB = 1.0
+# A mid-hand coverage gap is a stretch where the table was not observed (tab
+# in front, lobby, modal) long enough that consecutive *table* states are
+# farther apart than a normal sample. Gaps at or below this multiple of the
+# sampling interval are treated as brief HUD blips the existing debounce
+# already handles; longer gaps with a critical state change are unobserved.
+_COVERAGE_GAP_INTERVAL_MULT = 2.5
+_COVERAGE_GAP_MIN_S = 2.5
 
 
 def _sampling_interval(frames: list[rd.Frame]) -> float:
@@ -126,6 +133,53 @@ def _scaled_run(calib_count: int, interval_s: float) -> int:
     return max(calib_count, round(calib_count * scale))
 
 
+def _is_table_frame(frame: rd.Frame) -> bool:
+    return getattr(frame, "screen", "table") == "table"
+
+
+def _coverage_gap_threshold_s(interval_s: float) -> float:
+    return max(_COVERAGE_GAP_INTERVAL_MULT * interval_s, _COVERAGE_GAP_MIN_S)
+
+
+def _critical_unobserved_change(prev: dict[str, Any], cur: dict[str, Any]) -> bool:
+    """True when a mid-hand time gap likely hid a state change we must not invent.
+
+    Brief overlays that leave board/stacks/roster/dealer/hero unchanged are safe
+    to stitch. A board advance, pot move, roster change, dealer move, hero-card
+    change, or meaningful stack debit across an unobserved stretch means the
+    actions in the hole were not seen -- record the gap, do not fabricate them.
+    """
+    if prev.get("board_cards") != cur.get("board_cards"):
+        return True
+    if prev.get("hero_cards") != cur.get("hero_cards") and (
+        prev.get("hero_cards") or cur.get("hero_cards")
+    ):
+        return True
+    if set(prev.get("dealt_in") or []) != set(cur.get("dealt_in") or []):
+        return True
+    prev_dealer, cur_dealer = prev.get("dealer_seat"), cur.get("dealer_seat")
+    if (
+        prev_dealer is not None
+        and cur_dealer is not None
+        and prev_dealer != cur_dealer
+    ):
+        return True
+    prev_pot, cur_pot = prev.get("pot"), cur.get("pot")
+    if (
+        prev_pot is not None
+        and cur_pot is not None
+        and abs(cur_pot - prev_pot) > 1.0 + _EPS
+    ):
+        return True
+    seats = set(prev.get("stacks") or []) | set(cur.get("stacks") or [])
+    for seat in seats:
+        before = (prev.get("stacks") or {}).get(seat)
+        after = (cur.get("stacks") or {}).get(seat)
+        if before is not None and after is not None and abs(before - after) > 0.5 + _EPS:
+            return True
+    return False
+
+
 # --------------------------------------------------------------------------- #
 # Pass 1: per-frame table state + collapse to distinct states
 # --------------------------------------------------------------------------- #
@@ -138,7 +192,11 @@ def _session_anchor(frames: list[rd.Frame]) -> rd.TableAnchor | None:
     0.0038 reference-y units at worst (p50 0.0001-0.0005) over the 5 development
     geometries -- an order of magnitude inside the card-zone band guards.
     """
-    fits = [a for a in (rd.anchor_for_frame(f) for f in frames) if a is not None]
+    fits = [
+        a
+        for a in (rd.anchor_for_frame(f) for f in frames if _is_table_frame(f))
+        if a is not None
+    ]
     if len(fits) < ANCHOR_MIN_SESSION_FITS:
         return None
     return rd.TableAnchor(
@@ -398,6 +456,11 @@ def _frame_state(frame: rd.Frame, session_anchor: rd.TableAnchor | None = None) 
         # because a stack read was refused. Filled by _reconstruct_actions, which
         # is where transitions are walked; declared here so the key always exists.
         "unmeasured_transitions": [],
+        # Mid-hand coverage: seconds since the previous *table* state, and whether
+        # that gap hid a critical change. Filled in build_states / action walk.
+        "prior_gap_s": 0.0,
+        "sampling_interval_s": 0.0,
+        "coverage_gap": False,
         # Set by _settle_index when a settlement-scan transition is skipped
         # because this state's pot read was refused (the old code substituted a
         # STALE pot from an earlier state for the unread one).
@@ -572,10 +635,18 @@ def _debounce_bool_confirm(raw: list[dict[str, Any]], key: str, min_run: int = 3
 def build_states(frames: list[rd.Frame]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return (distinct states, events). Raw per-frame states are debounced first
     (cards, pot, stacks, bets -- single-frame OCR/classifier blips are rejected
-    unless the next reading confirms them), then collapsed to distinct states."""
-    session_anchor = _session_anchor(frames)
-    raw = [_frame_state(f, session_anchor) for f in frames]
-    interval_s = _sampling_interval(frames)
+    unless the next reading confirms them), then collapsed to distinct states.
+
+    Nontable frames (tab-in-front / lobby / modal) are omitted from inference
+    state: their timestamps create a ``prior_gap_s`` on the next table state so
+    action reconstruction can refuse to invent what happened underneath.
+    """
+    table_frames = [f for f in frames if _is_table_frame(f)]
+    session_anchor = _session_anchor(table_frames)
+    interval_s = _sampling_interval(table_frames if table_frames else frames)
+    raw = [_frame_state(f, session_anchor) for f in table_frames]
+    for state in raw:
+        state["sampling_interval_s"] = interval_s
     # Record the identity contests BEFORE the debounce absorbs them.
     _flag_identity_splits(raw, "hero_cards")
     _flag_identity_splits(raw, "board_cards")
@@ -596,6 +667,10 @@ def build_states(frames: list[rd.Frame]) -> tuple[list[dict[str, Any]], list[dic
         sig = _signature(state)
         if sig == last_sig:
             continue
+        if prev is not None:
+            state["prior_gap_s"] = state["time_s"] - prev["time_s"]
+        else:
+            state["prior_gap_s"] = 0.0
         state["state_index"] = len(states)
         states.append(state)
 
@@ -1355,6 +1430,8 @@ def _reconstruct_actions(
     # bet across that gap, the felt's still-showing raise reads as a fresh bet the
     # next frame and duplicates the action (see run-length debounce note at top).
     carried_bet: dict[tuple[str, int], float] = {}
+    interval_s = float(hand[0].get("sampling_interval_s") or 0.0) or _CALIB_INTERVAL_S
+    gap_threshold_s = _coverage_gap_threshold_s(interval_s)
     for i, (prev, cur) in enumerate(zip(window, window[1:], strict=False)):
         nxt = window[i + 2] if i + 2 < len(window) else None
         board_hwm = max(board_hwm, len(prev["board_cards"]))
@@ -1362,6 +1439,13 @@ def _reconstruct_actions(
         if street not in _STREET_BY_COUNT.values():
             continue
         pot_before = prev["pot"]
+        prior_gap_s = float(cur.get("prior_gap_s") or 0.0)
+        coverage_gap = (
+            prior_gap_s > gap_threshold_s
+            and _critical_unobserved_change(prev, cur)
+        )
+        if coverage_gap:
+            cur["coverage_gap"] = True
 
         # ---- money actions (bet_text delta, corroborated by the stack) ----
         money_seats: dict[int, tuple[float | None, float | None, str]] = {}
@@ -1381,7 +1465,18 @@ def _reconstruct_actions(
             amount = None
             derivation = ""
             unmeasurable = False
-            if stack_dropped:
+            if coverage_gap and (
+                stack_dropped
+                or stack_refused
+                or before is None
+                or after is None
+                or (before is not None and after is not None
+                    and abs(before - after) > 0.5 + _EPS)
+            ):
+                # Tab/lobby hid the table across a material money change. Do not
+                # invent a sized action from the post-gap stack delta.
+                unmeasurable = True
+            elif stack_dropped:
                 # the debounced stack delta is the most reliable size
                 amount = round(before - after, 2)
                 derivation = "stack_delta"
@@ -1470,7 +1565,12 @@ def _reconstruct_actions(
                                     else 0.0))
                 bet_grew = (cur_bet is not None and cur_bet >= 0.5 - _EPS
                             and (known_base is None or cur_bet > known_base + _EPS))
-                if fresh_pill or bet_grew:
+                stack_moved = (
+                    before is not None
+                    and after is not None
+                    and abs(before - after) > 0.5 + _EPS
+                )
+                if fresh_pill or bet_grew or (coverage_gap and stack_moved):
                     cur["unmeasured_transitions"].append(seat)
                 # A pill PROVES the act happened even when nothing can size it.
                 # The pill is evidence of the ACT, not of the SIZE, so the action
@@ -1481,7 +1581,8 @@ def _reconstruct_actions(
                 # over an unknown base is not enough to emit on: it is
                 # indistinguishable from the same raise being re-displayed, which
                 # is precisely the duplication the carried high-water mark exists
-                # to suppress.
+                # to suppress. Across a coverage gap, even a fresh pill only
+                # proves the act -- never invent a size from the post-gap stacks.
                 if fresh_pill:
                     money_seats[seat] = (None, before, "amount_unknown")
 
@@ -1549,6 +1650,12 @@ def _reconstruct_actions(
             if seat in money_seats or seat not in positions:
                 continue  # money and a fold can't both happen; unknown seats are noise
             if not street_has_bet.get(street):
+                continue
+            if coverage_gap and seat in gone and seat not in pill_folds:
+                # Roster shrunk across an unobserved stretch. A card_back
+                # disappearance may be a fold -- or a lobby sweep -- and we did
+                # not see which. Do not invent the fold; mark the hole.
+                cur["unmeasured_transitions"].append(seat)
                 continue
             if seat in gone and seat not in pill_folds:
                 if len(gone) >= 2:
@@ -1795,6 +1902,7 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
                                 if a["action_type"] in _MONEY_ACTIONS
                                 and a.get("amount") is None)
     amounts_unknown_in_ledger = bool(unmeasured_transitions or unknown_money_actions)
+    coverage_gaps = sum(1 for s in hand if s.get("coverage_gap"))
 
     # per-street end pot (last stable pot at each board count) + final pot.
     # Only states up to the settlement (pot swept to the winner) count: after it
@@ -2044,7 +2152,11 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
                 # could measure, is not a COMPLETE record of what happened,
                 # whatever else holds. PLAN.md: "Mark an incomplete sequence
                 # non-authoritative."
-                and not amounts_unknown_in_ledger)
+                and not amounts_unknown_in_ledger
+                # A tab/lobby covering the table across a critical state change
+                # leaves actions unobserved even when stacks happened to look
+                # continuous afterward.
+                and not coverage_gaps)
 
     # Which terminal event the spine actually OBSERVED, for the app's completion
     # evidence. Additive: no existing consumer reads this key. Anything the spine
@@ -2211,6 +2323,12 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         # the hand must not be presented as an authoritative record of what
         # happened. Fatal at the export gate; see SPINE_FATAL_CODES.
         warnings.append("amounts_unknown_in_ledger")
+    if coverage_gaps:
+        # The table was unobserved (tab-in-front / lobby / modal) across a
+        # stretch where board, pot, stacks, roster, or dealer changed. Recover
+        # what is visible on either side; do not invent the hole. Fatal so the
+        # hand exports as uncertain / needs_correction.
+        warnings.append("mid_hand_coverage_gap")
     if any(row.get("starting_stack_unknown") for row in player_rows):
         # A seat's starting stack was REFUSED (as opposed to a box that was never
         # detected). Accounting downstream rejects a None starting stack
@@ -2279,6 +2397,7 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         # actions the spine proved happened but could not size.
         "unmeasured_transitions": unmeasured_transitions,
         "unknown_money_actions": unknown_money_actions,
+        "coverage_gaps": coverage_gaps,
         "settle_scan_skipped": sum(1 for s in hand if s.get("settle_scan_skipped")),
         "anchor_missing_states": anchor_missing_states,
         "winner_seat": winner_seat,

@@ -69,7 +69,8 @@ def _create_database(
             CREATE TABLE videos (
                 id INTEGER PRIMARY KEY,
                 stored_path TEXT NOT NULL,
-                file_size_bytes INTEGER NOT NULL
+                file_size_bytes INTEGER NOT NULL,
+                content_sha256 TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE processing_jobs (
                 id INTEGER PRIMARY KEY,
@@ -326,7 +327,7 @@ def test_audit_rejects_missing_required_core_column(tmp_path: Path) -> None:
     schema_check = _checks_by_name(report)["schema_contract"]
     assert not report.healthy
     assert schema_check.status == "fail"
-    assert "videos: missing column(s) file_size_bytes" in schema_check.details
+    assert "videos: missing column(s) content_sha256, file_size_bytes" in schema_check.details
 
 
 def test_audit_rejects_backup_symlink_and_hard_link_to_live_database(

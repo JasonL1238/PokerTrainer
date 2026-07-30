@@ -467,6 +467,7 @@ class VideoRecord(PersistedModel):
     width: int | None = Field(default=None, ge=0)
     height: int | None = Field(default=None, ge=0)
     frame_count: int | None = Field(default=None, ge=0)
+    content_sha256: str = ""
     uploaded_at: datetime = Field(default_factory=utc_now)
     notes: str = ""
 

@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "case_id": "fixture_synthetic_hu_01",
+  "annotation": {
+    "passes": 2,
+    "adjudicated": true,
+    "notes": "Synthetic fixture for schema/corpus plumbing tests only. Not a real ClubWPT recording."
+  },
+  "hands": [
+    {
+      "hand_id": "h01",
+      "t_first": 0.0,
+      "t_last": 12.0,
+      "partial_start": false,
+      "partial_end": false,
+      "completion_class": "complete",
+      "terminal_event": "showdown",
+      "hero_cards": ["As", "Kd"],
+      "final_board": ["2c", "7d", "9h", "Ts", "Jc"],
+      "dealer_seat": 1,
+      "dealt_in_seats": [0, 1],
+      "starting_stacks": {"0": 100.0, "1": 100.0},
+      "actions": [
+        {"street": "preflop", "order": 1, "seat": 0, "action": "raise", "amount": 3.0, "amount_semantics": "incremental", "certain": true, "observable": true},
+        {"street": "preflop", "order": 2, "seat": 1, "action": "call", "amount": 2.0, "amount_semantics": "incremental", "certain": true, "observable": true},
+        {"street": "flop", "order": 1, "seat": 1, "action": "check", "amount": null, "amount_semantics": "incremental", "certain": true, "observable": true},
+        {"street": "flop", "order": 2, "seat": 0, "action": "bet", "amount": 5.0, "amount_semantics": "incremental", "certain": true, "observable": true},
+        {"street": "flop", "order": 3, "seat": 1, "action": "call", "amount": 5.0, "amount_semantics": "incremental", "certain": true, "observable": true},
+        {"street": "turn", "order": 1, "seat": 1, "action": "check", "amount": null, "amount_semantics": "incremental", "certain": true, "observable": true},
+        {"street": "turn", "order": 2, "seat": 0, "action": "check", "amount": null, "amount_semantics": "incremental", "certain": true, "observable": true},
+        {"street": "river", "order": 1, "seat": 1, "action": "check", "amount": null, "amount_semantics": "incremental", "certain": true, "observable": true},
+        {"street": "river", "order": 2, "seat": 0, "action": "check", "amount": null, "amount_semantics": "incremental", "certain": true, "observable": true}
+      ],
+      "actions_complete": true,
+      "final_pot": 16.0,
+      "winner_seat": 0,
+      "hero_net": 8.0,
+      "evidence": {"hero_cards_t": 0.0, "final_board_t": 10.0, "final_pot_t": 12.0}
+    },
+    {
+      "hand_id": "h02",
+      "t_first": 20.0,
+      "t_last": 28.0,
+      "partial_start": true,
+      "partial_end": false,
+      "completion_class": "partial",
+      "terminal_event": "unobserved",
+      "hero_cards": ["7h", "2d"],
+      "final_board": [],
+      "dealer_seat": 0,
+      "dealt_in_seats": [0, 1],
+      "starting_stacks": {"0": 108.0, "1": 92.0},
+      "actions": [
+        {"street": "preflop", "order": 1, "seat": 1, "action": "raise", "amount": 3.0, "amount_semantics": "incremental", "certain": true, "observable": true},
+        {"street": "preflop", "order": 2, "seat": 0, "action": "fold", "amount": null, "amount_semantics": "incremental", "certain": true, "observable": true}
+      ],
+      "actions_complete": false,
+      "final_pot": null,
+      "winner_seat": null,
+      "hero_net": -0.5,
+      "evidence": {"partial_start_t": 20.0}
+    }
+  ]
+}
