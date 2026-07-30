@@ -34,7 +34,9 @@ The release claim is deliberately narrower than “universal poker video
 reconstruction”:
 
 - only explicitly validated ClubWPT layouts and capture geometries are certified;
-- every CV import begins as a draft;
+- every CV hand that lands in a session begins as a needs-correction draft
+  (auto-add only for frame-validated full hands that did not start mid-hand;
+  incomplete/mid-start hands require an explicit draft add);
 - uncertain, partial, inconsistent, or unsupported evidence is rejected or
   routed to correction instead of being silently trusted;
 - manual confirmation and accounting reconciliation remain required before a
@@ -73,7 +75,8 @@ As of July 28, 2026, the repository contains:
   eligibility checks, exact ranges, retained assumptions, convergence, logs,
   strategy JSON, stale-result handling, and solver-grounded explanation checks;
 - offline video upload, metadata validation, frame extraction, detached CV
-  jobs, heartbeat/recovery behavior, timelines, and draft session import;
+  jobs, heartbeat/recovery behavior, timelines, and validate-then-import
+  (auto-add full validated hands; explicit draft add for incomplete segments);
 - an eight-region reconstruction model plus card recognition/OCR readers,
   temporal reconstruction, labeling tools, hard-example queues, and evaluation
   scripts;
@@ -2539,9 +2542,11 @@ Newly discovered release blockers, none of them closed:
 - Prevent adjacent physical hands being merged.
 - Exclude next-hand blinds/antes and auto top-ups from prior settlement.
 - Retain incomplete segments for review but never export them as complete.
-  App CV jobs import incomplete hero-preflop segments as ``partial`` /
-  ``uncertain`` draft hands under the session so the operator can fill blanks
-  and finalize them; hands where hero never played preflop are skipped.
+  Incomplete hero-preflop segments stay in the timeline export for evidence
+  review; they land in the session only after an explicit draft add (as
+  ``partial`` / ``uncertain`` ``needs_correction`` drafts) so the operator can
+  fill blanks and finalize them; hands where hero never played preflop are
+  skipped.
   Completeness still requires ``derive_completion_status`` (or an explicit
   operator finalize attestation) — incomplete never lands as ``complete``.
 - Make completed/partial classification a separately scored output.
@@ -3100,7 +3105,9 @@ GTO analysis.
   storage layout, solver scope, coaching configuration, tests, data health, and
   container commands current.
 - State the certified ClubWPT layout/corpus scope.
-- State that CV imports are drafts until confirmed.
+- State that CV hands enter the session only after frame validation (auto) or
+  an explicit draft add, remain ``needs_correction`` drafts until confirmed in
+  Study, and that study readiness and study inclusion stay separate.
 - State that no hosted deployment is active.
 
 ### PLAN

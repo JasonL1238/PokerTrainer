@@ -303,7 +303,7 @@ def test_database_backup_is_consistent_and_rotates(tmp_path: Path) -> None:
     restored.close()
 
 
-def test_worker_completes_import_and_records_backup(
+def test_worker_completes_without_importing_hands(
     videos_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db_path = videos_dir.parent / "tracker.sqlite3"
@@ -312,6 +312,7 @@ def test_worker_completes_import_and_records_backup(
     job = db.create_processing_job(
         ProcessingJob(video_id=video.id, job_type="cv_reconstruction", status="running")
     )
+    session_count = len(db.fetch_sessions())
     db.close()
     paths = {
         "cv_timelines": videos_dir.parent / "timelines",
@@ -327,7 +328,6 @@ def test_worker_completes_import_and_records_backup(
         "export_timeline",
         lambda *args, **kwargs: {"cv_import_summary": {"exported_hands": 2}},
     )
-    monkeypatch.setattr(run_cv_job, "import_session", lambda db, payload: SimpleNamespace(id=55))
 
     exit_code = run_cv_job.run_job(
         job_id=job.id,
@@ -341,8 +341,199 @@ def test_worker_completes_import_and_records_backup(
     assert exit_code == 0
     assert saved.status == "completed"
     assert saved.progress_percent == 100
-    assert "Imported 2 hands" in saved.message
+    assert "Ready for validation" in saved.message
+    assert "2 hands exported" in saved.message
+    assert "Imported" not in saved.message
+    sessions = checked.fetch_sessions()
+    assert len(sessions) == session_count + 1
+    linked = checked.fetch_video(video.id)
+    assert linked.session_id is not None
+    assert any(session.id == linked.session_id for session in sessions)
+    destination = checked.fetch_session(linked.session_id)
+    assert destination is not None
+    assert destination.platform == "ClubWPT Gold"
+    assert "operator review" in destination.notes
+    assert checked.fetch_hands_by_session(linked.session_id) == []
     assert len(list(paths["backups"].glob("*.sqlite3"))) == 1
+    checked.close()
+
+
+def test_worker_links_existing_target_session_without_import(
+    videos_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from poker_tracker.persistence.models import Session
+
+    db_path = videos_dir.parent / "tracker.sqlite3"
+    db = make_db(str(db_path))
+    target = db.create_session(Session(name="Existing"))
+    video = add_video(db, videos_dir / "session.avi", playable=True, with_hash=True)
+    job = db.create_processing_job(
+        ProcessingJob(video_id=video.id, job_type="cv_reconstruction", status="running")
+    )
+    session_count = len(db.fetch_sessions())
+    db.close()
+    paths = {
+        "cv_timelines": videos_dir.parent / "timelines",
+        "exports": videos_dir.parent / "exports",
+        "backups": videos_dir.parent / "backups",
+    }
+    for path in paths.values():
+        path.mkdir()
+    monkeypatch.setattr(run_cv_job, "ensure_data_directories", lambda: paths)
+    monkeypatch.setattr(run_cv_job, "_run_pipeline", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        run_cv_job,
+        "export_timeline",
+        lambda *args, **kwargs: {"cv_import_summary": {"exported_hands": 3}},
+    )
+
+    exit_code = run_cv_job.run_job(
+        job_id=job.id,
+        video_path=Path(video.stored_path),
+        session_name="Unused name",
+        db_path=db_path,
+        target_session_id=target.id,
+    )
+
+    checked = PokerDatabase(db_path)
+    assert exit_code == 0
+    assert len(checked.fetch_sessions()) == session_count
+    assert checked.fetch_video(video.id).session_id == target.id
+    assert checked.fetch_hands_by_session(target.id) == []
+    checked.close()
+
+
+def test_worker_reuses_linked_video_session_on_rerun(
+    videos_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from poker_tracker.persistence.models import Session
+
+    db_path = videos_dir.parent / "tracker.sqlite3"
+    db = make_db(str(db_path))
+    existing = db.create_session(Session(name="Already linked", platform="ClubWPT Gold"))
+    video = add_video(db, videos_dir / "session.avi", playable=True, with_hash=True)
+    db.update_video_session(video.id, existing.id)
+    job = db.create_processing_job(
+        ProcessingJob(video_id=video.id, job_type="cv_reconstruction", status="running")
+    )
+    session_count = len(db.fetch_sessions())
+    db.close()
+    paths = {
+        "cv_timelines": videos_dir.parent / "timelines",
+        "exports": videos_dir.parent / "exports",
+        "backups": videos_dir.parent / "backups",
+    }
+    for path in paths.values():
+        path.mkdir()
+    monkeypatch.setattr(run_cv_job, "ensure_data_directories", lambda: paths)
+    monkeypatch.setattr(run_cv_job, "_run_pipeline", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        run_cv_job,
+        "export_timeline",
+        lambda *args, **kwargs: {"cv_import_summary": {"exported_hands": 1}},
+    )
+
+    exit_code = run_cv_job.run_job(
+        job_id=job.id,
+        video_path=Path(video.stored_path),
+        session_name="Should not create",
+        db_path=db_path,
+    )
+
+    checked = PokerDatabase(db_path)
+    assert exit_code == 0
+    assert len(checked.fetch_sessions()) == session_count
+    assert checked.fetch_video(video.id).session_id == existing.id
+    checked.close()
+
+
+def test_worker_honors_mid_run_video_session_reattach(
+    videos_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from poker_tracker.persistence.models import Session
+
+    db_path = videos_dir.parent / "tracker.sqlite3"
+    db = make_db(str(db_path))
+    reattached = db.create_session(Session(name="Attached mid-run", platform="ClubWPT Gold"))
+    video = add_video(db, videos_dir / "session.avi", playable=True, with_hash=True)
+    job = db.create_processing_job(
+        ProcessingJob(video_id=video.id, job_type="cv_reconstruction", status="running")
+    )
+    session_count = len(db.fetch_sessions())
+    db.close()
+    paths = {
+        "cv_timelines": videos_dir.parent / "timelines",
+        "exports": videos_dir.parent / "exports",
+        "backups": videos_dir.parent / "backups",
+    }
+    for path in paths.values():
+        path.mkdir()
+
+    def export_and_reattach(*args, **kwargs):
+        live = PokerDatabase(db_path)
+        live.update_video_session(video.id, reattached.id)
+        live.close()
+        return {"cv_import_summary": {"exported_hands": 2}}
+
+    monkeypatch.setattr(run_cv_job, "ensure_data_directories", lambda: paths)
+    monkeypatch.setattr(run_cv_job, "_run_pipeline", lambda *args, **kwargs: None)
+    monkeypatch.setattr(run_cv_job, "export_timeline", export_and_reattach)
+
+    exit_code = run_cv_job.run_job(
+        job_id=job.id,
+        video_path=Path(video.stored_path),
+        session_name="Should not create",
+        db_path=db_path,
+    )
+
+    checked = PokerDatabase(db_path)
+    assert exit_code == 0
+    assert len(checked.fetch_sessions()) == session_count
+    assert checked.fetch_video(video.id).session_id == reattached.id
+    checked.close()
+
+
+def test_worker_fails_when_target_session_missing(
+    videos_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db_path = videos_dir.parent / "tracker.sqlite3"
+    db = make_db(str(db_path))
+    video = add_video(db, videos_dir / "session.avi", playable=True, with_hash=True)
+    job = db.create_processing_job(
+        ProcessingJob(video_id=video.id, job_type="cv_reconstruction", status="running")
+    )
+    session_count = len(db.fetch_sessions())
+    db.close()
+    paths = {
+        "cv_timelines": videos_dir.parent / "timelines",
+        "exports": videos_dir.parent / "exports",
+        "backups": videos_dir.parent / "backups",
+    }
+    for path in paths.values():
+        path.mkdir()
+    monkeypatch.setattr(run_cv_job, "ensure_data_directories", lambda: paths)
+    monkeypatch.setattr(run_cv_job, "_run_pipeline", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        run_cv_job,
+        "export_timeline",
+        lambda *args, **kwargs: {"cv_import_summary": {"exported_hands": 1}},
+    )
+
+    exit_code = run_cv_job.run_job(
+        job_id=job.id,
+        video_path=Path(video.stored_path),
+        session_name="Missing target",
+        db_path=db_path,
+        target_session_id=999_999,
+    )
+
+    checked = PokerDatabase(db_path)
+    saved = checked.fetch_processing_job(job.id)
+    assert exit_code == 1
+    assert saved.status == "failed"
+    assert "Session not found" in saved.error_message
+    assert len(checked.fetch_sessions()) == session_count
+    assert checked.fetch_video(video.id).session_id is None
     checked.close()
 
 
@@ -461,7 +652,7 @@ def test_cancel_processing_job_enters_cancelling_when_kill_fails(
     db.close()
 
 
-def test_worker_honors_cancel_before_import(
+def test_worker_honors_cancel_before_session_link(
     videos_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db_path = videos_dir.parent / "tracker.sqlite3"
@@ -477,11 +668,6 @@ def test_worker_honors_cancel_before_import(
     )
     session_count = len(db.fetch_sessions())
     db.close()
-    imported = {"called": False}
-
-    def fake_import(db, payload):
-        imported["called"] = True
-        return SimpleNamespace(id=99)
 
     paths = {
         "cv_timelines": videos_dir.parent / "timelines",
@@ -492,7 +678,6 @@ def test_worker_honors_cancel_before_import(
         path.mkdir()
     monkeypatch.setattr(run_cv_job, "ensure_data_directories", lambda: paths)
     monkeypatch.setattr(run_cv_job, "_run_pipeline", lambda *args, **kwargs: None)
-    monkeypatch.setattr(run_cv_job, "import_session", fake_import)
 
     exit_code = run_cv_job.run_job(
         job_id=job.id,
@@ -505,12 +690,12 @@ def test_worker_honors_cancel_before_import(
     saved = checked.fetch_processing_job(job.id)
     assert exit_code == 1
     assert saved.status == "cancelled"
-    assert imported["called"] is False
     assert len(checked.fetch_sessions()) == session_count
+    assert checked.fetch_video(video.id).session_id is None
     checked.close()
 
 
-def test_backup_failure_skips_import(
+def test_backup_failure_skips_session_link(
     videos_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db_path = videos_dir.parent / "tracker.sqlite3"
@@ -521,7 +706,6 @@ def test_backup_failure_skips_import(
     )
     session_count = len(db.fetch_sessions())
     db.close()
-    imported = {"called": False}
 
     paths = {
         "cv_timelines": videos_dir.parent / "timelines",
@@ -542,11 +726,6 @@ def test_backup_failure_skips_import(
         "backup_database",
         lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full")),
     )
-    monkeypatch.setattr(
-        run_cv_job,
-        "import_session",
-        lambda db, payload: imported.__setitem__("called", True) or SimpleNamespace(id=55),
-    )
 
     exit_code = run_cv_job.run_job(
         job_id=job.id,
@@ -560,8 +739,8 @@ def test_backup_failure_skips_import(
     assert exit_code == 1
     assert saved.status == "failed"
     assert "disk full" in saved.error_message
-    assert imported["called"] is False
     assert len(checked.fetch_sessions()) == session_count
+    assert checked.fetch_video(video.id).session_id is None
     assert saved.pid is None
     checked.close()
 
@@ -664,10 +843,10 @@ def test_mark_completed_does_not_override_cancelled_job(tmp_path: Path) -> None:
     db.close()
 
 
-def test_worker_completes_when_cancel_arrives_during_import(
+def test_worker_completes_when_cancel_arrives_during_session_prepare(
     videos_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Import is atomic with job completion: late cancel must not leave drafts orphaned."""
+    """Late cancel during session link still completes; no hands are imported."""
     db_path = videos_dir.parent / "tracker.sqlite3"
     db = make_db(str(db_path))
     video = add_video(db, videos_dir / "session.avi", playable=True, with_hash=True)
@@ -693,18 +872,7 @@ def test_worker_completes_when_cancel_arrives_during_import(
     monkeypatch.setattr(
         run_cv_job,
         "export_timeline",
-        lambda *args, **kwargs: {
-            "export_version": 5,
-            "session": {
-                "name": "Late cancel",
-                "date_played": "2026-07-30",
-                "platform": "",
-                "stakes": "",
-                "notes": "",
-            },
-            "hands": [],
-            "cv_import_summary": {"exported_hands": 0},
-        },
+        lambda *args, **kwargs: {"cv_import_summary": {"exported_hands": 0}},
     )
     monkeypatch.setattr(
         run_cv_job,
@@ -712,18 +880,20 @@ def test_worker_completes_when_cancel_arrives_during_import(
         lambda *args, **kwargs: paths["backups"] / "backup.sqlite3",
     )
 
-    real_import = run_cv_job.import_session
+    real_ensure = run_cv_job._ensure_destination_session
 
-    def import_then_mark_cancelling(database, payload):
+    def ensure_then_mark_cancelling(database, **kwargs):
         database.update_processing_job(
             job.id,
             expected_statuses=("running",),
             status="cancelling",
             message="Cancelling",
         )
-        return real_import(database, payload)
+        return real_ensure(database, **kwargs)
 
-    monkeypatch.setattr(run_cv_job, "import_session", import_then_mark_cancelling)
+    monkeypatch.setattr(
+        run_cv_job, "_ensure_destination_session", ensure_then_mark_cancelling
+    )
 
     exit_code = run_cv_job.run_job(
         job_id=job.id,
@@ -736,8 +906,10 @@ def test_worker_completes_when_cancel_arrives_during_import(
     saved = checked.fetch_processing_job(job.id)
     assert exit_code == 0
     assert saved.status == "completed"
-    assert "cancel arrived after import" in saved.message
-    assert checked.fetch_video(video.id).session_id is not None
+    assert "cancel arrived after export" in saved.message
+    linked = checked.fetch_video(video.id)
+    assert linked.session_id is not None
+    assert checked.fetch_hands_by_session(linked.session_id) == []
     checked.close()
 
 

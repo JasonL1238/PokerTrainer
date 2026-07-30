@@ -110,6 +110,13 @@ from poker_tracker.services.study_readiness import (
     is_reconstructed_hand,
     unattested_assumption_dependence,
 )
+from poker_tracker.services.validated_hand_import import (
+    autonomous_import_blockers,
+    ensure_hand_imported,
+    find_existing_imported_hand,
+    import_all_autonomous_eligible,
+    related_cv_job_ids,
+)
 from poker_tracker.solver.eligibility import prepare_solver_spot
 from poker_tracker.solver.jobs import (
     SolverJobAlreadyRunningError,
@@ -182,6 +189,7 @@ from poker_tracker.ui.reconstruction_review import (
     load_timeline_for_job,
     observed_facts,
     states_for_hand,
+    timeline_path_for_job,
 )
 from poker_tracker.ui.roi import ROI_TYPES, validate_roi_bounds
 from poker_tracker.ui.roi_profiles import (
@@ -5840,7 +5848,8 @@ def show_cv_reconstruction(db: PokerDatabase, video: VideoRecord) -> None:
     workflow_step(
         3,
         "Reconstruct completed hands",
-        "Append auditable draft hands from this recording to its session.",
+        "Export a timeline for frame validation. Hands join the session only when "
+        "validated or when you add a draft.",
         state="active",
     )
     linked_session = db.fetch_session(video.session_id) if video.session_id is not None else None
@@ -5848,16 +5857,16 @@ def show_cv_reconstruction(db: PokerDatabase, video: VideoRecord) -> None:
         session_name = linked_session.name
         target_session_id = linked_session.id
         st.info(
-            f"Reconstructed hands will be added to **{linked_session.name}**. "
+            f"Validated and draft hands will be added to **{linked_session.name}**. "
             "Existing hand numbers are preserved when possible and collisions are renumbered."
         )
     else:
         target_session_id = None
         session_name = st.text_input(
-            "Imported session name",
+            "Destination session name",
             value=Path(video.original_filename).stem,
             key=f"cv_session_name_{video.id}",
-            help="This unassigned video will create a new session.",
+            help="This unassigned video will create a new empty session for later hand adds.",
         )
     latest_jobs = [
         job for job in db.fetch_jobs_by_video(video.id) if job.job_type == "cv_reconstruction"
@@ -5929,14 +5938,49 @@ def show_cv_reconstruction(db: PokerDatabase, video: VideoRecord) -> None:
     else:
         st.caption("No reconstruction has been run for this source video.")
 
+    hands_in_session = 0
+    if video.session_id is not None and latest_jobs:
+        # Prefer completed-job evidence presence over raw job status for step 4.
+        for completed in [job for job in latest_jobs if job.status == "completed"]:
+            if completed.id is None:
+                continue
+            related = related_cv_job_ids(db, video.id)
+            try:
+                timeline = load_timeline_for_job(completed.id)
+            except (OSError, ValueError, json.JSONDecodeError):
+                timeline = None
+            if not timeline:
+                continue
+            for hand in timeline.get("hands") or []:
+                number = int(hand.get("hand_number") or 0)
+                if number < 1:
+                    continue
+                if find_existing_imported_hand(
+                    db,
+                    session_id=video.session_id,
+                    job_id=completed.id,
+                    timeline_hand_number=number,
+                    related_job_ids=related,
+                ):
+                    hands_in_session += 1
+            break
+    step4_state = (
+        "complete"
+        if hands_in_session > 0
+        else "active"
+        if latest_jobs and latest_jobs[0].status == "completed"
+        else "pending"
+    )
     workflow_step(
         4,
-        "Review imported hands",
-        "Open the generated drafts in Study and verify their source evidence.",
-        state="complete" if latest_jobs and latest_jobs[0].status == "completed" else "pending",
+        "Validate or add drafts",
+        "Mark every frame Correct to auto-add full hands, or Add draft for incomplete ones. "
+        "Study stays separate until you confirm.",
+        state=step4_state,
     )
     st.caption(
-        "Completed jobs create needs-correction drafts with source confidence and provenance."
+        "Completed jobs export timelines for review. Session hands appear only after "
+        "autonomous validation or an explicit draft add."
     )
 
 
@@ -6113,9 +6157,33 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
         "job — stop anytime and return here later to change or continue."
     )
     st.caption(
-        "You do not need to finish every hand in the video now. Partial progress is "
-        "kept. Validation does not rewrite imported hands or retrain a model."
+        "A full hand with every frame Correct and a clean start/end is added to the "
+        "session automatically. Incomplete or mid-start hands stay out until you "
+        "click Add draft. Study still requires separate confirmation."
     )
+    video = db.fetch_video(job.video_id)
+    session_id = video.session_id if video is not None else None
+    related_jobs = related_cv_job_ids(db, job.video_id) if video is not None else {job.id}
+    recovery_key = f"evidence_auto_import_scanned_{job.id}"
+    if session_id is not None and not st.session_state.get(recovery_key):
+        scan_results = import_all_autonomous_eligible(db, job.id)
+        blocked_for_destination = any(
+            "destination session" in ";".join(result.reasons)
+            for result in scan_results
+            if result.status == "blocked"
+        )
+        if not blocked_for_destination:
+            st.session_state[recovery_key] = True
+        imported = [result for result in scan_results if result.status == "imported"]
+        if imported:
+            st.success(
+                f"Added {len(imported)} previously validated hand(s) to the session."
+            )
+    elif session_id is None:
+        st.warning(
+            "This video is not linked to a destination session yet, so hands cannot "
+            "be added. Re-run reconstruction or attach the video to a session first."
+        )
     reviews = db.fetch_reconstruction_frame_reviews(job.id)
     review_lookup = {(review.hand_number, review.source_image): review for review in reviews}
     hand_numbers = [int(hand.get("hand_number", 0)) for hand in hands]
@@ -6168,6 +6236,35 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
             reviews_by_hand_image.get(number, {}),
             countable_images=navigable_images_by_hand.get(number, []),
         )
+        in_session = (
+            session_id is not None
+            and find_existing_imported_hand(
+                db,
+                session_id=session_id,
+                job_id=job.id,
+                timeline_hand_number=number,
+                related_job_ids=related_jobs,
+            )
+            is not None
+        )
+        gate = autonomous_import_blockers(
+            timeline,
+            hand,
+            timeline_path=timeline_path_for_job(job.id),
+            reviews_by_image=reviews_by_hand_image.get(number, {}),
+        )
+        if in_session:
+            session_status = "in session"
+        elif session_id is None:
+            session_status = "no destination session"
+        elif gate.ok:
+            session_status = "ready to auto-add"
+        elif progress["flagged"]:
+            session_status = "flagged — add draft to edit"
+        elif progress["remaining"]:
+            session_status = "frames remaining"
+        else:
+            session_status = "; ".join(gate.reasons[:2]) or "blocked"
         progress_rows.append(
             {
                 "Hand": f"#{number}",
@@ -6175,6 +6272,7 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
                 "Validated": f"{progress['reviewed']}/{progress['total']}",
                 "Remaining": progress["remaining"],
                 "Flagged": progress["flagged"],
+                "Session": session_status,
             }
         )
     with st.expander("Saved progress by hand · resume anytime", expanded=reviewed_frames > 0):
@@ -6264,6 +6362,76 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
     )
 
     hand = next(item for item in hands if int(item.get("hand_number", 0)) == selected_hand_number)
+    selected_in_session = (
+        session_id is not None
+        and find_existing_imported_hand(
+            db,
+            session_id=session_id,
+            job_id=job.id,
+            timeline_hand_number=selected_hand_number,
+            related_job_ids=related_jobs,
+        )
+        is not None
+    )
+    selected_gate = autonomous_import_blockers(
+        timeline,
+        hand,
+        timeline_path=timeline_path_for_job(job.id),
+        reviews_by_image=reviews_by_hand_image.get(selected_hand_number, {}),
+    )
+    draft_col, status_col = st.columns([1, 2])
+    if session_id is None:
+        status_col.warning(
+            "Link this video to a destination session before adding hands."
+        )
+    elif selected_in_session:
+        status_col.success(
+            "This hand is in the session. Edit facts in Study → Fix & confirm. "
+            "It is not study-ready until you confirm and set study inclusion."
+        )
+    else:
+        add_label = (
+            "Add to session now"
+            if selected_gate.ok
+            else "Add draft to session"
+        )
+        if draft_col.button(
+            add_label,
+            key=f"evidence_add_draft_{job.id}_{selected_hand_number}",
+            width="stretch",
+            help=(
+                "Save this timeline hand into the destination session for editing."
+            ),
+        ):
+            try:
+                result = ensure_hand_imported(
+                    db,
+                    job.id,
+                    selected_hand_number,
+                    mode="auto" if selected_gate.ok else "draft",
+                )
+            except Exception as exc:  # noqa: BLE001 - keep the review UI usable
+                st.error(f"Could not add hand: {exc}")
+            else:
+                if result.status in {"imported", "already_present"}:
+                    flash(
+                        f"{result.message} Edit in Study when ready — not study material yet."
+                    )
+                    st.rerun()
+                else:
+                    st.error(result.message or "Could not add draft.")
+        if selected_gate.ok:
+            status_col.info(
+                "All frames Correct and the hand is full — it will auto-add when "
+                "you mark the last frame, or use Add to session now."
+            )
+        else:
+            status_col.warning(
+                "Not auto-added yet: "
+                + ("; ".join(selected_gate.reasons) or "validation incomplete")
+                + ". Use Add draft to edit incomplete or mid-start hands."
+            )
+
     states = states_for_hand(timeline, hand)
     if not states:
         st.warning("No retained source states could be matched to this hand.")
@@ -6442,7 +6610,18 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
                     flash("Frame issue saved. You can leave and resume later.")
                     st.rerun()
 
-    flagged = [review for review in reviews if review.status == "incorrect"]
+    # Count only navigable frames so the expander matches the summary metrics.
+    navigable_images = {
+        (number, image)
+        for number, images in navigable_images_by_hand.items()
+        for image in images
+    }
+    flagged = [
+        review
+        for review in reviews
+        if review.status == "incorrect"
+        and (review.hand_number, review.source_image) in navigable_images
+    ]
     if flagged:
         with st.expander(f"Improvement queue · {len(flagged)} flagged frame(s)"):
             st.dataframe(
@@ -6539,17 +6718,50 @@ def _mark_evidence_correct(
     cursor_key: str,
     frame_count: int,
 ) -> None:
-    db.upsert_reconstruction_frame_review(
-        ReconstructionFrameReview(
-            job_id=job_id,
-            hand_number=hand_number,
-            source_image=str(state["image"]),
-            timestamp_seconds=float(state.get("time_s", 0)),
-            status="correct",
-        )
-    )
-    _move_evidence_cursor(cursor_key, 1, frame_count)
-    flash("Frame marked correct. Progress is saved — stop anytime.")
+    lock_key = f"evidence_correct_lock_{job_id}_{hand_number}_{state.get('image')}"
+    if st.session_state.get(lock_key):
+        return
+    st.session_state[lock_key] = True
+    try:
+        try:
+            db.upsert_reconstruction_frame_review(
+                ReconstructionFrameReview(
+                    job_id=job_id,
+                    hand_number=hand_number,
+                    source_image=str(state["image"]),
+                    timestamp_seconds=float(state.get("time_s", 0)),
+                    status="correct",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            flash(f"Could not save frame verdict: {exc}")
+            return
+        _move_evidence_cursor(cursor_key, 1, frame_count)
+        try:
+            result = ensure_hand_imported(db, job_id, hand_number, mode="auto")
+        except Exception as exc:  # noqa: BLE001
+            flash(
+                f"Frame marked correct, but session import failed: {exc}. "
+                "Use Add draft if you want to retry."
+            )
+            return
+        if result.status == "imported":
+            flash(
+                f"Frame marked correct. {result.message} "
+                "Not study-ready until you confirm in Study."
+            )
+        elif result.status == "already_present":
+            flash("Frame marked correct. Hand already in the session.")
+        elif result.status == "blocked" and result.reasons:
+            flash(
+                "Frame marked correct. Not auto-added yet: "
+                + "; ".join(result.reasons)
+                + ". Use Add draft if you want to edit it now."
+            )
+        else:
+            flash("Frame marked correct. Progress is saved — stop anytime.")
+    finally:
+        st.session_state.pop(lock_key, None)
 
 
 def show_legacy_frame_extraction(db: PokerDatabase, video: VideoRecord) -> None:

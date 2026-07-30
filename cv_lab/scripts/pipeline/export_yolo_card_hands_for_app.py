@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from datetime import date
 from pathlib import Path
@@ -327,13 +328,24 @@ def _hand_notes(hand: dict[str, Any], *, timeline_path: Path) -> str:
         sources += ", ..."
     notes = (
         "CV draft from YOLO card timeline. "
-        f"timeline={timeline_path}; t={hand.get('t_start')}..{hand.get('t_end')}; "
+        f"timeline={timeline_path}; timeline_hand_number={hand.get('hand_number')}; "
+        f"t={hand.get('t_start')}..{hand.get('t_end')}; "
         f"warnings={warnings}; source_images={sources}"
     )
     manual = hand.get("manual_correction")
     if manual:
         notes += f"; manual_correction={manual.get('action', 'keep')}; manual_notes={manual.get('notes', '')}"
     return notes
+
+
+def timeline_hand_number_from_notes(notes: str | None) -> int | None:
+    """Parse ``timeline_hand_number=<n>`` from CV hand notes when present."""
+    if not notes:
+        return None
+    match = re.search(r"timeline_hand_number=(\d+)", notes)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 # A code whose severity says the reconstruction is WRONG (>= 0.5) is the pipeline

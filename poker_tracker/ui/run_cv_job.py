@@ -15,7 +15,7 @@ from pathlib import Path
 from cv_lab.scripts.pipeline.export_yolo_card_hands_for_app import export_timeline
 from poker_tracker.persistence.backup import BACKUP_KEEP_COUNT, backup_database
 from poker_tracker.persistence.db import PokerDatabase
-from poker_tracker.persistence.import_export import import_hands_into_session, import_session
+from poker_tracker.persistence.models import Session
 from poker_tracker.ui.jobs import mark_cancelled, mark_completed, mark_failed, update_progress
 from poker_tracker.ui.video_ingest import (
     assert_stored_video_matches_record,
@@ -106,9 +106,9 @@ def run_job(
             timeline_path,
             export_path,
             session_name=session_name,
-            # Incomplete hero-preflop segments become partial draft hands under
-            # the session so the operator can fill blanks and finalize them.
-            # Hands where hero never played preflop are still skipped by export.
+            # Incomplete segments stay in the export for evidence review. Hands
+            # are not bulk-imported here; frame validation or an explicit draft
+            # add lands them in the session later.
             include_incomplete=True,
         )
         _check_deadline(deadline)
@@ -116,27 +116,31 @@ def run_job(
         _heartbeat(db, job_id, 92, "Backing up study database")
         backup_path = backup_database(db_path, Path(paths["backups"]))
         _assert_not_cancelled(db, job_id)
-        _heartbeat(db, job_id, 96, "Importing reconstructed hands")
+        _heartbeat(db, job_id, 96, "Preparing session for validation")
         _assert_not_cancelled(db, job_id)
-        # Import + job completion + video link in one transaction. If the process
-        # dies mid-import, SQLite rolls back the hands; if it commits, the job
-        # cannot report "cancelled" while drafts remain (re-run would append).
+        # Session link + job completion in one transaction. Hands are added later
+        # by validate-then-import (auto or manual draft), not on job finish.
         with db.transaction():
-            imported = (
-                import_hands_into_session(db, payload, target_session_id)
-                if target_session_id is not None
-                else import_session(db, payload)
+            current_video = db.fetch_video(job.video_id)
+            if current_video is None:
+                raise ValueError(f"Video #{job.video_id} was not found.")
+            destination = _ensure_destination_session(
+                db,
+                session_name=session_name,
+                target_session_id=target_session_id,
+                video_session_id=current_video.session_id,
             )
-            exported_count = payload.get("cv_import_summary", {}).get(
-                "exported_hands", 0
+            exported_count = int(
+                payload.get("cv_import_summary", {}).get("exported_hands", 0) or 0
             )
             message = (
-                f"Imported {exported_count} hands into session #{imported.id}; "
-                f"backup {backup_path.name}"
+                f"Ready for validation; {exported_count} hands exported for "
+                f"session #{destination.id} — add each when validated or as a "
+                f"draft; backup {backup_path.name}"
             )
             current = db.fetch_processing_job(job_id)
             if current is not None and current.status in {"cancelling", "cancelled"}:
-                message = f"{message} (cancel arrived after import)."
+                message = f"{message} (cancel arrived after export)."
             video_id = current.video_id if current is not None else job.video_id
             db.update_processing_job(
                 job_id,
@@ -147,8 +151,7 @@ def run_job(
                 clear_pid=True,
                 completed_at=datetime.now(UTC),
             )
-            if db.fetch_session(imported.id) is not None:
-                db.update_video_session(video_id, imported.id)
+            db.update_video_session(video_id, destination.id)
         return 0
     except JobCancelled as exc:
         try:
@@ -228,6 +231,43 @@ def _run_pipeline(
             pid_path.unlink(missing_ok=True)
     if process.returncode:
         raise RuntimeError(f"Reconstruction pipeline exited with code {process.returncode}.")
+
+
+def _ensure_destination_session(
+    db: PokerDatabase,
+    *,
+    session_name: str,
+    target_session_id: int | None,
+    video_session_id: int | None = None,
+) -> Session:
+    """Return the session reconstructed hands will be added into later.
+
+    Prefers an explicit target, then an already-linked video session, then creates
+    a ClubWPT-provenance session so re-running a completed job does not spawn
+    duplicate empty destinations.
+    """
+    preferred_id = target_session_id if target_session_id is not None else video_session_id
+    if preferred_id is not None:
+        existing = db.fetch_session(preferred_id)
+        if existing is None:
+            if target_session_id is not None:
+                raise ValueError(f"Session not found: {target_session_id}")
+        else:
+            return existing
+    created = db.create_session(
+        Session(
+            name=session_name.strip() or "Reconstructed",
+            platform="ClubWPT Gold",
+            notes=(
+                "Prepared by offline CV reconstruction. Hands are added after "
+                "frame validation or an explicit draft add; they still require "
+                "operator review before study."
+            ),
+        )
+    )
+    if created.id is None:
+        raise RuntimeError("Destination session was not persisted.")
+    return created
 
 
 def _pipeline_pid_path(progress_path: Path) -> Path:

@@ -83,11 +83,18 @@ The Import workflow connects a saved video to the existing two-model CV pipeline
 1. Save and validate a completed-session video.
 2. Start one detached `cv_reconstruction` job.
 3. Track PID, heartbeat, progress, and safe error state in SQLite.
-4. Produce a retained timeline and session export.
+4. Produce a retained timeline and session export; create or link a destination
+   session (no bulk hand import on job finish).
 5. Create a consistent SQLite backup.
-6. Import reconstructed hands as needs-correction drafts with confidence and provenance.
-7. Either flag the hand for later debugging or correct it immediately in Study.
-8. Retain before/after audit records, reconcile the ledger, and rerun coaching
+6. Review frames in Import: a full hand is auto-added when every navigable frame
+   is Correct (none flagged), the cards are complete, the terminal event was
+   observed, and the hand did not start mid-recording; incomplete or mid-start
+   hands stay out until you click **Add draft** (or **Add to session now** when
+   the auto gate already passes).
+7. Edit session hands in Study (Fix & confirm / finalize). Study readiness and
+   study inclusion stay separate — being in the session is not study-ready.
+8. Either flag the hand for later debugging or correct it immediately in Study.
+9. Retain before/after audit records, reconcile the ledger, and rerun coaching
    before marking the hand reviewed.
 
 Only one local processing job can run at a time. On restart, dead or stale workers are marked failed instead of remaining stuck. SQLite uses WAL mode so the UI can continue reading while the worker writes.

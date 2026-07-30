@@ -45,6 +45,7 @@ from cv_lab.scripts.pipeline.ocr_readers import (
     DECIMAL_EVIDENCE,
     DIGIT_SIZE,
     REFUSAL_CODES,
+    AmountRead,
     TemplateOCR,
     _norm,
     binarize_text,
@@ -1415,6 +1416,36 @@ def test_production_entrypoint_recovers_small_render_via_upscale(
     assert recovered.value == 19.5
 
 
+def test_production_entrypoint_recovers_job4_stack_crops(
+    production_bank, monkeypatch
+) -> None:
+    """Real 1052x732 ClubWPT stack crops from job 4: native bank refuses under
+    the calibrated floor, but the entrypoint must recover the on-screen BB value.
+    These are the exact failure mode that left session Hands empty (30/30
+    starting_stack_unknown)."""
+    expected = {
+        "stack_1458_90_at_1052x732.png": 1458.9,
+        "stack_203_30_at_1052x732.png": 203.3,
+        "stack_212_20_at_1052x732.png": 212.2,
+        "stack_204_50_at_1052x732.png": 204.5,
+        "stack_191_at_1052x732.png": 191.0,
+        "stack_224_20_at_1052x732.png": 224.2,
+    }
+    monkeypatch.setattr(ocr_readers, "_bank", lambda: production_bank)
+    job4 = FIXTURES / "job4_1052x732"
+    for name, value in expected.items():
+        img = cv2.imread(str(job4 / name))
+        assert img is not None, name
+        native = production_bank.read_number_detail(img)
+        assert native.value is None, name
+        assert native.decimal_source == "below_calibrated_render_size", name
+        recovered = ocr_readers.read_amount_detail_from_image(
+            img, (0, 0, img.shape[1], img.shape[0])
+        )
+        assert recovered is not None, name
+        assert recovered.value == value, (name, recovered)
+
+
 def test_production_entrypoint_does_not_rescue_sprite_fragment(
     production_bank, monkeypatch
 ) -> None:
@@ -1439,6 +1470,215 @@ def test_production_entrypoint_does_not_rescue_sprite_fragment(
         assert detail.value is None, scale
         assert detail.decimal_source == "below_calibrated_render_size", scale
 
+
+def test_adversary_truncated_native_does_not_ship_wrong_value(
+    production_bank, monkeypatch
+) -> None:
+    """Adversary A/B: hostile scales must not invent wrong longer/shorter amounts.
+
+    Unknown is fine. A confident value other than the 1.0x truth is not.
+    Note: when a downscale destroys a leading digit (191->pixels show 19),
+    recovering 19 is pixel-faithful; that residual is accepted for coverage of
+    true 2-digit stacks like 50 BB.
+    """
+    monkeypatch.setattr(ocr_readers, "_bank", lambda: production_bank)
+    cases = [
+        ("job4_1052x732/stack_212_20_at_1052x732.png", 0.95, 212.2),
+        ("job4_1052x732/stack_224_20_at_1052x732.png", 0.70, 224.2),
+        ("stack_leading_decimal_clipped_at_2054x1470.png", 0.575, None),
+        ("pot_39_50_two_forged_separators_at_1272x896.png", 0.55, 39.5),
+        ("bet_0_50_dot_lost_at_890x627.png", 1.05, 0.5),
+        ("pot_39_50_two_forged_separators_at_1272x896.png", 0.70, 39.5),
+    ]
+    for name, scale, truth in cases:
+        img = cv2.imread(str(FIXTURES / name))
+        assert img is not None, name
+        h, w = img.shape[:2]
+        if "39_50" in name and scale <= 0.55:
+            interp = cv2.INTER_NEAREST
+        elif "0_50_dot_lost" in name:
+            interp = cv2.INTER_CUBIC
+        elif "39_50" in name:
+            interp = cv2.INTER_LINEAR
+        else:
+            interp = cv2.INTER_AREA
+        small = cv2.resize(
+            img, (max(1, round(w * scale)), max(1, round(h * scale))), interpolation=interp
+        )
+        detail = ocr_readers.read_amount_detail_from_image(
+            small, (0, 0, small.shape[1], small.shape[0])
+        )
+        assert detail is not None
+        # Clipped ``.60`` fixture at hostile NEAREST may still show only ``60``
+        # in-pixels; unknown or pixel-faithful 60 are both acceptable — a
+        # different wrong amount is not.
+        if "leading_decimal_clipped" in name:
+            assert detail.value in (None, 60.0), (name, scale, detail.value)
+            continue
+        assert detail.value in (None, truth), (name, scale, detail.value)
+
+
+def test_digit_runs_compatible_trailing_fraction_zero() -> None:
+    """Native under-floor OCR often drops the trailing fractional zero
+    (2122 vs 212.20); recovery must treat that as compatible."""
+    recovered = AmountRead(212.2, "212.20", 0.9, "dot", 5)
+    assert ocr_readers._digit_runs_compatible("2122", recovered)
+    assert ocr_readers._digit_runs_compatible("21220", recovered)
+    assert not ocr_readers._digit_runs_compatible("9999", recovered)
+
+
+def test_soft_digit_related_rejects_shorter_fragments() -> None:
+    """Free-path gate: never promote 191→19 or left-mask 0.50→50."""
+    short = AmountRead(19.0, "19", 0.9, "no_dot", 2)
+    assert not ocr_readers._soft_digit_related("191", short)
+    assert not ocr_readers._soft_digit_related("050", AmountRead(50.0, "50", 0.9, "no_dot", 2))
+    # Hamming on short all-zero native must not invent 50 from 00.
+    assert not ocr_readers._soft_digit_related("00", AmountRead(50.0, "50", 0.9, "no_dot", 2))
+    assert ocr_readers._soft_digit_related("19", AmountRead(198.5, "198.50", 0.9, "dot", 5))
+    assert ocr_readers._soft_digit_related("191", AmountRead(191.0, "191", 0.9, "no_dot", 3))
+    # Integer +1 growth is allowed (21 -> 218); decimal +1/+2 is not.
+    assert ocr_readers._soft_digit_related("21", AmountRead(218.0, "218", 0.9, "integer", 3))
+    assert not ocr_readers._soft_digit_related("21", AmountRead(21.8, "21.8", 0.9, "dot", 3))
+    assert not ocr_readers._soft_digit_related("22", AmountRead(22.42, "22.42", 0.9, "dot", 4))
+    assert not ocr_readers._soft_digit_related("6", AmountRead(60.0, "60", 0.9, "integer", 2))
+    assert ocr_readers._soft_digit_related("50", AmountRead(50.0, "50", 0.9, "integer", 2))
+    assert ocr_readers._soft_digit_related("", AmountRead(191.0, "191", 0.9, "no_dot", 3))
+    assert not ocr_readers._soft_digit_related("", AmountRead(0.0, "0", 0.9, "no_dot", 1))
+    # Same-length hamming only for long runs (compat-aligned).
+    assert not ocr_readers._soft_digit_related(
+        "215", AmountRead(218.0, "218", 0.9, "no_dot", 3)
+    )
+    assert ocr_readers._soft_digit_related(
+        "21520", AmountRead(21820.0, "21820", 0.9, "no_dot", 5)
+    )
+    # Ambiguous 19|20 recovers as 192.20 (digits 19220, not a prefix of 1920).
+    assert ocr_readers._soft_digit_related(
+        "1920",
+        AmountRead(192.2, "192.20", 0.9, "dot", 5),
+        native_raw="19|20",
+    )
+    # Truncated under-floor 19 -> 198.50.
+    assert ocr_readers._soft_digit_related(
+        "19", AmountRead(198.5, "198.50", 0.9, "dot", 5)
+    )
+    # 1.30 must not digit-equal native 130.
+    assert not ocr_readers._soft_digit_related(
+        "130", AmountRead(1.3, "1.30", 0.9, "dot", 3)
+    )
+    # Weak single-digit ambiguous pieces: need a 3+ digit recovery (181), not 11.
+    assert not ocr_readers._soft_digit_related(
+        "11",
+        AmountRead(11.0, "11", 0.9, "no_dot", 2),
+        native_raw="1|1",
+    )
+    assert ocr_readers._soft_digit_related(
+        "11",
+        AmountRead(181.0, "181", 0.9, "no_dot", 3),
+        native_raw="1|1",
+    )
+    # Near-match: native 2057 vs recovered 208.70 (one digit confusion + frac zero).
+    assert ocr_readers._soft_digit_related(
+        "2057", AmountRead(208.7, "208.70", 0.9, "dot", 5)
+    )
+
+
+def test_production_entrypoint_never_reads_wrong_value_on_frozen_fixtures(
+    production_bank, monkeypatch
+) -> None:
+    """Adversary: the bank-only scale sweep missed entrypoint recovery bugs
+    (sprite no_digit_run -> 0.0, suffix parse inventing 50.0 / 350.0). The public
+    entrypoint must also never return a confident wrong number."""
+    truth: dict[str, float | None] = {
+        "stack_314_90_at_1272x896.png": 314.9,
+        "bet_19_50_at_1272x896.png": 19.5,
+        "bet_0_50_at_2054x1470.png": 0.5,
+        "pot_89_1_one_decimal.png": 89.1,
+        "pot_240_9_one_decimal.png": 240.9,
+        "pot_165_integer.png": 165.0,
+        "stack_0_true_zero.png": 0.0,
+        "stack_218_at_1272x896.png": 218.0,
+        "stack_clipped_box_at_2722x1832.png": None,
+        "bet_chips_only_at_1272x896.png": None,
+        "pot_9_single_digit_at_2722x1832.png": 9.0,
+        "bet_chip_sprite_no_text.png": None,
+        "stack_343_60_at_1272x896.png": 343.6,
+        "stack_leading_decimal_clipped_at_2054x1470.png": None,
+        "pot_212_50_trailing_zero_at_2054x1470.png": 212.5,
+        "pot_240_9_chip_overlaps_run_at_2132x1378.png": 240.9,
+        "bet_chip_covered_malformed_suffix_at_2054x1470.png": None,
+        "stack_1131_90_above_calibrated_band_at_2138x1402.png": 1131.9,
+        "stack_99_50_menu_occluded_at_2138x1402.png": None,
+        "pot_6_50_sprite_occluded_at_2722x1832.png": None,
+        "stack_198_suffix_named_at_2054x1470.png": 198.0,
+        "stack_191_wide_gap_at_1272x896.png": 191.0,
+        "bet_0_50_dot_lost_at_890x627.png": 0.5,
+        "bet_18_30_suffix_absorbed_1399x986.png": 18.3,
+        "bet_chip_annulus_square_at_2722x1832.png": None,
+        "stack_197_at_2054x1470.png": 197.0,
+        "stack_197_speck_forged_decimal_at_2054x1470.png": 197.0,
+        "stack_343_60_sprite_far_fragments_at_1272x896.png": 343.6,
+        "stack_212_90_timer_badge_at_2062x1178.png": 212.9,
+        "stack_124_80_name_row_above_at_2138x1402.png": 124.8,
+        "stack_392_30_digit_severed_by_sprite_at_2062x1178.png": 392.3,
+        "stack_190_10_digit_occluded_into_affix_at_2722x1832.png": 190.1,
+        "stack_218_top_shaved_at_1272x896.png": 218.0,
+        "pot_39_50_two_forged_separators_at_1272x896.png": 39.5,
+        "stack_95_50_leading_digit_occluded_at_2138x1402.png": 95.5,
+        "stack_162_40_at_2138x1402.png": 162.4,
+    }
+    monkeypatch.setattr(ocr_readers, "_bank", lambda: production_bank)
+    wrong: list[tuple[str, float, object]] = []
+    for name, true_value in truth.items():
+        img = cv2.imread(str(FIXTURES / name))
+        assert img is not None, name
+        h, w = img.shape[:2]
+        for i in range(0, 31, 2):  # every 0.10 scale; full bank sweep covers denser
+            scale = round(0.60 + 0.05 * i, 2)
+            small = cv2.resize(
+                img,
+                (round(w * scale), round(h * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+            detail = ocr_readers.read_amount_detail_from_image(
+                small, (0, 0, small.shape[1], small.shape[0])
+            )
+            value = None if detail is None else detail.value
+            if value is not None and value != true_value:
+                wrong.append((name, scale, value))
+    assert wrong == [], f"entrypoint confident wrong reads: {wrong}"
+
+
+def test_adversary_reported_wrong_value_regressions_stay_unknown(
+    production_bank, monkeypatch
+) -> None:
+    """Concrete wrong values adversary A reproduced before the recovery harden."""
+    monkeypatch.setattr(ocr_readers, "_bank", lambda: production_bank)
+    cases = [
+        ("stack_343_60_sprite_far_fragments_at_1272x896.png", 0.80),
+        ("stack_343_60_sprite_far_fragments_at_1272x896.png", 0.85),
+        ("bet_0_50_dot_lost_at_890x627.png", 1.05),
+        ("pot_39_50_two_forged_separators_at_1272x896.png", 0.75),
+    ]
+    for name, scale in cases:
+        img = cv2.imread(str(FIXTURES / name))
+        assert img is not None, name
+        h, w = img.shape[:2]
+        small = cv2.resize(
+            img, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA
+        )
+        detail = ocr_readers.read_amount_detail_from_image(
+            small, (0, 0, small.shape[1], small.shape[0])
+        )
+        assert detail is not None
+        # Unknown is fine; a fabricated value is not. True values at these scales
+        # are either refused or (for bet_0_50) may recover correctly as 0.5.
+        if detail.value is not None:
+            if name.startswith("bet_0_50"):
+                assert detail.value == 0.5, (name, scale, detail.value)
+            elif name.startswith("pot_39_50"):
+                assert detail.value == 39.5, (name, scale, detail.value)
+            else:
+                assert detail.value == 343.6, (name, scale, detail.value)
 
 def test_no_frozen_fixture_reads_a_wrong_value_at_any_render_size(
     production_bank,
