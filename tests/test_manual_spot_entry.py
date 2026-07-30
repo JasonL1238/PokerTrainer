@@ -5,10 +5,15 @@ from __future__ import annotations
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import Session
 from poker_tracker.services.manual_spot_entry import (
+    ManualSpotDefaults,
     ManualSpotInput,
     PostflopActionInput,
     build_manual_spot,
+    format_postflop_line,
+    parse_manual_spot_lines,
+    parse_postflop_line,
     save_manual_spot,
+    save_manual_spots,
     validate_manual_spot,
 )
 from poker_tracker.services.study_readiness import accounting_is_established
@@ -118,3 +123,82 @@ def test_save_three_bet_spot_is_solver_eligible(tmp_path) -> None:
     assert prepared.spot is not None
     assert prepared.spot.pot_type == "three_bet"
     db.close()
+
+
+def test_parse_postflop_line_infers_call_and_streets() -> None:
+    actions, errors = parse_postflop_line(
+        "x/b3.5/c | x/b8/f",
+        hero_position="BB",
+        villain_position="BTN",
+    )
+    assert errors == []
+    assert [
+        (row.street, row.actor, row.action_type, row.amount) for row in actions
+    ] == [
+        ("flop", "hero", "check", None),
+        ("flop", "villain", "bet", 3.5),
+        ("flop", "hero", "call", 3.5),
+        ("turn", "hero", "check", None),
+        ("turn", "villain", "bet", 8.0),
+        ("turn", "hero", "fold", None),
+    ]
+    assert format_postflop_line(actions) == "hx/vb3.5/hc3.5 | hx/vb8/hf"
+
+
+def test_parse_postflop_line_respects_actor_prefixes() -> None:
+    actions, errors = parse_postflop_line(
+        "vb3/hc/hx",
+        hero_position="BTN",
+        villain_position="BB",
+    )
+    assert errors == []
+    assert [(row.actor, row.action_type, row.amount) for row in actions] == [
+        ("villain", "bet", 3.0),
+        ("hero", "call", 3.0),
+        ("hero", "check", None),
+    ]
+
+
+def test_parse_manual_spot_lines_batch(tmp_path) -> None:
+    defaults = ManualSpotDefaults()
+    parsed = parse_manual_spot_lines(
+        "\n".join(
+            [
+                "AhQs | Qd7s2c | x/b3.5/c | hero",
+                "KdKh | Ah9c2s | BB vs BTN | 3bet | open2.5 | 3b9 | x/b6/c | villain",
+                "# comment ignored",
+            ]
+        ),
+        defaults,
+        starting_hand_number=4,
+    )
+    assert parsed.errors == ()
+    assert len(parsed.spots) == 2
+    assert parsed.spots[0].hand_number == 4
+    assert parsed.spots[0].winner == "hero"
+    assert parsed.spots[0].pot_type == "single_raised"
+    assert parsed.spots[1].hand_number == 5
+    assert parsed.spots[1].pot_type == "three_bet"
+    assert parsed.spots[1].three_bet_to == 9.0
+    assert parsed.spots[1].winner == "villain"
+
+    db = PokerDatabase(tmp_path / "manual_batch.db")
+    db.init_db()
+    session = db.create_session(Session(name="Batch"))
+    assert session.id is not None
+    results = save_manual_spots(db, session.id, parsed.spots)
+    assert len(results) == 2
+    assert all(accounting.is_authoritative for _, accounting, _ in results)
+    hands = db.fetch_hands_by_session(session.id)
+    assert [hand.hand_number for hand in hands] == [4, 5]
+    db.close()
+
+
+def test_parse_manual_spot_lines_reports_bad_line() -> None:
+    parsed = parse_manual_spot_lines(
+        "AhQs | Qd7s2c",
+        ManualSpotDefaults(),
+        starting_hand_number=1,
+    )
+    assert parsed.spots == ()
+    assert any("need hero cards" in error for error in parsed.errors)

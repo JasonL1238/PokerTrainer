@@ -255,6 +255,8 @@ _PILL_ALIASES = {
     "all_in": "all-in",
     "allin": "all-in",
     "post_blind": "post_blind",
+    # ClubWPT labels missed-blind posts as "POST" on a green pill.
+    "post": "post_blind",
     "bb": "post_blind",
     "sb": "post_blind",
 }

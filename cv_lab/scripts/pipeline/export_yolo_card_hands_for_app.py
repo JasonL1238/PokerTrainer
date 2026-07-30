@@ -532,6 +532,10 @@ def _build_actions(hand: dict[str, Any]) -> list[Action]:
     actions: list[Action] = []
     for row in hand.get("actions", []) or []:
         seat = row.get("seat")
+        forced = row.get("forced_bet_type")
+        live_post = row.get("is_live_post")
+        if row.get("action_type") == "post_blind" and live_post is None:
+            live_post = True
         actions.append(Action(
             hand_id=0,
             player_key=f"seat:{seat}" if seat is not None else None,
@@ -542,6 +546,8 @@ def _build_actions(hand: dict[str, Any]) -> list[Action]:
             action_type=row["action_type"],
             amount=row.get("amount"),
             amount_semantics="incremental",
+            forced_bet_type=forced,  # type: ignore[arg-type]
+            is_live_post=live_post if live_post is None else bool(live_post),
             pot_before=row.get("pot_before"),
             stack_before=row.get("stack_before"),
         ))

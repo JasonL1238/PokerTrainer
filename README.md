@@ -12,7 +12,8 @@ The current implementation status, release gates, and remaining work live in
 The Streamlit application is organized around seven workflows:
 
 - **Overview** — portfolio metrics, recent sessions, and processing jobs.
-- **Sessions** — session summaries and compact manual solver-spot entry.
+- **Sessions** — session summaries and compact multi-hand solver-spot entry
+  (`x/b3.5/c` lines, single or paste).
 - **Hands** — searchable cross-session hand library.
 - **Study** — hand replay, recorded math, optional TexasSolver analysis,
   auditable correction, coaching reruns, notes, and review state.

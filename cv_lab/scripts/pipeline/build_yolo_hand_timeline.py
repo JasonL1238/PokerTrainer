@@ -981,6 +981,93 @@ def _seat_owes_call_on_street(
     )
 
 
+def _seat_checks_preflop_later(
+    hand: list[dict[str, Any]], seat: int, *, start_index: int = 0
+) -> bool:
+    """True when ``seat`` shows a preflop check after ``start_index``.
+
+    A non-blind seat that posts a live missed blind can check when action
+    returns; a limper who already called cannot. Used to disambiguate green
+    CALL/BET pills that are actually POST.
+    """
+    for state in hand[start_index:]:
+        if state.get("board_cards"):
+            break
+        if (state.get("pills") or {}).get(seat) == "check":
+            return True
+    return False
+
+
+def _is_live_post_action(
+    street: str,
+    seat: int,
+    positions: dict[int, str],
+    pill: str | None,
+    amount: float | None,
+    *,
+    later_preflop_check: bool = False,
+) -> bool:
+    """Classify a preflop chip commitment as a live missed-blind post.
+
+    Operator flag: "utg+1 is actually a post, not a call". ClubWPT paints POST
+    on the same green as CALL/BET, so OCR often yields ``bet_or_call``.
+    """
+    if street != "preflop":
+        return False
+    if pill == "post_blind":
+        return True
+    position = positions.get(seat, "")
+    if position in {"SB", "BB"}:
+        return False
+    if pill not in {rd.PILL_BET_OR_CALL, "call", "bet"}:
+        return False
+    if amount is not None and amount <= 1.0 + _EPS:
+        return True
+    return bool(amount is None and later_preflop_check)
+
+
+def _opening_bet_amount(
+    hand: list[dict[str, Any]], seat: int, first: dict[str, Any]
+) -> float | None:
+    """Standing bet size for a first-state action, or None when unknown.
+
+    Prefers the stack-constancy window (``_committed_at_start``). A same-street
+    bet_text scan is allowed ONLY when the seat has no stack series at all --
+    the mid-street-open case where HUDs never read -- and never past a refused
+    stack read (that break is exactly what ``_committed_at_start`` protects).
+    """
+    if (first.get("bets_unknown") or {}).get(seat):
+        return None
+    direct = first.get("bets", {}).get(seat)
+    if direct is not None and direct > _EPS:
+        return float(direct)
+    standing = _committed_at_start(hand, seat)
+    if standing is not None and standing > _EPS:
+        return float(standing)
+    # Stacks were readable somewhere: trust the constancy window's answer
+    # (including 0.0 / None after a refusal). Do not second-guess with a later
+    # bet_text that may postdate a hidden debit.
+    if _stack_series(hand, seat):
+        return None
+    # No stack series at all: take the first agreeing same-street bet_text.
+    first_board = len(first.get("board_cards") or [])
+    seen: float | None = None
+    for state in hand:
+        if len(state.get("board_cards") or []) != first_board:
+            break
+        if (state.get("stacks_unknown") or {}).get(seat):
+            break
+        if (state.get("bets_unknown") or {}).get(seat):
+            return None
+        cand = (state.get("bets") or {}).get(seat)
+        if cand is None:
+            continue
+        if seen is not None and abs(cand - seen) > _EPS:
+            return None
+        seen = float(cand)
+    return seen
+
+
 def _stack_series(hand: list[dict[str, Any]], seat: int) -> list[float]:
     return [s["stacks"][seat] for s in hand if seat in s["stacks"]]
 
@@ -1310,11 +1397,15 @@ def _reconstruct_actions(
         *,
         source: dict[str, Any] | None,
         derivation: str,
+        is_live_post: bool | None = None,
     ):
         street_index[street] = street_index.get(street, 0) + 1
         if atype in {"bet", "raise", "all-in"}:
             street_has_bet[street] = True
             street_raised[street] = True
+        # A live missed-blind post is a live bet to the posted level.
+        if atype == "post_blind" and is_live_post:
+            street_has_bet[street] = True
         acted.setdefault(street, set()).add(seat)
         actions.append(
             _action(
@@ -1329,6 +1420,7 @@ def _reconstruct_actions(
                 stack_before,
                 source=source,
                 derivation=derivation,
+                is_live_post=is_live_post,
             )
         )
 
@@ -1384,15 +1476,20 @@ def _reconstruct_actions(
             source=first,
             derivation="hero_dim",
         )
-    if not first["board_cards"]:
+    # Book actions already standing in the first state, including mid-street
+    # opens (operator: "missed where lj bet" when capture begins on the flop).
+    opening_street = _street_for_count(
+        len(first["board_cards"]), first.get("stage") or "preflop"
+    )
+    if opening_street in _STREET_BY_COUNT.values():
         first_seats = (
             set(positions) | set(first["pills"])
             | set(first["bets"]) | set(first_bets_unknown)
         )
-        preflop_order = _street_seat_order(positions, "preflop")
+        street_order = _street_seat_order(positions, opening_street)
         ordered_first_seats = (
-            [seat for seat in preflop_order if seat in first_seats]
-            + sorted(first_seats - set(preflop_order))
+            [seat for seat in street_order if seat in first_seats]
+            + sorted(first_seats - set(street_order))
         )
         for seat in ordered_first_seats:
             pill = first["pills"].get(seat)
@@ -1400,81 +1497,94 @@ def _reconstruct_actions(
             if pill == "fold":
                 folded.add(seat)
                 emit(
-                    "preflop", seat, "fold", None, None, first["stacks"].get(seat),
+                    opening_street, seat, "fold", None, None,
+                    first["stacks"].get(seat),
                     source=first, derivation="action_pill",
                 )
-            elif pill in {"raise", "bet", "call", rd.PILL_BET_OR_CALL}:
+            elif pill in {
+                "raise", "bet", "call", "post_blind", rd.PILL_BET_OR_CALL
+            }:
                 if bet is None and not (first.get("bets_unknown") or {}).get(seat):
-                    # bet_text flickers: it is absent on the hand's very first
-                    # state of the 07-23 3.33.54 PM session and present (24.0) on
-                    # the next 18. Publishing `raise amount=None` there left the
-                    # hero's own raise size unstated in an exported hand while it
-                    # was legible on screen throughout.
-                    #
-                    # ONLY for an ABSENT box. A REFUSED first-state bet is not a
-                    # gap this scan may fill: `first["bets"].get(seat)` returns
-                    # None for both, and falling through here published a number
-                    # from a LATER state as this action's amount, with every
-                    # unknown channel reading clean -- measured 6x overstatement
-                    # of the hero's own preflop raise on a synthetic two-arm
-                    # fixture differing only in attr_source, and two live corpus
-                    # hands (g0723a hand 1 seat 6, g0723b hand 1 seat 0). The
-                    # refusal keeps amount=None, which books the action as
-                    # unknown-money exactly like the mid-hand branch at
-                    # `prev_bet_unknown`.
-                    standing = _committed_at_start(hand, seat)
-                    bet = (standing if standing is not None and standing > _EPS
-                           else None)
-                # Preflop the blinds are already a standing bet, so the green
-                # CALL/BET ambiguity has only one legal reading here: a preflop
-                # "bet" does not exist, it is a raise, and an unraised green pill
-                # is a call. (Post-flop the same token is resolved structurally --
-                # see the money branch below.)
-                atype = {"bet": "raise", rd.PILL_BET_OR_CALL: "call"}.get(pill, pill)
-                emit("preflop", seat, atype,
-                     bet, None, first["stacks"].get(seat),
-                     source=first, derivation="action_pill")
+                    # bet_text flickers: absent on the first state, present on
+                    # the next. ONLY fill an ABSENT box; a REFUSED read stays
+                    # amount=None (see prior corpus regressions).
+                    bet = _opening_bet_amount(hand, seat, first)
+                later_check = (
+                    opening_street == "preflop"
+                    and _seat_checks_preflop_later(hand, seat, start_index=1)
+                )
+                if _is_live_post_action(
+                    opening_street, seat, positions, pill, bet,
+                    later_preflop_check=later_check,
+                ):
+                    emit(
+                        opening_street, seat, "post_blind", bet, None,
+                        first["stacks"].get(seat),
+                        source=first, derivation="action_pill",
+                        is_live_post=True,
+                    )
+                elif opening_street == "preflop":
+                    # Preflop blinds are already a standing bet, so green
+                    # CALL/BET is a call and a "bet" pill is a raise.
+                    atype = {
+                        "bet": "raise", rd.PILL_BET_OR_CALL: "call"
+                    }.get(pill, pill)
+                    emit(
+                        opening_street, seat, atype, bet, None,
+                        first["stacks"].get(seat),
+                        source=first, derivation="action_pill",
+                    )
+                else:
+                    # Mid-street open: standing aggression is a bet; green is
+                    # bet when nothing is yet booked on this street, else call.
+                    if pill in {"raise", "bet"}:
+                        atype = pill
+                    elif pill == rd.PILL_BET_OR_CALL:
+                        atype = (
+                            "call" if street_has_bet.get(opening_street) else "bet"
+                        )
+                    else:
+                        atype = pill
+                    emit(
+                        opening_street, seat, atype, bet, None,
+                        first["stacks"].get(seat),
+                        source=first, derivation="action_pill",
+                    )
             elif pill == "check":
                 emit(
-                    "preflop", seat, "check", None, None, first["stacks"].get(seat),
+                    opening_street, seat, "check", None, None,
+                    first["stacks"].get(seat),
                     source=first, derivation="action_pill",
                 )
-            elif pill is None and bet is not None and bet > 1.0 + _EPS:
-                emit(
-                    "preflop", seat, "call", bet, None, first["stacks"].get(seat),
-                    source=first, derivation="bet_text",
-                )
-            elif pill is None and bet is None:
+            elif pill is None and bet is not None:
+                if opening_street == "preflop" and bet > 1.0 + _EPS:
+                    emit(
+                        opening_street, seat, "call", bet, None,
+                        first["stacks"].get(seat),
+                        source=first, derivation="bet_text",
+                    )
+                elif opening_street != "preflop" and bet > _EPS:
+                    atype = (
+                        "call" if street_has_bet.get(opening_street) else "bet"
+                    )
+                    emit(
+                        opening_street, seat, atype, bet, None,
+                        first["stacks"].get(seat),
+                        source=first, derivation="bet_text",
+                    )
+            elif pill is None and bet is None and opening_street == "preflop":
                 # The pill-less arms the old iteration could never reach.
                 if first_bets_unknown.get(seat):
-                    # A REFUSED first-state bet: a bet box was detected and the
-                    # reader declined to size it. A refusal is never backfilled
-                    # from a later state (the same rule the pill branch above
-                    # follows), and a refused box cannot even prove an ACTION
-                    # happened -- a blind post produces the same box -- so no
-                    # action is emitted. But money of unknown size is standing
-                    # on the felt, and that is exactly what an unmeasured
-                    # transition is: it reaches amounts_unknown_in_ledger and
-                    # blocks the hand from exporting as complete.
+                    # A REFUSED first-state bet: money of unknown size is
+                    # standing; record the hole without inventing an action.
                     first["unmeasured_transitions"].append(seat)
                 elif first["stacks"].get(seat) is not None:
-                    # Bet box ABSENT on the first state (bet_text flickers; the
-                    # pill expired long ago). The constancy window anchored at
-                    # this state's own stack read -- the same proof that feeds
-                    # starting_stack -- says whether money was standing and how
-                    # much: while the stack reads its starting value the
-                    # standing bet is a constant, so a read anywhere in the
-                    # window measures the amount standing NOW. Anchoring at the
-                    # first state is required: a window that starts at a later
-                    # stack read proves nothing about this state.
                     standing = _committed_at_start(hand, seat)
                     if standing is None:
-                        # A refusal inside the window with no proven read: the
-                        # standing amount is unknown, not absent and not zero.
                         first["unmeasured_transitions"].append(seat)
                     elif standing > 1.0 + _EPS:
                         emit(
-                            "preflop", seat, "call", standing, None,
+                            opening_street, seat, "call", standing, None,
                             first["stacks"].get(seat),
                             source=first, derivation="bet_text",
                         )
@@ -1641,7 +1751,7 @@ def _reconstruct_actions(
                 # cost with no correctness benefit.
                 pill = cur["pills"].get(seat)
                 fresh_pill = (pill in {"raise", "bet", "call", "all-in",
-                                       rd.PILL_BET_OR_CALL}
+                                       "post_blind", rd.PILL_BET_OR_CALL}
                               and prev["pills"].get(seat) != pill)
                 cur_bet = cur["bets"].get(seat)
                 prev_bet = prev["bets"].get(seat)
@@ -1656,21 +1766,31 @@ def _reconstruct_actions(
                     and after is not None
                     and abs(before - after) > 0.5 + _EPS
                 )
-                if fresh_pill or bet_grew or (coverage_gap and stack_moved):
-                    cur["unmeasured_transitions"].append(seat)
-                # A pill PROVES the act happened even when nothing can size it.
-                # The pill is evidence of the ACT, not of the SIZE, so the action
-                # is emitted with amount=None -- never dropped, never given a
-                # fabricated number. Freshness is required (the same bar the check
-                # and fold handlers use) so a pill standing across several states
-                # books one action, not one per state. A bet_text that merely GREW
-                # over an unknown base is not enough to emit on: it is
-                # indistinguishable from the same raise being re-displayed, which
-                # is precisely the duplication the carried high-water mark exists
-                # to suppress. Across a coverage gap, even a fresh pill only
-                # proves the act -- never invent a size from the post-gap stacks.
-                if fresh_pill:
-                    money_seats[seat] = (None, before, "amount_unknown")
+                # Across a coverage gap, refuse stack-delta invention but still
+                # size from a readable current-frame bet_text (operator: "bb
+                # bets 20" with the felt showing 20 BB after a short hole).
+                felt_amount = None
+                if (
+                    coverage_gap
+                    and cur_bet is not None
+                    and cur_bet >= 0.5 - _EPS
+                    and (fresh_pill or bet_grew)
+                ):
+                    base = 0.0 if known_base is None else known_base
+                    if cur_bet > base + _EPS:
+                        felt_amount = round(cur_bet - base, 2)
+                    elif fresh_pill:
+                        felt_amount = round(cur_bet, 2)
+                if felt_amount is not None:
+                    money_seats[seat] = (felt_amount, before, "bet_text")
+                else:
+                    if fresh_pill or bet_grew or (coverage_gap and stack_moved):
+                        cur["unmeasured_transitions"].append(seat)
+                    # A pill PROVES the act happened even when nothing can size
+                    # it. Emit amount=None -- never drop, never fabricate from
+                    # post-gap stacks. Freshness avoids re-booking a standing pill.
+                    if fresh_pill:
+                        money_seats[seat] = (None, before, "amount_unknown")
 
         street_order = _street_seat_order(positions, street)
         money_order = {seat: index for index, seat in enumerate(street_order)}
@@ -1680,9 +1800,20 @@ def _reconstruct_actions(
         ):
             pill = cur["pills"].get(seat)
             after = cur["stacks"].get(seat)
+            later_check = (
+                street == "preflop"
+                and _seat_checks_preflop_later(hand, seat, start_index=i + 1)
+            )
+            live_post = _is_live_post_action(
+                street, seat, positions, pill, amount,
+                later_preflop_check=later_check,
+            )
             if after is not None and after <= _EPS:
                 atype = "all-in"
-            elif pill in {"raise", "bet", "call"}:
+                live_post = False
+            elif live_post:
+                atype = "post_blind"
+            elif pill in {"raise", "bet", "call", "post_blind"}:
                 atype = pill
             else:
                 # Reached for an unreadable pill AND for the green CALL/BET
@@ -1702,6 +1833,7 @@ def _reconstruct_actions(
             emit(
                 street, seat, atype, amount, pot_before, stack_before,
                 source=cur, derivation=derivation,
+                is_live_post=True if atype == "post_blind" else None,
             )
 
         # ---- folds: card_back disappeared OR a fresh fold pill (hero: pill only) ----
@@ -1749,6 +1881,11 @@ def _reconstruct_actions(
                 before = prev["stacks"].get(seat)
                 if before is not None and before <= _EPS:
                     continue  # an all-in player's cards flip over; they can't fold
+                shown = (cur.get("villain_cards") or {}).get(seat) or []
+                if len(shown) >= 2:
+                    # Showdown reveal removes the card back while adding hole
+                    # cards (operator: "no LJ called and showed the card").
+                    continue
             folded.add(seat)
             emit(
                 street, seat, "fold", None, pot_before, prev["stacks"].get(seat),
@@ -1918,8 +2055,9 @@ def _action(
     *,
     source: dict[str, Any] | None,
     derivation: str,
+    is_live_post: bool | None = None,
 ):
-    return {
+    payload = {
         "street": street,
         "action_index": index,
         "seat": seat,
@@ -1936,6 +2074,14 @@ def _action(
         "source_state_index": None if source is None else source.get("state_index"),
         "derivation": derivation,
     }
+    if atype == "post_blind":
+        # Missed-blind POST on ClubWPT is a live big-blind post unless sized as SB.
+        if amount is not None and amount <= 0.5 + _EPS:
+            payload["forced_bet_type"] = "small_blind"
+        else:
+            payload["forced_bet_type"] = "big_blind"
+        payload["is_live_post"] = True if is_live_post is None else bool(is_live_post)
+    return payload
 
 
 def _vote_board(hand: list[dict[str, Any]]) -> list[str]:

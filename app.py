@@ -90,9 +90,12 @@ from poker_tracker.services.hand_accounting import (
     reconcile_persisted_hand,
 )
 from poker_tracker.services.manual_spot_entry import (
+    ManualSpotDefaults,
     ManualSpotInput,
-    PostflopActionInput,
+    parse_manual_spot_lines,
+    parse_postflop_line,
     save_manual_spot,
+    save_manual_spots,
     validate_manual_spot,
 )
 from poker_tracker.services.settlement_sync import (
@@ -992,7 +995,7 @@ def show_sessions_workspace(db: PokerDatabase, session: Session | None) -> None:
         create_session_form(db, form_key="create_first_session")
         return
     summary_tab, hands_tab, videos_tab, add_tab = st.tabs(
-        ["Overview", "Hands", "Videos", "Add hand"]
+        ["Overview", "Hands", "Videos", "Add hands"]
     )
     with summary_tab:
         show_session_dashboard(db, session)
@@ -4044,7 +4047,7 @@ def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
             kpi_card("Passive actions", str(stats.passive_count), "Check or call")
 
     if stats.hand_count == 0:
-        st.info("No hands recorded yet. Add hands in the Enter Hand tab to see session stats.")
+        st.info("No hands recorded yet. Add hands in the Add hands tab to see session stats.")
         return
 
     winning_col, losing_col = st.columns(2)
@@ -4117,7 +4120,6 @@ def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
 
 
 _SOLVER_POSITIONS = ["UTG", "UTG+1", "LJ", "HJ", "CO", "BTN", "SB", "BB"]
-_POSTFLOP_LINE_ACTIONS = ["check", "bet", "call", "raise", "fold", "all-in"]
 
 
 def create_hand_form(db: PokerDatabase, session_id: int | None) -> None:
@@ -4127,135 +4129,199 @@ def create_hand_form(db: PokerDatabase, session_id: int | None) -> None:
 
     existing_hands = db.fetch_hands_by_session(session_id)
     next_hand_number = max((hand.hand_number for hand in existing_hands), default=0) + 1
+    used_numbers = {hand.hand_number for hand in existing_hands}
 
     st.caption(
-        "Enter a completed heads-up postflop spot. Blinds and preflop are filled in "
-        "from the pot type; only the postflop line needs to be typed."
+        "Completed heads-up postflop spots. Blinds/preflop come from pot type; "
+        "type the postflop line as `x/b3.5/c | x/b8/f` (OOP first; amounts in BB added)."
     )
 
-    # clear_on_submit=False so a validation error does not wipe the user's work;
-    # the line editor is reset explicitly after a successful save.
-    with st.form("create_hand", clear_on_submit=False):
-        cards_left, cards_right = st.columns(2)
-        with cards_left:
-            hero_cards = st.text_input("Hero cards", placeholder="Ah Qs")
-            hero_position = st.selectbox(
-                "Hero position", _SOLVER_POSITIONS, index=_SOLVER_POSITIONS.index("BB")
-            )
-            villain_position = st.selectbox(
-                "Villain position", _SOLVER_POSITIONS, index=_SOLVER_POSITIONS.index("BTN")
-            )
-        with cards_right:
-            board_cards = st.text_input("Board", placeholder="Qd 7s 2c")
-            starting_stack = st.number_input(
-                "Effective stack (BB)", min_value=1.0, value=100.0, step=1.0
-            )
-            table_size = st.number_input("Table size", min_value=5, max_value=8, value=6, step=1)
+    defaults = _manual_spot_defaults_controls()
+    mode = st.radio(
+        "Entry mode",
+        ["Single hand", "Multi-hand paste"],
+        horizontal=True,
+        key="manual_spot_entry_mode",
+    )
 
-        structure_left, structure_right = st.columns(2)
-        with structure_left:
+    if mode == "Multi-hand paste":
+        _create_multi_hand_form(db, session_id, defaults, next_hand_number, used_numbers)
+    else:
+        _create_single_hand_form(db, session_id, defaults, next_hand_number, used_numbers)
+
+
+def _manual_spot_defaults_controls() -> ManualSpotDefaults:
+    with st.expander("Table defaults (applied to every hand)", expanded=False):
+        pos_left, pos_right, stack_col = st.columns(3)
+        with pos_left:
+            hero_position = st.selectbox(
+                "Hero",
+                _SOLVER_POSITIONS,
+                index=_SOLVER_POSITIONS.index("BB"),
+                key="manual_spot_hero_pos",
+            )
+        with pos_right:
+            villain_position = st.selectbox(
+                "Villain",
+                _SOLVER_POSITIONS,
+                index=_SOLVER_POSITIONS.index("BTN"),
+                key="manual_spot_villain_pos",
+            )
+        with stack_col:
+            starting_stack = st.number_input(
+                "Effective stack (BB)",
+                min_value=1.0,
+                value=100.0,
+                step=1.0,
+                key="manual_spot_stack",
+            )
+
+        struct_left, struct_right = st.columns(2)
+        with struct_left:
             pot_type_label = st.radio(
                 "Pot type",
                 ["Single raised", "3-bet"],
                 horizontal=True,
+                key="manual_spot_pot_type",
             )
-            pot_type = "three_bet" if pot_type_label == "3-bet" else "single_raised"
-            opener_label = st.selectbox("Preflop opener", ["Villain", "Hero"], index=0)
-            opener = "hero" if opener_label == "Hero" else "villain"
+            opener_label = st.selectbox(
+                "Preflop opener",
+                ["Villain", "Hero"],
+                index=0,
+                key="manual_spot_opener",
+            )
             three_bettor_label = st.selectbox(
                 "3-bettor",
                 ["Hero", "Villain"],
                 index=0,
+                key="manual_spot_three_bettor",
                 help="Used only for 3-bet pots.",
             )
-            three_bettor = "hero" if three_bettor_label == "Hero" else "villain"
-        with structure_right:
-            open_to = st.number_input("Open to (BB)", min_value=1.5, value=2.5, step=0.5)
+        with struct_right:
+            open_to = st.number_input(
+                "Open to (BB)",
+                min_value=1.5,
+                value=2.5,
+                step=0.5,
+                key="manual_spot_open_to",
+            )
             three_bet_to = st.number_input(
                 "3-bet to (BB)",
                 min_value=2.0,
                 value=9.0,
                 step=0.5,
+                key="manual_spot_three_bet_to",
                 help="Used only for 3-bet pots.",
             )
+            table_size = st.number_input(
+                "Table size",
+                min_value=5,
+                max_value=8,
+                value=6,
+                step=1,
+                key="manual_spot_table_size",
+            )
 
-        st.markdown("##### Postflop line")
+    return ManualSpotDefaults(
+        hero_position=hero_position,
+        villain_position=villain_position,
+        table_size=int(table_size),
+        starting_stack=float(starting_stack),
+        pot_type="three_bet" if pot_type_label == "3-bet" else "single_raised",
+        opener="hero" if opener_label == "Hero" else "villain",
+        three_bettor="hero" if three_bettor_label == "Hero" else "villain",
+        open_to=float(open_to),
+        three_bet_to=float(three_bet_to),
+    )
+
+
+def _create_single_hand_form(
+    db: PokerDatabase,
+    session_id: int,
+    defaults: ManualSpotDefaults,
+    next_hand_number: int,
+    used_numbers: set[int],
+) -> None:
+    for key, default in (
+        ("manual_spot_hero_cards", ""),
+        ("manual_spot_board_cards", ""),
+        ("manual_spot_line_draft", "x/b3.5/c"),
+        ("manual_spot_notes", ""),
+    ):
+        if key not in st.session_state:
+            st.session_state[key] = default
+    # clear_on_submit=False so validation errors keep the typed line.
+    with st.form("create_hand", clear_on_submit=False):
+        cards_left, cards_right = st.columns(2)
+        with cards_left:
+            hero_cards = st.text_input(
+                "Hero cards", placeholder="Ah Qs", key="manual_spot_hero_cards"
+            )
+        with cards_right:
+            board_cards = st.text_input(
+                "Board", placeholder="Qd 7s 2c", key="manual_spot_board_cards"
+            )
+
+        postflop_line = st.text_input(
+            "Postflop line",
+            placeholder="x/b3.5/c | x/b8/f",
+            help=(
+                "x=check f=fold c=call b3.5=bet r10=raise ai50=all-in. "
+                "Streets: flop | turn | river. Optional h/v prefixes."
+            ),
+            key="manual_spot_line_draft",
+        )
         st.caption(
-            "Amount is chips added by that action (not raise-to). OOP acts first."
-        )
-        line_rows = st.data_editor(
-            [
-                {"Street": "flop", "Player": "Hero", "Action": "check", "Amount": None},
-                {"Street": "flop", "Player": "Villain", "Action": "bet", "Amount": 3.5},
-                {"Street": "flop", "Player": "Hero", "Action": "call", "Amount": 3.5},
-            ],
-            num_rows="dynamic",
-            hide_index=True,
-            width="stretch",
-            column_config={
-                "Street": st.column_config.SelectboxColumn(
-                    "Street", options=["flop", "turn", "river"], required=True
-                ),
-                "Player": st.column_config.SelectboxColumn(
-                    "Player", options=["Hero", "Villain"], required=True
-                ),
-                "Action": st.column_config.SelectboxColumn(
-                    "Action", options=_POSTFLOP_LINE_ACTIONS, required=True
-                ),
-                "Amount": st.column_config.NumberColumn(
-                    "Amount (BB)",
-                    min_value=0.0,
-                    step=0.5,
-                    help="Chips this action commits. Leave blank for check/fold.",
-                ),
-            },
-            key="manual_spot_line_editor",
+            f"{defaults.hero_position} vs {defaults.villain_position} · "
+            f"{'3-bet' if defaults.pot_type == 'three_bet' else 'SRP'} · "
+            f"{defaults.starting_stack:g} BB · OOP acts first unless you prefix h/v"
         )
 
-        outcome_left, outcome_right = st.columns(2)
+        outcome_left, outcome_right, notes_col = st.columns([1, 1, 2])
         with outcome_left:
             winner_label = st.selectbox("Winner", ["Hero", "Villain"], index=0)
-            hand_number = st.number_input(
-                "Hand number", min_value=1, step=1, value=next_hand_number
-            )
         with outcome_right:
-            notes = st.text_area("Notes (optional)", height=68)
+            hand_number = st.number_input(
+                "Hand #", min_value=1, step=1, value=next_hand_number
+            )
+        with notes_col:
+            notes = st.text_input("Notes (optional)", key="manual_spot_notes")
 
-        submitted = st.form_submit_button("Save spot", type="primary")
+        submitted = st.form_submit_button("Save hand", type="primary")
 
     if not submitted:
         return
 
-    if any(hand.hand_number == int(hand_number) for hand in existing_hands):
+    if int(hand_number) in used_numbers:
         st.error(
             f"Hand #{int(hand_number)} already exists in this session. Pick a different number."
         )
         return
 
-    postflop_actions = tuple(
-        PostflopActionInput(
-            street=str(row.get("Street") or "flop"),
-            actor="hero" if str(row.get("Player") or "") == "Hero" else "villain",
-            action_type=str(row.get("Action") or "check"),
-            amount=_optional_float(row.get("Amount")),
-        )
-        for row in line_rows
-        if str(row.get("Player") or "").strip() and str(row.get("Action") or "").strip()
+    actions, line_errors = parse_postflop_line(
+        postflop_line,
+        hero_position=defaults.hero_position,
+        villain_position=defaults.villain_position,
     )
+    if line_errors:
+        for error in line_errors:
+            st.error(error)
+        return
+
     spot = ManualSpotInput(
         hand_number=int(hand_number),
         hero_cards=hero_cards.strip(),
         board_cards=board_cards.strip(),
-        hero_position=hero_position,
-        villain_position=villain_position,
-        table_size=int(table_size),
-        starting_stack=float(starting_stack),
-        pot_type=pot_type,
-        opener=opener,
-        three_bettor=three_bettor,
-        open_to=float(open_to),
-        three_bet_to=float(three_bet_to),
-        postflop_actions=postflop_actions,
+        hero_position=defaults.hero_position,
+        villain_position=defaults.villain_position,
+        table_size=defaults.table_size,
+        starting_stack=defaults.starting_stack,
+        pot_type=defaults.pot_type,
+        opener=defaults.opener,
+        three_bettor=defaults.three_bettor,
+        open_to=defaults.open_to,
+        three_bet_to=defaults.three_bet_to,
+        postflop_actions=actions,
         winner="hero" if winner_label == "Hero" else "villain",
         notes=notes.strip(),
     )
@@ -4268,22 +4334,109 @@ def create_hand_form(db: PokerDatabase, session_id: int | None) -> None:
     try:
         saved_hand, accounting, warnings = save_manual_spot(db, session_id, spot)
     except (ValidationError, ValueError, LedgerError) as exc:
-        st.error(f"Could not save spot: {exc}")
+        st.error(f"Could not save hand: {exc}")
         return
 
-    st.session_state.pop("manual_spot_line_editor", None)
-    for warning in warnings:
-        st.warning(warning)
-    if accounting.is_authoritative:
-        flash(f"Hand #{saved_hand.hand_number} saved and ready for Study / solver.")
-    else:
-        flash(
-            f"Hand #{saved_hand.hand_number} saved. Finish accounting in Study → Fix & confirm "
-            "before running the solver."
-        )
-        if accounting.issues:
-            st.caption("; ".join(accounting.issues[:3]))
+    st.session_state["manual_spot_hero_cards"] = ""
+    st.session_state["manual_spot_board_cards"] = ""
+    st.session_state["manual_spot_line_draft"] = ""
+    st.session_state["manual_spot_notes"] = ""
+    _flash_manual_save_results([(saved_hand, accounting, warnings)])
     st.rerun()
+
+
+def _create_multi_hand_form(
+    db: PokerDatabase,
+    session_id: int,
+    defaults: ManualSpotDefaults,
+    next_hand_number: int,
+    used_numbers: set[int],
+) -> None:
+    st.caption(
+        "One hand per line. Defaults above fill positions/stack/pot type. "
+        "Example: `AhQs | Qd7s2c | x/b3.5/c | hero` — optional "
+        "`BB vs BTN`, `SRP`/`3bet`, `open2.5`, `3b9`."
+    )
+    with st.form("create_hands_batch", clear_on_submit=False):
+        batch_text = st.text_area(
+            "Hands",
+            height=180,
+            placeholder=(
+                "AhQs | Qd7s2c | x/b3.5/c | hero\n"
+                "KdKh | Ah9c2s | x/x | c/b12/c | villain\n"
+                "7h6h | BB vs BTN | Td9c2sJh | 3bet | x/b6/c | x/b14/f | hero"
+            ),
+            key="manual_spot_batch_text",
+        )
+        start_number = st.number_input(
+            "First hand number",
+            min_value=1,
+            step=1,
+            value=next_hand_number,
+            help="Later lines use the next free numbers in order.",
+        )
+        submitted = st.form_submit_button("Save hands", type="primary")
+
+    if not submitted:
+        return
+
+    parsed = parse_manual_spot_lines(
+        batch_text,
+        defaults,
+        starting_hand_number=int(start_number),
+    )
+    if parsed.errors:
+        for error in parsed.errors:
+            st.error(error)
+        return
+
+    conflicts = [spot.hand_number for spot in parsed.spots if spot.hand_number in used_numbers]
+    if conflicts:
+        st.error(
+            "Hand number"
+            + ("s" if len(conflicts) != 1 else "")
+            + f" already in this session: {', '.join(f'#{n}' for n in conflicts)}."
+        )
+        return
+
+    try:
+        results = save_manual_spots(db, session_id, parsed.spots)
+    except (ValidationError, ValueError, LedgerError) as exc:
+        st.error(f"Could not save hands: {exc}")
+        return
+
+    st.session_state["manual_spot_batch_text"] = ""
+    _flash_manual_save_results(results)
+    st.rerun()
+
+
+def _flash_manual_save_results(
+    results: list[tuple[Hand, AccountingReconciliation, list[str]]],
+) -> None:
+    ready = 0
+    for saved_hand, accounting, warnings in results:
+        for warning in warnings:
+            st.warning(f"Hand #{saved_hand.hand_number}: {warning}")
+        if accounting.is_authoritative:
+            ready += 1
+        elif accounting.issues:
+            st.caption(
+                f"Hand #{saved_hand.hand_number}: " + "; ".join(accounting.issues[:3])
+            )
+    if len(results) == 1:
+        saved_hand, accounting, _ = results[0]
+        if accounting.is_authoritative:
+            flash(f"Hand #{saved_hand.hand_number} saved and ready for Study / solver.")
+        else:
+            flash(
+                f"Hand #{saved_hand.hand_number} saved. Finish accounting in "
+                "Study → Fix & confirm before running the solver."
+            )
+        return
+    flash(
+        f"Saved {len(results)} hands"
+        + (f" ({ready} ready for Study / solver)." if ready else ".")
+    )
 
 
 def show_saved_hands(db: PokerDatabase, session: Session) -> None:

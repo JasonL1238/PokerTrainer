@@ -363,7 +363,7 @@ def test_settings_coaching_promotes_a_ready_manual_hand(tmp_path, monkeypatch) -
 
 
 def _run_add_hand_form(path: Path, monkeypatch) -> AppTest:
-    """The manual Add-hand form lives in the Sessions workspace's "Add hand" tab."""
+    """The manual Add-hands form lives in the Sessions workspace's "Add hands" tab."""
     _isolate(path, monkeypatch)
     app = AppTest.from_file(APP_PATH, default_timeout=30).run()
     app.radio[0].set_value(Page.SESSIONS)

@@ -2037,3 +2037,224 @@ def test_hero_dim_does_not_duplicate_fold_pill():
     hero_folds = [a for a in actions if a["seat"] == 0 and a["action_type"] == "fold"]
     assert len(hero_folds) == 1
     assert hero_folds[0]["derivation"] == "action_pill"
+
+
+def _action_state(
+    time_s,
+    *,
+    board,
+    dealt,
+    pills=None,
+    bets=None,
+    stacks=None,
+    pot=None,
+    prior_gap_s=None,
+    villain_cards=None,
+    hero_dim=False,
+):
+    return {
+        "time_s": float(time_s),
+        "image": f"{time_s}.jpg",
+        "state_index": 0,
+        "board_cards": list(board),
+        "dealt_in": list(dealt),
+        "pills": dict(pills or {}),
+        "bets": dict(bets or {}),
+        "stacks": dict(stacks or {}),
+        "stacks_unknown": {},
+        "bets_unknown": {},
+        "hero_cards": ["Ah", "Kd"],
+        "hero_dim": hero_dim,
+        "villain_cards": dict(villain_cards or {}),
+        "pot": pot,
+        "pot_unknown": None,
+        "stage": {0: "preflop", 3: "flop", 4: "turn", 5: "river"}.get(
+            len(board), "preflop"
+        ),
+        "sampling_interval_s": 1.0,
+        "prior_gap_s": (
+            0.0 if prior_gap_s is None and time_s == 0 else float(prior_gap_s or 1.0)
+        ),
+    }
+
+
+def test_mid_street_open_books_standing_flop_bet():
+    """Operator: capture begins mid-flop with LJ bet already on the felt."""
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import _reconstruct_actions
+
+    hand = [
+        _action_state(
+            0,
+            board=FLOP,
+            dealt=[0, 3, 5],
+            pills={5: "bet", 3: "check"},
+            pot=18.1,
+        ),
+        _action_state(
+            1,
+            board=FLOP,
+            dealt=[0, 3, 5],
+            pills={5: "bet", 3: "check"},
+            bets={5: 3.6},
+            pot=18.1,
+        ),
+        _action_state(
+            3,
+            board=FLOP,
+            dealt=[0, 3, 5],
+            pills={0: "call", 5: "bet"},
+            bets={0: 3.6, 5: 3.6},
+            stacks={0: 196.5, 3: 362.5, 5: 201.5},
+            pot=21.7,
+        ),
+    ]
+    actions = _reconstruct_actions(
+        hand,
+        {0: "BTN", 3: "UTG", 5: "LJ"},
+        {0: "Hero", 3: "UTG", 5: "LJ"},
+    )
+    lj_bets = [
+        a for a in actions
+        if a["seat"] == 5 and a["action_type"] == "bet" and a["street"] == "flop"
+    ]
+    assert lj_bets, actions
+    assert lj_bets[0]["amount"] == 3.6
+    assert not any(
+        a["seat"] == 5 and a["action_type"] == "check" and a["street"] == "flop"
+        for a in actions
+    )
+
+
+def test_showdown_reveal_is_not_a_fold():
+    """Operator: LJ called and showed cards; card-back gone is not a fold."""
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import _reconstruct_actions
+
+    hand = [
+        _action_state(
+            74,
+            board=RIVER,
+            dealt=[0, 5],
+            pills={0: "bet"},
+            bets={0: 75.0},
+            stacks={0: 167.6, 5: 176.2},
+            pot=150.9,
+        ),
+        _action_state(
+            75,
+            board=RIVER,
+            dealt=[0],
+            stacks={0: 167.6, 5: 101.2},
+            pot=225.9,
+            villain_cards={5: ["Qh", "As"]},
+        ),
+    ]
+    # Seed a prior river bet so street_has_bet is true via the first state's bet.
+    hand[0]["pills"] = {0: "bet"}
+    actions = _reconstruct_actions(
+        hand, {0: "BTN", 5: "LJ"}, {0: "Hero", 5: "LJ"}
+    )
+    assert not any(
+        a["seat"] == 5 and a["action_type"] == "fold" for a in actions
+    ), actions
+
+
+def test_coverage_gap_sizes_bet_from_readable_bet_text():
+    """Operator: BB bets 20 BB; gap must not discard a clear bet_text size."""
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import _reconstruct_actions
+
+    hand = [
+        _action_state(
+            13,
+            board=FLOP,
+            dealt=[1, 6, 7],
+            pills={6: "check"},
+            stacks={1: 202.2, 6: 181.0, 7: 212.2},
+            pot=42.0,
+            prior_gap_s=1.0,
+        ),
+        _action_state(
+            17,
+            board=FLOP,
+            dealt=[1, 6, 7],
+            pills={6: "check", 7: "bet"},
+            bets={7: 20.0},
+            stacks={1: 202.2, 6: 181.0, 7: 192.2},
+            pot=62.0,
+            prior_gap_s=4.0,
+        ),
+    ]
+    actions = _reconstruct_actions(
+        hand,
+        {1: "UTG+1", 6: "SB", 7: "BB"},
+        {1: "S1", 6: "SB", 7: "BB"},
+    )
+    bb_bets = [
+        a for a in actions
+        if a["seat"] == 7 and a["action_type"] == "bet" and a["street"] == "flop"
+    ]
+    assert len(bb_bets) == 1
+    assert bb_bets[0]["amount"] == 20.0
+    assert bb_bets[0]["derivation"] == "bet_text"
+
+
+def test_green_post_pill_is_live_post_not_call():
+    """Operator: UTG+1 POST is a live missed-blind post, not a call."""
+    from cv_lab.scripts.pipeline import region_detections as rd
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import _reconstruct_actions
+
+    assert rd.read_pill_action(
+        type("D", (), {"attr": "post"})(), dealt_in=True
+    ) == "post_blind"
+
+    hand = [
+        _action_state(
+            48,
+            board=[],
+            dealt=[0, 1, 2, 4],
+            pills={2: rd.PILL_BET_OR_CALL},
+            stacks={0: 201.8, 1: 199.5, 2: 198.5, 4: 1458.4},
+            pot=3.0,
+        ),
+        _action_state(
+            49,
+            board=[],
+            dealt=[0, 2, 4],
+            pills={1: "fold"},
+            stacks={0: 201.8, 2: 198.5, 4: 1458.4},
+            pot=3.0,
+        ),
+        _action_state(
+            51,
+            board=[],
+            dealt=[0, 2, 4],
+            pills={2: "check"},
+            stacks={0: 201.8, 2: 198.5, 4: 1458.4},
+            pot=3.0,
+        ),
+    ]
+    actions = _reconstruct_actions(
+        hand,
+        {0: "BB", 1: "UTG", 2: "UTG+1", 4: "LJ"},
+        {0: "Hero", 1: "UTG", 2: "UTG+1", 4: "LJ"},
+    )
+    posts = [
+        a for a in actions
+        if a["seat"] == 2 and a["action_type"] == "post_blind"
+    ]
+    assert len(posts) == 1, actions
+    assert posts[0]["is_live_post"] is True
+    assert posts[0]["forced_bet_type"] == "big_blind"
+    assert not any(
+        a["seat"] == 2 and a["action_type"] == "call" and a["street"] == "preflop"
+        and a.get("source_time_s") == 48.0
+        for a in actions
+    )
+
+
+def test_explicit_post_pill_alias_maps_to_post_blind():
+    from cv_lab.scripts.pipeline import region_detections as rd
+
+    for attr in ("post", "POST", "post_blind", "Post"):
+        assert rd.read_pill_action(
+            type("D", (), {"attr": attr})(), dealt_in=True
+        ) == "post_blind"
