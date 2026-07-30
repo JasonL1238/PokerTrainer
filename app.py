@@ -1357,14 +1357,14 @@ def render_study_replay(
 
     section_header_with_meta(
         "Decision history",
-        "Click any action to update the table above.",
+        "Choose one action per row to update the table above.",
         f"{len(actions)} ACTIONS",
     )
     if actions:
-        st.pills(
+        st.radio(
             "Replay action",
             options=list(range(len(actions))),
-            default=selected_index,
+            index=None,
             format_func=lambda index: study_action_label(actions[index], index),
             key=replay_key,
             label_visibility="collapsed",
@@ -1374,7 +1374,10 @@ def render_study_replay(
             "The gold-outlined seat acted. Dimmed seats had already folded. "
             "Choose Final hand to return to the completed result."
         )
-        with st.expander("Show pot, stack, SPR, and notes for every action"):
+        with st.expander(
+            "Full action details · pot, stack, SPR, and notes",
+            expanded=True,
+        ):
             render_action_timeline(
                 actions,
                 players=players,

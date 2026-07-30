@@ -52,8 +52,10 @@ def test_poker_table_uses_completed_hand_values() -> None:
         result_bb=9.25,
     )
 
-    assert "18.5 BB" in html
-    assert "+9.25 BB" in html
+    assert 'aria-label="18.5 big blinds"' in html
+    assert '<span>18.5</span><small>BB</small>' in html
+    assert 'aria-label="+9.25 big blinds"' in html
+    assert '<span>+9.25</span><small>BB</small>' in html
     assert "pt-seat-hero" in html
     assert "Product preview" not in html
 
@@ -232,6 +234,30 @@ def test_cards_layer_behind_hero_position_and_pot_clears_board() -> None:
     assert ".pt-hero-cards { position: relative; z-index: 2" in _POKER_CSS
     assert ".pt-pot { position: relative; z-index: 3" in _POKER_CSS
     assert html_order(_table_markup()) == ["pt-board", "pt-pot", "pt-hero-cards"]
+
+
+def test_table_visual_keeps_bb_units_visible_for_zero_and_unknown_values() -> None:
+    html = poker_table_html(
+        hero_cards="As Kh",
+        board_cards="",
+        pot_size=0,
+        players=[
+            HandPlayer(
+                hand_id=1,
+                player_name="Hero",
+                position="BTN",
+                starting_stack=None,
+                is_hero=True,
+            )
+        ],
+        result_bb=0,
+    )
+
+    assert 'aria-label="Unknown big blinds"' in html
+    assert '<span>—</span><small>BB</small>' in html
+    assert 'aria-label="0 big blinds"' in html
+    assert 'aria-label="+0 big blinds"' in html
+    assert ".pt-bb-amount small" in _POKER_CSS
 
 
 def _table_markup() -> str:

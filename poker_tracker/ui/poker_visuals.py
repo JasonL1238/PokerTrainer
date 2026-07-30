@@ -65,6 +65,17 @@ def cards_html(cards: str, *, empty_count: int = 0, delay_start: int = 0) -> str
     return '<span class="pt-card-row">' + "".join(rendered) + "</span>"
 
 
+def _bb_amount_html(value: float | None, *, signed: bool = False) -> str:
+    """Render a visible, accessible big-blind amount for table graphics."""
+
+    display = "—" if value is None else f"{value:+g}" if signed else f"{value:g}"
+    accessible = "Unknown big blinds" if value is None else f"{display} big blinds"
+    return (
+        f'<span class="pt-bb-amount" aria-label="{escape(accessible)}">'
+        f"<span>{escape(display)}</span><small>BB</small></span>"
+    )
+
+
 def _seat_html(
     player: HandPlayer,
     index: int,
@@ -78,7 +89,6 @@ def _seat_html(
     player_key = player.player_key or player.player_name
     actor_class = " pt-seat-acting" if player_key == actor_player_key else ""
     folded_class = " pt-seat-folded" if player_key in folded_player_keys else ""
-    stack = "—" if player.starting_stack is None else f"{player.starting_stack:g} BB"
     name = actor_label(player.player_name, None) or player.position or f"Seat {index + 1}"
     position = distinct_position(name, player.position)
     position_html = (
@@ -87,7 +97,7 @@ def _seat_html(
     return (
         f'<div class="pt-seat {seat_class}{hero_class}{actor_class}{folded_class}">'
         f'{position_html}<strong>{escape(name)}</strong>'
-        f'<span class="pt-seat-stack">{escape(stack)}</span></div>'
+        f'<span class="pt-seat-stack">{_bb_amount_html(player.starting_stack)}</span></div>'
     )
 
 
@@ -114,7 +124,6 @@ def poker_table_html(
         )
         for index, player in enumerate(table_players)
     )
-    pot = "—" if pot_size is None else f"{pot_size:g} BB"
     result_class = (
         "pt-result-positive"
         if (result_bb or 0) > 0
@@ -125,7 +134,10 @@ def poker_table_html(
     result = (
         ""
         if result_bb is None
-        else f'<span class="pt-table-result {result_class}">{result_bb:+g} BB</span>'
+        else (
+            f'<span class="pt-table-result {result_class}">'
+            f"{_bb_amount_html(result_bb, signed=True)}</span>"
+        )
     )
     return (
         '<figure class="pt-poker-stage">'
@@ -133,7 +145,7 @@ def poker_table_html(
         '<div class="pt-table-shell"><div class="pt-table-felt">'
         f'{seats}<div class="pt-table-center"><div class="pt-board">'
         f'{cards_html(board_cards, empty_count=5, delay_start=100)}</div>'
-        f'<div class="pt-pot"><span>POT</span><strong>{escape(pot)}</strong>'
+        f'<div class="pt-pot"><span>POT</span><strong>{_bb_amount_html(pot_size)}</strong>'
         '<i aria-hidden="true"></i></div>'
         f'<div class="pt-hero-cards"><span>HERO</span>'
         f'{cards_html(hero_cards, empty_count=2)}</div></div></div></div></figure>'
@@ -517,6 +529,10 @@ _POKER_CSS = r"""
 .pt-seat strong { color: var(--pt-text); font-size: .66rem; }
 .pt-seat-position { color: var(--pt-accent); font-size: .52rem; letter-spacing: .08em; }
 .pt-seat-stack { color: var(--pt-muted); font-family: var(--pt-font-mono); font-size: .57rem; margin-top: .14rem; }
+.pt-bb-amount { display: inline-flex; align-items: baseline; gap: .2rem; white-space: nowrap; }
+.pt-bb-amount small { color: var(--pt-accent); font-family: var(--pt-font-mono); font-size: .72em; font-weight: 800; letter-spacing: .055em; }
+.pt-seat .pt-bb-amount { display: inline-flex; overflow: visible; text-overflow: clip; }
+.pt-seat .pt-bb-amount > span { display: inline; overflow: visible; text-overflow: clip; }
 .pt-seat-hero { z-index: 5; border-color: #388057; box-shadow: 0 0 0 2px rgba(53,208,127,.1), 0 7px 18px rgba(0,0,0,.3); }
 .pt-seat-acting { z-index: 6; border-color: var(--pt-gold); box-shadow: 0 0 0 2px rgba(213,168,75,.16), 0 7px 18px rgba(0,0,0,.3); }
 .pt-seat-folded { opacity: .42; filter: grayscale(.7); }
@@ -547,6 +563,9 @@ _POKER_CSS = r"""
 .pt-pot { position: relative; z-index: 3; display: flex; align-items: center; gap: .4rem; padding: .28rem .5rem; border: 1px solid rgba(213,168,75,.34); border-radius: 5px; background: rgba(7,15,10,.8); }
 .pt-pot span { color: var(--pt-gold); font-size: .48rem; letter-spacing: .1em; }
 .pt-pot strong { color: var(--pt-text); font-family: var(--pt-font-mono); font-size: .64rem; }
+.pt-pot .pt-bb-amount > span { color: var(--pt-text); font-size: 1em; letter-spacing: normal; }
+.pt-pot .pt-bb-amount small { color: var(--pt-gold); }
+.pt-table-result .pt-bb-amount small { color: inherit; }
 .pt-pot i { width: 14px; height: 6px; border-radius: 50%; background: var(--pt-gold); box-shadow: 0 -3px 0 #8D702F, 0 -6px 0 #D5A84B; animation: pt-chip-in 300ms 260ms var(--pt-ease) both; }
 .pt-history-panel { width: 100%; overflow: hidden; border: 1px solid var(--pt-border); border-radius: var(--pt-radius); background: var(--pt-surface-soft); }
 .pt-history-summary { display: flex; justify-content: space-between; gap: .75rem; padding: .58rem .75rem; border-bottom: 1px solid var(--pt-border); background: var(--pt-surface); }
