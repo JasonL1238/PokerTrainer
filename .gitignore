@@ -59,3 +59,10 @@ data/exports/*
 !data/roi_previews/
 data/roi_previews/*
 !data/roi_previews/.gitkeep
+
+# Adversarial-agent scratch that has leaked into the repo root before. Agents are
+# instructed to write outside the tree; this is the backstop so a stray sweep
+# never commits synthetic crops or multi-MB measurement dumps.
+/adv/
+/margins.json
+/boxjitter_wrong.json

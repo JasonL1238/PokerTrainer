@@ -742,7 +742,7 @@ def show_product_overview(db: PokerDatabase) -> None:
     )
 
     with st.container(key="overview_actions"):
-        action_left, action_right, spacer = st.columns([1, 1, 3])
+        action_left, action_right, _ = st.columns([1, 1, 3])
         if action_left.button("Import completed session", type="primary", width="stretch"):
             navigate_to(Page.IMPORT)
             st.rerun()
@@ -4780,15 +4780,6 @@ def show_prompt_safety(prompt: str) -> None:
         st.success("Prompt safety check passed: post-session review only.")
     else:
         st.error("Prompt safety check failed: " + "; ".join(result.errors))
-
-
-def _optional_prompt_math_facts(
-    pot_before_call: float,
-    call_amount: float,
-) -> dict[str, float | str]:
-    if pot_before_call <= 0 or call_amount <= 0:
-        return {}
-    return {"required_equity_to_call": required_equity_to_call(call_amount, pot_before_call)}
 
 
 def _accounting_is_established(
