@@ -27,6 +27,7 @@ from poker_tracker.persistence.completion import (
     UNREADABLE_HAND_COLUMNS_KEY,
     CompletionEvidence,
     derive_completion_status,
+    has_operator_manual_completion,
     is_reconstructed,
     parse_completion_evidence,
     requires_assumption_attestation,
@@ -55,6 +56,7 @@ BlockerCategory = Literal[
     "coaching",
     "solver",
     "confirmation",
+    "study_preference",
 ]
 BlockerCode = Literal[
     "COMPLETION_NOT_COMPLETE",
@@ -69,10 +71,12 @@ BlockerCode = Literal[
     "STALE_COACHING_EVIDENCE",
     "STALE_SOLVER_EVIDENCE",
     "USER_CONFIRMATION_MISSING",
+    "STUDY_EXCLUDED_BY_OPERATOR",
 ]
 
 # Blockers are emitted in this order, and categories render in this order.
 BLOCKER_ORDER: tuple[BlockerCode, ...] = (
+    "STUDY_EXCLUDED_BY_OPERATOR",
     "COMPLETION_NOT_COMPLETE",
     "COMPLETION_EVIDENCE_MISSING",
     "INVALID_HERO_OR_BOARD_CARDS",
@@ -87,6 +91,7 @@ BLOCKER_ORDER: tuple[BlockerCode, ...] = (
     "USER_CONFIRMATION_MISSING",
 )
 CATEGORY_ORDER: tuple[BlockerCategory, ...] = (
+    "study_preference",
     "completion",
     "cards",
     "facts",
@@ -288,6 +293,18 @@ def evaluate_study_readiness(
     runs = [run for run in solver_runs]
 
     blockers: list[StudyBlocker] = []
+    if hand.study_inclusion == "skip":
+        blockers.append(
+            StudyBlocker(
+                code="STUDY_EXCLUDED_BY_OPERATOR",
+                category="study_preference",
+                reason="You marked this hand as non-study.",
+                clearing_action=(
+                    "Set Study inclusion to Auto or Study on this hand's row in "
+                    "Sessions → Hands (or Hands library)."
+                ),
+            )
+        )
     if is_reconstructed:
         blockers.extend(_completion_blockers(hand, evidence))
     blockers.extend(
@@ -456,11 +473,12 @@ def _completion_clearing_action(
                 "corrected in the meantime."
             )
         return (
-            "Only a reconstruction of a recording that contains both this hand's "
-            "start and its end can produce unbroken evidence: "
-            f"{NEW_RECONSTRUCTION_STEPS} A partial hand can be inspected and "
-            "corrected, but it can never become a study record — correcting facts "
-            "does not restore the missing footage."
+            "Fill in the missing facts under Fix & confirm → Correct hand facts, "
+            "then use Fix & confirm → Finalize incomplete hand to attest that you "
+            "completed this draft yourself. A partial hand never becomes complete "
+            "from footage that is not in the recording — only an explicit operator "
+            "finalize clears sticky truncation. Alternatively, "
+            f"{NEW_RECONSTRUCTION_STEPS}"
         )
     if status == "not_applicable":
         return (
@@ -528,6 +546,21 @@ def _card_blockers(
     problem = _unreadable_card_columns(evidence) or _card_problem(
         hand, is_reconstructed=is_reconstructed
     )
+    if problem is None and has_operator_manual_completion(evidence):
+        # Only enforce terminal/board agreement for operator-attested terminals.
+        # Pipeline-observed showdown with a missing board is already handled by
+        # completion_status; applying it broadly broke every clean-hand fixture.
+        op_terminal = evidence.extra.get("operator_terminal_event")
+        effective_terminal = (
+            op_terminal
+            if isinstance(op_terminal, str) and op_terminal
+            else evidence.terminal_event
+        )
+        if effective_terminal == "showdown" and len((hand.board_cards or "").split()) != 5:
+            problem = (
+                "operator terminal event is showdown but board_cards does not "
+                f"hold five cards (board={hand.board_cards!r})"
+            )
     if problem is None:
         return []
     return [

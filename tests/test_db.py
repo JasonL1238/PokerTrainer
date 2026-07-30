@@ -388,6 +388,7 @@ def test_fresh_and_migrated_hands_schema_are_identical(tmp_path) -> None:
     legacy.init_db()
     legacy._execute("ALTER TABLE hands DROP COLUMN completion_status")
     legacy._execute("ALTER TABLE hands DROP COLUMN completion_evidence")
+    legacy._execute("ALTER TABLE hands DROP COLUMN study_inclusion")
     legacy._execute("UPDATE schema_metadata SET value = '12' WHERE key = 'schema_version'")
     legacy._commit()
     assert [row[0] for row in signature(legacy)] == _v12_hands_table_columns()

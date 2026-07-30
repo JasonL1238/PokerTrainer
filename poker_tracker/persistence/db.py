@@ -25,16 +25,19 @@ from poker_tracker.persistence import backup as backup_module
 from poker_tracker.persistence.backup import backup_database
 from poker_tracker.persistence.completion import (
     DERIVED_EVIDENCE_KEYS,
+    OPERATOR_MANUAL_COMPLETION_KEY,
     UNREADABLE_CARDS_KEY,
     UNREADABLE_HAND_COLUMNS_KEY,
     confirm_assumption,
     derive_completion_status,
     dump_completion_evidence,
+    has_operator_manual_completion,
     is_assumption_dependence_code,
     parse_completion_evidence,
     requires_assumption_attestation,
     set_declared_settlement_code,
     strip_derived_evidence_markers,
+    strip_operator_attestation,
 )
 from poker_tracker.persistence.models import (
     Action,
@@ -58,6 +61,7 @@ from poker_tracker.persistence.models import (
     SolverRangeProfile,
     SolverRun,
     SourceType,
+    StudyInclusion,
     VideoRecord,
 )
 from poker_tracker.persistence.validation import CardValidationError, normalize_cards
@@ -69,7 +73,8 @@ DEFAULT_DB_PATH = os.environ.get(
     "POKER_DB_PATH",
     str(Path(__file__).resolve().parent.parent.parent / "poker_tracker.db"),
 )
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
+_PROCESSING_JOB_PID_UNSET = object()
 # A migration on a real database can outlast SQLite's 5s default, and a second
 # opener must wait for it rather than failing startup with "database is locked".
 BUSY_TIMEOUT_MS = int(os.environ.get("POKER_DB_BUSY_TIMEOUT_MS", "30000"))
@@ -143,6 +148,10 @@ _EVIDENCE_OWNED_COLUMNS = frozenset(
         "completion_status",
         "source_type",
         "completion_evidence",
+        # Operator Study-queue preference. Default is the non-empty enum
+        # ``auto``, never a blank restorable fallback, and restore must not
+        # overwrite an intentional inclusion choice from a marker payload.
+        "study_inclusion",
     }
 )
 
@@ -654,6 +663,7 @@ class PokerDatabase:
                 created_at TEXT NOT NULL,
                 completion_status TEXT NOT NULL DEFAULT 'not_applicable',
                 completion_evidence TEXT NOT NULL DEFAULT '{}',
+                study_inclusion TEXT NOT NULL DEFAULT 'auto',
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             );
 
@@ -989,9 +999,10 @@ class PokerDatabase:
                 session_id, hand_number, game_type, blinds_antes, table_size,
                 effective_stack, hero_position, hero_cards, board_cards, pot_size,
                 result, hero_bb_won, review_status, confidence_score, source_type,
-                tags, notes, created_at, completion_status, completion_evidence
+                tags, notes, created_at, completion_status, completion_evidence,
+                study_inclusion
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload["session_id"],
@@ -1016,13 +1027,21 @@ class PokerDatabase:
                 # A caller that round-trips a fetched hand -- import_session, a CV
                 # re-write, a test helper -- must not persist the reader's own
                 # unreadable-card annotation as if the pipeline had produced it.
+                # An operator finalize attestation is earned by acting on an
+                # existing hand, so a hand being CREATED cannot carry one:
+                # finalize_incomplete_hand is its only writer.
                 _serialize_json(
-                    strip_derived_evidence_markers(payload["completion_evidence"])
+                    strip_operator_attestation(
+                        strip_derived_evidence_markers(payload["completion_evidence"])
+                    )
                 ),
+                # Study inclusion is an operator preference set after the hand
+                # exists; create always starts at auto (update_study_inclusion).
+                "auto",
             ),
         )
         self._commit()
-        return hand.model_copy(update={"id": cursor.lastrowid})
+        return hand.model_copy(update={"id": cursor.lastrowid, "study_inclusion": "auto"})
 
     def update_hand_status(self, hand_id: int, review_status: str) -> None:
         """Set the review status, refusing to promote a hand the store knows is unproven.
@@ -1268,13 +1287,16 @@ class PokerDatabase:
             # the promotion path for acknowledged warnings), so it pins the
             # exemption boundary instead.
             status = stored.completion_status
-        if stored.completion_status == "partial":
+        if stored.completion_status == "partial" and not has_operator_manual_completion(
+            evidence
+        ):
             # Sticky, exactly as in _record_source_correction_in_evidence: no
             # evidence write restores missing footage. A hand whose column was set
             # to `partial` by a source this evidence does not repeat -- the v13
             # migration, or an import that honoured a payload's stronger claim over
             # a weaker re-derivation -- would otherwise be laundered up to
-            # `complete` by one acknowledgement.
+            # `complete` by one acknowledgement. Operator finalize is the sole
+            # exception: see finalize_incomplete_hand.
             status = "partial"
         with self.transaction():
             self._execute(
@@ -1309,6 +1331,163 @@ class PokerDatabase:
                         "acknowledged_codes": ", ".join(evidence.acknowledged_codes),
                     },
                     notes=notes.strip(),
+                )
+            )
+        refreshed = self.fetch_hand(hand_id)
+        if refreshed is None:
+            raise RuntimeError("Updated hand could not be reloaded.")
+        return refreshed
+
+    def update_study_inclusion(self, hand_id: int, study_inclusion: str) -> Hand:
+        """Set whether this hand should be studied, skipped, or follow readiness."""
+        if study_inclusion not in get_args(StudyInclusion):
+            raise ValueError(f"Unknown study inclusion: {study_inclusion!r}")
+        stored = self.fetch_hand(hand_id)
+        if stored is None:
+            raise ValueError("Hand not found.")
+        if stored.study_inclusion == study_inclusion:
+            return stored
+        with self.transaction():
+            self._execute(
+                "UPDATE hands SET study_inclusion = ? WHERE id = ?",
+                (study_inclusion, hand_id),
+            )
+            self._record_hand_correction(
+                HandCorrection(
+                    hand_id=hand_id,
+                    correction_type="hand_facts",
+                    before_state={"study_inclusion": stored.study_inclusion},
+                    after_state={"study_inclusion": study_inclusion},
+                    notes="Operator updated study inclusion preference.",
+                )
+            )
+        refreshed = self.fetch_hand(hand_id)
+        if refreshed is None:
+            raise RuntimeError("Updated hand could not be reloaded.")
+        return refreshed
+
+    def finalize_incomplete_hand(
+        self,
+        hand_id: int,
+        *,
+        terminal_event: str,
+        notes: str = "",
+    ) -> Hand:
+        """Operator attestation that an incomplete CV draft is now complete.
+
+        This is the only writer allowed to clear sticky partial truncation. The
+        operator must already have filled hero cards. Pipeline observation fields
+        (partial flags, boundary confidence, evidence_version, terminal_event) are
+        preserved; the operator claim lives under ``operator_manual_completion``
+        and ``operator_terminal_event``.
+        """
+        if terminal_event not in {"showdown", "fold_win", "hero_fold"}:
+            raise ValueError(
+                f"terminal_event must be showdown, fold_win, or hero_fold; "
+                f"got {terminal_event!r}"
+            )
+        stored = self.fetch_hand(hand_id)
+        if stored is None:
+            raise ValueError("Hand not found.")
+        if stored.source_type == "manual":
+            raise ValueError("Manual hands are operator-owned; nothing to finalize.")
+        if stored.completion_status not in {"partial", "uncertain"}:
+            raise ValueError(
+                "Only partial or uncertain reconstructed drafts can be finalized."
+            )
+        if not (stored.hero_cards or "").strip():
+            raise ValueError(
+                "Fill in hero cards before finalizing this incomplete hand."
+            )
+        board_tokens = [token for token in (stored.board_cards or "").split() if token]
+        if terminal_event == "showdown":
+            if len(board_tokens) != 5:
+                raise ValueError(
+                    "Showdown finalize requires five board cards; fill them in first."
+                )
+        previous = parse_completion_evidence(
+            strip_derived_evidence_markers(stored.completion_evidence)
+        )
+        # Soft-blanked drafts can clear a contradictory board while the pipeline
+        # still records an observed terminal. When the pipeline observed an
+        # outcome, the operator must attest that same outcome (not fold past a
+        # showdown, etc.).
+        if previous.terminal_event in {"showdown", "fold_win", "hero_fold"}:
+            if terminal_event != previous.terminal_event:
+                raise ValueError(
+                    f"Pipeline observed terminal_event={previous.terminal_event!r}; "
+                    f"finalize as {previous.terminal_event} (or correct the hand "
+                    f"facts / re-run reconstruction) instead of {terminal_event}."
+                )
+        if not previous.is_known:
+            raise ValueError(
+                "Cannot finalize a hand with no readable reconstruction evidence. "
+                "Run CV reconstruction again, or enter the hand manually."
+            )
+        if has_operator_manual_completion(previous):
+            raise ValueError("This hand has already been finalized by the operator.")
+        if previous.rejection_codes:
+            raise ValueError(
+                "This reconstruction was refused by the pipeline. Re-run "
+                "reconstruction or enter the hand manually; finalize cannot "
+                "override a rejection."
+            )
+        # Preserve every pipeline observation. Attestation is additive only.
+        payload = dump_completion_evidence(previous)
+        payload[OPERATOR_MANUAL_COMPLETION_KEY] = True
+        payload["operator_terminal_event"] = terminal_event
+        evidence = parse_completion_evidence(payload)
+        source_type = "corrected_cv"
+        status = derive_completion_status(evidence, source_type=source_type)
+        if status != "complete":
+            unresolved = ", ".join(evidence.unresolved_warning_codes) or "missing evidence"
+            raise ValueError(
+                "Finalize would not promote this hand to complete "
+                f"(status would be {status}; unresolved: {unresolved}). "
+                "Acknowledge source warnings and fill required facts first."
+            )
+        with self.transaction():
+            self._execute(
+                """
+                UPDATE hands
+                SET completion_status = ?, completion_evidence = ?, source_type = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    _serialize_json(dump_completion_evidence(evidence)),
+                    source_type,
+                    hand_id,
+                ),
+            )
+            # Stale retained analysis without the source_facts_corrected demotion:
+            # finalize itself is the attestation, and recording another acknowledgeable
+            # warning would immediately undo the promotion this writer exists for.
+            self._stale_retained_analysis(hand_id)
+            self._invalidate_hand_settlement(hand_id)
+            self._execute(
+                "UPDATE hands SET review_status = 'needs_correction' WHERE id = ?",
+                (hand_id,),
+            )
+            self._record_hand_correction(
+                HandCorrection(
+                    hand_id=hand_id,
+                    correction_type="hand_facts",
+                    before_state={
+                        "completion_status": stored.completion_status,
+                        "partial_start": str(previous.partial_start),
+                        "partial_end": str(previous.partial_end),
+                        "terminal_event": previous.terminal_event,
+                    },
+                    after_state={
+                        "completion_status": status,
+                        "operator_terminal_event": terminal_event,
+                        OPERATOR_MANUAL_COMPLETION_KEY: "true",
+                    },
+                    notes=(
+                        notes.strip()
+                        or "Operator finalized incomplete hand after filling blanks."
+                    ),
                 )
             )
         refreshed = self.fetch_hand(hand_id)
@@ -2594,11 +2773,17 @@ class PokerDatabase:
         payload["acknowledged_codes"] = [
             item for item in evidence.acknowledged_codes if item != code
         ]
+        # Keep operator finalize attestation across fill-blanks edits. The new
+        # SOURCE_CORRECTION_CODE warning demotes to uncertain until acknowledged;
+        # sticky partial still cannot clear without the attestation remaining.
         updated = parse_completion_evidence(payload)
         status = derive_completion_status(updated, source_type=row["source_type"])
-        if row["completion_status"] == "partial":
+        if row["completion_status"] == "partial" and not has_operator_manual_completion(
+            updated
+        ):
             # Sticky: no correction restores missing footage, and a hand whose
             # evidence has become unreadable must not lose the stronger claim.
+            # Operator finalize (finalize_incomplete_hand) is the sole exception.
             status = "partial"
         self._execute(
             """
@@ -3441,40 +3626,63 @@ class PokerDatabase:
         progress_percent: float | None = None,
         message: str | None = None,
         error_message: str | None = None,
-        pid: int | None = None,
+        pid: object = _PROCESSING_JOB_PID_UNSET,
+        clear_pid: bool = False,
         heartbeat_at: datetime | None = None,
         started_at: datetime | None = None,
         completed_at: datetime | None = None,
-    ) -> None:
+        expected_statuses: tuple[str, ...] | None = None,
+    ) -> ProcessingJob:
         current = self.fetch_processing_job(job_id)
         if current is None:
             raise ValueError(f"Processing job not found: {job_id}")
-        self._execute(
-            """
+        if clear_pid:
+            next_pid: int | None = None
+        elif pid is _PROCESSING_JOB_PID_UNSET:
+            next_pid = current.pid
+        else:
+            next_pid = pid  # type: ignore[assignment]
+        status_clause = ""
+        params: list[object] = [
+            status or current.status,
+            current.progress_percent if progress_percent is None else progress_percent,
+            current.message if message is None else message,
+            current.error_message if error_message is None else error_message,
+            next_pid,
+            _serialize_optional_datetime(
+                heartbeat_at if heartbeat_at is not None else current.heartbeat_at
+            ),
+            _serialize_optional_datetime(
+                started_at if started_at is not None else current.started_at
+            ),
+            _serialize_optional_datetime(
+                completed_at if completed_at is not None else current.completed_at
+            ),
+            job_id,
+        ]
+        if expected_statuses:
+            placeholders = ", ".join("?" for _ in expected_statuses)
+            status_clause = f" AND status IN ({placeholders})"
+            params.extend(expected_statuses)
+        cursor = self._execute(
+            f"""
             UPDATE processing_jobs
             SET status = ?, progress_percent = ?, message = ?, error_message = ?,
                 pid = ?, heartbeat_at = ?, started_at = ?, completed_at = ?
-            WHERE id = ?
+            WHERE id = ?{status_clause}
             """,
-            (
-                status or current.status,
-                current.progress_percent if progress_percent is None else progress_percent,
-                current.message if message is None else message,
-                current.error_message if error_message is None else error_message,
-                current.pid if pid is None else pid,
-                _serialize_optional_datetime(
-                    heartbeat_at if heartbeat_at is not None else current.heartbeat_at
-                ),
-                _serialize_optional_datetime(
-                    started_at if started_at is not None else current.started_at
-                ),
-                _serialize_optional_datetime(
-                    completed_at if completed_at is not None else current.completed_at
-                ),
-                job_id,
-            ),
+            tuple(params),
         )
         self._commit()
+        if cursor.rowcount != 1 and expected_statuses:
+            saved = self.fetch_processing_job(job_id)
+            if saved is not None:
+                return saved
+            raise ValueError(f"Processing job not found: {job_id}")
+        saved = self.fetch_processing_job(job_id)
+        if saved is None:
+            raise RuntimeError("Updated processing job could not be reloaded.")
+        return saved
 
     def fetch_processing_job(self, job_id: int) -> ProcessingJob | None:
         row = self._execute("SELECT * FROM processing_jobs WHERE id = ?", (job_id,)).fetchone()
@@ -3496,13 +3704,15 @@ class PokerDatabase:
 
     def fetch_running_jobs(self) -> list[ProcessingJob]:
         rows = self._execute(
-            "SELECT * FROM processing_jobs WHERE status = 'running' ORDER BY created_at, id"
+            "SELECT * FROM processing_jobs WHERE status IN "
+            "('queued', 'running', 'cancelling') ORDER BY created_at, id"
         ).fetchall()
         return [_processing_job_from_row(row) for row in rows]
 
     def fetch_active_jobs(self) -> list[ProcessingJob]:
         rows = self._execute(
-            "SELECT * FROM processing_jobs WHERE status IN ('queued', 'running') "
+            "SELECT * FROM processing_jobs WHERE status IN "
+            "('queued', 'running', 'cancelling') "
             "ORDER BY created_at, id"
         ).fetchall()
         return [_processing_job_from_row(row) for row in rows]
@@ -4160,6 +4370,22 @@ def _migrate_to_v14(db: PokerDatabase) -> None:
     db._ensure_column("videos", "content_sha256", "TEXT NOT NULL DEFAULT ''")
 
 
+def _migrate_to_v15(db: PokerDatabase) -> None:
+    """Persist operator study-inclusion preference per hand.
+
+    MIGRATION IMPACT (schema 14 -> 15)
+
+    Added:
+      - hands.study_inclusion TEXT NOT NULL DEFAULT 'auto'
+
+    Existing hands become ``auto`` (follow derived study readiness). Values are
+    ``auto`` | ``study`` | ``skip``. No hand facts, completion evidence, or
+    review status change. Export/import treat a missing field as ``auto``.
+    """
+
+    db._ensure_column("hands", "study_inclusion", "TEXT NOT NULL DEFAULT 'auto'")
+
+
 # Versioned migrations run in order and refuse databases written by newer apps.
 _MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {
     6: _migrate_to_v6,
@@ -4171,6 +4397,7 @@ _MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {
     12: _migrate_to_v12,
     13: _migrate_to_v13,
     14: _migrate_to_v14,
+    15: _migrate_to_v15,
 }
 
 
@@ -4395,6 +4622,13 @@ def _hand_from_row(row: sqlite3.Row) -> Hand:
         # it back verbatim let a row written through create_hand be reconstructed
         # for study_readiness and exempt for the Study page's own predicate.
         data["completion_status"] = "uncertain"
+    if data.get("study_inclusion") not in get_args(StudyInclusion):
+        # Conservative, like every degradation above it: 'auto' would silently
+        # re-admit a hand the operator excluded, and this reader's contract is
+        # that degradation can only ever ADD study-readiness blockers. 'skip'
+        # emits STUDY_EXCLUDED_BY_OPERATOR, whose clearing action is the Save
+        # control the operator already has.
+        data["study_inclusion"] = "skip"
     _degrade_unreadable_cards(data)
     try:
         hand = Hand(**{**data, "created_at": _parse_datetime(data["created_at"])})

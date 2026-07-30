@@ -140,6 +140,35 @@ def assumption_dependence_input(code: str) -> str:
 # that rests on being entered here.
 IMPORTED_HAND_KEY = "imported_from_payload"
 
+# Where a truncated/incomplete CV draft records that the operator finished the
+# hand by filling blanks themselves. Lives in ``extra`` so it survives
+# export/import. ``finalize_incomplete_hand`` is the only writer allowed to set
+# it, and it is the only path that may clear sticky partial truncation — the
+# claim is no longer "the recording contains the whole hand" but "the operator
+# completed the facts from knowledge/notes".
+OPERATOR_MANUAL_COMPLETION_KEY = "operator_manual_completion"
+
+# The terminal outcome the operator asserted alongside the attestation above.
+OPERATOR_TERMINAL_EVENT_KEY = "operator_terminal_event"
+
+# The attestation pair is earned by an operator acting on an EXISTING hand, so no
+# writer that creates a hand from a payload may carry one in. Only
+# ``finalize_incomplete_hand`` may set them.
+OPERATOR_ATTESTATION_KEYS = frozenset(
+    {OPERATOR_MANUAL_COMPLETION_KEY, OPERATOR_TERMINAL_EVENT_KEY}
+)
+
+
+def strip_operator_attestation(value: object) -> dict[str, object]:
+    """Drop an operator finalize attestation a new hand cannot have earned."""
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): item
+        for key, item in value.items()
+        if str(key) not in OPERATOR_ATTESTATION_KEYS
+    }
+
 
 def is_reconstructed(source_type: object, completion_status: object) -> bool:
     """The one predicate deciding which blockers, controls, and writers apply.
@@ -423,25 +452,57 @@ def _only_assumption_codes(value: object) -> tuple[str, ...]:
     )
 
 
+def has_operator_manual_completion(evidence: CompletionEvidence) -> bool:
+    """True when the operator attested they finished an incomplete CV draft."""
+    return evidence.extra.get(OPERATOR_MANUAL_COMPLETION_KEY) is True
+
+
 def derive_completion_status(
     evidence: CompletionEvidence, *, source_type: str
 ) -> CompletionStatus:
-    """The only promotion path to ``complete``; it can never un-truncate a hand."""
+    """The only promotion path to ``complete``; it can never un-truncate a hand.
+
+    Sticky ``partial`` holds unless ``operator_manual_completion`` is attested:
+    correcting facts does not restore missing footage, but an explicit operator
+    finalize of a draft hand is a different claim (see
+    ``PokerDatabase.finalize_incomplete_hand``). When attested, terminal-event and
+    boundary-confidence gates also accept the operator's claim rather than
+    requiring pipeline observations the recording may not contain.
+    """
     if source_type == "manual":
         return "not_applicable"
     if not evidence.is_known:
         return "uncertain"
-    if evidence.partial_start is True or evidence.partial_end is True:
-        return "partial"  # sticky: no correction can undo truncation
-    if evidence.partial_start is None or evidence.partial_end is None:
+    operator_completed = has_operator_manual_completion(evidence)
+    if (
+        not operator_completed
+        and (evidence.partial_start is True or evidence.partial_end is True)
+    ):
+        return "partial"  # sticky: ordinary correction cannot undo truncation
+    if (
+        not operator_completed
+        and (evidence.partial_start is None or evidence.partial_end is None)
+    ):
         return "uncertain"
-    if evidence.terminal_event not in OBSERVED_TERMINAL_EVENTS:
+    if not operator_completed and evidence.terminal_event not in OBSERVED_TERMINAL_EVENTS:
         # Allow-list, never deny-list: an unrecognised terminal event is not an
         # observed one, whatever produced it. See OBSERVED_TERMINAL_EVENTS.
         return "uncertain"
+    if operator_completed:
+        # Operator terminal may live in extra when the pipeline left terminal
+        # unobserved; accept either channel.
+        op_terminal = evidence.extra.get("operator_terminal_event")
+        if (
+            evidence.terminal_event not in OBSERVED_TERMINAL_EVENTS
+            and op_terminal not in OBSERVED_TERMINAL_EVENTS
+        ):
+            return "uncertain"
     if (
-        evidence.boundary_confidence is None
-        or not 0.0 < evidence.boundary_confidence <= 1.0
+        not operator_completed
+        and (
+            evidence.boundary_confidence is None
+            or not 0.0 < evidence.boundary_confidence <= 1.0
+        )
     ):
         # A presence check alone accepted 0.0, -3.0 and 42.0 as proof that the
         # boundaries were observed. The field is documented as 0.0-1.0; a value

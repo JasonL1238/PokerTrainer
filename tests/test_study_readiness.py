@@ -149,6 +149,7 @@ def _evaluate(hand: Hand, **overrides: Any) -> Any:
 
 
 _SINGLE_BLOCKER_CASES: tuple[tuple[str, dict[str, Any], dict[str, Any]], ...] = (
+    ("STUDY_EXCLUDED_BY_OPERATOR", {"study_inclusion": "skip"}, {}),
     ("COMPLETION_NOT_COMPLETE", {"completion_status": "uncertain"}, {}),
     ("INVALID_HERO_OR_BOARD_CARDS", {"hero_cards": ""}, {}),
     (
@@ -683,6 +684,8 @@ def _build_case(
     call_overrides: dict[str, Any] = {"user_confirmed": True}
     evidence_overrides: dict[str, Any] = {}
 
+    if "STUDY_EXCLUDED_BY_OPERATOR" in codes:
+        hand_overrides["study_inclusion"] = "skip"
     if "COMPLETION_NOT_COMPLETE" in codes:
         hand_overrides["completion_status"] = "uncertain"
     if "UNSUPPORTED_TABLE_LAYOUT" in codes:
@@ -748,6 +751,7 @@ def _expected_reconstructed(codes: frozenset[str]) -> set[str]:
 
 
 _MANUAL_APPLICABLE = {
+    "STUDY_EXCLUDED_BY_OPERATOR",
     "INVALID_HERO_OR_BOARD_CARDS",
     "UNREADABLE_HAND_COLUMNS",
     "ACCOUNTING_NOT_AUTHORITATIVE",

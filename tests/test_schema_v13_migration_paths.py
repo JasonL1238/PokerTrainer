@@ -379,8 +379,9 @@ def test_fresh_schema_declares_completion_columns_last_with_conservative_default
 
     signature = _hands_signature(db)
 
-    assert signature[-2] == ("completion_status", "TEXT", 1, "'not_applicable'")
-    assert signature[-1] == ("completion_evidence", "TEXT", 1, "'{}'")
+    assert signature[-3] == ("completion_status", "TEXT", 1, "'not_applicable'")
+    assert signature[-2] == ("completion_evidence", "TEXT", 1, "'{}'")
+    assert signature[-1] == ("study_inclusion", "TEXT", 1, "'auto'")
     db.close()
 
 

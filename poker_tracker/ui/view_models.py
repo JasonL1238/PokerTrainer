@@ -5,7 +5,11 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from poker_tracker.persistence.completion import BoundaryEvidence, CompletionEvidence
+from poker_tracker.persistence.completion import (
+    BoundaryEvidence,
+    CompletionEvidence,
+    has_operator_manual_completion,
+)
 from poker_tracker.persistence.models import Hand, ProcessingJob, Session, VideoRecord
 
 
@@ -201,6 +205,9 @@ def completion_evidence_rows(
             else f"{evidence.boundary_confidence:g}",
         ),
     ]
+    if has_operator_manual_completion(evidence):
+        op_terminal = evidence.extra.get("operator_terminal_event") or "Not recorded"
+        rows.append(("Operator-finalized", f"Yes · terminal {op_terminal}"))
     span = [
         f"{value:g}s"
         for value in (

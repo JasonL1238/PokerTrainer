@@ -38,6 +38,10 @@ ReviewStatus = Literal["unreviewed", "reviewed", "needs_correction"]
 FrameReviewStatus = Literal["unreviewed", "correct", "incorrect"]
 SourceType = Literal["manual", "cv_import", "corrected_cv"]
 CompletionStatus = Literal["complete", "partial", "uncertain", "not_applicable"]
+# Operator preference for the Study queue. Independent of derived study readiness:
+# ``auto`` follows readiness, ``study`` keeps the hand in the queue for manual fill
+# and coaching once ready, ``skip`` excludes it from study/coaching workflows.
+StudyInclusion = Literal["auto", "study", "skip"]
 ReviewType = Literal["hand", "session"]
 SafetyMode = Literal["post_session_only"]
 CorrectionType = Literal[
@@ -63,7 +67,7 @@ HandIssueType = Literal[
     "coaching",
     "other",
 ]
-JobStatus = Literal["queued", "running", "completed", "failed"]
+JobStatus = Literal["queued", "running", "cancelling", "completed", "failed", "cancelled"]
 JobType = Literal["frame_extraction", "cv_reconstruction"]
 SolverRunStatus = Literal[
     "queued",
@@ -206,6 +210,7 @@ class Hand(PersistedModel):
     # newer producer must survive a round trip instead of being dropped by
     # extra="ignore", and a corrupt blob must never raise into the UI.
     completion_evidence: dict[str, object] = Field(default_factory=dict)
+    study_inclusion: StudyInclusion = "auto"
     # Set only by the READ-TIME display substitution that replaces `hero_bb_won`
     # with the derived ledger result on an authoritative hand, so a writer can
     # refuse an object whose "observation" is actually a derivation. Excluded from

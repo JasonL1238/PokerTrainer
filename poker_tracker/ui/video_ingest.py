@@ -343,7 +343,12 @@ def _require_container_and_codec(path: Path) -> None:
 
 
 def _require_decodable_frames(path: Path, *, frame_count: int | None) -> None:
-    """Decode first/middle/last samples so truncated files fail closed."""
+    """Decode first/middle/near-end samples so truncated files fail closed.
+
+    OpenCV often over-reports frame_count on screen recordings, so the exact
+    last index can fail even when the file is healthy. Near-end sampling walks
+    backward from the claimed end until one frame decodes.
+    """
     import cv2
 
     capture = cv2.VideoCapture(str(path))
@@ -351,20 +356,38 @@ def _require_decodable_frames(path: Path, *, frame_count: int | None) -> None:
         if not capture.isOpened():
             raise ValueError(f"Could not open video: {path}")
         total = int(frame_count or 0)
-        targets = {0}
-        if total > 1:
-            targets.add(max(0, total // 2))
-            targets.add(max(0, total - 1))
-        for index in sorted(targets):
-            if total > 0:
-                capture.set(cv2.CAP_PROP_POS_FRAMES, float(index))
-            ok, frame = capture.read()
-            if not ok or frame is None:
-                raise ValueError(
-                    f"Could not decode frames from video near index {index}: {path}"
-                )
+        if not _read_frame_at(capture, 0, total):
+            raise ValueError(f"Could not decode frames from video near index 0: {path}")
+        if total <= 1:
+            return
+        mid = max(0, total // 2)
+        if not _read_frame_at(capture, mid, total):
+            raise ValueError(
+                f"Could not decode frames from video near index {mid}: {path}"
+            )
+        near_end_candidates = [
+            max(0, total - 1),
+            max(0, total - 2),
+            max(0, total - 30),
+            max(0, total - 300),
+            max(0, int(total * 0.95)),
+        ]
+        if any(_read_frame_at(capture, index, total) for index in near_end_candidates):
+            return
+        raise ValueError(
+            f"Could not decode frames near the end of video: {path}"
+        )
     finally:
         capture.release()
+
+
+def _read_frame_at(capture: object, index: int, total: int) -> bool:
+    import cv2
+
+    if total > 0:
+        capture.set(cv2.CAP_PROP_POS_FRAMES, float(index))  # type: ignore[attr-defined]
+    ok, frame = capture.read()  # type: ignore[attr-defined]
+    return bool(ok) and frame is not None
 
 
 def _cleanup_failed_ingest(path: Path) -> None:

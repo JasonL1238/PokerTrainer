@@ -55,9 +55,11 @@ from poker_tracker.math.study_math import (
     realized_equity,
 )
 from poker_tracker.persistence.completion import (
+    OBSERVED_TERMINAL_EVENTS,
     CompletionEvidence,
     acknowledge_codes,
     dump_completion_evidence,
+    has_operator_manual_completion,
     is_assumption_dependence_code,
     parse_completion_evidence,
 )
@@ -76,6 +78,7 @@ from poker_tracker.persistence.models import (
     Session,
     SettlementEntry,
     SolverRangeProfile,
+    StudyInclusion,
     VideoRecord,
     utc_now,
 )
@@ -139,7 +142,12 @@ from poker_tracker.ui.components import (
     trust_badge,
     workflow_step,
 )
-from poker_tracker.ui.cv_jobs import CVJobAlreadyRunningError, reconcile_stuck_jobs, start_cv_job
+from poker_tracker.ui.cv_jobs import (
+    CVJobAlreadyRunningError,
+    cancel_processing_job,
+    reconcile_stuck_jobs,
+    start_cv_job,
+)
 from poker_tracker.ui.frame_extraction import (
     delete_extracted_frames,
     extract_frames_for_video,
@@ -210,6 +218,13 @@ ACTION_TYPES = [
 ]
 POSITIONS = ["", "UTG", "UTG+1", "LJ", "HJ", "CO", "BTN", "SB", "BB"]
 REVIEW_STATUSES = ["unreviewed", "reviewed", "needs_correction"]
+STUDY_INCLUSION_OPTIONS: list[StudyInclusion] = ["auto", "study", "skip"]
+STUDY_INCLUSION_LABELS = {
+    "auto": "Auto (follow readiness)",
+    "study": "Study hand",
+    "skip": "Non-study hand",
+}
+TERMINAL_EVENT_OPTIONS = sorted(OBSERVED_TERMINAL_EVENTS)
 COACHING_MODES = ["Theory + Exploit", "Theory Only", "Exploit Only", "Leak Finder"]
 HAND_ISSUE_LABELS = {
     "hand_boundary": "Hand boundary / missing hand",
@@ -373,7 +388,10 @@ def guarded_update_hand_status(
 ) -> bool:
     """Single choke point for review-status writes; refuses to promote a blocked hand."""
 
-    if status == "reviewed" and not readiness.is_ready:
+    trust_ready = readiness.is_ready or (
+        readiness.codes() == ("STUDY_EXCLUDED_BY_OPERATOR",)
+    )
+    if status == "reviewed" and not trust_ready:
         st.error(
             "This hand is not study-ready. Clear the blockers listed above before "
             "marking it reviewed."
@@ -398,9 +416,15 @@ def review_status_options(hand: Hand, readiness: StudyReadiness) -> tuple[list[s
     invalidated it -- used to have 'reviewed' re-appended purely because the
     stored value had to appear in the option list. The control then offered, and
     preselected, the one value the page's own blocker list said was false.
+
+    Non-study preference alone does not block archival review: exclusion from
+    coaching is not the same as "this hand's facts are untrustworthy."
     """
+    trust_ready = readiness.is_ready or (
+        readiness.codes() == ("STUDY_EXCLUDED_BY_OPERATOR",)
+    )
     options = [
-        item for item in REVIEW_STATUSES if item != "reviewed" or readiness.is_ready
+        item for item in REVIEW_STATUSES if item != "reviewed" or trust_ready
     ]
     if hand.review_status in options:
         return options, options.index(hand.review_status)
@@ -481,6 +505,10 @@ def study_fix_groups(
     """Group blockers that one user action commonly clears together."""
 
     definitions = {
+        "study_preference": (
+            "Choose study vs non-study",
+            "Fix & confirm → Study inclusion",
+        ),
         "evidence": (
             "Verify the reconstructed hand",
             "Fix & confirm → Correct hand facts / Source warnings",
@@ -1063,17 +1091,50 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
     if not all_hands:
         empty_state("Nothing queued for study", "Import or add a completed hand first.")
         return
-    available_ids = {hand.id for hand in all_hands if hand.id is not None}
+    # Non-study hands stay in the library but drop out of the Study queue.
+    # Marking a hand as Study pins it ahead of Auto hands in navigation.
+    study_queue = [
+        hand for hand in all_hands
+        if hand.id is not None and hand.study_inclusion != "skip"
+    ]
+    if not study_queue:
+        empty_state(
+            "No study hands queued",
+            "Every hand is marked non-study. Change Study inclusion on a hand to reopen it here.",
+        )
+        return
+    available_ids = {hand.id for hand in study_queue}
     requested = st.session_state.get("study_hand_id")
     if requested not in available_ids:
-        session_hands = [hand for hand in all_hands if session and hand.session_id == session.id]
-        requested = (session_hands or all_hands)[0].id
-        _set_study_hand_id(requested)
-    hand = next(item for item in all_hands if item.id == requested)
+        # Keep an explicitly requested non-study hand visible so the operator
+        # can change Study inclusion without the picker silently swapping hands.
+        requested_hand = next((item for item in all_hands if item.id == requested), None)
+        if (
+            requested_hand is not None
+            and requested_hand.study_inclusion == "skip"
+            and requested_hand.id is not None
+        ):
+            study_queue = [requested_hand]
+            available_ids = {requested_hand.id}
+            st.warning(
+                f"Hand #{requested_hand.hand_number} is marked non-study. "
+                "Change Study inclusion below to return it to the queue."
+            )
+        else:
+            session_hands = [
+                hand for hand in study_queue if session and hand.session_id == session.id
+            ]
+            requested = (session_hands or study_queue)[0].id
+            _set_study_hand_id(requested)
+    hand = next(item for item in study_queue if item.id == requested)
     hand_session = next(item for item in sessions if item.id == hand.session_id)
     ordered = sorted(
-        (item for item in all_hands if item.session_id == hand.session_id and item.id is not None),
-        key=lambda item: (item.hand_number, item.id or 0),
+        (item for item in study_queue if item.session_id == hand.session_id),
+        key=lambda item: (
+            0 if item.study_inclusion == "study" else 1,
+            item.hand_number,
+            item.id or 0,
+        ),
     )
 
     actions = db.fetch_actions_by_hand(hand.id)
@@ -1151,7 +1212,12 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
 
 def study_hand_label(hand: Hand) -> str:
     result = "—" if hand.hero_bb_won is None else f"{hand.hero_bb_won:+g} BB"
-    return f"Hand #{hand.hand_number} · {hand.hero_cards or 'Unknown cards'} · {result}"
+    inclusion = STUDY_INCLUSION_LABELS.get(hand.study_inclusion, hand.study_inclusion)
+    completion = hand.completion_status.replace("_", " ")
+    return (
+        f"Hand #{hand.hand_number} · {hand.hero_cards or 'Unknown cards'} · "
+        f"{result} · {completion} · {inclusion}"
+    )
 
 
 def render_study_hand_navigation(
@@ -1520,9 +1586,11 @@ def render_study_fix_and_confirm(
     status_col, tools_col = st.columns([0.9, 1.45], gap="large")
     with status_col:
         st.markdown("#### Confirm the saved hand")
+        show_study_inclusion_controls(db, hand)
         if is_reconstructed:
             show_reconstruction_evidence(hand, completion_evidence)
             show_source_warning_controls(db, hand, completion_evidence)
+            show_finalize_incomplete_hand(db, hand, completion_evidence)
             _offer_frame_validation_link(db, hand)
         if hand_requires_user_confirmation(hand):
             st.checkbox(
@@ -1745,6 +1813,100 @@ def show_hand_issue_controls(
                 else:
                     flash("Debugging issue resolved.")
                     st.rerun()
+
+
+def show_study_inclusion_controls(db: PokerDatabase, hand: Hand) -> None:
+    """Let the operator mark any hand as study or non-study."""
+    if hand.id is None:
+        return
+    with st.expander("Study inclusion", expanded=hand.study_inclusion != "auto"):
+        st.caption(
+            "Study keeps this hand in the study queue. Non-study excludes it from "
+            "coaching. Auto follows the usual readiness checks."
+        )
+        current = hand.study_inclusion if hand.study_inclusion in STUDY_INCLUSION_OPTIONS else "auto"
+        choice = st.radio(
+            "Include in study?",
+            STUDY_INCLUSION_OPTIONS,
+            index=STUDY_INCLUSION_OPTIONS.index(current),
+            format_func=lambda value: STUDY_INCLUSION_LABELS[value],
+            key=f"study_inclusion_{hand.id}",
+            horizontal=True,
+        )
+        if st.button("Save study inclusion", key=f"save_study_inclusion_{hand.id}"):
+            try:
+                db.update_study_inclusion(hand.id, choice)
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                flash(f"Study inclusion set to {STUDY_INCLUSION_LABELS[choice]}.")
+                st.rerun()
+
+
+def show_finalize_incomplete_hand(
+    db: PokerDatabase, hand: Hand, evidence: CompletionEvidence
+) -> None:
+    """Allow the operator to complete an incomplete/partial CV draft by hand."""
+    if hand.id is None:
+        return
+    if hand.source_type == "manual" and hand.completion_status == "not_applicable":
+        return
+    if has_operator_manual_completion(evidence) and hand.completion_status == "complete":
+        st.caption("This draft was finalized by operator attestation.")
+        return
+    if hand.completion_status not in {"partial", "uncertain"}:
+        return
+    with st.expander("Finalize incomplete hand", expanded=True):
+        st.caption(
+            "Incomplete CV segments import as draft hands under this session. "
+            "Fill blanks in Correct hand facts (hero cards required), then attest "
+            "the terminal outcome. Preflop folds are valid study hands."
+        )
+        if not (hand.hero_cards or "").strip():
+            st.warning("Fill in hero cards before finalizing.")
+        default_terminal = (
+            evidence.terminal_event
+            if evidence.terminal_event in TERMINAL_EVENT_OPTIONS
+            else "hero_fold"
+        )
+        terminal = st.selectbox(
+            "How did this hand end?",
+            TERMINAL_EVENT_OPTIONS,
+            index=TERMINAL_EVENT_OPTIONS.index(default_terminal),
+            format_func=lambda value: value.replace("_", " ").title(),
+            key=f"finalize_terminal_{hand.id}",
+        )
+        notes = st.text_input(
+            "Finalize notes (optional)",
+            key=f"finalize_notes_{hand.id}",
+            placeholder="Example: folded preflop after reviewing the video",
+        )
+        if st.button(
+            "Mark complete from my fill-in",
+            key=f"finalize_incomplete_{hand.id}",
+            type="primary",
+            disabled=not (hand.hero_cards or "").strip(),
+        ):
+            try:
+                finalized = db.finalize_incomplete_hand(
+                    hand.id,
+                    terminal_event=terminal,
+                    notes=notes,
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+            else:
+                if finalized.completion_status == "complete":
+                    flash(
+                        "Incomplete hand finalized as complete. Confirm evidence "
+                        "and mark reviewed when ready."
+                    )
+                else:
+                    flash(
+                        f"Finalize saved (status: {finalized.completion_status}). "
+                        "Clear remaining blockers under Fix & confirm before study."
+                    )
+                st.rerun()
 
 
 def show_hand_fact_editor(db: PokerDatabase, hand: Hand) -> None:
@@ -1992,6 +2154,8 @@ def show_study_coach_review(
         st.code(prompt, language="text")
     if readiness.has("OPEN_DEBUGGING_ISSUE"):
         st.warning("Resolve the open debugging issue before generating coaching.")
+    if readiness.has("STUDY_EXCLUDED_BY_OPERATOR"):
+        st.warning("This hand is marked non-study; coaching is disabled.")
     if st.button(
         "Generate and save corrected-hand coaching",
         key=f"study_rerun_coaching_{hand.id}",
@@ -1999,6 +2163,7 @@ def show_study_coach_review(
             provider is None
             or not is_authoritative
             or readiness.has("OPEN_DEBUGGING_ISSUE")
+            or readiness.has("STUDY_EXCLUDED_BY_OPERATOR")
         ),
         width="stretch",
     ):
@@ -2149,6 +2314,8 @@ def show_solver_review(
                 language="bash",
             )
             st.caption("You can verify this later in Settings → Solver.")
+    if readiness.has("STUDY_EXCLUDED_BY_OPERATOR"):
+        st.warning("This hand is marked non-study; solver analysis is disabled.")
     if st.button(
         "Run TexasSolver analysis",
         key=f"solver_analyze_{hand.id}",
@@ -2157,7 +2324,8 @@ def show_solver_review(
         disabled=bool(range_errors)
         or oop_range is None
         or ip_range is None
-        or not binary_ready,
+        or not binary_ready
+        or readiness.has("STUDY_EXCLUDED_BY_OPERATOR"),
     ):
         try:
             run = start_solver_job(
@@ -2408,6 +2576,8 @@ def _show_solver_runs(
         st.warning(str(exc))
     if readiness.has("OPEN_DEBUGGING_ISSUE"):
         st.warning("Resolve the open debugging issue before explaining this solver result.")
+    if readiness.has("STUDY_EXCLUDED_BY_OPERATOR"):
+        st.warning("This hand is marked non-study; solver explanation is disabled.")
     if st.button(
         "Explain solver result with AI",
         key=f"solver_explain_{latest.id}",
@@ -2415,6 +2585,7 @@ def _show_solver_runs(
             provider is None
             or not _accounting_is_established(hand, accounting)
             or readiness.has("OPEN_DEBUGGING_ISSUE")
+            or readiness.has("STUDY_EXCLUDED_BY_OPERATOR")
         ),
         width="stretch",
     ):
@@ -2912,6 +3083,7 @@ def show_insights_workspace(db: PokerDatabase) -> None:
                 hand
                 for hand in hands
                 if hand.id is not None
+                and hand.study_inclusion != "skip"
                 and not hand_study_readiness(
                     db,
                     hand,
@@ -3270,6 +3442,10 @@ def render_hand_results(
             continue
         session = sessions_by_id[item.session_id]
         result = "Result unknown" if item.hero_bb_won is None else f"{item.hero_bb_won:+g} BB"
+        completion_label = item.completion_status.replace("_", " ").title()
+        study_label = STUDY_INCLUSION_LABELS.get(
+            item.study_inclusion, item.study_inclusion
+        )
         with st.container(border=True, key=f"{key_prefix}_hand_{item.id}"):
             summary, action = st.columns([6, 1])
             with summary:
@@ -3281,6 +3457,7 @@ def render_hand_results(
                     f"{session.name} · {session.date_played.isoformat()} · "
                     f"{item.hero_position or 'Position unknown'} · "
                     f"{item.review_status.replace('_', ' ').title()} · "
+                    f"{completion_label} · {study_label} · "
                     f"{', '.join(item.tags) or 'No tags'}"
                 )
             if action.button(
@@ -3291,6 +3468,33 @@ def render_hand_results(
             ):
                 _open_hand_for_study(item)
                 st.rerun()
+            with st.expander("Study inclusion"):
+                study_choice = st.radio(
+                    "Include in study?",
+                    STUDY_INCLUSION_OPTIONS,
+                    index=STUDY_INCLUSION_OPTIONS.index(
+                        item.study_inclusion
+                        if item.study_inclusion in STUDY_INCLUSION_OPTIONS
+                        else "auto"
+                    ),
+                    format_func=lambda value: STUDY_INCLUSION_LABELS[value],
+                    key=f"{key_prefix}_study_inclusion_{item.id}",
+                    horizontal=True,
+                )
+                if st.button(
+                    "Save study inclusion",
+                    key=f"{key_prefix}_save_study_inclusion_{item.id}",
+                ):
+                    try:
+                        db.update_study_inclusion(item.id, study_choice)
+                    except ValueError as exc:
+                        st.error(str(exc))
+                    else:
+                        flash(
+                            f"Hand #{item.hand_number}: "
+                            f"{STUDY_INCLUSION_LABELS[study_choice]}."
+                        )
+                        st.rerun()
             # The control NEW_RECONSTRUCTION_STEPS depends on: comparing a
             # blocked hand against its rebuilt copy ends with deleting one of
             # them, and this row is the session's hand list where that happens.
@@ -5152,6 +5356,7 @@ def show_hand_coach_review(
             not _accounting_is_established(hand, accounting)
             or readiness.has("OPEN_DEBUGGING_ISSUE")
             or readiness.has("ACCOUNTING_ASSUMPTION_DEPENDENT")
+            or readiness.has("STUDY_EXCLUDED_BY_OPERATOR")
         ),
     ):
         try:
@@ -5191,8 +5396,20 @@ def show_session_coach_review(
     provider,
     coaching_mode: str,
 ) -> None:
-    stats = compute_session_stats(db, session.id)
-    selected_hands = select_session_review_hands(hands)
+    study_hands = [
+        hand
+        for hand in hands
+        if hand.study_inclusion != "skip"
+        and hand.completion_status in {"complete", "not_applicable"}
+    ]
+    if not study_hands:
+        st.warning(
+            "No complete study hands in this session yet. Finalize incomplete drafts "
+            "or change Study inclusion before generating session coaching."
+        )
+        return
+    stats = compute_session_stats(db, session.id, hands=study_hands)
+    selected_hands = select_session_review_hands(study_hands)
     histories = [
         _format_persisted_hand_history(db, session, hand)
         for hand in selected_hands
@@ -5201,6 +5418,22 @@ def show_session_coach_review(
     st.caption(
         f"Selected hands: {', '.join(f'#{hand.hand_number}' for hand in selected_hands) or 'none'}"
     )
+    excluded_notes: list[str] = []
+    skipped = sum(1 for hand in hands if hand.study_inclusion == "skip")
+    if skipped:
+        excluded_notes.append(f"{skipped} non-study")
+    drafts = sum(
+        1
+        for hand in hands
+        if hand.study_inclusion != "skip"
+        and hand.completion_status not in {"complete", "not_applicable"}
+    )
+    if drafts:
+        excluded_notes.append(f"{drafts} incomplete draft")
+    if excluded_notes:
+        st.caption(
+            "Excluded " + " and ".join(excluded_notes) + " hand(s) from session coaching."
+        )
     prompt = build_session_review_prompt(
         session,
         stats,
@@ -5478,13 +5711,25 @@ def show_cv_reconstruction(db: PokerDatabase, video: VideoRecord) -> None:
     latest_jobs = [
         job for job in db.fetch_jobs_by_video(video.id) if job.job_type == "cv_reconstruction"
     ]
-    active = next((job for job in latest_jobs if job.status in {"queued", "running"}), None)
-    if st.button(
-        "Run CV reconstruction",
-        type="primary",
-        disabled=active is not None,
-        key=f"cv_start_{video.id}",
-    ):
+    active = next(
+        (job for job in latest_jobs if job.status in {"queued", "running", "cancelling"}),
+        None,
+    )
+    start_col, cancel_col = st.columns([3, 1])
+    with start_col:
+        start_clicked = st.button(
+            "Run CV reconstruction",
+            type="primary",
+            disabled=active is not None,
+            key=f"cv_start_{video.id}",
+        )
+    with cancel_col:
+        cancel_clicked = st.button(
+            "Cancel",
+            disabled=active is None,
+            key=f"cv_cancel_{video.id}",
+        )
+    if start_clicked:
         try:
             started = start_cv_job(
                 db,
@@ -5497,13 +5742,31 @@ def show_cv_reconstruction(db: PokerDatabase, video: VideoRecord) -> None:
             st.rerun()
         except (CVJobAlreadyRunningError, ValueError, RuntimeError) as exc:
             st.error(str(exc))
+    if cancel_clicked and active is not None and active.id is not None:
+        try:
+            cancelled = cancel_processing_job(db, active.id)
+            if cancelled.status == "cancelled":
+                flash(f"Cancelled reconstruction job #{cancelled.id}.")
+            elif cancelled.status == "cancelling":
+                flash(
+                    f"Cancellation requested for job #{cancelled.id}; "
+                    "waiting for the worker to stop."
+                )
+            else:
+                flash(
+                    f"Reconstruction job #{cancelled.id} already finished "
+                    f"as {cancelled.status}."
+                )
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
 
     latest_jobs = [
         job for job in db.fetch_jobs_by_video(video.id) if job.job_type == "cv_reconstruction"
     ]
     if latest_jobs:
         latest = latest_jobs[0]
-        if latest.status in {"queued", "running"}:
+        if latest.status in {"queued", "running", "cancelling"}:
             _show_live_cv_job_status(db, video.id)
         else:
             _render_cv_job_status(latest)
@@ -5540,7 +5803,7 @@ def _show_live_cv_job_status(db: PokerDatabase, video_id: int) -> None:
         st.info("Waiting for the reconstruction worker to start.")
         return
     latest = latest_jobs[0]
-    if latest.status not in {"queued", "running"}:
+    if latest.status not in {"queued", "running", "cancelling"}:
         st.rerun()
     _render_cv_job_status(latest)
     st.caption("Updating automatically — you can leave this page open.")

@@ -8,6 +8,7 @@ from typing import Any
 from poker_tracker.persistence.completion import (
     DERIVED_EVIDENCE_KEYS,
     IMPORTED_HAND_KEY,
+    OPERATOR_MANUAL_COMPLETION_KEY,
     derive_completion_status,
     parse_completion_evidence,
     strip_derived_evidence_markers,
@@ -478,6 +479,14 @@ def _apply_completion_import_defaults(hand_data: dict[str, Any]) -> None:
     # re-measured from the chips on every read -- simply reappears until they do.
     if "confirmed_assumption_codes" in evidence:
         evidence["confirmed_assumption_codes"] = []
+    # Operator finalize attestation is the same class of statement: it says THIS
+    # operator completed a truncated draft. A payload must not carry that claim
+    # into a foreign database and launder sticky partial into complete.
+    evidence.pop(OPERATOR_MANUAL_COMPLETION_KEY, None)
+    evidence.pop("operator_terminal_event", None)
+    # Study inclusion is a local operator preference, not a transferable fact.
+    # Reset to auto so a forged "skip"/"study" is not attributed to the importer.
+    hand_data["study_inclusion"] = "auto"
     # Stamped on every imported hand, whatever it declares its source_type to be.
     # The manual exemption is the argument "you entered this hand yourself, so a
     # declared ante or rake is your own observation", and that argument is false

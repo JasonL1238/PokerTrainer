@@ -12,15 +12,21 @@ from pathlib import Path
 
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import ProcessingJob
-from poker_tracker.ui.jobs import mark_failed
+from poker_tracker.ui.jobs import mark_cancelled, mark_failed
 from poker_tracker.ui.video_ingest import (
     assert_stored_video_matches_record,
     require_playable_video,
     resolve_stored_video_path,
 )
-from poker_tracker.ui.video_storage import JOB_LOGS_DIR, VIDEOS_DIR, ensure_data_directories
+from poker_tracker.ui.video_storage import (
+    CV_TIMELINES_DIR,
+    JOB_LOGS_DIR,
+    VIDEOS_DIR,
+    ensure_data_directories,
+)
 
 DEFAULT_STALE_AFTER = timedelta(minutes=15)
+_LIVE_STATUSES = frozenset({"queued", "running", "cancelling"})
 
 
 class CVJobAlreadyRunningError(RuntimeError):
@@ -114,8 +120,9 @@ def start_cv_job(
         raise RuntimeError("Could not start the reconstruction worker.") from exc
 
     now = _now()
-    db.update_processing_job(
+    saved = db.update_processing_job(
         job.id,
+        expected_statuses=("queued",),
         status="running",
         pid=process.pid,
         heartbeat_at=now,
@@ -123,10 +130,63 @@ def start_cv_job(
         progress_percent=1,
         message="Worker started",
     )
-    saved = db.fetch_processing_job(job.id)
-    if saved is None:
+    if saved.status != "running" or saved.pid != process.pid:
+        _terminate_job_group(process.pid)
+        _terminate_pipeline_sidecar(job.id)
+        refreshed = db.fetch_processing_job(job.id)
+        if refreshed is not None and refreshed.status in {"cancelling", "cancelled"}:
+            if refreshed.status == "cancelling":
+                return mark_cancelled(
+                    db,
+                    job.id,
+                    "Cancelled while the reconstruction worker was launching.",
+                )
+            return refreshed
+        raise ValueError(
+            "The reconstruction job changed while the worker was launching; "
+            "the worker was stopped."
+        )
+    refreshed = db.fetch_processing_job(job.id)
+    if refreshed is None:
         raise RuntimeError("The launched processing job could not be reloaded.")
-    return saved
+    if refreshed.status in {"cancelling", "cancelled"}:
+        _terminate_job_group(process.pid)
+        _terminate_pipeline_sidecar(job.id)
+        if refreshed.status == "cancelling":
+            return mark_cancelled(
+                db,
+                job.id,
+                "Cancelled while the reconstruction worker was launching.",
+            )
+        return refreshed
+    return refreshed
+
+
+def cancel_processing_job(db: PokerDatabase, job_id: int) -> ProcessingJob:
+    """Request cancellation of one active CV/processing job."""
+    job = db.fetch_processing_job(job_id)
+    if job is None:
+        raise ValueError("Processing job not found.")
+    if job.status not in _LIVE_STATUSES:
+        return job
+    _terminate_pipeline_sidecar(job_id)
+    if job.pid and not _terminate_job_group(job.pid):
+        return db.update_processing_job(
+            job_id,
+            expected_statuses=("queued", "running", "cancelling"),
+            status="cancelling",
+            message="Cancelling",
+            error_message="Cancellation requested; waiting for the worker to stop.",
+        )
+    return db.update_processing_job(
+        job_id,
+        expected_statuses=("queued", "running", "cancelling"),
+        status="cancelled",
+        message="Cancelled",
+        error_message="Cancelled by user.",
+        clear_pid=True,
+        completed_at=_now(),
+    )
 
 
 def reconcile_stuck_jobs(
@@ -135,25 +195,59 @@ def reconcile_stuck_jobs(
     stale_after: timedelta = DEFAULT_STALE_AFTER,
     now: datetime | None = None,
 ) -> list[int]:
-    """Fail running jobs whose worker is gone or heartbeat has expired."""
+    """Fail or finalize jobs whose worker is gone or heartbeat has expired."""
     current = now or _now()
     reconciled: list[int] = []
-    for job in db.fetch_running_jobs():
+    for job in db.fetch_active_jobs():
         if job.id is None:
             continue
         reference = job.heartbeat_at or job.started_at or job.created_at
         stale = current - _as_utc(reference) > stale_after
-        dead = job.pid is None or not _pid_is_alive(job.pid)
-        if stale and not dead and not _terminate_job_group(job.pid):
+        alive = _pid_is_alive(job.pid)
+        if job.status == "queued" and not stale:
             continue
-        if dead or stale:
-            reason = "worker process is no longer running" if dead else "worker heartbeat expired"
-            mark_failed(db, job.id, f"Orphaned after restart: {reason}.")
+        if not stale and alive:
+            continue
+        if job.status == "cancelling":
+            if alive and not _terminate_job_group(job.pid):
+                continue
+            mark_cancelled(
+                db,
+                job.id,
+                "Cancelled after the reconstruction worker stopped.",
+            )
             reconciled.append(job.id)
+            continue
+        if stale and alive and not _terminate_job_group(job.pid):
+            continue
+        reason = (
+            "worker process is no longer running"
+            if not alive
+            else "worker heartbeat expired"
+        )
+        mark_failed(db, job.id, f"Orphaned after restart: {reason}.")
+        reconciled.append(job.id)
     return reconciled
 
 
-def _pid_is_alive(pid: int) -> bool:
+def _terminate_pipeline_sidecar(job_id: int) -> None:
+    """Kill a detached pipeline child recorded next to the progress snapshot."""
+    pid_path = CV_TIMELINES_DIR / f"job_{job_id}_pipeline.pid"
+    try:
+        raw = pid_path.read_text(encoding="utf-8").strip()
+        pipeline_pid = int(raw)
+    except (OSError, ValueError):
+        return
+    _terminate_job_group(pipeline_pid)
+    try:
+        pid_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _pid_is_alive(pid: int | None) -> bool:
+    if pid is None:
+        return False
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -164,6 +258,7 @@ def _pid_is_alive(pid: int) -> bool:
 
 
 def _terminate_job_group(pid: int | None) -> bool:
+    """Send TERM/KILL to a process group; True only when the PID is gone."""
     if pid is None:
         return True
     try:
@@ -177,7 +272,7 @@ def _terminate_job_group(pid: int | None) -> bool:
             return False
     except PermissionError:
         return False
-    deadline = time.monotonic() + 0.5
+    deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
         if not _pid_is_alive(pid):
             return True
@@ -188,12 +283,17 @@ def _terminate_job_group(pid: int | None) -> bool:
         try:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
-            pass
+            return not _pid_is_alive(pid)
         except PermissionError:
             return False
     except PermissionError:
         return False
-    return True
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if not _pid_is_alive(pid):
+            return True
+        time.sleep(0.05)
+    return not _pid_is_alive(pid)
 
 
 def _as_utc(value: datetime) -> datetime:

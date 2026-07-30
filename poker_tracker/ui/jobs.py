@@ -29,22 +29,42 @@ def update_progress(db: PokerDatabase, job_id: int, progress_percent: float, mes
     )
 
 
-def mark_completed(db: PokerDatabase, job_id: int, message: str = "Completed") -> None:
-    db.update_processing_job(
+def mark_completed(db: PokerDatabase, job_id: int, message: str = "Completed") -> ProcessingJob:
+    return db.update_processing_job(
         job_id,
+        expected_statuses=("running",),
         status="completed",
         progress_percent=100,
         message=message,
+        clear_pid=True,
         completed_at=_now(),
     )
 
 
-def mark_failed(db: PokerDatabase, job_id: int, error_message: str) -> None:
-    db.update_processing_job(
+def mark_failed(db: PokerDatabase, job_id: int, error_message: str) -> ProcessingJob:
+    return db.update_processing_job(
         job_id,
+        expected_statuses=("queued", "running", "cancelling"),
         status="failed",
         message="Failed",
         error_message=error_message,
+        clear_pid=True,
+        completed_at=_now(),
+    )
+
+
+def mark_cancelled(
+    db: PokerDatabase,
+    job_id: int,
+    error_message: str = "Cancelled by user.",
+) -> ProcessingJob:
+    return db.update_processing_job(
+        job_id,
+        expected_statuses=("queued", "running", "cancelling"),
+        status="cancelled",
+        message="Cancelled",
+        error_message=error_message,
+        clear_pid=True,
         completed_at=_now(),
     )
 

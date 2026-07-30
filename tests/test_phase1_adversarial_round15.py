@@ -499,6 +499,7 @@ _RAW_COLUMN_PREDICATES = {
     # Live-run bookkeeping owned by the job worker: 'is a background process still
     # holding this row?' is a question about the column, not about study evidence.
     ("poker_tracker/persistence/db.py", "update_solver_run"),
+    ("poker_tracker/persistence/db.py", "update_processing_job"),
     ("poker_tracker/persistence/db.py", "fetch_active_solver_runs"),
     ("poker_tracker/persistence/db.py", "fetch_running_jobs"),
     ("poker_tracker/persistence/db.py", "fetch_active_jobs"),

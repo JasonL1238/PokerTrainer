@@ -55,8 +55,9 @@ As of July 28, 2026, the repository contains:
   Insights, Import, and Settings;
 - SQLite persistence for sessions, hands, players, actions, settlements,
   coaching, corrections, issues, videos, processing jobs, extracted frames,
-  ROI profiles, review evidence, range profiles, solver runs, and explicit hand
-  completion status plus its versioned reconstruction evidence (schema 13);
+  ROI profiles, review evidence, range profiles, solver runs, explicit hand
+  completion status plus its versioned reconstruction evidence, and per-hand
+  study inclusion preference (schema 15);
 - schema migration protection, WAL operation, JSON import/export version 5,
   pinned pre-migration and rotating pre-import backups, and a read-only
   data-health/restore audit;
@@ -792,6 +793,7 @@ Blockers are emitted, and categories rendered, in this order:
 
 | Code | Category | Applies to |
 | --- | --- | --- |
+| `STUDY_EXCLUDED_BY_OPERATOR` | study_preference | all hands |
 | `COMPLETION_NOT_COMPLETE` | completion | reconstructed hands |
 | `COMPLETION_EVIDENCE_MISSING` | completion | reconstructed hands |
 | `INVALID_HERO_OR_BOARD_CARDS` | cards | all hands |
@@ -806,9 +808,10 @@ Blockers are emitted, and categories rendered, in this order:
 | `USER_CONFIRMATION_MISSING` | confirmation | reconstructed and imported hands |
 
 A manual hand (`source_type == "manual"` and `completion_status ==
-"not_applicable"`) can only ever emit the cards, `UNREADABLE_HAND_COLUMNS`,
-`ACCOUNTING_NOT_AUTHORITATIVE`, issue, coaching, and solver blockers, so the
-pre-Phase-1 manual workflow is unchanged — with two qualifications, and they are the two blockers scoped on
+"not_applicable"`) can only ever emit the study-preference, cards,
+`UNREADABLE_HAND_COLUMNS`, `ACCOUNTING_NOT_AUTHORITATIVE`, issue, coaching, and
+solver blockers, so the pre-Phase-1 manual workflow is unchanged — with two
+qualifications, and they are the two blockers scoped on
 "entered here" rather than on the pair. `ACCOUNTING_ASSUMPTION_DEPENDENT` is
 scoped by `requires_assumption_attestation`: a hand this operator entered *in
 this database* is exempt, because a declared ante or rake is that operator's own
@@ -2536,6 +2539,11 @@ Newly discovered release blockers, none of them closed:
 - Prevent adjacent physical hands being merged.
 - Exclude next-hand blinds/antes and auto top-ups from prior settlement.
 - Retain incomplete segments for review but never export them as complete.
+  App CV jobs import incomplete hero-preflop segments as ``partial`` /
+  ``uncertain`` draft hands under the session so the operator can fill blanks
+  and finalize them; hands where hero never played preflop are skipped.
+  Completeness still requires ``derive_completion_status`` (or an explicit
+  operator finalize attestation) — incomplete never lands as ``complete``.
 - Make completed/partial classification a separately scored output.
 
 ### Action reconstruction

@@ -24,6 +24,7 @@ from cv_lab.scripts.eval.validate_yolo_card_timeline import (  # noqa: E402
     WARNING_SEVERITY,
     validate_timeline,
 )
+from poker_tracker.math.cards import CardParseError, parse_visible_cards  # noqa: E402
 from poker_tracker.persistence.completion import (  # noqa: E402
     EVIDENCE_SCHEMA_VERSION,
     BoundaryEvidence,
@@ -38,6 +39,17 @@ from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session  
 DEFAULT_TIMELINE = "cv_lab/results/yolo_card_timeline_card_changes_v1.json"
 DEFAULT_OUT = "cv_lab/results/yolo_card_hands_draft_session.json"
 VALID_BOARD_COUNTS = {0, 3, 4, 5}
+# Validator codes that mean "cards are incomplete/invalid" rather than "the
+# reconstruction is wrong". When include_incomplete is set, these alone must not
+# block draft import — soft blanking + operator fill-in is the recovery path.
+DRAFT_CARD_WARNING_CODES = frozenset(
+    {
+        "invalid_hero_count",
+        "invalid_board_count",
+        "hero_cards_not_two",
+        "duplicate_visible_cards",
+    }
+)
 HAND_CORRECTION_FIELDS = ["hand_number", "hero_cards", "board_cards", "action", "notes"]
 
 
@@ -538,6 +550,79 @@ def _assert_actions_reference_players(
         )
 
 
+def hero_participated_preflop(hand: dict[str, Any]) -> bool:
+    """True when hero was dealt in or acted preflop (fold counts as playing).
+
+    Sit-outs and segments with no hero cards and no hero preflop action are
+    excluded: there is nothing to study about hero's preflop decision. A preflop
+    fold after observing cards is included — coaching can still target that fold.
+    Incomplete OCR (1 or 3+ detected hole cards) still counts as dealt-in so
+    the draft can land for the operator to fill blanks.
+    """
+    if len(hand.get("hero") or []) >= 1:
+        return True
+    if hand.get("hero_folded"):
+        return True
+    hero_seats = {
+        int(player["seat"])
+        for player in (hand.get("players") or [])
+        if player.get("is_hero") and player.get("seat") is not None
+    }
+    if not hero_seats:
+        hero_seats = {0}
+    for action in hand.get("actions") or []:
+        seat = action.get("seat")
+        if seat is None or int(seat) not in hero_seats:
+            continue
+        street = action.get("street")
+        if street is None:
+            continue
+        if street != "preflop":
+            continue
+        if action.get("action_type") in {
+            "fold",
+            "check",
+            "call",
+            "bet",
+            "raise",
+            "all-in",
+            "post_blind",
+        }:
+            return True
+    return False
+
+
+def _soft_card_fields_for_draft(
+    hand: dict[str, Any],
+) -> tuple[str, str]:
+    """Return app-format hero/board cards, blanking fields the Hand model refuses.
+
+    Incomplete drafts must still land so the operator can fill blanks. Invalid
+    counts or duplicate visible cards would raise ValidationError and skip the
+    whole hand — blanking the offending field keeps the draft importable.
+    """
+    hero_raw = list(hand.get("hero") or [])
+    board_raw = list(hand.get("board") or [])
+    hero_cards = _cards_to_app(hero_raw) if len(hero_raw) in {0, 2} else ""
+    board_cards = (
+        _cards_to_app(board_raw) if len(board_raw) in VALID_BOARD_COUNTS else ""
+    )
+    if hero_cards:
+        hero_tokens = hero_cards.split()
+        if len(set(hero_tokens)) != len(hero_tokens):
+            hero_cards = ""
+    if board_cards:
+        board_tokens = board_cards.split()
+        if len(set(board_tokens)) != len(board_tokens):
+            board_cards = ""
+    if hero_cards and board_cards:
+        try:
+            parse_visible_cards(hero_cards, board_cards)
+        except CardParseError:
+            board_cards = ""
+    return hero_cards, board_cards
+
+
 def hand_to_import_payload(
     hand: dict[str, Any],
     *,
@@ -549,11 +634,12 @@ def hand_to_import_payload(
     followed_by_hand: bool = False,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    hero_cards = _cards_to_app(hand.get("hero"))
-    board_cards = _cards_to_app(hand.get("board"))
     board_count = len(hand.get("board") or [])
 
     if hand.get("drop_from_export"):
+        return None
+
+    if not hero_participated_preflop(hand):
         return None
 
     if not include_incomplete:
@@ -561,7 +647,10 @@ def hand_to_import_payload(
             return None
         if len(hand.get("hero") or []) != 2 or board_count not in VALID_BOARD_COUNTS:
             return None
-
+        hero_cards = _cards_to_app(hand.get("hero"))
+        board_cards = _cards_to_app(hand.get("board"))
+    else:
+        hero_cards, board_cards = _soft_card_fields_for_draft(hand)
     partial_start, partial_end, terminal_event = _boundary_flags(
         hand, preceded_by_hand=preceded_by_hand, followed_by_hand=followed_by_hand,
     )
@@ -671,9 +760,14 @@ def timeline_to_session_payload(
         validation = validation_by_hand.get(hand.get("hand_number"))
         codes = sorted({w.get("code") for w in (validation or {}).get("warnings", [])
                         if w.get("code")})
+        blocking_codes = set(codes)
+        if include_incomplete:
+            # Card-shape warnings are draft-repairable; keep them in validation_codes
+            # so they still land in warning_codes / confidence, but do not gate import.
+            blocking_codes -= DRAFT_CARD_WARNING_CODES
         if (
             validation
-            and validation.get("warning_count", 0) > 0
+            and blocking_codes
             and not allow_validation_warnings
             and not manual_corrected
         ):
@@ -682,10 +776,10 @@ def timeline_to_session_payload(
                 "reason": "validation_warnings",
                 # Name the codes: "3 validation warnings" alone gave an operator
                 # no way to tell a rejected side pot from a board regression.
-                "codes": codes,
+                "codes": sorted(blocking_codes),
                 "detail": (
-                    f"{validation['warning_count']} validation warnings "
-                    f"({', '.join(codes) or 'unspecified'}); "
+                    f"{len(blocking_codes)} validation warnings "
+                    f"({', '.join(sorted(blocking_codes)) or 'unspecified'}); "
                     "use --allow-validation-warnings to export anyway."
                 ),
             })
@@ -712,10 +806,22 @@ def timeline_to_session_payload(
             })
             continue
         if payload is None:
+            if hand.get("drop_from_export"):
+                reason = "dropped"
+                detail = "Hand was marked drop_from_export."
+            elif not hero_participated_preflop(hand):
+                reason = "hero_did_not_play_preflop"
+                detail = "Hero was not dealt in and took no preflop action."
+            else:
+                reason = "incomplete_or_invalid_cards"
+                detail = (
+                    "Use --include-incomplete to export needs-correction drafts "
+                    "when model validation allows it."
+                )
             skipped.append({
                 "timeline_hand_number": hand.get("hand_number"),
-                "reason": "incomplete_or_invalid_cards",
-                "detail": "Use --include-incomplete to export needs-correction drafts when model validation allows it.",
+                "reason": reason,
+                "detail": detail,
             })
             continue
         hands.append(payload)

@@ -1322,6 +1322,7 @@ def test_the_assumption_blocker_carries_the_measurement_it_names(
 def test_the_blocker_order_matches_the_documented_table() -> None:
     """PLAN.md publishes this order; a silent reshuffle changes what an operator reads first."""
     assert BLOCKER_ORDER == (
+        "STUDY_EXCLUDED_BY_OPERATOR",
         "COMPLETION_NOT_COMPLETE",
         "COMPLETION_EVIDENCE_MISSING",
         "INVALID_HERO_OR_BOARD_CARDS",

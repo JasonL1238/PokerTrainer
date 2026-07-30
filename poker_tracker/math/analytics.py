@@ -37,9 +37,18 @@ class SessionStats:
     observed_result_count: int = 0
 
 
-def compute_session_stats(db: PokerDatabase, session_id: int) -> SessionStats:
-    """Compute basic/manual session stats from stored hands and actions."""
-    hands = db.fetch_hands_by_session(session_id)
+def compute_session_stats(
+    db: PokerDatabase,
+    session_id: int,
+    hands: list[Hand] | None = None,
+) -> SessionStats:
+    """Compute basic/manual session stats from stored hands and actions.
+
+    When ``hands`` is provided, stats are computed from that list instead of
+    every hand in the session (used to exclude non-study hands from coaching).
+    """
+    if hands is None:
+        hands = db.fetch_hands_by_session(session_id)
     # Only hands with a recorded result count toward result stats; treating a
     # missing result as 0 BB would deflate the averages.
     result_hands: list[Hand] = []
