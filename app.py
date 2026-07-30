@@ -445,6 +445,19 @@ def render_study_readiness(readiness: StudyReadiness) -> None:
                 st.caption(f"· {item}")
 
 
+def render_study_workflow(readiness: StudyReadiness) -> None:
+    """Give the tabbed Study workspace one short, plain-language status."""
+
+    with st.container(key="study_workflow_guide"):
+        st.markdown("#### Start with Replay, then fix, then analyze")
+        state = (
+            "Ready to analyze"
+            if readiness.is_ready
+            else f"{len(readiness.blockers)} item(s) to fix"
+        )
+        st.caption(f"Only one part of the workflow is shown at a time · {state}.")
+
+
 def show_reconstruction_evidence(hand: Hand, evidence: CompletionEvidence) -> None:
     """Draw the evidence the confirmation checkbox asks the operator to attest to.
 
@@ -1021,236 +1034,362 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
         user_confirmed=user_confirmed,
     )
 
+    render_study_workflow(readiness)
+    render_study_hand_navigation(ordered, hand, hand_session)
+
     with st.container(key="study_workspace"):
-        list_col, replay_col, inspector_col = st.columns([0.82, 1.78, 1.15], gap="large")
-        with list_col:
-            with st.container(key="study_hand_list"):
-                st.markdown("#### Session queue")
-                active_index = next(
-                    index for index, item in enumerate(ordered) if item.id == hand.id
-                )
-                previous_col, count_col, next_col = st.columns([1, 1.4, 1])
-                if previous_col.button(
-                    "←",
-                    key=f"study_previous_{hand.id}",
-                    disabled=active_index == 0,
-                    help="Previous hand",
-                    width="stretch",
-                ):
-                    st.session_state["study_hand_id"] = ordered[active_index - 1].id
-                    st.rerun()
-                count_col.caption(f"{active_index + 1} of {len(ordered)}")
-                if next_col.button(
-                    "→",
-                    key=f"study_next_{hand.id}",
-                    disabled=active_index == len(ordered) - 1,
-                    help="Next hand",
-                    width="stretch",
-                ):
-                    st.session_state["study_hand_id"] = ordered[active_index + 1].id
-                    st.rerun()
-
-                window_start = max(0, min(active_index - 3, max(0, len(ordered) - 7)))
-                for queued in ordered[window_start : window_start + 7]:
-                    result = "—" if queued.hero_bb_won is None else f"{queued.hero_bb_won:+g} BB"
-                    label = f"#{queued.hand_number}  {queued.hero_cards or 'Unknown'}  ·  {result}"
-                    if st.button(
-                        label,
-                        key=f"study_queue_{queued.id}",
-                        type="primary" if queued.id == hand.id else "secondary",
-                        disabled=queued.id == hand.id,
-                        width="stretch",
-                    ):
-                        st.session_state["study_hand_id"] = queued.id
-                        st.rerun()
-                data_callout("Session", hand_session.name)
-                st.caption(
-                    f"Played {hand_session.date_played} · {hand_session.stakes or 'Stakes not recorded'}"
-                )
-                st.caption(f"Source · {hand.source_type.replace('_', ' ').title()}")
-                st.caption(
-                    f"Reconstruction confidence · {confidence_label(hand.confidence_score)}"
-                )
-                st.caption("A bucketed model signal, not proof the hand is correct.")
-                data_callout(
-                    "Completion",
-                    hand.completion_status.replace("_", " ").title(),
-                )
-
-                st.markdown("##### Study readiness")
-                render_study_readiness(readiness)
-                if is_reconstructed:
-                    show_reconstruction_evidence(hand, completion_evidence)
-                    show_source_warning_controls(db, hand, completion_evidence)
-                # Drawn under exactly the condition USER_CONFIRMATION_MISSING is
-                # emitted under -- reconstructed OR imported -- so the blocker
-                # never names a checkbox that is not on the page. An imported
-                # hand declaring `source_type: manual` owes this confirmation
-                # too: the importing operator has not vouched for it.
-                if hand_requires_user_confirmation(hand):
-                    st.checkbox(
-                        "I have read the evidence above and confirm this hand is correct",
-                        key=study_confirmation_key(hand, accounting),
-                    )
-
-                # Never offer "reviewed" while blocked; the guarded writer below is
-                # the defense in depth behind this.
-                status_options, status_index = review_status_options(hand, readiness)
-                status_key = f"study_status_{hand.id}"
-                if st.session_state.get(status_key) not in status_options:
-                    st.session_state.pop(status_key, None)
-                status = st.selectbox(
-                    "Review status",
-                    status_options,
-                    index=status_index,
-                    key=status_key,
-                )
-                if st.button("Save review status", key=f"study_save_{hand.id}", width="stretch"):
-                    if guarded_update_hand_status(db, hand, readiness, status):
-                        flash("Review status updated.")
-                        st.rerun()
-
-        with replay_col:
-            section_header_with_meta(
-                f"Hand #{hand.hand_number}",
-                "Completed-hand replay",
-                hand.game_type.upper() if hand.game_type else "NO-LIMIT HOLD'EM",
-            )
-            render_poker_table(
-                hero_cards=hand.hero_cards,
-                board_cards=hand.board_cards,
-                pot_size=(
-                    accounting.ledger.gross_pot
-                    if _accounting_is_established(hand, accounting)
-                    else hand.pot_size
-                ),
-                players=players,
-                result_bb=_hero_ledger_result(hand, accounting, players, hand.hero_bb_won),
-                label=f"{hand_session.name} · {hand.hero_position or 'Position not recorded'}",
-            )
-            section_header_with_meta(
-                "Decision history",
-                "Saved actions grouped by street.",
-                f"{len(actions)} ACTIONS",
-            )
-            render_action_timeline(
+        replay_tab, fix_tab, analyze_tab = st.tabs(
+            ["1 · Replay", "2 · Fix & confirm", "3 · Analyze"]
+        )
+        with replay_tab:
+            render_study_replay(
+                hand_session,
+                hand,
                 actions,
-                players=players,
-                effective_stack=hand.effective_stack,
-                initial_pot=(
-                    accounting.settlement.dead_money
-                    if accounting is not None and accounting.settlement is not None
-                    else None
-                ),
-                ledger=None if accounting is None else accounting.ledger,
+                players,
+                accounting,
+                accounting_error,
+                readiness,
             )
-            with st.expander("Raw hand history"):
-                st.code(
-                    format_hand_history(
-                        hand_session,
-                        hand,
-                        actions,
-                        players,
-                        ledger=None if accounting is None else accounting.ledger,
-                        accounting_issues=_accounting_prompt_issues(accounting, accounting_error),
-                        accounting_authoritative=_accounting_is_established(hand, accounting),
-                    ),
-                    language="text",
-                )
+        with fix_tab:
+            render_study_fix_and_confirm(
+                db,
+                hand,
+                actions,
+                players,
+                accounting,
+                accounting_error,
+                readiness,
+                hand_issues,
+                is_reconstructed,
+                completion_evidence,
+            )
+        with analyze_tab:
+            render_study_analysis(
+                db,
+                hand_session,
+                hand,
+                actions,
+                players,
+                accounting,
+                accounting_error,
+                readiness,
+                coaching_reviews,
+            )
 
-        with inspector_col:
-            with st.container(key="study_inspector"):
-                st.markdown("#### Analysis inspector")
-                summary_tab, math_tab, solver_tab, coach_tab, notes_tab = st.tabs(
-                    ["Summary", "Math", "Solver", "Coach", "Notes"]
-                )
-                with summary_tab:
-                    show_hand_issue_controls(db, hand, hand_issues)
-                    data_callout("Position", hand.hero_position or "Not recorded")
-                    data_callout(
-                        "Effective stack",
-                        "—" if hand.effective_stack is None else f"{hand.effective_stack:g} BB",
-                    )
-                    data_callout(
-                        "Final pot",
-                        (
-                            f"{accounting.ledger.gross_pot:g} BB · reconciled"
-                            if _accounting_is_established(hand, accounting)
-                            else "—"
-                            if hand.pot_size is None
-                            else f"{hand.pot_size:g} BB · observed"
-                        ),
-                    )
-                    st.caption(f"Tags · {', '.join(hand.tags) or 'None'}")
-                    _render_accounting_status(accounting, accounting_error)
-                    show_accounting_editor(
-                        db,
-                        hand,
-                        players,
-                        accounting,
-                        accounting_error,
-                    )
-                    show_hand_fact_editor(db, hand)
-                    show_player_editor(db, players)
-                    show_action_editor(db, actions, players)
-                    show_correction_history(db, hand.id)
-                with math_tab:
-                    st.caption("Recorded facts only — no live or current-hand recommendations.")
-                    call_snapshots = (
-                        [
-                            snapshot
-                            for snapshot in accounting.ledger.snapshots
-                            if snapshot.kind in {"call", "all-in"} and snapshot.call_increment > 0
-                        ]
-                        if accounting is not None and accounting.ledger.is_legal
-                        else []
-                    )
-                    if call_snapshots:
-                        decision = call_snapshots[-1]
-                        required = required_equity_to_call(
-                            decision.call_increment, decision.pot_before
-                        )
-                        st.markdown(
-                            equity_meter_html(required, label="Required equity"),
-                            unsafe_allow_html=True,
-                        )
-                        st.caption(
-                            f"Calling {decision.call_increment:g} BB into a "
-                            f"{decision.pot_before:g} BB pot from the reconciled action ledger."
-                        )
-                    else:
-                        empty_state(
-                            "No call math available",
-                            accounting_error
-                            or "Reconcile a legal call action to calculate required equity.",
-                        )
-                with solver_tab:
-                    show_solver_review(
-                        db,
-                        hand_session,
-                        hand,
-                        actions,
-                        players,
-                        accounting,
-                        accounting_error,
-                        readiness,
-                    )
-                with coach_tab:
-                    show_study_coach_review(
-                        db,
-                        hand_session,
-                        hand,
-                        actions,
-                        players,
-                        accounting,
-                        accounting_error,
-                        coaching_reviews,
-                        readiness,
-                    )
-                with notes_tab:
-                    st.markdown("##### Hand notes")
-                    st.write(hand.notes or "No notes recorded.")
-                    st.caption("Edit saved hand notes in Summary · Correct hand facts.")
+
+def study_hand_label(hand: Hand) -> str:
+    result = "—" if hand.hero_bb_won is None else f"{hand.hero_bb_won:+g} BB"
+    return f"Hand #{hand.hand_number} · {hand.hero_cards or 'Unknown cards'} · {result}"
+
+
+def render_study_hand_navigation(
+    ordered: list[Hand],
+    hand: Hand,
+    session: Session,
+) -> None:
+    """Keep hand selection in one compact row shared by every Study mode."""
+
+    active_index = next(index for index, item in enumerate(ordered) if item.id == hand.id)
+    hand_ids = [item.id for item in ordered if item.id is not None]
+    hands_by_id = {item.id: item for item in ordered if item.id is not None}
+    with st.container(key="study_hand_navigation"):
+        previous_col, chooser_col, next_col = st.columns([0.45, 3.1, 0.45])
+        if previous_col.button(
+            "←",
+            key=f"study_previous_{hand.id}",
+            disabled=active_index == 0,
+            help="Previous hand",
+            width="stretch",
+        ):
+            st.session_state["study_hand_id"] = ordered[active_index - 1].id
+            st.rerun()
+        selected_id = chooser_col.selectbox(
+            "Choose a completed hand",
+            hand_ids,
+            index=active_index,
+            format_func=lambda hand_id: study_hand_label(hands_by_id[hand_id]),
+            key=f"study_hand_picker_{hand.id}",
+        )
+        if selected_id != hand.id:
+            st.session_state["study_hand_id"] = selected_id
+            st.rerun()
+        if next_col.button(
+            "→",
+            key=f"study_next_{hand.id}",
+            disabled=active_index == len(ordered) - 1,
+            help="Next hand",
+            width="stretch",
+        ):
+            st.session_state["study_hand_id"] = ordered[active_index + 1].id
+            st.rerun()
+        st.caption(
+            f"{active_index + 1} of {len(ordered)} · {session.name} · "
+            f"{hand.source_type.replace('_', ' ').title()} · "
+            f"{hand.completion_status.replace('_', ' ').title()}"
+        )
+        st.caption(
+            f"Reconstruction confidence · {confidence_label(hand.confidence_score)}"
+        )
+
+
+def render_study_replay(
+    session: Session,
+    hand: Hand,
+    actions: list[Action],
+    players: list[HandPlayer],
+    accounting: AccountingReconciliation | None,
+    accounting_error: str | None,
+    readiness: StudyReadiness,
+) -> None:
+    """Show only the completed-hand replay and its recorded decisions."""
+
+    table_col, summary_col = st.columns([1.7, 0.75], gap="large")
+    with table_col:
+        section_header_with_meta(
+            f"Hand #{hand.hand_number}",
+            "Completed-hand replay",
+            hand.game_type.upper() if hand.game_type else "NO-LIMIT HOLD'EM",
+        )
+        render_poker_table(
+            hero_cards=hand.hero_cards,
+            board_cards=hand.board_cards,
+            pot_size=(
+                accounting.ledger.gross_pot
+                if _accounting_is_established(hand, accounting)
+                else hand.pot_size
+            ),
+            players=players,
+            result_bb=_hero_ledger_result(hand, accounting, players, hand.hero_bb_won),
+            label=f"{session.name} · {hand.hero_position or 'Position not recorded'}",
+        )
+    with summary_col:
+        st.markdown("#### Hand snapshot")
+        data_callout("Position", hand.hero_position or "Not recorded")
+        data_callout(
+            "Effective stack",
+            "—" if hand.effective_stack is None else f"{hand.effective_stack:g} BB",
+        )
+        data_callout(
+            "Final pot",
+            (
+                f"{accounting.ledger.gross_pot:g} BB · reconciled"
+                if _accounting_is_established(hand, accounting)
+                else "—"
+                if hand.pot_size is None
+                else f"{hand.pot_size:g} BB · observed"
+            ),
+        )
+        if readiness.is_ready:
+            st.success("The saved hand is ready for analysis.")
+        else:
+            st.warning(
+                f"{len(readiness.blockers)} item(s) must be resolved before this "
+                "hand is fully study-ready."
+            )
+        st.caption("Next: open the Fix & confirm tab.")
+
+    section_header_with_meta(
+        "Decision history",
+        "What happened, in saved action order.",
+        f"{len(actions)} ACTIONS",
+    )
+    render_action_timeline(
+        actions,
+        players=players,
+        effective_stack=hand.effective_stack,
+        initial_pot=(
+            accounting.settlement.dead_money
+            if accounting is not None and accounting.settlement is not None
+            else None
+        ),
+        ledger=None if accounting is None else accounting.ledger,
+    )
+    with st.expander("Show raw hand history"):
+        st.code(
+            format_hand_history(
+                session,
+                hand,
+                actions,
+                players,
+                ledger=None if accounting is None else accounting.ledger,
+                accounting_issues=_accounting_prompt_issues(accounting, accounting_error),
+                accounting_authoritative=_accounting_is_established(hand, accounting),
+            ),
+            language="text",
+        )
+
+
+def render_study_fix_and_confirm(
+    db: PokerDatabase,
+    hand: Hand,
+    actions: list[Action],
+    players: list[HandPlayer],
+    accounting: AccountingReconciliation | None,
+    accounting_error: str | None,
+    readiness: StudyReadiness,
+    hand_issues: list[HandIssue],
+    is_reconstructed: bool,
+    completion_evidence: CompletionEvidence,
+) -> None:
+    """Present blocker resolution first and keep technical editors opt-in."""
+
+    st.markdown("### Fix & confirm")
+    st.caption(
+        "Check the short list below. Open a correction tool only when that part "
+        "of the saved hand is wrong."
+    )
+    if readiness.is_ready:
+        st.success("Everything required is confirmed. This hand is ready to analyze.")
+    else:
+        st.warning(f"{len(readiness.blockers)} item(s) still block a trusted analysis.")
+        blocker_groups = list(readiness.by_category().items())
+        blocker_columns = st.columns(min(2, len(blocker_groups)))
+        for index, (category, blockers) in enumerate(blocker_groups):
+            with blocker_columns[index % len(blocker_columns)]:
+                with st.container(border=True):
+                    st.markdown(f"**{BLOCKER_CATEGORY_LABELS[category]}**")
+                    st.write(blockers[0].reason)
+                    if len(blockers) > 1:
+                        st.caption(f"+ {len(blockers) - 1} more")
+        with st.expander("Show exact requirements"):
+            render_study_readiness(readiness)
+
+    status_col, tools_col = st.columns([0.9, 1.45], gap="large")
+    with status_col:
+        st.markdown("#### Confirm the saved hand")
+        if is_reconstructed:
+            show_reconstruction_evidence(hand, completion_evidence)
+            show_source_warning_controls(db, hand, completion_evidence)
+        if hand_requires_user_confirmation(hand):
+            st.checkbox(
+                "I have read the evidence above and confirm this hand is correct",
+                key=study_confirmation_key(hand, accounting),
+            )
+        with st.expander("Set review status", expanded=readiness.is_ready):
+            status_options, status_index = review_status_options(hand, readiness)
+            status_key = f"study_status_{hand.id}"
+            if st.session_state.get(status_key) not in status_options:
+                st.session_state.pop(status_key, None)
+            status = st.selectbox(
+                "Review status",
+                status_options,
+                index=status_index,
+                key=status_key,
+            )
+            if st.button(
+                "Save review status",
+                key=f"study_save_{hand.id}",
+                width="stretch",
+            ):
+                if guarded_update_hand_status(db, hand, readiness, status):
+                    flash("Review status updated.")
+                    st.rerun()
+        show_hand_issue_controls(db, hand, hand_issues)
+
+    with tools_col:
+        st.markdown("#### Correction tools")
+        st.caption("These are closed by default. Open only the section you need.")
+        with st.expander("Accounting status"):
+            _render_accounting_status(accounting, accounting_error)
+        show_accounting_editor(
+            db,
+            hand,
+            players,
+            accounting,
+            accounting_error,
+        )
+        show_hand_fact_editor(db, hand)
+        show_player_editor(db, players)
+        show_action_editor(db, actions, players)
+        show_correction_history(db, hand.id)
+
+
+def render_study_analysis(
+    db: PokerDatabase,
+    session: Session,
+    hand: Hand,
+    actions: list[Action],
+    players: list[HandPlayer],
+    accounting: AccountingReconciliation | None,
+    accounting_error: str | None,
+    readiness: StudyReadiness,
+    coaching_reviews,
+) -> None:
+    """Group analysis tools separately from reconstruction and correction."""
+
+    st.markdown("### Analyze")
+    if readiness.is_ready:
+        st.success("This hand is confirmed and ready for post-session analysis.")
+    else:
+        st.warning(
+            f"Analysis is limited until {len(readiness.blockers)} remaining "
+            "item(s) are fixed or confirmed."
+        )
+
+    math_tab, solver_tab, coach_tab, notes_tab = st.tabs(
+        ["Quick math", "TexasSolver", "AI coach", "Notes"]
+    )
+    with math_tab:
+        st.caption(
+            "Fast calculations from the saved ledger only—no live or current-hand "
+            "recommendations."
+        )
+        call_snapshots = (
+            [
+                snapshot
+                for snapshot in accounting.ledger.snapshots
+                if snapshot.kind in {"call", "all-in"} and snapshot.call_increment > 0
+            ]
+            if accounting is not None and accounting.ledger.is_legal
+            else []
+        )
+        if call_snapshots:
+            decision = call_snapshots[-1]
+            required = required_equity_to_call(
+                decision.call_increment, decision.pot_before
+            )
+            st.markdown(
+                equity_meter_html(required, label="Required equity"),
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                f"Calling {decision.call_increment:g} BB into a "
+                f"{decision.pot_before:g} BB pot from the reconciled action ledger."
+            )
+        else:
+            empty_state(
+                "No call math available",
+                accounting_error
+                or "Reconcile a legal call action to calculate required equity.",
+            )
+    with solver_tab:
+        show_solver_review(
+            db,
+            session,
+            hand,
+            actions,
+            players,
+            accounting,
+            accounting_error,
+            readiness,
+        )
+    with coach_tab:
+        show_study_coach_review(
+            db,
+            session,
+            hand,
+            actions,
+            players,
+            accounting,
+            accounting_error,
+            coaching_reviews,
+            readiness,
+        )
+    with notes_tab:
+        st.markdown("##### Hand notes")
+        st.write(hand.notes or "No notes recorded.")
+        st.caption("Edit notes in Fix & confirm → Correct hand facts.")
 
 
 def show_hand_issue_controls(
@@ -1360,7 +1499,7 @@ def show_hand_fact_editor(db: PokerDatabase, hand: Hand) -> None:
         stored = db.fetch_hand(hand.id)
         if stored is not None:
             hand = stored
-    with st.expander("Correct hand facts", expanded=hand.review_status == "needs_correction"):
+    with st.expander("Correct hand facts", expanded=False):
         st.caption(
             "Saving changes updates this hand in SQLite, records before/after evidence, "
             "and marks prior coaching stale."
@@ -1644,20 +1783,52 @@ def show_solver_review(
 ) -> None:
     """Configure and run one auditable post-session TexasSolver analysis."""
 
-    st.caption("Completed-hand, heads-up postflop analysis only.")
+    st.markdown("##### TexasSolver postflop analysis")
+    st.caption(
+        "TexasSolver analyzes one saved heads-up postflop decision. It does not "
+        "solve preflop, multiway, tournament, or live hands."
+    )
+    with st.expander("How to use TexasSolver", expanded=False):
+        workflow_step(
+            1,
+            "Make the hand eligible",
+            "In Fix & confirm, correct the cards, players, positions, and actions; "
+            "then reconcile the chip ledger.",
+        )
+        workflow_step(
+            2,
+            "Choose both starting ranges",
+            "Use Default first. Premade and Custom are available when you have a "
+            "better range assumption.",
+        )
+        workflow_step(
+            3,
+            "Run and inspect",
+            "Run the analysis, refresh while it works, then review Hero's saved "
+            "combo frequencies and assumptions.",
+        )
+        st.caption(
+            "Optional: use Explain solver result with AI only after the solver run "
+            "finishes. The explanation is grounded in the saved frequencies."
+        )
+
     prepared = prepare_solver_spot(hand, players, actions, accounting)
     for warning in prepared.eligibility.warnings:
         st.warning(warning)
     runs = db.fetch_solver_runs_by_hand(hand.id) if hand.id is not None else []
     if not prepared.eligibility.eligible or prepared.spot is None:
+        st.warning("This hand is not ready for TexasSolver yet.")
+        st.markdown("**Fix these items in Fix & confirm:**")
         for reason in prepared.eligibility.reasons:
-            st.error(reason)
+            st.markdown(f"- {reason}")
         _show_solver_runs(
             db, session, hand, players, actions, accounting, accounting_error, runs, readiness
         )
         return
 
     spot = prepared.spot
+    st.success("Eligible heads-up postflop spot found.")
+    st.markdown("###### 1. Confirm the selected spot")
     st.markdown(
         f"**{spot.street.title()} · {spot.oop.player_name} (OOP) vs "
         f"{spot.ip.player_name} (IP)**"
@@ -1665,6 +1836,11 @@ def show_solver_review(
     st.caption(
         f"{spot.pot:g} BB pot · {spot.effective_stack:g} BB effective · "
         f"{spot.pot_type.replace('_', ' ')}"
+    )
+    st.markdown("###### 2. Choose starting ranges")
+    st.caption(
+        "Default is the recommended first pass. Built-in ranges are transparent "
+        "study estimates, not solved preflop GTO ranges."
     )
     user_profiles = db.fetch_solver_range_profiles()
     oop_range, oop_error = _solver_range_selector(
@@ -1681,16 +1857,31 @@ def show_solver_review(
     if ip_range is not None:
         _show_resolved_range(ip_range)
 
+    st.markdown("###### 3. Run TexasSolver")
     binary_ready = True
     try:
         binary = configured_binary()
         configured_resource_dir(binary)
-        st.caption(f"Backend · TexasSolver {PINNED_CONSOLE_COMMIT} · {binary}")
+        st.success("TexasSolver is installed and ready.")
+        st.caption(f"Pinned backend · {PINNED_CONSOLE_COMMIT} · {binary}")
     except (FileNotFoundError, PermissionError) as exc:
         binary_ready = False
         st.warning(str(exc))
+        with st.expander("One-time local TexasSolver setup", expanded=True):
+            st.write(
+                "Install or compile the pinned console solver, keep its resources "
+                "directory beside the binary, then restart PokerTrainer with:"
+            )
+            st.code(
+                "export TEXAS_SOLVER_PATH=/absolute/path/to/console_solver\n"
+                "# Only needed when resources is not beside the binary:\n"
+                "export TEXAS_SOLVER_RESOURCE_DIR=/absolute/path/to/resources\n"
+                "streamlit run app.py",
+                language="bash",
+            )
+            st.caption("You can verify this later in Settings → Solver.")
     if st.button(
-        "Analyze completed hand",
+        "Run TexasSolver analysis",
         key=f"solver_analyze_{hand.id}",
         type="primary",
         width="stretch",
@@ -1737,6 +1928,9 @@ def _solver_range_selector(
     st.markdown(
         f"##### {player.player_name} · {player.position or 'position unknown'} · "
         f"{player.role.upper()}"
+    )
+    st.caption(
+        "Default uses the built-in estimate matched to this seat and pot type."
     )
     mode = st.radio(
         "Range source",
@@ -1857,7 +2051,7 @@ def _show_solver_runs(
         return
     latest = runs[0]
     st.divider()
-    st.markdown(f"##### Latest solver run #{latest.id}")
+    st.markdown(f"##### Solver result · run #{latest.id}")
     st.caption(
         f"Status · {latest.status.replace('_', ' ').title()} · "
         f"backend {latest.backend_name} {latest.backend_version}"
@@ -2575,6 +2769,22 @@ def show_settings_workspace(db: PokerDatabase, session: Session | None) -> None:
 
 def show_solver_settings(db: PokerDatabase) -> None:
     section_header("TexasSolver", "Optional post-session heads-up analysis backend")
+    with st.expander("Setup and usage guide", expanded=False):
+        st.markdown(
+            "1. Install or compile the pinned `console_solver` build.\n"
+            "2. Set `TEXAS_SOLVER_PATH` and, if necessary, "
+            "`TEXAS_SOLVER_RESOURCE_DIR`.\n"
+            "3. Restart PokerTrainer.\n"
+            "4. Open **Study → TexasSolver** on an eligible completed hand."
+        )
+        st.code(
+            "export TEXAS_SOLVER_PATH=/absolute/path/to/console_solver\n"
+            "# Optional when resources is not beside console_solver:\n"
+            "export TEXAS_SOLVER_RESOURCE_DIR=/absolute/path/to/resources\n"
+            "export POKERTRAINER_SOLVER_THREADS=4\n"
+            "streamlit run app.py",
+            language="bash",
+        )
     try:
         binary = configured_binary()
         configured_resource_dir(binary)
@@ -2582,7 +2792,7 @@ def show_solver_settings(db: PokerDatabase) -> None:
         st.caption(f"Pinned console compatibility target · {PINNED_CONSOLE_COMMIT}")
     except (FileNotFoundError, PermissionError) as exc:
         st.warning(str(exc))
-        st.code("export TEXAS_SOLVER_PATH=/absolute/path/to/console_solver", language="bash")
+        st.caption("Open Setup and usage guide above for the complete configuration.")
     st.caption(
         "Built-in profiles are estimated study inputs. They are not solved preflop GTO ranges."
     )
@@ -3695,7 +3905,23 @@ def show_player_editor(db: PokerDatabase, players: list[HandPlayer]) -> None:
                 st.error(f"Could not update player: {exc}")
 
 
-def show_action_editor(db: PokerDatabase, actions: list[Action], players: list[HandPlayer]) -> None:
+def show_action_editor(
+    db: PokerDatabase,
+    actions: list[Action],
+    players: list[HandPlayer],
+) -> None:
+    with st.expander("Edit or add actions", expanded=False):
+        st.caption(
+            "Use this only when the saved action history does not match the recording."
+        )
+        show_action_editor_contents(db, actions, players)
+
+
+def show_action_editor_contents(
+    db: PokerDatabase,
+    actions: list[Action],
+    players: list[HandPlayer],
+) -> None:
     st.markdown("##### Edit / Delete Actions")
     if not actions:
         st.caption("No actions saved.")

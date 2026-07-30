@@ -282,14 +282,17 @@ def test_baseline_ar1397_reconstructs_seven_hands(baseline_timeline) -> None:
     assert sum(s["unanchored_cards"] for s in states) == 0
 
 
-def test_baseline_ar1397_export_is_unchanged(baseline_timeline) -> None:
-    """Three hands out with their boards; four held back, each for a named,
+def test_baseline_ar1397_export_reflects_button_order_repair(baseline_timeline) -> None:
+    """Four hands out with their boards; three held back, each for a named,
     verified reason. No rejection signal may take a hand off this list without one.
 
-    This list was six until action_sequence_illegal was added, and five until chip
-    conservation was. None of the departures is a regression -- each hand carries a
-    record that cannot be true:
-      hand 1  preflop  seat 7 calls 2.0 and then folds, nothing raised between;
+    Hand 1 used to be held back because numeric seat sorting put its already-visible
+    BB raise before an earlier-position call, making the later fold appear to face
+    no raise. Button-derived ordering now reconstructs the coherent sequence and
+    retains all eight occupied seats despite three pre-capture folds.
+
+    The remaining departures are not regressions -- each hand carries a record
+    that cannot be true:
       hand 2  river    seat 3 goes all-in for 148.1 and then folds;
       hand 7  preflop  seat 3 "calls 50.0" into a 34.5 BB pot -- the frozen
               pre-fix read of an on-screen 0.50, so the ledger overshoots the pot
@@ -299,12 +302,11 @@ def test_baseline_ar1397_export_is_unchanged(baseline_timeline) -> None:
     payload = timeline_to_session_payload(
         baseline_timeline, timeline_path="t.json", session_name="S")
     assert [h["hand"]["board_cards"] for h in payload["hands"]] == [
-        "8h 5h Qs", "4c 3d 5s 6s Jh", "7h Ah As",
+        "5h 4h 3s 2h 7h", "8h 5h Qs", "4c 3d 5s 6s Jh", "7h Ah As",
     ]
     summary = payload["cv_import_summary"]
-    assert summary["exported_hands"] == 3
+    assert summary["exported_hands"] == 4
     assert [(s["timeline_hand_number"], sorted(s["codes"])) for s in summary["skipped"]] == [
-        (1, ["action_sequence_illegal"]),
         (2, ["action_sequence_illegal"]),
         (3, ["board_regression", "street_order_issue"]),
         (7, ["contributions_exceed_pot"]),

@@ -39,7 +39,7 @@ from cv_lab.scripts.pipeline.landmark_anchor import ANCHOR_MIN_SESSION_FITS
 DEFAULT_OUT = "cv_lab/results/yolo_hand_timeline.json"
 
 _STREET_BY_COUNT = {0: "preflop", 3: "flop", 4: "turn", 5: "river"}
-_POSITION_NAMES = ["BTN", "SB", "BB", "UTG", "UTG+1", "MP", "HJ", "CO"]
+_POSITION_NAMES = ["BTN", "SB", "BB", "UTG", "UTG+1", "LJ", "HJ", "CO"]
 _EPS = 1e-6
 
 # Run-length debounce thresholds are calibrated at this sampling interval. When
@@ -765,6 +765,100 @@ def _positions(players: list[int], dealer_seat: int | None) -> dict[int, str]:
             for k, seat in enumerate(ordered)}
 
 
+def _street_seat_order(positions: dict[int, str], street: str) -> list[int]:
+    """Seats in legal action order, derived only from the button-anchored ring.
+
+    ``positions`` preserves the ring order produced by ``_positions``:
+    BTN, SB, BB, then the remaining seats through CO.  Preflop begins left of
+    the big blind; later streets begin left of the button.  This is used only to
+    order actions that first become visible in the same sampled state.  Action
+    detections never feed back into position assignment.
+    """
+    ring = list(positions)
+    if len(ring) <= 1:
+        return ring
+    if street == "preflop":
+        # Heads-up is the exception: the button is also the small blind and acts
+        # first preflop.  Multiway action begins with the seat left of the BB.
+        return ring if len(ring) == 2 else ring[3:] + ring[:3]
+    return ring[1:] + ring[:1]
+
+
+def _player_seats(
+    hand: list[dict[str, Any]], dealer_seat: int | None
+) -> list[int]:
+    """Recover the hand roster, including players who folded before capture.
+
+    Card backs and action pills remain the primary participation evidence.  When
+    the first captured state is already mid-hand, however, early folders have
+    neither: the client has removed their cards and their short-lived FOLD pills
+    have expired.  Stable stack HUDs are then the surviving occupancy evidence.
+    The dealer button independently proves its own seat participated.
+
+    Opening stack occupancy is used only when the first state itself proves the
+    hand was already under way (board, action pill, or a bet above a blind), and
+    a stack seat must repeat.  This keeps a one-frame stack false positive from
+    creating a player while allowing a recording that begins mid-action to retain
+    the seats whose folds occurred before frame zero.
+    """
+    if not hand:
+        return []
+    from collections import Counter
+
+    dealt_counts = Counter(seat for state in hand for seat in state["dealt_in"])
+    opening_dealt = {seat for state in hand[:2] for seat in state["dealt_in"]}
+    pill_counts = Counter(
+        seat for state in hand for seat in (state.get("pills") or {})
+    )
+    players = {
+        seat for seat, count in dealt_counts.items()
+        if count >= 2 or seat in opening_dealt
+    } | {
+        seat for seat, count in pill_counts.items()
+        if count >= 2
+    }
+
+    first = hand[0]
+    mid_hand_open = bool(
+        first["board_cards"]
+        or first.get("pills")
+        or any(
+            amount is not None and amount > 1.0 + _EPS
+            for amount in (first.get("bets") or {}).values()
+        )
+    )
+    if mid_hand_open:
+        stack_counts = Counter(
+            seat for state in hand for seat in (state.get("stacks") or {})
+        )
+        players.update(
+            seat for seat in first.get("stacks", {})
+            if stack_counts[seat] >= 2
+        )
+
+    if dealer_seat is not None:
+        players.add(dealer_seat)
+    if not players:
+        players.update(dealt_counts)
+    return sorted(players)
+
+
+def _opening_live_seats(first: dict[str, Any]) -> set[int]:
+    """Seats with evidence they were still live when the first state was seen."""
+    first_bets_unknown = first.get("bets_unknown") or {}
+    return (
+        set(first["dealt_in"])
+        | set(first.get("villain_cards") or {})
+        | ({0} if len(first["hero_cards"]) == 2 else set())
+        | {
+            seat for seat, pill in (first.get("pills") or {}).items()
+            if pill != "fold"
+        }
+        | set(first.get("bets") or {})
+        | set(first_bets_unknown)
+    )
+
+
 def _stack_series(hand: list[dict[str, Any]], seat: int) -> list[float]:
     return [s["stacks"][seat] for s in hand if seat in s["stacks"]]
 
@@ -1143,9 +1237,22 @@ def _reconstruct_actions(
     # transition when a refusal leaves it unprovable.
     first = hand[0]
     first_bets_unknown = first.get("bets_unknown") or {}
+    # A recovered opening-roster seat with no cards, non-fold pill, or standing
+    # bet has already folded before capture began.  Keep it in the positional
+    # ring, but never synthesize later checks or actions for it.
+    preobserved_folded = set(positions) - _opening_live_seats(first)
+    folded.update(preobserved_folded)
     if not first["board_cards"]:
-        for seat in sorted(set(positions) | set(first["pills"])
-                           | set(first["bets"]) | set(first_bets_unknown)):
+        first_seats = (
+            set(positions) | set(first["pills"])
+            | set(first["bets"]) | set(first_bets_unknown)
+        )
+        preflop_order = _street_seat_order(positions, "preflop")
+        ordered_first_seats = (
+            [seat for seat in preflop_order if seat in first_seats]
+            + sorted(first_seats - set(preflop_order))
+        )
+        for seat in ordered_first_seats:
             pill = first["pills"].get(seat)
             bet = first["bets"].get(seat)
             if pill == "fold":
@@ -1378,7 +1485,12 @@ def _reconstruct_actions(
                 if fresh_pill:
                     money_seats[seat] = (None, before, "amount_unknown")
 
-        for seat, (amount, stack_before, derivation) in sorted(money_seats.items()):
+        street_order = _street_seat_order(positions, street)
+        money_order = {seat: index for index, seat in enumerate(street_order)}
+        for seat, (amount, stack_before, derivation) in sorted(
+            money_seats.items(),
+            key=lambda item: (money_order.get(item[0], len(money_order)), item[0]),
+        ):
             pill = cur["pills"].get(seat)
             after = cur["stacks"].get(seat)
             if after is not None and after <= _EPS:
@@ -1430,7 +1542,10 @@ def _reconstruct_actions(
         }
         pill_folds = {seat for seat, pill in cur["pills"].items()
                       if pill == "fold" and prev["pills"].get(seat) != "fold"}
-        for seat in sorted((gone | pill_folds) - folded):
+        for seat in sorted(
+            (gone | pill_folds) - folded,
+            key=lambda item: (money_order.get(item, len(money_order)), item),
+        ):
             if seat in money_seats or seat not in positions:
                 continue  # money and a fold can't both happen; unknown seats are noise
             if not street_has_bet.get(street):
@@ -1457,7 +1572,12 @@ def _reconstruct_actions(
         cur_hwm = max(board_hwm, len(cur["board_cards"]))
         if cur_hwm > board_hwm:
             check_street = _street_for_count(cur_hwm, cur["stage"])
-        for seat, pill in sorted(cur["pills"].items()):
+        check_order = _street_seat_order(positions, check_street)
+        check_rank = {seat: index for index, seat in enumerate(check_order)}
+        for seat, pill in sorted(
+            cur["pills"].items(),
+            key=lambda item: (check_rank.get(item[0], len(check_rank)), item[0]),
+        ):
             if pill != "check" or prev["pills"].get(seat) == "check":
                 continue
             if seat in money_seats or seat in folded or seat not in positions:
@@ -1495,14 +1615,22 @@ def _reconstruct_actions(
     all_in_at: dict[int, int] = {a["seat"]: order.index(a["street"]) for a in actions
                                  if a["action_type"] == "all-in" and a["street"] in order}
     for si, street in enumerate(order):
-        live = [p for p in positions
-                if p not in folded_at or order.index(folded_at[p]) > si]
+        live = [
+            p for p in positions
+            if p not in preobserved_folded
+            and (p not in folded_at or order.index(folded_at[p]) > si)
+        ]
         # seats already all-in on an earlier street cannot act; with fewer than
         # two actionable seats there is no betting round to check through
         actionable = [p for p in live if all_in_at.get(p, 99) >= si]
         if len(actionable) < 2:
             continue
-        for seat in sorted(actionable):
+        action_order = _street_seat_order(positions, street)
+        action_rank = {seat: index for index, seat in enumerate(action_order)}
+        for seat in sorted(
+            actionable,
+            key=lambda item: (action_rank.get(item, len(action_rank)), item),
+        ):
             if seat in acted.get(street, set()):
                 continue
             if not street_has_bet.get(street):
@@ -1608,31 +1736,10 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
     board = _vote_board(hand)
     dealer_seat = _mode([s["dealer_seat"] for s in hand])
 
-    # A seat is a player with two states of card_back evidence, or with any
-    # evidence in the hand's opening states (instant folders show exactly one
-    # frame of cards). A single mid-hand misdetection must not conjure a
-    # phantom player.
-    from collections import Counter
-
-    dealt_counts = Counter(seat for s in hand for seat in s["dealt_in"])
-    opening = {seat for s in hand[:2] for seat in s["dealt_in"]}
-    # A seat that folded BEFORE the hand came into view has no card_back at all --
-    # the client removes its cards and leaves only the FOLD pill, which stays on
-    # the felt. _reconstruct_actions reads exactly that pill and books the fold, so
-    # a card_back-only roster produced a ledger naming a seat the roster did not,
-    # and the app's ingest rolls the WHOLE session back on that reference (measured
-    # on the 07-11 recording: players {0,1,2,3,4,7} with a preflop `seat:5` fold;
-    # 0 sessions and 0 hands imported, three good hands lost with it).
-    #
-    # A persistent pill is participation evidence of the same kind as a persistent
-    # card_back and is held to the SAME two-state bar, so one misdetection still
-    # cannot conjure a phantom player.
-    pill_counts = Counter(seat for s in hand for seat in (s.get("pills") or {}))
-    players = sorted({seat for seat, n in dealt_counts.items()
-                      if n >= 2 or seat in opening}
-                     | {seat for seat, n in pill_counts.items() if n >= 2})
-    if not players:
-        players = sorted(dealt_counts)
+    # The roster combines direct card/pill evidence with stable opening
+    # occupancy when capture begins after early folds.  Positions are then
+    # assigned exclusively from the dealer button and this physical seat ring.
+    players = _player_seats(hand, dealer_seat)
     positions = _positions(players, dealer_seat)
     player_name = {seat: ("Hero" if seat == 0 else f"Seat{seat}") for seat in players}
 
@@ -1966,7 +2073,15 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         # essentially every hand with a winner. The action ledger is the witness --
         # a seat whose last reconstructed action is a fold is out; a seat that never
         # acted counts as live, which biases toward NOT asserting a fold.
-        contenders = [s for s in players if last_action.get(s) != "fold"]
+        # Seats recovered only from stable opening occupancy had already folded
+        # before capture.  They belong in the positional ring, but cannot turn a
+        # one-player fold win into a fabricated multiway showdown merely because
+        # no reconstructable FOLD action exists for their pre-capture fold.
+        preobserved_folded = set(players) - _opening_live_seats(hand[0])
+        contenders = [
+            seat for seat in players
+            if seat not in preobserved_folded and last_action.get(seat) != "fold"
+        ]
         if len(contenders) <= 1:
             terminal_event = "fold_win"
         elif len(board) == 5:

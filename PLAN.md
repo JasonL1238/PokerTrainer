@@ -76,13 +76,15 @@ As of July 28, 2026, the repository contains:
 - an eight-region reconstruction model plus card recognition/OCR readers,
   temporal reconstruction, labeling tools, hard-example queues, and evaluation
   scripts;
-- Study controls for correcting hand facts, players, and actions while retaining
-  before/after audit history and staling derived coaching/solver evidence;
+- a guided three-mode Study workflow (Replay, Fix & confirm, Analyze) that keeps
+  hand selection compact, hides advanced corrections until opened, and includes
+  inline TexasSolver setup/use guidance while retaining before/after correction
+  history and staling derived coaching/solver evidence;
 - a persistent cross-session issue inbox that freezes debugging evidence and
   retains resolution notes;
 - authenticated local/container operation, a non-root Docker runtime, pinned
   CV dependencies, healthchecks, and CI;
-- 1091 passing tests with one intentionally skipped test at the latest inventory
+- 1508 passing tests with one intentionally skipped test at the latest inventory
   (see "Verification record" below, which is the authoritative count and which
   this bullet must be updated to match), with Ruff and the configured MyPy target
   green.
@@ -101,6 +103,11 @@ Observed evidence:
 - the default export recovered six of seven completed hands;
 - it also included the unfinished eighth hand;
 - representative hero and board cards were visually correct;
+- review of a recording that began mid-preflop exposed a roster defect: players
+  who folded before frame zero were dropped, shifting BTN/SB/BB labels and
+  same-frame action order; reconstruction now recovers stable opening occupancy,
+  anchors labels to the dealer button, and retains those seats as pre-observation
+  folds (see `cv_lab/notes/15_mid_hand_button_position_repair.md`);
 - reconstructed action ledgers still contained non-authoritative and
   overcommit cases.
 
@@ -1765,26 +1772,20 @@ protect. The consequence is recorded under "Known non-blocking gaps".
 
 ### Verification record
 
-Re-run after the round-15 repairs, on the working tree, macOS 24.6.0
+Re-run after the mid-hand button-position repair, on the working tree, macOS 24.6.0
 (darwin/arm64). Re-derived from the code, not carried forward: the previous
 revision of this table recorded `1326 passed` while the tree produced `1412`,
 because the round-14 repairs and their 20 regressions landed without this
 section being re-run — which is round 15's own finding about this document, and
 the reason the count below was taken from a fresh run rather than edited.
 
-As in round 13, a concurrent Phase 5 workflow was editing
-`cv_lab/scripts/pipeline/ocr_readers.py` DURING these runs (107 lines added
-mid-session, uncommitted), so `tests/test_ocr_readers.py` drifted run to run and a
-later run caught it mid-edit with 3 failures in that file alone. The count below
-is from the run taken before those edits landed; the run with that one in-flight
-CV file excluded is green throughout (`1435 passed`), and it covers every Phase 1
-file. Round-16 eligibility requires the whole tree green at the moment the
-counting rounds run, which is a Phase 5 close-out condition, not a Phase 1 one.
+The full tree was stable during this run. OpenCV 5 changed the synthetic text
+rasterization used by six calibrated OCR tests, so the declared dependency is
+now capped below 5; the result below uses OpenCV 4.11 and NumPy 2.2.6.
 
 | Command | Result |
 | --- | --- |
-| `python -m pytest -q` | `1502 passed, 1 skipped` |
-| `python -m pytest -q --ignore=tests/test_ocr_readers.py` | `1435 passed` |
+| `python -m pytest -q` | `1508 passed, 1 skipped` |
 | `python -m ruff check .` | `All checks passed!` |
 | `python -m mypy` | `Success: no issues found in 11 source files` |
 | `git diff --check` | no output, exit 0 |
@@ -1806,9 +1807,9 @@ unchanged, no table added or dropped; the real file was SHA-256-hashed before an
 after and is byte-identical. Reading its version stamp still leaves `-shm`/`-wal`
 sidecars beside it, which is the documented gap below, not a write to the database.
 
-The suite grew from the 442 tests of the Phase 0 baseline to 1502. That count
-includes the CV suites, which a concurrent Phase 5 workflow is editing, so the
-number will drift; the Phase 1 files in it are `test_study_readiness*.py`,
+The suite grew from the 442 tests of the Phase 0 baseline to 1508. That count
+includes the CV suites, so the number will drift; the Phase 1 files in it are
+`test_study_readiness*.py`,
 `test_completion_evidence.py`, `test_schema_v13_migration_paths.py`,
 `test_phase1_readiness_bypass.py`, `test_review_promotion_surfaces_ui.py`,
 `test_phase1_assumption_dependence.py`,

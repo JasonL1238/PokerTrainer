@@ -50,6 +50,12 @@ def test_study_fact_correction_updates_database_and_audit(
     app.run()
 
     assert not list(app.exception)
+    rendered = "\n".join(str(item.value) for item in app.markdown)
+    assert "Start with Replay, then fix, then analyze" in rendered
+    assert "TexasSolver postflop analysis" in rendered
+    assert any(item.label == "How to use TexasSolver" for item in app.expander)
+    assert any(item.label == "Correct hand facts" for item in app.expander)
+    assert any(item.label == "Edit or add actions" for item in app.expander)
     next(item for item in app.text_input if item.label == "Board cards").set_value(
         "Qd 7s 6c"
     )

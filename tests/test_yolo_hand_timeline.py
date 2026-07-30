@@ -108,6 +108,66 @@ def test_spine_assigns_positions_from_dealer():
     assert by_seat[0]["is_hero"] is True
 
 
+def test_mid_hand_start_keeps_pre_capture_folders_in_button_position_ring():
+    """The flagged job-2 shape: capture begins facing a BB raise after three
+    players have already folded, so their card backs and FOLD pills are gone.
+
+    Stable stack HUDs retain the eight occupied seats.  The dealer button at
+    seat 4 must therefore yield seat 5=SB, seat 6=BB, seat 7=UTG and hero
+    seat 0=UTG+1.  The already-standing actions are ordered around that same
+    button-derived ring; they are never numerically seat-sorted.
+    """
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import reconstruct
+
+    states, _events = _states_from(_hand_fixture())
+    for state in states:
+        state["dealer_seat"] = 4
+        state["stacks"].update({
+            1: 194.6,
+            2: 140.7,
+            3: 181.1,
+            5: 191.3,
+            6: 183.0,
+            7: 321.2,
+        })
+    states[0]["dealt_in"] = [0, 2, 5, 6, 7]
+    states[0]["pills"] = {
+        0: "call",
+        2: "call",
+        5: "call",
+        6: "raise",
+        7: "call",
+    }
+    states[0]["bets"] = {0: 2.0, 2: 2.0, 5: 2.0, 6: 10.0, 7: 2.0}
+
+    hand = reconstruct(states, 1)
+    by_seat = {player["seat"]: player for player in hand["players"]}
+    assert set(by_seat) == set(range(8))
+    assert {
+        seat: by_seat[seat]["position"] for seat in range(8)
+    } == {
+        4: "BTN",
+        5: "SB",
+        6: "BB",
+        7: "UTG",
+        0: "UTG+1",
+        1: "LJ",
+        2: "HJ",
+        3: "CO",
+    }
+
+    opening = [
+        action for action in hand["actions"]
+        if action["source_state_index"] == states[0]["state_index"]
+        and action["street"] == "preflop"
+    ]
+    assert [action["seat"] for action in opening[:5]] == [7, 0, 2, 5, 6]
+    assert [action["amount"] for action in opening[:5]] == [2.0, 2.0, 2.0, 2.0, 10.0]
+    assert not {
+        action["seat"] for action in hand["actions"]
+    } & {1, 3, 4}, "pre-capture folders stay positional but receive no invented actions"
+
+
 def test_spine_derives_action_sizes_from_stack_deltas():
     hand = _build()["hands"][0]
     got = {(a["action_type"], a["amount"]) for a in hand["actions"]}

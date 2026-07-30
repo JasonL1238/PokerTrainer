@@ -24,6 +24,12 @@ CV, equity, solver, and coaching output remain separately labeled by source and
 confidence. The application does not turn approximate inputs into a universal
 GTO score.
 
+Study shows one task at a time:
+
+1. **Replay** — inspect the table and saved decision history.
+2. **Fix & confirm** — resolve blockers and open only the correction tool needed.
+3. **Analyze** — use quick math, TexasSolver, coaching, or notes.
+
 ## Local setup
 
 Requirements:
@@ -317,6 +323,23 @@ The Study workspace can run TexasSolver against a completed, reconciled,
 heads-up NLHE cash-game postflop spot. Five- through eight-handed tables are
 supported through their input ranges; the solver itself receives the two
 remaining postflop ranges.
+
+### Using the integration
+
+1. Open **Study** and choose a completed hand.
+2. In **Fix & confirm**, correct any cards, positions, players, or actions and
+   reconcile the chip ledger. **Show exact requirements** explains each blocker.
+3. Confirm imported/reconstructed evidence after it matches the recording.
+4. Open **Analyze → TexasSolver**. The app checks eligibility and explains every
+   item that still needs correction.
+5. Confirm the automatically selected heads-up street, pot, and effective stack.
+6. Start with **Default** ranges for both players, or choose a premade/custom
+   range when you have a better assumption.
+7. Press **Run TexasSolver analysis**. Solver work runs in the background; use
+   **Refresh** to check it or **Cancel** to stop it.
+8. Review Hero's combo frequencies, convergence, assumptions, and the mapped
+   recorded action. Optionally generate an AI explanation grounded in that
+   saved solver evidence.
 
 For local use, compile or install the pinned `console` implementation and
 configure its absolute path:
