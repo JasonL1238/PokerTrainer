@@ -50,6 +50,18 @@ DRAFT_CARD_WARNING_CODES = frozenset(
         "duplicate_visible_cards",
     }
 )
+# Operator-fillable reconstruction gaps. include_incomplete drafts keep these in
+# completion_evidence, but must not refuse import — otherwise small-window OCR
+# refusals and mid-hand coverage holes leave the session with 0 hands while the
+# timeline still has studyable hero-preflop segments.
+DRAFT_OPERATOR_FILLABLE_CODES = frozenset(
+    {
+        "amounts_unknown_in_ledger",
+        "starting_stack_unknown",
+        "mid_hand_coverage_gap",
+        "hero_card_identity_split",
+    }
+)
 HAND_CORRECTION_FIELDS = ["hand_number", "hero_cards", "board_cards", "action", "notes"]
 
 
@@ -762,9 +774,9 @@ def timeline_to_session_payload(
                         if w.get("code")})
         blocking_codes = set(codes)
         if include_incomplete:
-            # Card-shape warnings are draft-repairable; keep them in validation_codes
-            # so they still land in warning_codes / confidence, but do not gate import.
-            blocking_codes -= DRAFT_CARD_WARNING_CODES
+            # Card-shape warnings and operator-fillable reconstruction gaps stay
+            # in validation_codes / completion_evidence, but do not gate import.
+            blocking_codes -= DRAFT_CARD_WARNING_CODES | DRAFT_OPERATOR_FILLABLE_CODES
         if (
             validation
             and blocking_codes

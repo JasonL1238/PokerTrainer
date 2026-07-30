@@ -1385,6 +1385,61 @@ def test_reads_below_the_calibrated_render_size_are_unknown(production_bank) -> 
     assert detail.decimal_source in REFUSAL_CODES
 
 
+def test_production_entrypoint_recovers_small_render_via_upscale(
+    production_bank, monkeypatch
+) -> None:
+    """Job-4 style ~1050x730 captures refuse every HUD amount as
+    below_calibrated_render_size even when digits are human-legible (13 BB raise,
+    20 BB flop bet). Lowering the floor reintroduces confident wrong values; the
+    production entrypoint instead upscales into the calibrated band and accepts
+    only a multi-scale consensus that matches the native digit run.
+
+    The bank itself must still refuse the native small crop -- only the
+    entrypoint may recover."""
+    img = cv2.imread(str(FIXTURES / "bet_19_50_at_1272x896.png"))
+    assert img is not None
+    h, w = img.shape[:2]
+    # 0.80x is inside the floor band for this fixture; 0.85x refuses for a
+    # different reason (unexplained ink) and must not be "rescued" by upscale.
+    small = cv2.resize(img, (round(w * 0.80), round(h * 0.80)),
+                       interpolation=cv2.INTER_AREA)
+    native = production_bank.read_number_detail(small)
+    assert native.value is None
+    assert native.decimal_source == "below_calibrated_render_size"
+
+    monkeypatch.setattr(ocr_readers, "_bank", lambda: production_bank)
+    recovered = ocr_readers.read_amount_detail_from_image(
+        small, (0, 0, small.shape[1], small.shape[0])
+    )
+    assert recovered is not None
+    assert recovered.value == 19.5
+
+
+def test_production_entrypoint_does_not_rescue_sprite_fragment(
+    production_bank, monkeypatch
+) -> None:
+    """Adversary: upscaling stack_343_60_sprite_far_fragments at several scales
+    returned confident 0.0 while the screen shows 343.6. A lone under-floor "0"
+    must stay unknown -- multi-scale agreement alone is not enough because every
+    scale agrees on the fragment."""
+    img = cv2.imread(str(FIXTURES / "stack_343_60_sprite_far_fragments_at_1272x896.png"))
+    assert img is not None
+    h, w = img.shape[:2]
+    monkeypatch.setattr(ocr_readers, "_bank", lambda: production_bank)
+    for scale in (0.71, 0.84, 0.97, 0.98):
+        small = cv2.resize(img, (round(w * scale), round(h * scale)),
+                           interpolation=cv2.INTER_AREA)
+        native = production_bank.read_number_detail(small)
+        if native.decimal_source != "below_calibrated_render_size":
+            continue
+        detail = ocr_readers.read_amount_detail_from_image(
+            small, (0, 0, small.shape[1], small.shape[0])
+        )
+        assert detail is not None
+        assert detail.value is None, scale
+        assert detail.decimal_source == "below_calibrated_render_size", scale
+
+
 def test_no_frozen_fixture_reads_a_wrong_value_at_any_render_size(
     production_bank,
 ) -> None:

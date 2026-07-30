@@ -53,6 +53,18 @@ def filter_sessions(sessions: Iterable[Session], query: str) -> list[Session]:
     ]
 
 
+def sessions_on_date(sessions: Iterable[Session], played_on: date) -> list[Session]:
+    """Return sessions whose date_played matches the selected calendar day."""
+
+    return [session for session in sessions if session.date_played == played_on]
+
+
+def session_dates(sessions: Iterable[Session]) -> set[date]:
+    """Return the distinct played dates present in a session list."""
+
+    return {session.date_played for session in sessions}
+
+
 def hand_search_text(hand: Hand, session: Session) -> str:
     """Build a broad text index for fast hand-library search."""
 

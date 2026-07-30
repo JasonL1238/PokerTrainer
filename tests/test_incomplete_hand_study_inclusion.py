@@ -470,3 +470,64 @@ def test_post_finalize_fact_edit_keeps_attestation(tmp_path) -> None:
         acknowledged.completion_evidence
     ).extra.get(OPERATOR_MANUAL_COMPLETION_KEY) is True
     db.close()
+
+
+def test_include_incomplete_exports_amount_unknown_draft() -> None:
+    """Job 4 imported 0 hands because amounts_unknown_in_ledger still blocked
+    drafts even with include_incomplete. Operator-fillable money gaps must import."""
+    from cv_lab.scripts.pipeline.export_yolo_card_hands_for_app import (
+        timeline_to_session_payload,
+    )
+
+    hand = {
+        "hand_number": 1,
+        "t_start": 0.0,
+        "t_end": 40.0,
+        "hero": ["2h", "9s"],
+        "board": ["3h", "5h", "7h", "4h", "5s"],
+        "complete_cards": True,
+        "hero_folded": True,
+        "terminal_event": "hero_fold",
+        "warnings": [
+            "amounts_unknown_in_ledger",
+            "mid_hand_coverage_gap",
+            "starting_stack_unknown",
+        ],
+        "unknown_money_actions": 3,
+        "players": [
+            {
+                "seat": 0,
+                "position": "UTG",
+                "player_name": "Hero",
+                "starting_stack": None,
+                "is_hero": True,
+            }
+        ],
+        "actions": [
+            {
+                "street": "preflop",
+                "action_index": 1,
+                "seat": 0,
+                "player_name": "Hero",
+                "position": "UTG",
+                "action_type": "fold",
+                "amount": None,
+            }
+        ],
+        "source_images": ["a.jpg"],
+    }
+    timeline = {"states": [], "hands": [hand]}
+    blocked = timeline_to_session_payload(
+        timeline, timeline_path="t.json", session_name="S", include_incomplete=False
+    )
+    assert blocked["hands"] == []
+
+    allowed = timeline_to_session_payload(
+        timeline, timeline_path="t.json", session_name="S", include_incomplete=True
+    )
+    assert len(allowed["hands"]) == 1
+    evidence = allowed["hands"][0]["hand"]["completion_evidence"]
+    codes = set(evidence.get("rejection_codes") or []) | set(
+        evidence.get("warning_codes") or []
+    )
+    assert "amounts_unknown_in_ledger" in codes

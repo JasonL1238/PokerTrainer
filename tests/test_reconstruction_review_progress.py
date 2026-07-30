@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from poker_tracker.ui.reconstruction_review import (
+    empty_hands_review_message,
     first_unreviewed_frame_index,
     hand_frame_progress,
     hand_validation_label,
@@ -84,3 +85,35 @@ def test_job_id_from_hand_notes_parses_timeline_path() -> None:
         == 12
     )
     assert job_id_from_hand_notes("manual hand") is None
+
+
+def test_empty_hands_review_message_explains_all_nontable_frames() -> None:
+    message = empty_hands_review_message(
+        {
+            "metadata": {"layout_profile": "1052x732-unsupported"},
+            "summary": {
+                "frames": 1912,
+                "table_frames": 0,
+                "nontable_frames": 1912,
+                "hands": 0,
+            },
+            "hands": [],
+            "states": [],
+        }
+    )
+    assert "non-table" in message
+    assert "1052x732-unsupported" in message
+    assert "1272" in message
+
+
+def test_empty_hands_review_message_mentions_unsupported_layout() -> None:
+    message = empty_hands_review_message(
+        {
+            "metadata": {"layout_profile": "640x448-unsupported"},
+            "summary": {"frames": 10, "hands": 0},
+            "hands": [],
+            "states": [],
+        }
+    )
+    assert "640x448-unsupported" in message
+    assert "no hands" in message.lower()

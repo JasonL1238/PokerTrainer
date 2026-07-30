@@ -317,3 +317,45 @@ def test_a_three_point_frame_fit_is_not_trusted_to_zone_cards():
     # ... and anchor_from_points itself is unchanged: it still produces the fit,
     # so the coin-based path and the session median keep their own semantics.
     assert la.anchor_from_points(pts[:4], REF_PTS) is not None
+
+
+def _paint_reference_coins(img, *, radius: int, pot_radius: int) -> None:
+    import cv2
+
+    height, width = img.shape[:2]
+    for nx, ny in la.REF_SEAT_COINS:
+        cv2.circle(
+            img,
+            (int(nx * width), int(ny * height)),
+            radius,
+            (0, 220, 0),
+            -1,
+        )
+    cv2.circle(
+        img,
+        (int(la.REF_POT_COIN[0] * width), int(la.REF_POT_COIN[1] * height)),
+        pot_radius,
+        (0, 220, 0),
+        -1,
+    )
+
+
+def test_detect_coins_keeps_half_scale_seat_constellation() -> None:
+    """Fixed 3x3 open + area>=40 erased ClubWPT coins on ~1052x732 windows."""
+    np = pytest.importorskip("numpy")
+    scale = 0.5
+    width = int(la.REF_W * scale)
+    height = int(la.REF_H * scale)
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    img[:] = (40, 40, 40)
+    _paint_reference_coins(img, radius=max(3, int(11 * scale)), pot_radius=max(4, int(14 * scale)))
+    coins = la.detect_coins(img)
+    assert len(coins) >= 8, f"expected seat+pot coins at half scale, got {len(coins)}"
+
+
+def test_detect_coins_reference_scale_still_finds_constellation() -> None:
+    np = pytest.importorskip("numpy")
+    img = np.zeros((la.REF_H, la.REF_W, 3), dtype=np.uint8)
+    img[:] = (40, 40, 40)
+    _paint_reference_coins(img, radius=11, pot_radius=14)
+    assert len(la.detect_coins(img)) >= 8

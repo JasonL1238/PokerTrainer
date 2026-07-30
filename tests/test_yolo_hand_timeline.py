@@ -1821,3 +1821,219 @@ def test_time_jump_with_board_advance_is_a_coverage_gap_without_nontable_marker(
     assert hand["coverage_gaps"] >= 1
     assert "mid_hand_coverage_gap" in hand["warnings"]
     assert hand["complete"] is False
+
+
+def test_hero_dim_at_open_emits_fold_and_blocks_inferred_checks():
+    """Operator: hero folded long ago but dim cards kept seat 0 live."""
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import _reconstruct_actions
+
+    def state(time_s, *, board, dealt, pills=None, bets=None, stacks=None, pot=None):
+        return {
+            "time_s": float(time_s),
+            "image": f"{time_s}.jpg",
+            "state_index": 0,
+            "board_cards": list(board),
+            "dealt_in": list(dealt),
+            "pills": dict(pills or {}),
+            "bets": dict(bets or {}),
+            "stacks": dict(stacks or {}),
+            "stacks_unknown": {},
+            "bets_unknown": {},
+            "hero_cards": ["Ah", "Kd"],
+            "hero_dim": True,
+            "villain_cards": {},
+            "pot": pot,
+            "pot_unknown": None,
+            "stage": {0: "preflop", 3: "flop"}.get(len(board), "preflop"),
+            "sampling_interval_s": 1.0,
+            "prior_gap_s": 0.0 if time_s == 0 else 1.0,
+        }
+
+    hand = [
+        state(0, board=[], dealt=[0, 1, 6, 7], pills={1: "raise", 6: "call"},
+              bets={1: 3.0, 6: 3.0}, stacks={0: 200, 1: 200, 6: 200, 7: 200}, pot=7.5),
+        state(4, board=[], dealt=[0, 1, 6, 7], pills={7: "raise"},
+              bets={7: 13.0, 1: 3.0, 6: 3.0}, stacks={0: 200, 1: 200, 6: 200, 7: 187}, pot=22),
+        state(6, board=[], dealt=[0, 1, 6, 7], pills={1: "call"},
+              bets={7: 13.0, 1: 13.0, 6: 3.0}, stacks={0: 200, 1: 187, 6: 200, 7: 187}, pot=32),
+        state(9, board=FLOP, dealt=[0, 1, 6, 7],
+              stacks={0: 200, 1: 187, 6: 187, 7: 187}, pot=42),
+    ]
+    positions = {0: "UTG", 1: "UTG+1", 6: "SB", 7: "BB"}
+    names = {0: "Hero", 1: "S1", 6: "SB", 7: "BB"}
+    actions = _reconstruct_actions(hand, positions, names)
+    assert any(
+        a["seat"] == 0 and a["action_type"] == "fold" and a["derivation"] == "hero_dim"
+        for a in actions
+    )
+    assert not any(a["seat"] == 0 and a["action_type"] == "check" for a in actions)
+
+
+def test_still_in_seat_after_raise_infers_call_when_street_advances():
+    """Operator: because SB is still in you should assume they called."""
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import _reconstruct_actions
+
+    def state(time_s, *, board, dealt, pills=None, bets=None, stacks=None, pot=None):
+        return {
+            "time_s": float(time_s),
+            "image": f"{time_s}.jpg",
+            "state_index": 0,
+            "board_cards": list(board),
+            "dealt_in": list(dealt),
+            "pills": dict(pills or {}),
+            "bets": dict(bets or {}),
+            "stacks": dict(stacks or {}),
+            "stacks_unknown": {},
+            "bets_unknown": {},
+            "hero_cards": ["Ah", "Kd"],
+            "hero_dim": False,
+            "villain_cards": {},
+            "pot": pot,
+            "pot_unknown": None,
+            "stage": {0: "preflop", 3: "flop"}.get(len(board), "preflop"),
+            "sampling_interval_s": 1.0,
+            "prior_gap_s": 0.0 if time_s == 0 else 1.0,
+        }
+
+    # No stack reads: money size unknown; still-in must still book the call.
+    hand = [
+        state(0, board=[], dealt=[1, 6, 7], pills={1: "raise", 6: "call"},
+              bets={1: 3.0, 6: 3.0}, pot=7.5),
+        state(4, board=[], dealt=[1, 6, 7], pills={7: "raise"},
+              bets={7: 13.0, 1: 3.0, 6: 3.0}, pot=22),
+        state(6, board=[], dealt=[1, 6, 7], pills={1: "call"},
+              bets={7: 13.0, 1: 13.0, 6: 3.0}, pot=32),
+        state(9, board=FLOP, dealt=[1, 6, 7], pot=42),
+    ]
+    actions = _reconstruct_actions(
+        hand, {1: "UTG+1", 6: "SB", 7: "BB"}, {1: "S1", 6: "SB", 7: "BB"}
+    )
+    inferred = [
+        a for a in actions
+        if a["seat"] == 6 and a["derivation"] == "inferred_still_in"
+    ]
+    assert len(inferred) == 1
+    assert inferred[0]["action_type"] == "call"
+    assert inferred[0]["street"] == "preflop"
+
+
+def test_still_in_call_is_not_inferred_across_coverage_gap():
+    """Adversary: board advance after a long hole must not invent still-in calls."""
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import _reconstruct_actions
+
+    def state(time_s, *, board, dealt, pills=None, bets=None, prior_gap_s=1.0, pot=None):
+        return {
+            "time_s": float(time_s),
+            "image": f"{time_s}.jpg",
+            "state_index": 0,
+            "board_cards": list(board),
+            "dealt_in": list(dealt),
+            "pills": dict(pills or {}),
+            "bets": dict(bets or {}),
+            "stacks": {},
+            "stacks_unknown": {},
+            "bets_unknown": {},
+            "hero_cards": ["Ah", "Kd"],
+            "hero_dim": False,
+            "villain_cards": {},
+            "pot": pot,
+            "pot_unknown": None,
+            "stage": {0: "preflop", 3: "flop"}.get(len(board), "preflop"),
+            "sampling_interval_s": 1.0,
+            "prior_gap_s": float(prior_gap_s),
+        }
+
+    hand = [
+        state(0, board=[], dealt=[1, 6, 7], pills={1: "raise", 6: "call"},
+              bets={1: 3.0, 6: 3.0}, prior_gap_s=0.0, pot=7.5),
+        state(4, board=[], dealt=[1, 6, 7], pills={7: "raise"},
+              bets={7: 13.0, 1: 3.0, 6: 3.0}, pot=22),
+        # Long unobserved hole then flop; SB still listed dealt-in at both ends.
+        state(20, board=FLOP, dealt=[1, 6, 7], prior_gap_s=16.0, pot=42),
+    ]
+    actions = _reconstruct_actions(
+        hand, {1: "UTG+1", 6: "SB", 7: "BB"}, {1: "S1", 6: "SB", 7: "BB"}
+    )
+    assert not any(a.get("derivation") == "inferred_still_in" for a in actions)
+
+
+def test_still_in_does_not_call_for_all_in_seat():
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import _reconstruct_actions
+
+    def state(time_s, *, board, dealt, pills=None, bets=None, stacks=None, pot=None):
+        return {
+            "time_s": float(time_s),
+            "image": f"{time_s}.jpg",
+            "state_index": 0,
+            "board_cards": list(board),
+            "dealt_in": list(dealt),
+            "pills": dict(pills or {}),
+            "bets": dict(bets or {}),
+            "stacks": dict(stacks or {}),
+            "stacks_unknown": {},
+            "bets_unknown": {},
+            "hero_cards": ["Ah", "Kd"],
+            "hero_dim": False,
+            "villain_cards": {},
+            "pot": pot,
+            "pot_unknown": None,
+            "stage": {0: "preflop", 3: "flop"}.get(len(board), "preflop"),
+            "sampling_interval_s": 1.0,
+            "prior_gap_s": 0.0 if time_s == 0 else 1.0,
+        }
+
+    hand = [
+        state(0, board=[], dealt=[1, 7], pills={1: "raise"}, bets={1: 50.0},
+              stacks={1: 0.0, 7: 100.0}, pot=51),
+        state(2, board=[], dealt=[1, 7], pills={7: "raise"}, bets={7: 100.0, 1: 50.0},
+              stacks={1: 0.0, 7: 50.0}, pot=151),
+        state(4, board=FLOP, dealt=[1, 7], stacks={1: 0.0, 7: 50.0}, pot=151),
+    ]
+    actions = _reconstruct_actions(
+        hand, {1: "UTG", 7: "BB"}, {1: "S1", 7: "BB"}
+    )
+    assert not any(
+        a["seat"] == 1 and a["derivation"] == "inferred_still_in" for a in actions
+    )
+
+
+def test_hero_dim_does_not_duplicate_fold_pill():
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import _reconstruct_actions
+
+    first = {
+        "time_s": 0.0,
+        "image": "0.jpg",
+        "state_index": 0,
+        "board_cards": [],
+        "dealt_in": [0, 1],
+        "pills": {0: "fold", 1: "raise"},
+        "bets": {1: 3.0},
+        "stacks": {0: 100.0, 1: 100.0},
+        "stacks_unknown": {},
+        "bets_unknown": {},
+        "hero_cards": ["Ah", "Kd"],
+        "hero_dim": True,
+        "villain_cards": {},
+        "pot": 4.5,
+        "pot_unknown": None,
+        "stage": "preflop",
+        "sampling_interval_s": 1.0,
+        "prior_gap_s": 0.0,
+    }
+    second = {
+        **first,
+        "time_s": 3.0,
+        "image": "3.jpg",
+        "board_cards": FLOP,
+        "dealt_in": [1],
+        "pills": {},
+        "bets": {},
+        "stage": "flop",
+        "prior_gap_s": 3.0,
+    }
+    actions = _reconstruct_actions(
+        [first, second], {0: "BTN", 1: "BB"}, {0: "Hero", 1: "BB"}
+    )
+    hero_folds = [a for a in actions if a["seat"] == 0 and a["action_type"] == "fold"]
+    assert len(hero_folds) == 1
+    assert hero_folds[0]["derivation"] == "action_pill"

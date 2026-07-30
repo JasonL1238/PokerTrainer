@@ -62,6 +62,47 @@ def load_timeline_for_job(
     return payload
 
 
+def empty_hands_review_message(timeline: dict[str, Any]) -> str:
+    """Explain a completed job whose timeline has nothing to validate."""
+    summary = timeline.get("summary") or {}
+    metadata = timeline.get("metadata") or {}
+    frames = int(summary.get("frames") or 0)
+    table_frames = summary.get("table_frames")
+    nontable_frames = summary.get("nontable_frames")
+    layout = str(metadata.get("layout_profile") or "").strip()
+    unsupported = layout.endswith("-unsupported")
+
+    if (
+        isinstance(table_frames, int)
+        and isinstance(nontable_frames, int)
+        and frames > 0
+        and table_frames == 0
+    ):
+        detail = (
+            f"All {frames} sampled frames were classified as non-table "
+            "(lobby, modal, transition, or unrecognized layout), so detection never ran."
+        )
+        if unsupported:
+            detail += (
+                f" Layout {layout} is below the calibrated ClubWPT window size — "
+                "record the full client closer to 1272×896 or larger."
+            )
+        return detail
+
+    if unsupported:
+        return (
+            f"Reconstruction finished with no hands. Layout {layout} is outside the "
+            "calibrated ClubWPT geometries, so the table was never reconstructed."
+        )
+
+    if frames > 0:
+        return (
+            f"Reconstruction finished over {frames} sampled frames but produced no "
+            "hands to validate."
+        )
+    return "The reconstruction did not produce any hands to validate."
+
+
 def states_for_hand(
     timeline: dict[str, Any], hand: dict[str, Any]
 ) -> list[dict[str, Any]]:

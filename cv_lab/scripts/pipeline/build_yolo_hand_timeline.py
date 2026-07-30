@@ -919,18 +919,65 @@ def _player_seats(
 
 
 def _opening_live_seats(first: dict[str, Any]) -> set[int]:
-    """Seats with evidence they were still live when the first state was seen."""
+    """Seats with evidence they were still live when the first state was seen.
+
+    Hero hole cards stay on screen after a fold (they grey out in place), so a
+    ``hero_dim`` first state must NOT count seat 0 as live -- otherwise the
+    opening roster keeps a folded hero and later inferred checks invent actions
+    for a player who already left.
+    """
     first_bets_unknown = first.get("bets_unknown") or {}
-    return (
+    hero_live = (
+        len(first["hero_cards"]) == 2 and not first.get("hero_dim")
+    )
+    live = (
         set(first["dealt_in"])
         | set(first.get("villain_cards") or {})
-        | ({0} if len(first["hero_cards"]) == 2 else set())
+        | ({0} if hero_live else set())
         | {
             seat for seat, pill in (first.get("pills") or {}).items()
             if pill != "fold"
         }
         | set(first.get("bets") or {})
         | set(first_bets_unknown)
+    )
+    if first.get("hero_dim"):
+        live.discard(0)
+    return live
+
+
+def _seat_owes_call_on_street(
+    actions: list[dict[str, Any]], street: str, seat: int
+) -> bool:
+    """True when a later raise/bet on ``street`` has not been answered by ``seat``.
+
+    Used when the board advances while the seat is still dealt-in: remaining in
+    the hand after facing an unanswered raise means they called (operator:
+    "because SB is still in you should assume they called").
+    """
+    street_actions = [action for action in actions if action["street"] == street]
+    if any(
+        action["seat"] == seat and action["action_type"] == "all-in"
+        for action in street_actions
+    ):
+        # An all-in seat stays dealt-in but cannot answer a later raise.
+        return False
+    last_aggressor_index = max(
+        (
+            index
+            for index, action in enumerate(street_actions)
+            if action["action_type"] in {"raise", "bet", "all-in"}
+        ),
+        default=-1,
+    )
+    if last_aggressor_index < 0:
+        return False
+    aggressor = street_actions[last_aggressor_index]["seat"]
+    if aggressor == seat:
+        return False
+    return not any(
+        action["seat"] == seat
+        for action in street_actions[last_aggressor_index + 1 :]
     )
 
 
@@ -1317,6 +1364,26 @@ def _reconstruct_actions(
     # ring, but never synthesize later checks or actions for it.
     preobserved_folded = set(positions) - _opening_live_seats(first)
     folded.update(preobserved_folded)
+    if (
+        0 in preobserved_folded
+        and first.get("hero_dim")
+        and len(first.get("hero_cards") or []) == 2
+        and first.get("pills", {}).get(0) != "fold"
+    ):
+        # Greyed hero cards at hand open: book the fold so later streets cannot
+        # synthesize checks for a hero who already left (operator flag: "hero
+        # folded a long time ago"). Skip when a fold pill is already present --
+        # the first-state pill loop books that fold once.
+        emit(
+            "preflop",
+            0,
+            "fold",
+            None,
+            None,
+            first["stacks"].get(0),
+            source=first,
+            derivation="hero_dim",
+        )
     if not first["board_cards"]:
         first_seats = (
             set(positions) | set(first["pills"])
@@ -1446,6 +1513,25 @@ def _reconstruct_actions(
         )
         if coverage_gap:
             cur["coverage_gap"] = True
+
+        # ---- hero_dim rising mid-hand: persistent fold indicator ----
+        if (
+            cur.get("hero_dim")
+            and not prev.get("hero_dim")
+            and 0 in positions
+            and 0 not in folded
+        ):
+            folded.add(0)
+            emit(
+                street,
+                0,
+                "fold",
+                None,
+                pot_before,
+                prev["stacks"].get(0),
+                source=cur,
+                derivation="hero_dim",
+            )
 
         # ---- money actions (bet_text delta, corroborated by the stack) ----
         money_seats: dict[int, tuple[float | None, float | None, str]] = {}
@@ -1671,6 +1757,47 @@ def _reconstruct_actions(
                     "action_pill" if seat in pill_folds else "card_back_disappeared"
                 ),
             )
+
+        # ---- still-in calls when the street closes ----
+        # After money/fold evidence for this transition: if the board advanced
+        # and a live seat still owes a response to the last raise, remaining
+        # dealt-in is proof they called (amount may still be unknown).
+        # Never across a coverage_gap: both endpoints being dealt-in does not
+        # prove continuous presence through an unobserved stretch.
+        cur_board_hwm = max(board_hwm, len(cur["board_cards"]))
+        if (
+            cur_board_hwm > board_hwm
+            and street_has_bet.get(street)
+            and not coverage_gap
+        ):
+            still_in = (
+                (set(prev.get("dealt_in") or []) & set(cur.get("dealt_in") or []))
+                - folded
+            )
+            if cur.get("hero_dim"):
+                still_in.discard(0)
+            for seat in sorted(
+                still_in,
+                key=lambda item: (money_order.get(item, len(money_order)), item),
+            ):
+                if seat not in positions or seat in money_seats:
+                    continue
+                stack_now = prev["stacks"].get(seat)
+                if stack_now is not None and stack_now <= _EPS:
+                    # Already all-in: remains dealt-in but cannot answer a raise.
+                    continue
+                if not _seat_owes_call_on_street(actions, street, seat):
+                    continue
+                emit(
+                    street,
+                    seat,
+                    "call",
+                    None,
+                    pot_before,
+                    prev["stacks"].get(seat),
+                    source=cur,
+                    derivation="inferred_still_in",
+                )
 
         # ---- checks: fresh check pill, no money this transition ----
         # A fresh check pill arriving together WITH a new board card belongs to
@@ -2446,6 +2573,8 @@ def _layout_profile(frames: list[rd.Frame]) -> str:
 def build_hand_timeline(frames: list[rd.Frame]) -> dict[str, Any]:
     states, events = build_states(frames)
     hands = [reconstruct(hand, i) for i, hand in enumerate(_segment(states), start=1)]
+    table_frames = sum(1 for frame in frames if _is_table_frame(frame))
+    nontable_frames = len(frames) - table_frames
     return {
         "metadata": {
             "source": "yolo_region_detections",
@@ -2460,6 +2589,8 @@ def build_hand_timeline(frames: list[rd.Frame]) -> dict[str, Any]:
         },
         "summary": {
             "frames": len(frames),
+            "table_frames": table_frames,
+            "nontable_frames": nontable_frames,
             "states": len(states),
             "events": len(events),
             "hands": len(hands),

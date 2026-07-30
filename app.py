@@ -89,6 +89,12 @@ from poker_tracker.services.hand_accounting import (
     persist_reconciliation,
     reconcile_persisted_hand,
 )
+from poker_tracker.services.manual_spot_entry import (
+    ManualSpotInput,
+    PostflopActionInput,
+    save_manual_spot,
+    validate_manual_spot,
+)
 from poker_tracker.services.settlement_sync import (
     SettlementSyncRefused,
     sync_recorded_figures_from_ledger,
@@ -167,6 +173,7 @@ from poker_tracker.ui.poker_visuals import (
 )
 from poker_tracker.ui.reconstruction_review import (
     ISSUE_GUIDANCE,
+    empty_hands_review_message,
     first_unreviewed_frame_index,
     hand_frame_progress,
     hand_validation_label,
@@ -188,6 +195,8 @@ from poker_tracker.ui.session_library import (
     date_session_name,
     filter_hands,
     filter_sessions,
+    session_dates,
+    sessions_on_date,
 )
 from poker_tracker.ui.ui_theme import brand_header, inject_theme
 from poker_tracker.ui.video_ingest import ingest_uploaded_video
@@ -970,7 +979,7 @@ def show_sessions_workspace(db: PokerDatabase, session: Session | None) -> None:
     if session is None:
         empty_state(
             "Create your first session",
-            "Create one below. Its date becomes the memorable default name.",
+            "Create one below. Date played defaults to today and can be changed later.",
         )
         create_session_form(db, form_key="create_first_session")
         return
@@ -1237,12 +1246,12 @@ def render_study_hand_navigation(
     if "study_hand_picker" not in st.session_state:
         st.session_state["study_hand_picker"] = hand.id
     with st.container(key="study_hand_navigation"):
-        previous_col, chooser_col, next_col = st.columns([0.7, 2.6, 0.7])
+        previous_col, chooser_col, next_col = st.columns([1.1, 2.2, 1.1])
         previous_col.button(
-            "← Prev",
+            "← Previous hand",
             key="study_previous_hand",
             disabled=active_index == 0,
-            help="Previous hand",
+            help="Go to the previous hand in this session",
             width="stretch",
             on_click=_set_study_hand_id,
             args=(ordered[active_index - 1].id if active_index > 0 else hand.id,),
@@ -1258,10 +1267,10 @@ def render_study_hand_navigation(
             st.session_state["study_hand_id"] = selected_id
             st.rerun()
         next_col.button(
-            "Next →",
+            "Next hand →",
             key="study_next_hand",
             disabled=active_index >= len(ordered) - 1,
-            help="Next hand",
+            help="Go to the next hand in this session",
             width="stretch",
             type="primary",
             on_click=_set_study_hand_id,
@@ -1272,7 +1281,7 @@ def render_study_hand_navigation(
             ),
         )
         st.caption(
-            f"{active_index + 1} of {len(ordered)} · {session.name} · "
+            f"Hand {active_index + 1} of {len(ordered)} · {session.name} · "
             f"{hand.source_type.replace('_', ' ').title()} · "
             f"{hand.completion_status.replace('_', ' ').title()}"
         )
@@ -3163,10 +3172,20 @@ def show_import_workspace(db: PokerDatabase, session: Session | None) -> None:
         "Import a completed session",
         "Keep every recording from the same completed session together, then reconstruct its hands.",
     )
-    if session is None:
+    sessions = db.fetch_sessions()
+    if not sessions:
         empty_state(
             "Create a session for these recordings",
-            "The date becomes its default name; you can attach more videos at any time.",
+            "Every session needs a played date (defaults to today). You can change it any time.",
+        )
+        create_session_form(db, form_key="create_import_session")
+        return
+
+    session = _choose_import_session(db, sessions, session)
+    if session is None:
+        empty_state(
+            "Select or create a session",
+            "Pick a session below, or create one with a played date before importing.",
         )
         create_session_form(db, form_key="create_import_session")
         return
@@ -3330,43 +3349,54 @@ def show_session_library(
     """Render a searchable, visible session index instead of another dropdown."""
 
     with st.expander("Browse all sessions", expanded=active_session is None):
-        query = st.text_input(
-            "Find a session",
-            placeholder="Try “July 27”, “ClubWPT”, “1/2”, or a note",
-            key="session_library_search",
-        )
-        matches = filter_sessions(sessions, query)
-        if not matches:
-            st.caption("No sessions match that search.")
-            return
-
-        st.caption(f"{len(matches)} session{'s' if len(matches) != 1 else ''}")
-        for item in matches[:20]:
-            if item.id is None:
-                continue
-            hands = db.fetch_hands_by_session(item.id)
-            videos = db.fetch_videos(item.id)
-            with st.container(border=True, key=f"session_card_{item.id}"):
-                detail, action = st.columns([5, 1])
-                with detail:
-                    st.markdown(f"**{item.name}**")
-                    st.caption(
-                        f"{item.date_played.strftime('%A, %b')} {item.date_played.day} · "
-                        f"{item.platform or 'Platform not set'} · "
-                        f"{item.stakes or 'Stakes not set'} · "
-                        f"{len(hands)} hands · {len(videos)} videos"
-                    )
-                if action.button(
-                    "Open" if active_session is None or item.id != active_session.id else "Current",
-                    key=f"open_session_{item.id}",
-                    type="primary"
-                    if active_session is not None and item.id == active_session.id
-                    else "secondary",
-                    disabled=active_session is not None and item.id == active_session.id,
-                    width="stretch",
-                ):
-                    _activate_session(item.id)
-                    st.rerun()
+        search_tab, calendar_tab = st.tabs(["Search", "Calendar"])
+        active_id = active_session.id if active_session is not None else None
+        with calendar_tab:
+            render_calendar_session_browser(
+                sessions,
+                key_prefix="session_library",
+                active_id=active_id,
+            )
+        with search_tab:
+            query = st.text_input(
+                "Find a session",
+                placeholder="Try “July 27”, “ClubWPT”, “1/2”, or a note",
+                key="session_library_search",
+            )
+            matches = filter_sessions(sessions, query)
+            if not matches:
+                st.caption("No sessions match that search.")
+            else:
+                st.caption(f"{len(matches)} session{'s' if len(matches) != 1 else ''}")
+                for item in matches[:20]:
+                    if item.id is None:
+                        continue
+                    hands = db.fetch_hands_by_session(item.id)
+                    videos = db.fetch_videos(item.id)
+                    with st.container(border=True, key=f"session_card_{item.id}"):
+                        detail, action = st.columns([5, 1])
+                        with detail:
+                            st.markdown(f"**{item.name}**")
+                            st.caption(
+                                f"{item.date_played.strftime('%A, %b')} {item.date_played.day} · "
+                                f"{item.platform or 'Platform not set'} · "
+                                f"{item.stakes or 'Stakes not set'} · "
+                                f"{len(hands)} hands · {len(videos)} videos"
+                            )
+                        if action.button(
+                            "Open"
+                            if active_session is None or item.id != active_session.id
+                            else "Current",
+                            key=f"open_session_{item.id}",
+                            type="primary"
+                            if active_session is not None and item.id == active_session.id
+                            else "secondary",
+                            disabled=active_session is not None
+                            and item.id == active_session.id,
+                            width="stretch",
+                        ):
+                            _activate_session(item.id)
+                            st.rerun()
 
 
 def _open_hand_for_study(hand: Hand) -> None:
@@ -3640,6 +3670,8 @@ def _save_video_upload(
                 ingested.path.unlink(missing_ok=True)
                 raise
             flash(f"Added {saved.original_filename} to {session.name}.")
+            if session.id is not None:
+                st.session_state[_import_collect_panel_key(session.id)] = False
             st.rerun()
         except ValueError as exc:
             st.error(str(exc))
@@ -3721,7 +3753,11 @@ def create_session_form(
     form_key: str = "create_session",
 ) -> None:
     with st.form(form_key, clear_on_submit=True):
-        date_played = st.date_input("Date played", value=date.today())
+        date_played = st.date_input(
+            "Date played",
+            value=date.today(),
+            help="Defaults to today. Every session keeps a played date you can edit later.",
+        )
         generated_name = date_session_name(date_played, db.fetch_sessions())
         name = st.text_input(
             "Custom name (optional)",
@@ -3750,6 +3786,91 @@ def create_session_form(
         st.rerun()
 
 
+def edit_session_form(db: PokerDatabase, session: Session) -> None:
+    """Edit session fields, including the played date, after creation."""
+
+    if session.id is None:
+        return
+    with st.expander("Edit session details", expanded=False):
+        with st.form(f"edit_session_{session.id}"):
+            date_played = st.date_input(
+                "Date played",
+                value=session.date_played,
+                help="Change the session date any time after creation.",
+            )
+            name = st.text_input("Name", value=session.name)
+            platform = st.text_input("Platform", value=session.platform)
+            stakes = st.text_input("Stakes", value=session.stakes)
+            notes = st.text_area("Notes", value=session.notes, height=80)
+            submitted = st.form_submit_button("Save session changes")
+        if submitted:
+            try:
+                updated = db.update_session(
+                    session.model_copy(
+                        update={
+                            "name": name.strip() or session.name,
+                            "date_played": date_played,
+                            "platform": platform.strip() or "Manual",
+                            "stakes": stakes.strip(),
+                            "notes": notes.strip(),
+                        }
+                    )
+                )
+                flash(f"Updated session: {updated.name}.")
+                st.rerun()
+            except ValueError as exc:
+                st.error(str(exc))
+
+
+def _session_button_label(session: Session) -> str:
+    return f"{session.date_played.strftime('%b')} {session.date_played.day} · {session.name}"
+
+
+def render_calendar_session_browser(
+    sessions: list[Session],
+    *,
+    key_prefix: str,
+    active_id: int | None = None,
+) -> None:
+    """Pick a calendar day, then open a session played on that date."""
+
+    known_dates = session_dates(sessions)
+    default = date.today()
+    if active_id is not None:
+        active = next((item for item in sessions if item.id == active_id), None)
+        if active is not None:
+            default = active.date_played
+    elif known_dates:
+        default = max(known_dates)
+
+    picked = st.date_input(
+        "Calendar day",
+        value=default,
+        key=f"{key_prefix}_calendar_day",
+        help="Use the calendar to find which day a session was played.",
+    )
+    matches = sessions_on_date(sessions, picked)
+    day_label = f"{picked.strftime('%A, %b')} {picked.day}, {picked.year}"
+    if matches:
+        st.caption(f"{len(matches)} session{'s' if len(matches) != 1 else ''} on {day_label}")
+    else:
+        st.caption(f"No sessions on {day_label}.")
+        return
+
+    for item in matches:
+        if item.id is None:
+            continue
+        if st.button(
+            _session_button_label(item),
+            key=f"{key_prefix}_cal_session_{item.id}",
+            type="primary" if item.id == active_id else "secondary",
+            disabled=item.id == active_id,
+            width="stretch",
+        ):
+            _activate_session(item.id)
+            st.rerun()
+
+
 def select_session(db: PokerDatabase) -> Session | None:
     sessions = db.fetch_sessions()
     if not sessions:
@@ -3767,9 +3888,7 @@ def select_session(db: PokerDatabase) -> Session | None:
         active = next(item for item in sessions if item.id == active_id)
         recent = [active, *recent[:5]]
     labels = {
-        session.id: (
-            f"{session.date_played.strftime('%b')} {session.date_played.day} · {session.name}"
-        )
+        session.id: _session_button_label(session)
         for session in recent
         if session.id is not None
     }
@@ -3784,8 +3903,75 @@ def select_session(db: PokerDatabase) -> Session | None:
         ):
             _activate_session(session_id)
             st.rerun()
+    with st.expander("Calendar", expanded=False):
+        render_calendar_session_browser(
+            sessions,
+            key_prefix="sidebar",
+            active_id=active_id if isinstance(active_id, int) else None,
+        )
     st.caption("Older sessions are searchable in Sessions.")
     return next(session for session in sessions if session.id == active_id)
+
+
+def _choose_import_session(
+    db: PokerDatabase,
+    sessions: list[Session],
+    current: Session | None,
+) -> Session | None:
+    """Let Import pick its target session, with calendar and create options."""
+
+    if current is None and sessions:
+        active_id = st.session_state.get("active_session_id")
+        current = next((item for item in sessions if item.id == active_id), sessions[0])
+        if current.id is not None:
+            _activate_session(current.id)
+
+    if current is None:
+        return None
+
+    with st.container(border=True, key="import_session_target"):
+        st.markdown(f"**Import into:** {current.name}")
+        st.caption(
+            f"Date played · {current.date_played.strftime('%A, %b')} "
+            f"{current.date_played.day}, {current.date_played.year}"
+            + (f" · {current.stakes}" if current.stakes else "")
+        )
+        with st.expander("Change session", expanded=False):
+            recent_tab, calendar_tab = st.tabs(["Recent", "Calendar"])
+            active_id = current.id
+            with calendar_tab:
+                render_calendar_session_browser(
+                    sessions,
+                    key_prefix="import_target",
+                    active_id=active_id,
+                )
+            with recent_tab:
+                for item in sessions[:12]:
+                    if item.id is None:
+                        continue
+                    if st.button(
+                        _session_button_label(item),
+                        key=f"import_pick_session_{item.id}",
+                        type="primary" if item.id == active_id else "secondary",
+                        disabled=item.id == active_id,
+                        width="stretch",
+                    ):
+                        _activate_session(item.id)
+                        st.rerun()
+        with st.expander("New session for this import", expanded=False):
+            create_session_form(db, form_key="create_import_target_session")
+    return current
+
+
+def _import_collect_panel_key(session_id: int) -> str:
+    return f"import_collect_expanded_{session_id}"
+
+
+def _import_collect_is_open(session_id: int, *, has_videos: bool) -> bool:
+    key = _import_collect_panel_key(session_id)
+    if key not in st.session_state:
+        st.session_state[key] = not has_videos
+    return bool(st.session_state[key])
 
 
 def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
@@ -3796,6 +3982,7 @@ def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
     st.caption(
         f"{session.date_played} · {session.stakes or 'stakes not set'} · {session.platform or 'platform not set'}"
     )
+    edit_session_form(db, session)
 
     winrate_help = f"{stats.average_hero_bb:+.2f} BB/hand over {stats.hands_with_result} hands with recorded results"
     if stats.bb_per_100_ci is not None:
@@ -3921,6 +4108,10 @@ def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
             st.rerun()
 
 
+_SOLVER_POSITIONS = ["UTG", "UTG+1", "LJ", "HJ", "CO", "BTN", "SB", "BB"]
+_POSTFLOP_LINE_ACTIONS = ["check", "bet", "call", "raise", "fold", "all-in"]
+
+
 def create_hand_form(db: PokerDatabase, session_id: int | None) -> None:
     if session_id is None:
         st.error("Select a saved session before adding hands.")
@@ -3929,264 +4120,162 @@ def create_hand_form(db: PokerDatabase, session_id: int | None) -> None:
     existing_hands = db.fetch_hands_by_session(session_id)
     next_hand_number = max((hand.hand_number for hand in existing_hands), default=0) + 1
 
+    st.caption(
+        "Enter a completed heads-up postflop spot. Blinds and preflop are filled in "
+        "from the pot type; only the postflop line needs to be typed."
+    )
+
     # clear_on_submit=False so a validation error does not wipe the user's work;
-    # the form and editors are reset explicitly after a successful save.
+    # the line editor is reset explicitly after a successful save.
     with st.form("create_hand", clear_on_submit=False):
-        st.markdown("#### Hand Setup")
-        setup_left, setup_right = st.columns(2)
-        with setup_left:
+        cards_left, cards_right = st.columns(2)
+        with cards_left:
+            hero_cards = st.text_input("Hero cards", placeholder="Ah Qs")
+            hero_position = st.selectbox(
+                "Hero position", _SOLVER_POSITIONS, index=_SOLVER_POSITIONS.index("BB")
+            )
+            villain_position = st.selectbox(
+                "Villain position", _SOLVER_POSITIONS, index=_SOLVER_POSITIONS.index("BTN")
+            )
+        with cards_right:
+            board_cards = st.text_input("Board", placeholder="Qd 7s 2c")
+            starting_stack = st.number_input(
+                "Effective stack (BB)", min_value=1.0, value=100.0, step=1.0
+            )
+            table_size = st.number_input("Table size", min_value=5, max_value=8, value=6, step=1)
+
+        structure_left, structure_right = st.columns(2)
+        with structure_left:
+            pot_type_label = st.radio(
+                "Pot type",
+                ["Single raised", "3-bet"],
+                horizontal=True,
+            )
+            pot_type = "three_bet" if pot_type_label == "3-bet" else "single_raised"
+            opener_label = st.selectbox("Preflop opener", ["Villain", "Hero"], index=0)
+            opener = "hero" if opener_label == "Hero" else "villain"
+            three_bettor_label = st.selectbox(
+                "3-bettor",
+                ["Hero", "Villain"],
+                index=0,
+                help="Used only for 3-bet pots.",
+            )
+            three_bettor = "hero" if three_bettor_label == "Hero" else "villain"
+        with structure_right:
+            open_to = st.number_input("Open to (BB)", min_value=1.5, value=2.5, step=0.5)
+            three_bet_to = st.number_input(
+                "3-bet to (BB)",
+                min_value=2.0,
+                value=9.0,
+                step=0.5,
+                help="Used only for 3-bet pots.",
+            )
+
+        st.markdown("##### Postflop line")
+        st.caption(
+            "Amount is chips added by that action (not raise-to). OOP acts first."
+        )
+        line_rows = st.data_editor(
+            [
+                {"Street": "flop", "Player": "Hero", "Action": "check", "Amount": None},
+                {"Street": "flop", "Player": "Villain", "Action": "bet", "Amount": 3.5},
+                {"Street": "flop", "Player": "Hero", "Action": "call", "Amount": 3.5},
+            ],
+            num_rows="dynamic",
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Street": st.column_config.SelectboxColumn(
+                    "Street", options=["flop", "turn", "river"], required=True
+                ),
+                "Player": st.column_config.SelectboxColumn(
+                    "Player", options=["Hero", "Villain"], required=True
+                ),
+                "Action": st.column_config.SelectboxColumn(
+                    "Action", options=_POSTFLOP_LINE_ACTIONS, required=True
+                ),
+                "Amount": st.column_config.NumberColumn(
+                    "Amount (BB)",
+                    min_value=0.0,
+                    step=0.5,
+                    help="Chips this action commits. Leave blank for check/fold.",
+                ),
+            },
+            key="manual_spot_line_editor",
+        )
+
+        outcome_left, outcome_right = st.columns(2)
+        with outcome_left:
+            winner_label = st.selectbox("Winner", ["Hero", "Villain"], index=0)
             hand_number = st.number_input(
                 "Hand number", min_value=1, step=1, value=next_hand_number
             )
-            game_type = st.text_input("Game type", value="No-limit Hold'em cash")
-            blinds_antes = st.text_input("Blinds / antes", placeholder="1/2 NL, 0.25 ante")
-            table_size = st.number_input("Table size", min_value=2, max_value=10, value=6, step=1)
-            effective_stack = st.number_input(
-                "Declared effective stack (BB)",
-                min_value=0.0,
-                value=None,
-                step=1.0,
-                placeholder="Unknown",
-                help="Optional summary evidence. Decision-level effective stacks are derived from players.",
-            )
-            source_type = st.selectbox("Source", ["manual", "cv_import", "corrected_cv"])
-        with setup_right:
-            hero_position = st.selectbox("Hero position", POSITIONS, index=6)
-            hero_cards = st.text_input("Hero cards", placeholder="Ah Qs")
-            board_cards = st.text_input("Board cards", placeholder="Qd 7s 2c 9h 3s")
-            pot_size = st.number_input(
-                "Observed final pot (BB)",
-                min_value=0.0,
-                value=None,
-                step=1.0,
-                placeholder="Unknown",
-            )
-            hero_bb_won = st.number_input(
-                "Observed final result in BB",
-                value=None,
-                step=0.5,
-                placeholder="Unknown",
-            )
-            result = st.text_input("Result text", placeholder="Hero wins")
-            # A hand being created has no accounting and no review, so "reviewed"
-            # is never a legitimate starting status here.
-            review_status = st.selectbox(
-                "Review status", ["unreviewed", "needs_correction"]
-            )
+        with outcome_right:
+            notes = st.text_area("Notes (optional)", height=68)
 
-        tags = st.multiselect("Tags", sorted(HAND_TAGS))
-        notes = st.text_area("Hand notes / pro-style hand history", height=100)
+        submitted = st.form_submit_button("Save spot", type="primary")
 
-        st.markdown("#### Players In The Hand")
-        player_rows = collect_player_inputs()
+    if not submitted:
+        return
 
-        st.markdown("#### Action Line")
-        action_rows = collect_action_inputs()
-        submitted = st.form_submit_button("Save hand")
-
-    if submitted:
-        if any(hand.hand_number == int(hand_number) for hand in existing_hands):
-            st.error(
-                f"Hand #{int(hand_number)} already exists in this session. Pick a different number."
-            )
-            return
-        # A hand entered by hand but declared reconstructed carries no evidence, so
-        # it starts unproven instead of being mintable as reviewed.
-        is_declared_reconstructed = source_type != "manual"
-        completion_status = "uncertain" if is_declared_reconstructed else "not_applicable"
-        if is_declared_reconstructed:
-            review_status = "needs_correction"
-        try:
-            # One transaction: a validation error in any player/action row rolls
-            # back the whole hand instead of persisting a partial save.
-            with db.transaction():
-                saved_hand = db.create_hand(
-                    Hand(
-                        session_id=session_id,
-                        hand_number=int(hand_number),
-                        game_type=game_type.strip(),
-                        blinds_antes=blinds_antes.strip(),
-                        table_size=int(table_size),
-                        effective_stack=_optional_float(effective_stack),
-                        hero_position=hero_position,
-                        hero_cards=hero_cards,
-                        board_cards=board_cards,
-                        pot_size=_optional_float(pot_size),
-                        result=result.strip(),
-                        hero_bb_won=_optional_float(hero_bb_won),
-                        review_status=review_status,
-                        source_type=source_type,
-                        completion_status=completion_status,
-                        tags=tags,
-                        notes=notes.strip(),
-                    )
-                )
-                save_player_rows(db, saved_hand.id, player_rows)
-                save_action_rows(db, saved_hand.id, action_rows)
-        except (ValidationError, ValueError) as exc:
-            st.error(f"Could not save hand: {exc}")
-            return
-        # Reset the data editors explicitly: clear_on_submit does not cover them,
-        # and stale rows would leak into the next hand.
-        for editor_key in ["players_editor", *(f"{street}_actions_editor" for street in STREETS)]:
-            st.session_state.pop(editor_key, None)
-        flash(f"Hand #{int(hand_number)} saved.")
-        st.rerun()
-
-
-def collect_player_inputs() -> list[dict]:
-    edited_rows = st.data_editor(
-        [
-            {
-                "Player": "Hero",
-                "Seat": None,
-                "Position": "BTN",
-                "Starting stack": None,
-                "Hero?": True,
-                "Notes": "",
-            },
-            {
-                "Player": "",
-                "Seat": None,
-                "Position": "",
-                "Starting stack": None,
-                "Hero?": False,
-                "Notes": "",
-            },
-            {
-                "Player": "",
-                "Seat": None,
-                "Position": "",
-                "Starting stack": None,
-                "Hero?": False,
-                "Notes": "",
-            },
-        ],
-        num_rows="dynamic",
-        hide_index=True,
-        width="stretch",
-        column_config={
-            "Seat": st.column_config.NumberColumn("Seat", min_value=0, max_value=9, step=1),
-            "Position": st.column_config.SelectboxColumn("Position", options=POSITIONS),
-            "Starting stack": st.column_config.NumberColumn("Starting stack (BB)", min_value=0),
-            "Hero?": st.column_config.CheckboxColumn("Hero?"),
-        },
-        key="players_editor",
-    )
-    return [
-        {
-            "player_name": str(row.get("Player") or "").strip(),
-            "seat_index": (None if row.get("Seat") is None else int(row["Seat"])),
-            "position": str(row.get("Position") or "").strip(),
-            "starting_stack": _optional_float(row.get("Starting stack")),
-            "is_hero": bool(row.get("Hero?")),
-            "notes": str(row.get("Notes") or "").strip(),
-        }
-        for row in edited_rows
-    ]
-
-
-def collect_action_inputs() -> list[dict]:
-    rows: list[dict] = []
-    for street in STREETS:
-        with st.expander(street.title(), expanded=street == "preflop"):
-            st.caption(
-                "Amount is the additional BB committed by this action, not the total raise-to size."
-            )
-            edited_rows = st.data_editor(
-                _default_action_rows(street),
-                num_rows="dynamic",
-                hide_index=True,
-                width="stretch",
-                column_config={
-                    "Player": st.column_config.TextColumn("Player"),
-                    "Position": st.column_config.SelectboxColumn("Position", options=POSITIONS),
-                    "Action": st.column_config.SelectboxColumn("Action", options=ACTION_TYPES),
-                    "Forced post": st.column_config.SelectboxColumn(
-                        "Forced post",
-                        options=[
-                            "",
-                            "small_blind",
-                            "big_blind",
-                            "ante",
-                            "big_blind_ante",
-                            "straddle",
-                            "dead_blind",
-                            "bring_in",
-                        ],
-                    ),
-                    "Post status": st.column_config.SelectboxColumn(
-                        "Post status", options=["", "live", "dead"]
-                    ),
-                    "Amount": st.column_config.NumberColumn(
-                        "Increment committed (BB)",
-                        min_value=0,
-                        help="For a raise, enter only the additional chips moved into the pot.",
-                    ),
-                    "Pot before": st.column_config.NumberColumn("Pot before (BB)", min_value=0),
-                    "Stack before": st.column_config.NumberColumn("Stack before (BB)", min_value=0),
-                    "Notes": st.column_config.TextColumn("Notes"),
-                },
-                key=f"{street}_actions_editor",
-            )
-            for row in _non_empty_action_rows(edited_rows):
-                row["Street"] = street
-                rows.append(row)
-    return [
-        {
-            "street": str(row.get("Street") or "preflop"),
-            "player_name": str(row.get("Player") or "").strip(),
-            "position": str(row.get("Position") or "").strip(),
-            "action_type": str(row.get("Action") or "fold"),
-            "forced_bet_type": str(row.get("Forced post") or "") or None,
-            "is_live_post": (
-                None if not row.get("Post status") else row.get("Post status") == "live"
-            ),
-            "amount": _optional_float(row.get("Amount")),
-            "pot_before": _optional_float(row.get("Pot before")),
-            "stack_before": _optional_float(row.get("Stack before")),
-            "notes": str(row.get("Notes") or "").strip(),
-        }
-        for row in rows
-    ]
-
-
-def save_player_rows(db: PokerDatabase, hand_id: int | None, player_rows: list[dict]) -> None:
-    if hand_id is None:
-        raise ValueError("Hand must be saved before players can be saved.")
-    for row in player_rows:
-        if not row["player_name"]:
-            continue
-        db.create_hand_player(HandPlayer(hand_id=hand_id, **row))
-
-
-def save_action_rows(db: PokerDatabase, hand_id: int | None, action_rows: list[dict]) -> None:
-    if hand_id is None:
-        raise ValueError("Hand must be saved before actions can be saved.")
-    players = db.fetch_players_by_hand(hand_id)
-    for row in action_rows:
-        if not row["player_name"]:
-            continue
-        matches = [
-            player
-            for player in players
-            if player.player_name == row["player_name"]
-            and (not row["position"] or player.position == row["position"])
-        ]
-        if len(matches) != 1:
-            matches = [player for player in players if player.player_name == row["player_name"]]
-        if len(matches) != 1:
-            raise ValueError(
-                f"Action player {row['player_name']!r} must match exactly one saved player."
-            )
-        db.create_action(
-            Action(
-                hand_id=hand_id,
-                player_key=matches[0].player_key,
-                amount_semantics="incremental",
-                **row,
-            )
+    if any(hand.hand_number == int(hand_number) for hand in existing_hands):
+        st.error(
+            f"Hand #{int(hand_number)} already exists in this session. Pick a different number."
         )
+        return
+
+    postflop_actions = tuple(
+        PostflopActionInput(
+            street=str(row.get("Street") or "flop"),
+            actor="hero" if str(row.get("Player") or "") == "Hero" else "villain",
+            action_type=str(row.get("Action") or "check"),
+            amount=_optional_float(row.get("Amount")),
+        )
+        for row in line_rows
+        if str(row.get("Player") or "").strip() and str(row.get("Action") or "").strip()
+    )
+    spot = ManualSpotInput(
+        hand_number=int(hand_number),
+        hero_cards=hero_cards.strip(),
+        board_cards=board_cards.strip(),
+        hero_position=hero_position,
+        villain_position=villain_position,
+        table_size=int(table_size),
+        starting_stack=float(starting_stack),
+        pot_type=pot_type,
+        opener=opener,
+        three_bettor=three_bettor,
+        open_to=float(open_to),
+        three_bet_to=float(three_bet_to),
+        postflop_actions=postflop_actions,
+        winner="hero" if winner_label == "Hero" else "villain",
+        notes=notes.strip(),
+    )
+    errors = validate_manual_spot(spot)
+    if errors:
+        for error in errors:
+            st.error(error)
+        return
+
+    try:
+        saved_hand, accounting, warnings = save_manual_spot(db, session_id, spot)
+    except (ValidationError, ValueError, LedgerError) as exc:
+        st.error(f"Could not save spot: {exc}")
+        return
+
+    st.session_state.pop("manual_spot_line_editor", None)
+    for warning in warnings:
+        st.warning(warning)
+    if accounting.is_authoritative:
+        flash(f"Hand #{saved_hand.hand_number} saved and ready for Study / solver.")
+    else:
+        flash(
+            f"Hand #{saved_hand.hand_number} saved. Finish accounting in Study → Fix & confirm "
+            "before running the solver."
+        )
+        if accounting.issues:
+            st.caption("; ".join(accounting.issues[:3]))
+    st.rerun()
 
 
 def show_saved_hands(db: PokerDatabase, session: Session) -> None:
@@ -5607,6 +5696,52 @@ def _accounting_prompt_math_facts(
 
 
 def show_video_processing(db: PokerDatabase, session: Session) -> None:
+    if session.id is None:
+        return
+    all_videos = db.fetch_videos(session.id)
+    has_videos = bool(all_videos)
+    collect_open = _import_collect_is_open(session.id, has_videos=has_videos)
+
+    if has_videos and not collect_open:
+        st.success(
+            f"{len(all_videos)} recording{'s' if len(all_videos) != 1 else ''} "
+            f"validated for **{session.name}**. Import panel is hidden."
+        )
+        reopen, picker = st.columns([1, 2])
+        if reopen.button(
+            "Add or change recordings",
+            key=f"reopen_import_collect_{session.id}",
+        ):
+            st.session_state[_import_collect_panel_key(session.id)] = True
+            st.rerun()
+        labels = {
+            video.id: (
+                f"{video.original_filename} · "
+                f"{_format_optional_seconds(video.duration_seconds)}"
+            )
+            for video in all_videos
+            if video.id is not None
+        }
+        available_ids = set(labels)
+        selected_video_id = st.session_state.get("video_context_id")
+        if selected_video_id not in available_ids:
+            selected_video_id = next(iter(labels))
+            st.session_state["video_context_id"] = selected_video_id
+        chosen = picker.selectbox(
+            "Recording",
+            options=list(labels),
+            format_func=lambda video_id: labels[video_id],
+            index=list(labels).index(selected_video_id),
+            key=f"collapsed_video_select_{session.id}",
+            label_visibility="collapsed",
+        )
+        if chosen != selected_video_id:
+            st.session_state["video_context_id"] = chosen
+            st.rerun()
+        video = next(video for video in all_videos if video.id == chosen)
+        show_video_jobs_and_frames(db, video)
+        return
+
     workflow_step(
         1,
         "Collect the session recordings",
@@ -5616,7 +5751,7 @@ def show_video_processing(db: PokerDatabase, session: Session) -> None:
     st.caption(
         f"Adding to **{session.name}** · this workflow never captures or analyzes a live table."
     )
-    with st.expander("Add another recording", expanded=not db.fetch_videos(session.id)):
+    with st.expander("Add another recording", expanded=not has_videos):
         _save_video_upload(db, session, key_prefix=f"import_{session.id}")
 
     workflow_step(
@@ -5624,10 +5759,32 @@ def show_video_processing(db: PokerDatabase, session: Session) -> None:
         "Validate the source",
         "Choose a recording with one click and confirm its metadata.",
     )
-    all_videos = db.fetch_videos(session.id)
     if not all_videos:
         st.info("No videos are linked to this session yet.")
         return
+
+    video = _select_session_video(all_videos, key_prefix="import")
+    if video is None:
+        st.error("Selected video no longer exists.")
+        return
+    show_video_metadata(video)
+    done_col, _ = st.columns([1, 3])
+    if done_col.button(
+        "Done — hide import panel",
+        key=f"hide_import_collect_{session.id}",
+        type="primary",
+    ):
+        st.session_state[_import_collect_panel_key(session.id)] = False
+        st.rerun()
+    show_video_jobs_and_frames(db, video)
+
+
+def _select_session_video(
+    all_videos: list[VideoRecord],
+    *,
+    key_prefix: str,
+) -> VideoRecord | None:
+    """Pick the active recording for import / reconstruction."""
 
     available_ids = {video.id for video in all_videos if video.id is not None}
     selected_video_id = st.session_state.get("video_context_id")
@@ -5645,20 +5802,14 @@ def show_video_processing(db: PokerDatabase, session: Session) -> None:
         )
         if source_columns[index % len(source_columns)].button(
             label,
-            key=f"choose_video_{item.id}",
+            key=f"{key_prefix}_choose_video_{item.id}",
             type="primary" if item.id == selected_video_id else "secondary",
             disabled=item.id == selected_video_id,
             width="stretch",
         ):
             st.session_state["video_context_id"] = item.id
             st.rerun()
-
-    video = db.fetch_video(selected_video_id)
-    if video is None:
-        st.error("Selected video no longer exists.")
-        return
-    show_video_metadata(video)
-    show_video_jobs_and_frames(db, video)
+    return next((video for video in all_videos if video.id == selected_video_id), None)
 
 
 def show_video_metadata(video: VideoRecord) -> None:
@@ -5772,10 +5923,6 @@ def show_cv_reconstruction(db: PokerDatabase, video: VideoRecord) -> None:
             _render_cv_job_status(latest)
         completed_jobs = [job for job in latest_jobs if job.status == "completed"]
         if completed_jobs:
-            st.success(
-                "Reconstruction finished. Frame labels save permanently — validate "
-                "part of a hand now and resume the rest any time from this page."
-            )
             review_job = _choose_frame_review_job(db, video.id, completed_jobs)
             if review_job is not None:
                 show_reconstruction_evidence_review(db, review_job)
@@ -5953,9 +6100,13 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
         return
     hands = timeline.get("hands", [])
     if not hands:
-        st.info("The reconstruction did not produce any hands to validate.")
+        st.warning(empty_hands_review_message(timeline))
         return
 
+    st.success(
+        "Reconstruction finished. Frame labels save permanently — validate "
+        "part of a hand now and resume the rest any time from this page."
+    )
     st.markdown("#### Frame evidence review")
     st.caption(
         "Validate one frame at a time. Every verdict is saved permanently to this "
@@ -6071,13 +6222,13 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
         if st.session_state.get(selected_key) in hand_numbers
         else 0
     )
-    prev_hand_col, chooser_col, next_hand_col = st.columns([0.7, 2.6, 0.7])
+    prev_hand_col, chooser_col, next_hand_col = st.columns([1.1, 2.2, 1.1])
     prev_hand_col.button(
-        "← Hand",
+        "← Previous hand",
         key=f"evidence_prev_hand_{job.id}",
         disabled=active_hand_index == 0,
         width="stretch",
-        help="Previous timeline hand",
+        help="Go to the previous timeline hand",
         on_click=_queue_evidence_hand,
         args=(
             pending_key,
@@ -6092,12 +6243,12 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
         key=selected_key,
     )
     next_hand_col.button(
-        "Hand →",
+        "Next hand →",
         key=f"evidence_next_hand_{job.id}",
         disabled=active_hand_index >= len(hand_numbers) - 1,
         width="stretch",
         type="primary",
-        help="Next timeline hand",
+        help="Go to the next timeline hand",
         on_click=_queue_evidence_hand,
         args=(
             pending_key,
@@ -6106,6 +6257,10 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
             else hand_numbers[-1],
             f"evidence_cursor_{job.id}_{hand_numbers[active_hand_index + 1] if active_hand_index < len(hand_numbers) - 1 else hand_numbers[-1]}",
         ),
+    )
+    st.caption(
+        f"Hand {active_hand_index + 1} of {len(hand_numbers)} · "
+        f"use Next hand → when this hand’s frames are done"
     )
 
     hand = next(item for item in hands if int(item.get("hand_number", 0)) == selected_hand_number)
@@ -6961,28 +7116,6 @@ def _hand_summary_rows(hands: list[Hand]) -> list[dict]:
         }
         for hand in hands
     ]
-
-
-def _default_action_rows(street: str) -> list[dict]:
-    row_count = 4 if street == "preflop" else 1
-    return [
-        {
-            "Player": "",
-            "Position": "",
-            "Action": "fold",
-            "Forced post": "",
-            "Post status": "",
-            "Amount": None,
-            "Pot before": None,
-            "Stack before": None,
-            "Notes": "",
-        }
-        for _ in range(row_count)
-    ]
-
-
-def _non_empty_action_rows(rows: list[dict]) -> list[dict]:
-    return [row for row in rows if str(row.get("Player") or "").strip()]
 
 
 def _optional_float(value: object) -> float | None:

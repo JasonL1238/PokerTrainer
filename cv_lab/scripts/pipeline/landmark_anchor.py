@@ -260,19 +260,46 @@ def _median(vals: list[float]) -> float:
     return xs[mid] if n % 2 else (xs[mid - 1] + xs[mid]) / 2.0
 
 
+def _coin_detection_scale(width: int, height: int) -> float:
+    """Frame size relative to the coin-reference constellation basis.
+
+    Morphology kernels and the minimum blob area were measured on REF_W x REF_H.
+    A half-size ClubWPT window (~1052x732) still has the same green seat coins,
+    but a fixed 3x3 open + area>=40 erase them. Shrink those gates with scale;
+    never grow them past the calibrated 3 / 7 / 40 on larger frames.
+    """
+    if width <= 0 or height <= 0:
+        return 1.0
+    return min(float(width) / float(REF_W), float(height) / float(REF_H))
+
+
+def _odd_kernel(size: int) -> int:
+    size = max(1, int(size))
+    return size if size % 2 == 1 else size + 1
+
+
 def detect_coins(img_bgr):
     """Return list of dicts: {cx, cy, area} for saturated-green coin blobs (pixels)."""
     import cv2
 
+    height, width = img_bgr.shape[:2]
+    scale = _coin_detection_scale(width, height)
+    # Cap at the calibrated kernels so larger recordings keep the measured gates.
+    open_k = _odd_kernel(max(1, min(3, round(3 * scale))))
+    close_k = _odd_kernel(max(1, min(7, round(7 * scale))))
+    min_area = max(8.0, 40.0 * (scale ** 2))
+
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, (45, 120, 50), (95, 255, 255))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    if open_k > 1:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((open_k, open_k), np.uint8))
+    if close_k > 1:
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8))
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     out = []
     for c in cnts:
         a = cv2.contourArea(c)
-        if a < 40:
+        if a < min_area:
             continue
         x, y, w, h = cv2.boundingRect(c)
         if not (0.5 < w / h < 2.0):        # roughly round

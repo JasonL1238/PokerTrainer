@@ -1316,6 +1316,23 @@ def _crop(img_bgr: np.ndarray, xyxy: Sequence[float]) -> np.ndarray:
     return img_bgr[y1:y2, x1:x2]
 
 
+# Small ClubWPT windows (e.g. ~1050x730 captures) render HUD digits under the
+# calibrated run-height floor (12px). Lowering that floor re-admits confident
+# wrong values on native-small noise; instead the production entrypoint upscales
+# into the band and re-reads. Acceptance is conservative:
+#   * only ``below_calibrated_render_size`` triggers a retry
+#   * several nearby scale factors are tried
+#   * a value is accepted only when >=2 scales agree on it AND the digit string
+#     matches the native (refused) run -- a lone 2x read of a sprite fragment
+#     that natively saw raw='0' must not become a confident 0.0
+_SMALL_RENDER_UPSCALE_FACTORS = (1.75, 2.0, 2.25)
+_SMALL_RENDER_MIN_AGREEING_SCALES = 2
+
+
+def _digits_only(raw: str) -> str:
+    return "".join(ch for ch in raw if ch.isdigit())
+
+
 def read_amount_detail_from_image(img_bgr: np.ndarray, xyxy: Sequence[float]) -> AmountRead | None:
     """Full read detail, or None when no template bank is calibrated at all.
 
@@ -1331,7 +1348,52 @@ def read_amount_detail_from_image(img_bgr: np.ndarray, xyxy: Sequence[float]) ->
     bank = _bank()
     if bank is None:
         return None
-    return bank.read_number_detail(_crop(img_bgr, xyxy))
+    crop = _crop(img_bgr, xyxy)
+    detail = bank.read_number_detail(crop)
+    if (
+        detail.value is not None
+        or detail.decimal_source != "below_calibrated_render_size"
+        or crop.size == 0
+    ):
+        return detail
+
+    native_digits = _digits_only(detail.raw)
+    if not native_digits:
+        return detail
+    # A lone under-floor "0" is the measured sprite-fragment failure mode
+    # (stack_343_60_sprite_far_fragments): every upscale agrees on 0.0 while the
+    # screen shows 343.6. Real single-digit bets are 1-9; a true 0 BB stack still
+    # reads natively on calibrated sizes and does not need this recovery path.
+    if native_digits == "0":
+        return detail
+
+    votes: dict[float, list[AmountRead]] = {}
+    h, w = crop.shape[:2]
+    for factor in _SMALL_RENDER_UPSCALE_FACTORS:
+        up = cv2.resize(
+            crop,
+            (
+                max(1, int(round(w * factor))),
+                max(1, int(round(h * factor))),
+            ),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        retried = bank.read_number_detail(up)
+        if retried.value is None:
+            continue
+        if _digits_only(retried.raw) != native_digits:
+            continue
+        votes.setdefault(retried.value, []).append(retried)
+
+    consensus = [
+        (value, reads)
+        for value, reads in votes.items()
+        if len(reads) >= _SMALL_RENDER_MIN_AGREEING_SCALES
+    ]
+    if len(consensus) != 1:
+        return detail
+    _, reads = consensus[0]
+    return reads[len(reads) // 2]
 
 
 def read_pill_attr(img_bgr: np.ndarray, xyxy: Sequence[float]) -> str | None:

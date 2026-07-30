@@ -63,8 +63,8 @@ As of July 28, 2026, the repository contains:
   data-health/restore audit;
 - derived, never-persisted study readiness with per-blocker reasons and clearing
   actions, enforced at the store and behind a single guarded UI writer;
-- manual entry and editing for sessions, hands, players, actions, settlements,
-  and review state;
+- compact manual solver-spot entry plus full editing for sessions, hands, players,
+  actions, settlements, and review state;
 - poker math for cards, ranges, equity, pot odds, EV, ICM, analytics, and
   authoritative action-ledger accounting;
 - post-session Theory and Exploit coaching through configured providers, with

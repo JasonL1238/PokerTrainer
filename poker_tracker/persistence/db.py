@@ -990,6 +990,38 @@ class PokerDatabase:
         self._commit()
         return session.model_copy(update={"id": cursor.lastrowid})
 
+    def update_session(self, session: Session) -> Session:
+        """Update mutable session fields. Schema unchanged — date_played already exists."""
+
+        if session.id is None:
+            raise ValueError("Cannot update a session without an id.")
+        if self.fetch_session(session.id) is None:
+            raise ValueError("Session not found.")
+        payload = session.model_dump()
+        name = str(payload["name"]).strip()
+        if not name:
+            raise ValueError("Session name cannot be empty.")
+        self._execute(
+            """
+            UPDATE sessions
+            SET name = ?, date_played = ?, platform = ?, stakes = ?, notes = ?
+            WHERE id = ?
+            """,
+            (
+                name,
+                _serialize_date(payload["date_played"]),
+                payload["platform"],
+                payload["stakes"],
+                payload["notes"],
+                payload["id"],
+            ),
+        )
+        self._commit()
+        updated = self.fetch_session(session.id)
+        if updated is None:
+            raise RuntimeError("Updated session could not be reloaded.")
+        return updated
+
     def create_hand(self, hand: Hand) -> Hand:
         _refuse_display_copy(hand, "store")
         payload = hand.model_dump()
