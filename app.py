@@ -92,6 +92,7 @@ from poker_tracker.services.settlement_sync import (
 )
 from poker_tracker.services.study_readiness import (
     BlockerCategory,
+    StudyBlocker,
     StudyReadiness,
     accounting_is_established,
     evaluate_study_readiness,
@@ -147,6 +148,7 @@ from poker_tracker.ui.frame_extraction import (
 from poker_tracker.ui.image_utils import image_dimensions, save_roi_crop_preview
 from poker_tracker.ui.navigation import Page, navigate_to, render_navigation
 from poker_tracker.ui.poker_visuals import (
+    action_replay_state,
     equity_meter_html,
     inject_poker_visual_styles,
     poker_table_html,
@@ -446,16 +448,81 @@ def render_study_readiness(readiness: StudyReadiness) -> None:
 
 
 def render_study_workflow(readiness: StudyReadiness) -> None:
-    """Give the tabbed Study workspace one short, plain-language status."""
+    """Explain readiness as concrete checks and grouped fix steps."""
 
     with st.container(key="study_workflow_guide"):
         st.markdown("#### Start with Replay, then fix, then analyze")
-        state = (
-            "Ready to analyze"
-            if readiness.is_ready
-            else f"{len(readiness.blockers)} item(s) to fix"
+        if readiness.is_ready:
+            st.caption("This hand passed every trust check and is ready to analyze.")
+            return
+        fix_groups = study_fix_groups(readiness)
+        st.caption(
+            f"{len(readiness.blockers)} trust check(s) are failing. Some clear "
+            f"together, so there are {len(fix_groups)} concrete fix step(s). "
+            "Replay still works; trusted analysis waits until these checks pass."
         )
-        st.caption(f"Only one part of the workflow is shown at a time · {state}.")
+        with st.expander(
+            f"What needs fixing · {len(fix_groups)} step(s)",
+            expanded=False,
+        ):
+            for index, (title, destination, blockers) in enumerate(fix_groups, start=1):
+                st.markdown(f"**{index}. {title}**")
+                for blocker in blockers:
+                    st.write(f"• {blocker.reason}")
+                st.caption(f"Open: {destination}")
+
+
+def study_fix_groups(
+    readiness: StudyReadiness,
+) -> list[tuple[str, str, list[StudyBlocker]]]:
+    """Group blockers that one user action commonly clears together."""
+
+    definitions = {
+        "evidence": (
+            "Verify the reconstructed hand",
+            "Fix & confirm → Correct hand facts / Source warnings",
+        ),
+        "accounting": (
+            "Reconcile the chips",
+            "Fix & confirm → Accounting reconciliation",
+        ),
+        "issues": (
+            "Resolve saved debugging issues",
+            "Fix & confirm → Saved debugging issue",
+        ),
+        "coaching": (
+            "Refresh coaching",
+            "Analyze → AI coach",
+        ),
+        "solver": (
+            "Refresh solver evidence",
+            "Analyze → TexasSolver",
+        ),
+        "confirmation": (
+            "Confirm the saved hand",
+            "Fix & confirm → Confirm the saved hand",
+        ),
+    }
+    evidence_codes = {
+        "COMPLETION_NOT_COMPLETE",
+        "COMPLETION_EVIDENCE_MISSING",
+        "INVALID_HERO_OR_BOARD_CARDS",
+        "UNREADABLE_HAND_COLUMNS",
+        "UNSUPPORTED_TABLE_LAYOUT",
+        "UNRESOLVED_SOURCE_WARNING",
+    }
+    grouped: dict[str, list[StudyBlocker]] = {}
+    for blocker in readiness.blockers:
+        key = (
+            "evidence"
+            if blocker.code in evidence_codes
+            else blocker.category
+        )
+        grouped.setdefault(key, []).append(blocker)
+    return [
+        (definitions[key][0], definitions[key][1], blockers)
+        for key, blockers in grouped.items()
+    ]
 
 
 def show_reconstruction_evidence(hand: Hand, evidence: CompletionEvidence) -> None:
@@ -1144,35 +1211,134 @@ def render_study_replay(
 ) -> None:
     """Show only the completed-hand replay and its recorded decisions."""
 
+    replay_key = f"study_replay_action_{hand.id}"
+    selected_index = st.session_state.get(replay_key)
+    if not isinstance(selected_index, int) or not 0 <= selected_index < len(actions):
+        selected_index = None
+    initial_pot = (
+        accounting.settlement.dead_money
+        if accounting is not None and accounting.settlement is not None
+        else None
+    )
+    replay_state = (
+        action_replay_state(
+            actions,
+            selected_index,
+            players=players,
+            board_cards=hand.board_cards,
+            initial_pot=initial_pot,
+            ledger=None if accounting is None else accounting.ledger,
+        )
+        if selected_index is not None
+        else None
+    )
+    if actions:
+        previous_col, current_col, next_col, final_col = st.columns(
+            [0.65, 2.7, 0.65, 0.9]
+        )
+        if previous_col.button(
+            "←",
+            key=f"study_replay_previous_{hand.id}",
+            disabled=selected_index == 0,
+            help="Previous action",
+            width="stretch",
+        ):
+            st.session_state[replay_key] = (
+                len(actions) - 1 if selected_index is None else selected_index - 1
+            )
+            st.rerun()
+        current_col.markdown(
+            "**Final hand**"
+            if selected_index is None
+            else f"**{study_action_label(actions[selected_index], selected_index)}**"
+        )
+        if next_col.button(
+            "→",
+            key=f"study_replay_next_{hand.id}",
+            disabled=selected_index is None,
+            help="Next action",
+            width="stretch",
+        ):
+            st.session_state[replay_key] = (
+                None if selected_index == len(actions) - 1 else selected_index + 1
+            )
+            st.rerun()
+        if final_col.button(
+            "Final hand",
+            key=f"study_replay_final_{hand.id}",
+            disabled=selected_index is None,
+            width="stretch",
+        ):
+            st.session_state[replay_key] = None
+            st.rerun()
+
     table_col, summary_col = st.columns([1.7, 0.75], gap="large")
     with table_col:
         section_header_with_meta(
             f"Hand #{hand.hand_number}",
-            "Completed-hand replay",
-            hand.game_type.upper() if hand.game_type else "NO-LIMIT HOLD'EM",
+            (
+                "Completed-hand replay"
+                if selected_index is None
+                else f"Table immediately after action {selected_index + 1}"
+            ),
+            (
+                hand.game_type.upper()
+                if selected_index is None and hand.game_type
+                else "FINAL HAND"
+                if selected_index is None
+                else f"ACTION {selected_index + 1} OF {len(actions)}"
+            ),
         )
         render_poker_table(
             hero_cards=hand.hero_cards,
-            board_cards=hand.board_cards,
+            board_cards=(
+                hand.board_cards if replay_state is None else replay_state.board_cards
+            ),
             pot_size=(
-                accounting.ledger.gross_pot
+                replay_state.pot_size
+                if replay_state is not None
+                else accounting.ledger.gross_pot
                 if _accounting_is_established(hand, accounting)
                 else hand.pot_size
             ),
-            players=players,
-            result_bb=_hero_ledger_result(hand, accounting, players, hand.hero_bb_won),
-            label=f"{session.name} · {hand.hero_position or 'Position not recorded'}",
+            players=players if replay_state is None else replay_state.players,
+            result_bb=(
+                _hero_ledger_result(hand, accounting, players, hand.hero_bb_won)
+                if replay_state is None
+                else None
+            ),
+            label=(
+                f"{session.name} · {hand.hero_position or 'Position not recorded'}"
+                if selected_index is None
+                else study_action_label(actions[selected_index], selected_index)
+            ),
+            actor_player_key=(
+                None if replay_state is None else replay_state.actor_player_key
+            ),
+            folded_player_keys=(
+                frozenset() if replay_state is None else replay_state.folded_player_keys
+            ),
         )
     with summary_col:
         st.markdown("#### Hand snapshot")
-        data_callout("Position", hand.hero_position or "Not recorded")
         data_callout(
-            "Effective stack",
-            "—" if hand.effective_stack is None else f"{hand.effective_stack:g} BB",
+            "View",
+            "Final hand"
+            if selected_index is None
+            else f"After action {selected_index + 1}",
         )
         data_callout(
-            "Final pot",
+            "Hero position",
+            hand.hero_position or "Not recorded",
+        )
+        data_callout(
+            "Pot",
             (
+                f"{replay_state.pot_size:g} BB · replay"
+                if replay_state is not None and replay_state.pot_size is not None
+                else "—"
+                if replay_state is not None
+                else
                 f"{accounting.ledger.gross_pot:g} BB · reconciled"
                 if _accounting_is_established(hand, accounting)
                 else "—"
@@ -1184,27 +1350,40 @@ def render_study_replay(
             st.success("The saved hand is ready for analysis.")
         else:
             st.warning(
-                f"{len(readiness.blockers)} item(s) must be resolved before this "
-                "hand is fully study-ready."
+                "Replay is available. Trusted analysis is paused until the "
+                "checklist above is cleared."
             )
         st.caption("Next: open the Fix & confirm tab.")
 
     section_header_with_meta(
         "Decision history",
-        "What happened, in saved action order.",
+        "Click any action to update the table above.",
         f"{len(actions)} ACTIONS",
     )
-    render_action_timeline(
-        actions,
-        players=players,
-        effective_stack=hand.effective_stack,
-        initial_pot=(
-            accounting.settlement.dead_money
-            if accounting is not None and accounting.settlement is not None
-            else None
-        ),
-        ledger=None if accounting is None else accounting.ledger,
-    )
+    if actions:
+        st.pills(
+            "Replay action",
+            options=list(range(len(actions))),
+            default=selected_index,
+            format_func=lambda index: study_action_label(actions[index], index),
+            key=replay_key,
+            label_visibility="collapsed",
+            width="stretch",
+        )
+        st.caption(
+            "The gold-outlined seat acted. Dimmed seats had already folded. "
+            "Choose Final hand to return to the completed result."
+        )
+        with st.expander("Show pot, stack, SPR, and notes for every action"):
+            render_action_timeline(
+                actions,
+                players=players,
+                effective_stack=hand.effective_stack,
+                initial_pot=initial_pot,
+                ledger=None if accounting is None else accounting.ledger,
+            )
+    else:
+        render_action_timeline(actions)
     with st.expander("Show raw hand history"):
         st.code(
             format_hand_history(
@@ -1218,6 +1397,17 @@ def render_study_replay(
             ),
             language="text",
         )
+
+
+def study_action_label(action: Action, index: int) -> str:
+    """Return a compact but complete label for an action-replay control."""
+
+    actor = actor_label(action.player_name, action.position) or "Unknown player"
+    amount = "" if action.amount is None else f" · {action.amount:g} BB"
+    return (
+        f"{index + 1:02d} · {action.street.title()} · {actor} · "
+        f"{action.action_type.replace('-', ' ').title()}{amount}"
+    )
 
 
 def render_study_fix_and_confirm(
@@ -1242,16 +1432,19 @@ def render_study_fix_and_confirm(
     if readiness.is_ready:
         st.success("Everything required is confirmed. This hand is ready to analyze.")
     else:
-        st.warning(f"{len(readiness.blockers)} item(s) still block a trusted analysis.")
-        blocker_groups = list(readiness.by_category().items())
-        blocker_columns = st.columns(min(2, len(blocker_groups)))
-        for index, (category, blockers) in enumerate(blocker_groups):
+        fix_groups = study_fix_groups(readiness)
+        st.warning(
+            f"{len(readiness.blockers)} trust check(s) are failing across "
+            f"{len(fix_groups)} fix step(s)."
+        )
+        blocker_columns = st.columns(min(2, len(fix_groups)))
+        for index, (title, destination, blockers) in enumerate(fix_groups):
             with blocker_columns[index % len(blocker_columns)]:
                 with st.container(border=True):
-                    st.markdown(f"**{BLOCKER_CATEGORY_LABELS[category]}**")
-                    st.write(blockers[0].reason)
-                    if len(blockers) > 1:
-                        st.caption(f"+ {len(blockers) - 1} more")
+                    st.markdown(f"**{index + 1}. {title}**")
+                    for blocker in blockers:
+                        st.write(f"• {blocker.reason}")
+                    st.caption(f"Use: {destination}")
         with st.expander("Show exact requirements"):
             render_study_readiness(readiness)
 
@@ -1323,8 +1516,8 @@ def render_study_analysis(
         st.success("This hand is confirmed and ready for post-session analysis.")
     else:
         st.warning(
-            f"Analysis is limited until {len(readiness.blockers)} remaining "
-            "item(s) are fixed or confirmed."
+            f"Analysis is limited while {len(readiness.blockers)} trust check(s) "
+            "remain. Open Fix & confirm and follow the grouped checklist."
         )
 
     math_tab, solver_tab, coach_tab, notes_tab = st.tabs(

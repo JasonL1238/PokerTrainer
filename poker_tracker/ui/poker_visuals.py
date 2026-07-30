@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from html import escape
 
 import streamlit as st
@@ -64,9 +65,19 @@ def cards_html(cards: str, *, empty_count: int = 0, delay_start: int = 0) -> str
     return '<span class="pt-card-row">' + "".join(rendered) + "</span>"
 
 
-def _seat_html(player: HandPlayer, index: int, total: int) -> str:
+def _seat_html(
+    player: HandPlayer,
+    index: int,
+    total: int,
+    *,
+    actor_player_key: str | None = None,
+    folded_player_keys: frozenset[str] = frozenset(),
+) -> str:
     seat_class = f"pt-seat-{index + 1}-of-{min(max(total, 2), 9)}"
     hero_class = " pt-seat-hero" if player.is_hero else ""
+    player_key = player.player_key or player.player_name
+    actor_class = " pt-seat-acting" if player_key == actor_player_key else ""
+    folded_class = " pt-seat-folded" if player_key in folded_player_keys else ""
     stack = "—" if player.starting_stack is None else f"{player.starting_stack:g} BB"
     name = actor_label(player.player_name, None) or player.position or f"Seat {index + 1}"
     position = distinct_position(name, player.position)
@@ -74,7 +85,7 @@ def _seat_html(player: HandPlayer, index: int, total: int) -> str:
         f'<span class="pt-seat-position">{escape(position)}</span>' if position else ""
     )
     return (
-        f'<div class="pt-seat {seat_class}{hero_class}">'
+        f'<div class="pt-seat {seat_class}{hero_class}{actor_class}{folded_class}">'
         f'{position_html}<strong>{escape(name)}</strong>'
         f'<span class="pt-seat-stack">{escape(stack)}</span></div>'
     )
@@ -88,11 +99,20 @@ def poker_table_html(
     players: Sequence[HandPlayer],
     result_bb: float | None = None,
     label: str = "Completed hand replay",
+    actor_player_key: str | None = None,
+    folded_player_keys: frozenset[str] = frozenset(),
 ) -> str:
     """Return an oval digital table using only completed-hand display data."""
     table_players = list(players[:9])
     seats = "".join(
-        _seat_html(player, index, len(table_players)) for index, player in enumerate(table_players)
+        _seat_html(
+            player,
+            index,
+            len(table_players),
+            actor_player_key=actor_player_key,
+            folded_player_keys=folded_player_keys,
+        )
+        for index, player in enumerate(table_players)
     )
     pot = "—" if pot_size is None else f"{pot_size:g} BB"
     result_class = (
@@ -125,6 +145,106 @@ def render_poker_table(**kwargs) -> None:
     st.markdown(poker_table_html(**kwargs), unsafe_allow_html=True)
 
 
+def _action_board_cards(board_cards: str, street: str) -> str:
+    """Return only the community cards that had been dealt on ``street``."""
+
+    visible_count = {
+        "preflop": 0,
+        "flop": 3,
+        "turn": 4,
+        "river": 5,
+        "showdown": 5,
+    }.get(street, 0)
+    return " ".join(_card_tokens(board_cards)[:visible_count])
+
+
+@dataclass(frozen=True)
+class ActionReplayState:
+    """One reconstructed table state selected from a completed action line."""
+
+    players: tuple[HandPlayer, ...]
+    board_cards: str
+    pot_size: float | None
+    actor_player_key: str
+    folded_player_keys: frozenset[str]
+
+
+def action_replay_state(
+    actions: Sequence[Action],
+    selected_index: int,
+    *,
+    players: Sequence[HandPlayer],
+    board_cards: str,
+    initial_pot: float | None = None,
+    ledger: HandLedger | None = None,
+) -> ActionReplayState:
+    """Reconstruct the table immediately after one saved completed-hand action."""
+
+    if not 0 <= selected_index < len(actions):
+        raise IndexError("selected action is outside the saved action history")
+    stacks = {
+        player.player_key or player.player_name: player.starting_stack
+        for player in players
+    }
+    names_to_keys: dict[str, list[str]] = {}
+    for player in players:
+        names_to_keys.setdefault(player.player_name, []).append(
+            player.player_key or player.player_name
+        )
+    folded: set[str] = set()
+    running_pot = initial_pot
+    actor_key = ""
+    for index, action in enumerate(actions[: selected_index + 1]):
+        matching_keys = names_to_keys.get(action.player_name, [])
+        actor_key = action.player_key or (
+            matching_keys[0] if len(matching_keys) == 1 else action.player_name
+        )
+        snapshot = (
+            ledger.snapshots[index]
+            if ledger is not None and index < len(ledger.snapshots)
+            else None
+        )
+        if snapshot is not None:
+            stacks[actor_key] = snapshot.stack_after
+            running_pot = snapshot.pot_after
+        else:
+            if action.stack_before is not None:
+                stacks[actor_key] = action.stack_before
+            pot_before = action.pot_before if action.pot_before is not None else running_pot
+            is_money_action = action.action_type in {
+                "ante",
+                "post_blind",
+                "call",
+                "bet",
+                "raise",
+                "all-in",
+            }
+            stack_before = stacks.get(actor_key)
+            if is_money_action and action.amount is not None and stack_before is not None:
+                stacks[actor_key] = max(0.0, stack_before - action.amount)
+            running_pot = (
+                pot_before + action.amount
+                if pot_before is not None and action.amount is not None and is_money_action
+                else pot_before
+            )
+        if action.action_type == "fold":
+            folded.add(actor_key)
+    replay_players = tuple(
+        player.model_copy(
+            update={"starting_stack": stacks.get(player.player_key or player.player_name)}
+        )
+        for player in players
+    )
+    selected_action = actions[selected_index]
+    return ActionReplayState(
+        players=replay_players,
+        board_cards=_action_board_cards(board_cards, selected_action.street),
+        pot_size=running_pot,
+        actor_player_key=actor_key,
+        folded_player_keys=frozenset(folded),
+    )
+
+
 def action_timeline_html(
     actions: Iterable[Action],
     *,
@@ -133,7 +253,7 @@ def action_timeline_html(
     initial_pot: float | None = None,
     ledger: HandLedger | None = None,
 ) -> str:
-    """Return a compact, scan-friendly decision history for a completed hand."""
+    """Return the complete saved action history without truncating row details."""
     items = list(actions)
     if not items:
         return (
@@ -159,32 +279,45 @@ def action_timeline_html(
             # reconciled derived ledger.
             ledger = None
     nodes: list[str] = []
-    stacks = {
-        player.player_name: player.starting_stack
+    stacks: dict[str, float | None] = {
+        player.player_key or player.player_name: player.starting_stack
         for player in players
-        if player.starting_stack is not None
     }
+    names_to_keys: dict[str, list[str]] = {}
+    for player in players:
+        names_to_keys.setdefault(player.player_name, []).append(
+            player.player_key or player.player_name
+        )
     active_players = set(stacks)
     running_pot = initial_pot
     for index, action in enumerate(items):
+        actor_key = action.player_key
+        if actor_key is None:
+            matching_keys = names_to_keys.get(action.player_name, [])
+            actor_key = matching_keys[0] if len(matching_keys) == 1 else action.player_name
         street = action.street.title()
         amount = "—" if action.amount is None else f"{action.amount:g} BB"
         tone = action.action_type.replace("all-in", "raise")
-        snapshot = ledger.snapshots[index] if ledger is not None else None
+        snapshot = (
+            ledger.snapshots[index]
+            if ledger is not None and index < len(ledger.snapshots)
+            else None
+        )
         if snapshot is not None:
             effective_range = snapshot.effective_stack_range_before
             pot_before = snapshot.pot_before
             pot_after = snapshot.pot_after
             pot_is_estimated = action.pot_before is None
+            stacks[actor_key] = snapshot.stack_after
         else:
             if action.stack_before is not None:
-                stacks[action.player_name] = action.stack_before
-                active_players.add(action.player_name)
-            active_stacks = [
-                stacks[name]
-                for name in active_players
-                if name in stacks and stacks[name] is not None
-            ]
+                stacks[actor_key] = action.stack_before
+                active_players.add(actor_key)
+            active_stacks: list[float] = []
+            for name in active_players:
+                stack = stacks.get(name)
+                if stack is not None:
+                    active_stacks.append(stack)
             row_effective_stack = min(active_stacks) if active_stacks else effective_stack
             if effective_stack is not None:
                 row_effective_stack = (
@@ -263,28 +396,36 @@ def action_timeline_html(
         actor = actor_label(action.player_name, None) or "Unknown player"
         position_value = distinct_position(actor, action.position)
         position = f"<small>{escape(position_value)}</small>" if position_value else ""
+        if snapshot is None:
+            if (
+                action.amount is not None
+                and is_money_action
+                and actor_key in stacks
+                and stacks[actor_key] is not None
+            ):
+                stacks[actor_key] = max(0.0, stacks[actor_key] - action.amount)
+            if pot_after is not None:
+                running_pot = pot_after
+        if action.action_type == "fold":
+            active_players.discard(actor_key)
         nodes.append(
             f'<li class="pt-action pt-action-{escape(tone)}" style="--action-delay:{index * 45}ms">'
+            '<div class="pt-history-copy">'
+            '<div class="pt-history-primary">'
             f'<span class="pt-history-sequence">{index + 1:02d}</span>'
             f'<span class="pt-history-street">{escape(street)}</span>'
             f'<span class="pt-history-actor"><strong>{escape(actor)}</strong>{position}</span>'
             f'<span class="pt-history-decision">{escape(action.action_type.replace("-", " ").title())}</span>'
-            f'<span class="pt-history-size">{escape(amount)}</span>'
+            f'<span class="pt-history-size">{escape(amount)}</span></div>'
             '<span class="pt-history-context">'
             f"<span><b>Pot</b> {escape(pot_context)}</span>"
             f"<span><b>Effective stack</b> {escape(effective_context)}</span>"
-            f"<span><b>SPR</b> {escape(spr_context)}</span>{notes}</span></li>"
+            f"<span><b>SPR</b> {escape(spr_context)}</span>{notes}</span></div></li>"
         )
-        if snapshot is None:
-            if action.amount is not None and is_money_action and action.player_name in stacks:
-                stacks[action.player_name] = max(0.0, stacks[action.player_name] - action.amount)
-            if action.action_type == "fold":
-                active_players.discard(action.player_name)
-            if pot_after is not None:
-                running_pot = pot_after
     return (
-        '<section class="pt-history-panel"><div class="pt-history-head" aria-hidden="true">'
-        "<span>No.</span><span>Street</span><span>Actor</span><span>Decision</span><span>Size</span></div>"
+        '<section class="pt-history-panel">'
+        f'<div class="pt-history-summary"><strong>All {len(items)} saved actions</strong>'
+        "<span>No saved actions are hidden.</span></div>"
         '<ol class="pt-timeline pt-decision-history" aria-label="Completed hand decision history">'
         + "".join(nodes)
         + "</ol></section>"
@@ -377,6 +518,8 @@ _POKER_CSS = r"""
 .pt-seat-position { color: var(--pt-accent); font-size: .52rem; letter-spacing: .08em; }
 .pt-seat-stack { color: var(--pt-muted); font-family: var(--pt-font-mono); font-size: .57rem; margin-top: .14rem; }
 .pt-seat-hero { z-index: 5; border-color: #388057; box-shadow: 0 0 0 2px rgba(53,208,127,.1), 0 7px 18px rgba(0,0,0,.3); }
+.pt-seat-acting { z-index: 6; border-color: var(--pt-gold); box-shadow: 0 0 0 2px rgba(213,168,75,.16), 0 7px 18px rgba(0,0,0,.3); }
+.pt-seat-folded { opacity: .42; filter: grayscale(.7); }
 .pt-seat-1-of-2, .pt-seat-1-of-3, .pt-seat-1-of-4, .pt-seat-1-of-5, .pt-seat-1-of-6, .pt-seat-1-of-7, .pt-seat-1-of-8, .pt-seat-1-of-9 { left: 50%; top: 102%; }
 .pt-seat-2-of-2 { left: 50%; top: -2%; }
 .pt-seat-2-of-3, .pt-seat-2-of-4, .pt-seat-2-of-5, .pt-seat-2-of-6, .pt-seat-2-of-7, .pt-seat-2-of-8, .pt-seat-2-of-9 { left: 11%; top: 58%; }
@@ -406,12 +549,15 @@ _POKER_CSS = r"""
 .pt-pot strong { color: var(--pt-text); font-family: var(--pt-font-mono); font-size: .64rem; }
 .pt-pot i { width: 14px; height: 6px; border-radius: 50%; background: var(--pt-gold); box-shadow: 0 -3px 0 #8D702F, 0 -6px 0 #D5A84B; animation: pt-chip-in 300ms 260ms var(--pt-ease) both; }
 .pt-history-panel { width: 100%; overflow: hidden; border: 1px solid var(--pt-border); border-radius: var(--pt-radius); background: var(--pt-surface-soft); }
-.pt-history-head, .stMarkdown ol.pt-decision-history > li.pt-action { display: grid; grid-template-columns: 28px 68px minmax(60px, 1fr) 76px 64px; column-gap: .55rem; align-items: center; }
-.pt-history-head { min-height: 30px; padding: .35rem .7rem; border-bottom: 1px solid var(--pt-border); background: var(--pt-surface); color: var(--pt-muted); font-family: var(--pt-font-mono); font-size: .52rem; font-weight: 680; letter-spacing: .065em; text-transform: uppercase; }
+.pt-history-summary { display: flex; justify-content: space-between; gap: .75rem; padding: .58rem .75rem; border-bottom: 1px solid var(--pt-border); background: var(--pt-surface); }
+.pt-history-summary strong { color: var(--pt-text); font-size: .66rem; }
+.pt-history-summary span { color: var(--pt-muted); font-size: .6rem; text-align: right; }
 .stMarkdown ol.pt-decision-history { display: block !important; width: 100%; max-width: 100%; box-sizing: border-box; overflow: visible; margin: 0 !important; padding: 0 !important; list-style: none !important; }
-.stMarkdown ol.pt-decision-history > li.pt-action { position: relative; height: 68px; box-sizing: border-box; margin: 0; padding: .42rem .7rem .38rem; border-bottom: 1px solid rgba(51,70,59,.58); list-style: none !important; row-gap: .28rem; animation: pt-action-in 180ms var(--pt-ease) both; animation-delay: var(--action-delay); }
+.stMarkdown ol.pt-decision-history > li.pt-action { position: relative; min-height: 76px; box-sizing: border-box; margin: 0; padding: .62rem .7rem; border-bottom: 1px solid rgba(51,70,59,.58); list-style: none !important; animation: pt-action-in 180ms var(--pt-ease) both; animation-delay: var(--action-delay); }
 .stMarkdown ol.pt-decision-history > li.pt-action:last-child { border-bottom: 0; }
 .stMarkdown ol.pt-decision-history > li.pt-action::before { content: ""; position: absolute; inset: 9px auto 9px 0; width: 2px; background: var(--pt-muted); }
+.pt-history-copy { min-width: 0; display: grid; gap: .65rem; padding-left: .2rem; }
+.pt-history-primary { display: grid; grid-template-columns: 28px 58px minmax(70px, 1fr) 72px 60px; column-gap: .45rem; align-items: center; }
 .pt-history-sequence, .pt-history-size { color: var(--pt-muted); font-family: var(--pt-font-mono); font-size: .59rem; }
 .pt-history-street { color: var(--pt-gold); font-size: .58rem; font-weight: 720; letter-spacing: .045em; text-transform: uppercase; }
 .pt-history-actor { min-width: 0; display: flex; align-items: baseline; gap: .35rem; overflow: hidden; }
@@ -420,9 +566,9 @@ _POKER_CSS = r"""
 .pt-history-actor small { color: var(--pt-muted); font-size: .52rem; }
 .pt-history-decision { color: var(--pt-text); font-size: .64rem; }
 .pt-history-size { color: var(--pt-text); text-align: right; }
-.pt-history-context { grid-column: 1 / -1; min-width: 0; display: flex; align-items: center; gap: .45rem 1rem; padding-left: calc(28px + .55rem); color: var(--pt-muted); font-family: var(--pt-font-mono); font-size: .52rem; white-space: nowrap; }
+.pt-history-context { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: .45rem 1rem; padding-left: calc(28px + .45rem); color: var(--pt-muted); font-family: var(--pt-font-mono); font-size: .52rem; }
 .pt-history-context b { color: #718078; font-family: var(--pt-font-sans); font-size: .49rem; font-weight: 680; letter-spacing: .045em; text-transform: uppercase; }
-.pt-history-note { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.pt-history-note { width: 100%; white-space: normal; line-height: 1.45; }
 .stMarkdown ol.pt-decision-history > li.pt-action-fold::before { background: var(--pt-negative); }
 .stMarkdown ol.pt-decision-history > li.pt-action-call::before, .stMarkdown ol.pt-decision-history > li.pt-action-check::before { background: var(--pt-warning); }
 .stMarkdown ol.pt-decision-history > li.pt-action-bet::before, .stMarkdown ol.pt-decision-history > li.pt-action-raise::before { background: var(--pt-accent); }
@@ -465,9 +611,11 @@ _POKER_CSS = r"""
   .pt-table-center { bottom: calc(22px - 2%); gap: 6px; }
   .pt-hero-cards { gap: 2px; }
   .pt-pot { padding: .24rem .38rem; }
-  .pt-history-head, .stMarkdown ol.pt-decision-history > li.pt-action { grid-template-columns: 56px minmax(54px, 1fr) 62px 54px; column-gap: .35rem; }
-  .pt-history-head > span:first-child, .pt-history-sequence { display: none; }
-  .pt-history-head, .stMarkdown ol.pt-decision-history > li.pt-action { padding-inline: .55rem; }
+  .pt-history-summary { display: grid; }
+  .pt-history-summary span { text-align: left; }
+  .pt-history-primary { grid-template-columns: 46px minmax(54px, 1fr) 62px 54px; column-gap: .35rem; }
+  .pt-history-sequence { display: none; }
+  .stMarkdown ol.pt-decision-history > li.pt-action { padding-inline: .55rem; }
   .pt-history-context { padding-left: 0; gap: .35rem .65rem; font-size: .49rem; }
   .pt-history-context b { font-size: .46rem; }
   .pt-range-grid { min-width: 455px; }

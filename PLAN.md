@@ -77,14 +77,16 @@ As of July 28, 2026, the repository contains:
   temporal reconstruction, labeling tools, hard-example queues, and evaluation
   scripts;
 - a guided three-mode Study workflow (Replay, Fix & confirm, Analyze) that keeps
-  hand selection compact, hides advanced corrections until opened, and includes
-  inline TexasSolver setup/use guidance while retaining before/after correction
-  history and staling derived coaching/solver evidence;
+  hand selection compact, lets any saved action drive one shared reconstructed
+  table replay, groups failing trust checks into concrete fix steps, hides
+  advanced corrections until opened, and includes inline TexasSolver setup/use
+  guidance while retaining before/after correction history and staling derived
+  coaching/solver evidence;
 - a persistent cross-session issue inbox that freezes debugging evidence and
   retains resolution notes;
 - authenticated local/container operation, a non-root Docker runtime, pinned
   CV dependencies, healthchecks, and CI;
-- 1508 passing tests with one intentionally skipped test at the latest inventory
+- 1509 passing tests with one intentionally skipped test at the latest inventory
   (see "Verification record" below, which is the authoritative count and which
   this bullet must be updated to match), with Ruff and the configured MyPy target
   green.
@@ -1785,7 +1787,7 @@ now capped below 5; the result below uses OpenCV 4.11 and NumPy 2.2.6.
 
 | Command | Result |
 | --- | --- |
-| `python -m pytest -q` | `1508 passed, 1 skipped` |
+| `python -m pytest -q` | `1509 passed, 1 skipped` |
 | `python -m ruff check .` | `All checks passed!` |
 | `python -m mypy` | `Success: no issues found in 11 source files` |
 | `git diff --check` | no output, exit 0 |
@@ -1807,7 +1809,7 @@ unchanged, no table added or dropped; the real file was SHA-256-hashed before an
 after and is byte-identical. Reading its version stamp still leaves `-shm`/`-wal`
 sidecars beside it, which is the documented gap below, not a write to the database.
 
-The suite grew from the 442 tests of the Phase 0 baseline to 1508. That count
+The suite grew from the 442 tests of the Phase 0 baseline to 1509. That count
 includes the CV suites, so the number will drift; the Phase 1 files in it are
 `test_study_readiness*.py`,
 `test_completion_evidence.py`, `test_schema_v13_migration_paths.py`,

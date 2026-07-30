@@ -323,7 +323,7 @@ def evaluate_study_readiness(
                 ),
                 clearing_action=(
                     "Tick 'I have read the evidence above and confirm this hand is "
-                    "correct' beside the review status control."
+                    "correct' under Fix & confirm → Confirm the saved hand."
                 ),
             )
         )
@@ -742,12 +742,12 @@ def _accounting_blockers(
     clearing_action = (
         "Open the session's hand editor and correct the stack sizes, action "
         "amounts, or player identities the ledger rejected — the Accounting "
-        "reconciliation panel cannot change them. Reopen Study → Summary → "
+        "reconciliation panel cannot change them. Reopen Fix & confirm → "
         "Accounting reconciliation afterwards and save the settlement until its "
         "status reads reconciled."
         if accounting_error
         else (
-            "Open Study → Summary → Accounting reconciliation, fix the flagged "
+            "Open Fix & confirm → Accounting reconciliation, fix the flagged "
             "contributions or awards, and save the settlement until its status "
             "reads reconciled."
         )
@@ -828,7 +828,7 @@ def _assumption_blockers(
                 "hero result are not established by the recording alone."
             ),
             clearing_action=(
-                "Open Study → Summary → Accounting reconciliation and press "
+                "Open Fix & confirm → Accounting reconciliation and press "
                 "'Confirm this assumption' beside each listed assumption, which "
                 "records the exact chip movement you are attesting to. Confirming "
                 "the hand as a whole does not clear this. If the chips did not "
@@ -941,7 +941,7 @@ def _coaching_blockers(reviews: list[RetainedReview]) -> list[StudyBlocker]:
                 "correction and has not been re-run."
             ),
             clearing_action=(
-                "Re-run coaching in Study → Coach, or press Discard stale coaching "
+                "Re-run coaching in Analyze → AI coach, or press Discard stale coaching "
                 "there. Re-running keeps the stale review visible as retained "
                 "history; discarding is the way out when no coaching provider is "
                 "configured, which is every imported hand's starting state."
@@ -977,7 +977,7 @@ def _solver_blockers(runs: list[SolverRun]) -> list[StudyBlocker]:
                     "solver evidence for it is current."
                 ),
                 clearing_action=(
-                    "Wait for the cancellation to finish in Study → Solver, then "
+                    "Wait for the cancellation to finish in Analyze → TexasSolver, then "
                     "either re-run the solve or press Delete stale run beside the "
                     "cancelled run."
                 ),
@@ -992,7 +992,7 @@ def _solver_blockers(runs: list[SolverRun]) -> list[StudyBlocker]:
                 "correction and has not been re-run."
             ),
             clearing_action=(
-                "Re-run the solve in Study → Solver, or press Delete stale run "
+                "Re-run the solve in Analyze → TexasSolver, or press Delete stale run "
                 "beside it. Deleting is the only clearing action when the hand is "
                 "no longer solver-eligible, which is why the control exists."
             ),

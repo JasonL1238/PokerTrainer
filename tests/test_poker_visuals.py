@@ -1,6 +1,7 @@
 from poker_tracker.persistence.models import Action, HandPlayer
 from poker_tracker.ui.poker_visuals import (
     _POKER_CSS,
+    action_replay_state,
     action_timeline_html,
     equity_meter_html,
     playing_card_html,
@@ -92,9 +93,11 @@ def test_action_timeline_maps_semantic_action_tones() -> None:
     assert "pt-action-call" in html
     assert "pt-history-panel" in html
     assert "Completed hand decision history" in html
-    assert "<span>Decision</span>" in html
+    assert "All 2 saved actions" in html
     assert '<span class="pt-history-decision">Raise</span>' in html
     assert '<span class="pt-history-size">3 BB</span>' in html
+    assert "No saved actions are hidden" in html
+    assert "Reconstructed table after action" not in html
 
 
 def test_action_timeline_does_not_repeat_matching_position() -> None:
@@ -117,8 +120,8 @@ def test_action_timeline_does_not_repeat_matching_position() -> None:
 def test_decision_history_uses_scoped_consistent_rows() -> None:
     assert ".stMarkdown ol.pt-decision-history" in _POKER_CSS
     assert "display: block !important" in _POKER_CSS
-    assert "height: 68px" in _POKER_CSS
-    assert "grid-template-columns: 28px 68px" in _POKER_CSS
+    assert "min-height: 76px" in _POKER_CSS
+    assert ".pt-history-note { width: 100%; white-space: normal" in _POKER_CSS
 
 
 def test_decision_history_includes_reconstructed_pot_stack_spr_and_notes() -> None:
@@ -152,6 +155,74 @@ def test_decision_history_includes_reconstructed_pot_stack_spr_and_notes() -> No
     assert "72 BB" in html
     assert "<b>SPR</b> 6.0" in html
     assert "Detected from bet pill" in html
+
+
+def test_action_replay_reconstructs_the_selected_board_and_player_state() -> None:
+    players = [
+        HandPlayer(
+            hand_id=1,
+            player_name="Hero",
+            position="BTN",
+            starting_stack=100,
+            is_hero=True,
+        ),
+        HandPlayer(hand_id=1, player_name="Villain", position="BB", starting_stack=100),
+    ]
+    actions = [
+        Action(
+            hand_id=1,
+            street="preflop",
+            player_name="Hero",
+            position="BTN",
+            action_type="raise",
+            amount=3,
+            stack_before=100,
+            pot_before=1.5,
+        ),
+        Action(
+            hand_id=1,
+            street="flop",
+            player_name="Villain",
+            position="BB",
+            action_type="fold",
+            pot_before=7.5,
+            stack_before=97,
+        ),
+    ]
+
+    preflop = action_replay_state(
+        actions,
+        0,
+        players=players,
+        board_cards="Qs 7d 2c 9h 3s",
+    )
+    flop = action_replay_state(
+        actions,
+        1,
+        players=players,
+        board_cards="Qs 7d 2c 9h 3s",
+    )
+
+    assert preflop.board_cards == ""
+    assert preflop.pot_size == 4.5
+    assert preflop.players[0].starting_stack == 97
+    assert preflop.folded_player_keys == frozenset()
+    assert flop.board_cards == "Qs 7d 2c"
+    assert flop.pot_size == 7.5
+    assert players[1].player_key in flop.folded_player_keys
+
+    html = poker_table_html(
+        hero_cards="As Kh",
+        board_cards=flop.board_cards,
+        pot_size=flop.pot_size,
+        players=flop.players,
+        actor_player_key=flop.actor_player_key,
+        folded_player_keys=flop.folded_player_keys,
+    )
+    assert "Q of spades" in html
+    assert "9 of hearts" not in html
+    assert "pt-seat-acting" in html
+    assert "pt-seat-folded" in html
 
 
 def test_cards_layer_behind_hero_position_and_pot_clears_board() -> None:

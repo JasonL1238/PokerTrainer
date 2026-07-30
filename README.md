@@ -26,7 +26,9 @@ GTO score.
 
 Study shows one task at a time:
 
-1. **Replay** — inspect the table and saved decision history.
+1. **Replay** — inspect the full saved action history. Click any action to update
+   the single table replay to that moment, including the street board, pot,
+   remaining stacks, folded seats, and highlighted actor.
 2. **Fix & confirm** — resolve blockers and open only the correction tool needed.
 3. **Analyze** — use quick math, TexasSolver, coaching, or notes.
 
