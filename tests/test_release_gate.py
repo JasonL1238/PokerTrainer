@@ -8,7 +8,6 @@ from pathlib import Path
 from poker_tracker.release_gate.evaluate import evaluate_answer_key_against_timeline
 from poker_tracker.release_gate.runner import run_release_gate
 from poker_tracker.validation.corpus import EXIT_SETUP_INVALID
-from poker_tracker.validation.hashing import sha256_canonical_json
 
 REPO = Path(__file__).resolve().parents[1]
 MANIFEST = REPO / "validation" / "clubwpt_v1.json"

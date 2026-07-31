@@ -1426,7 +1426,7 @@ def _near_digit_match(native_digits: str, retried_digits: str) -> bool:
     for cand in candidates:
         if len(cand) != len(native_digits):
             continue
-        if sum(a != b for a, b in zip(cand, native_digits)) == 1:
+        if sum(a != b for a, b in zip(cand, native_digits, strict=True)) == 1:
             return True
     return False
 
@@ -1576,7 +1576,7 @@ def _soft_digit_related(
     if (
         len(native_digits) == len(retried_digits)
         and len(native_digits) >= 4
-        and sum(a != b for a, b in zip(native_digits, retried_digits)) <= 1
+        and sum(a != b for a, b in zip(native_digits, retried_digits, strict=True)) <= 1
     ):
         return True
     if _near_digit_match(native_digits, retried_digits):
@@ -1679,7 +1679,7 @@ def _digit_runs_compatible(
     if (
         len(native_digits) == len(retried_digits)
         and len(native_digits) >= 4
-        and sum(a != b for a, b in zip(native_digits, retried_digits)) == 1
+        and sum(a != b for a, b in zip(native_digits, retried_digits, strict=True)) == 1
     ):
         return True
     if _near_digit_match(native_digits, retried_digits):

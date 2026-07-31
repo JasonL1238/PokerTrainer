@@ -459,9 +459,10 @@ def _one_hand_session_payload(
     hand = full_hands[position]
     preceded = position > 0
     followed = position < len(full_hands) - 1
+    from datetime import date
+
     from cv_lab.scripts.eval.validate_yolo_card_timeline import validate_timeline
     from poker_tracker.persistence.models import Session
-    from datetime import date
 
     codes: list[str] = []
     if isinstance(timeline.get("states"), list):

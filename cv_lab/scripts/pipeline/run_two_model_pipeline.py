@@ -38,11 +38,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirna
 
 import cv_lab.scripts.pipeline.region_detections as rd  # noqa: E402
 from cv_lab.scripts.pipeline.build_yolo_hand_timeline import build_hand_timeline  # noqa: E402
-from cv_lab.scripts.pipeline.classify_screen import classify as classify_screen  # noqa: E402
 from cv_lab.scripts.pipeline.card_classifier import (  # noqa: E402
     DEFAULT_CLS_WEIGHTS,
     CardClassifier,
 )
+from cv_lab.scripts.pipeline.classify_screen import classify as classify_screen  # noqa: E402
 from cv_lab.scripts.pipeline.evaluate_yolo_cards import (  # noqa: E402
     DEFAULT_YOLOV12_VENDOR,
     _load_yolo_class,

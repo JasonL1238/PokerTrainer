@@ -1074,7 +1074,6 @@ def test_reconstruction_evidence_surface_renders_the_fields_confirmation_names(
     from streamlit.testing.v1 import AppTest
 
     import poker_tracker.persistence.db as db_module
-    from poker_tracker.persistence.completion import parse_completion_evidence
 
     path = tmp_path / "round8-ui.sqlite3"
     hand_id = _seed_ui_hand(path)

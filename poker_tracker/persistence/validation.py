@@ -4,9 +4,6 @@ from collections.abc import Iterable
 
 from poker_tracker.math.cards import CardParseError, parse_cards
 
-RANKS = "23456789TJQKA"
-SUITS = "cdhs"
-
 
 class CardValidationError(ValueError):
     """Raised when a card string cannot be parsed as standard rank/suit cards."""
@@ -37,14 +34,3 @@ def validate_tags(tags: list[str], allowed_tags: set[str]) -> list[str]:
         if normalized not in cleaned:
             cleaned.append(normalized)
     return cleaned
-
-
-def _normalize_card(token: str) -> str:
-    if len(token) != 2:
-        raise CardValidationError(f"Invalid card token: {token}")
-
-    rank = token[0].upper()
-    suit = token[1].lower()
-    if rank not in RANKS or suit not in SUITS:
-        raise CardValidationError(f"Invalid card token: {token}")
-    return f"{rank}{suit}"

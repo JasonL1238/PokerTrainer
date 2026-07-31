@@ -389,16 +389,6 @@ class LLMProviderConfig(BaseModel):
     has_api_key: bool = False
 
 
-class CoachingRequest(BaseModel):
-    prompt: str
-    review_type: ReviewType
-    provider_name: str = "unconfigured"
-    model_name: str = ""
-    hand_id: int | None = None
-    session_id: int | None = None
-    safety_mode: SafetyMode = "post_session_only"
-
-
 class CoachingResponse(PersistedModel):
 
     id: int | None = None

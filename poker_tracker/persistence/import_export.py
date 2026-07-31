@@ -313,10 +313,6 @@ def import_hands_into_session(
     return refreshed
 
 
-def import_session_json(db: PokerDatabase, path: str | Path) -> Session:
-    return import_session(db, json.loads(Path(path).read_text(encoding="utf-8")))
-
-
 IMPORTED_ANALYSIS_STALE_REASON = (
     "Imported from another database; rerun coaching against these records."
 )

@@ -4,10 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from poker_tracker.persistence.models import SolverRangeProfile
-
 SolverStreet = Literal["flop", "turn", "river"]
-RangeSelectionMode = Literal["default", "premade", "custom"]
 
 
 class EligibilityResult(BaseModel):
@@ -63,13 +60,6 @@ class ResolvedRange(BaseModel):
     range_percent: float = Field(ge=0, le=1)
     requested_profile: str = ""
     mismatches: list[str] = Field(default_factory=list)
-
-
-class RangeSelection(BaseModel):
-    mode: RangeSelectionMode = "default"
-    profile: SolverRangeProfile | None = None
-    custom_notation: str = ""
-    custom_name: str = ""
 
 
 class ActionFrequency(BaseModel):

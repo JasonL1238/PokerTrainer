@@ -101,19 +101,6 @@ def clip_roi_to_bounds(region: ROIRegion, image_width: int, image_height: int) -
     return region.model_copy(update={"x": x, "y": y, "width": width, "height": height})
 
 
-def roi_region_to_dict(region: ROIRegion) -> dict[str, Any]:
-    """Convert an ROI region to JSON-compatible data."""
-    data = region.model_dump()
-    for key in ("created_at", "updated_at"):
-        data[key] = data[key].isoformat()
-    return data
-
-
-def roi_region_from_dict(payload: dict[str, Any]) -> ROIRegion:
-    """Create an ROI region from exported JSON-compatible data."""
-    return ROIRegion(**payload)
-
-
 def safe_roi_key(value: str) -> str:
     """Normalize a user-facing ROI key for filenames and future CV/OCR code."""
     key = re.sub(r"[^a-zA-Z0-9._-]+", "_", value.strip()).strip("._-").lower()

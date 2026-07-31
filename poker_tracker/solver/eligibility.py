@@ -16,10 +16,6 @@ from poker_tracker.solver.models import (
 _STREET_ORDER = ("flop", "turn", "river")
 
 
-class SolverEligibilityError(ValueError):
-    """Raised when a saved hand cannot produce an honest TexasSolver spot."""
-
-
 @dataclass(frozen=True)
 class PreparedSpot:
     eligibility: EligibilityResult

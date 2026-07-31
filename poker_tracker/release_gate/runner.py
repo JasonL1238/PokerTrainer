@@ -204,7 +204,7 @@ def _run_fixture_predictions(manifest_path: Path) -> dict[str, Any]:
     case_reports: list[dict[str, Any]] = []
     scored = 0
     failed = 0
-    for index, case in enumerate(cases):
+    for case in cases:
         if not isinstance(case, dict):
             continue
         runtime_class = case.get("runtime_class")

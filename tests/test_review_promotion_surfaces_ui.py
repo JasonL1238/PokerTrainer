@@ -2,13 +2,15 @@
 
 ``test_study_readiness_ui`` covers the Study workspace, the Study coach button,
 and the solver-explanation button. The remaining ways a hand can acquire
-``review_status = 'reviewed'`` are the saved-hands expander, the Settings ->
-Coaching tab, and the manual Add-hand form. Each is driven here through a real
-Streamlit run against a real SQLite file.
+``review_status = 'reviewed'`` are the saved-hands expander and the Settings ->
+Coaching tab; both are driven here through a real Streamlit run against a real
+SQLite file. Manual entry is the one surface that writes a hand without ever
+being able to promote it, and is covered structurally at the end of this file.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import streamlit as st
@@ -25,6 +27,12 @@ from poker_tracker.persistence.models import (
     SettlementEntry,
 )
 from poker_tracker.services.hand_accounting import persist_reconciliation
+from poker_tracker.services.manual_spot_entry import (
+    ManualSpotInput,
+    PostflopActionInput,
+    build_manual_spot,
+    save_manual_spot,
+)
 from poker_tracker.ui.navigation import Page
 from tests.conftest import attest_declared_assumptions
 
@@ -358,56 +366,75 @@ def test_settings_coaching_promotes_a_ready_manual_hand(tmp_path, monkeypatch) -
 
 
 # --------------------------------------------------------------------------
-# The manual Add-hand form: the other way review_status is written
+# Manual spot entry: the other way a hand is written into a session
 # --------------------------------------------------------------------------
+#
+# The free-form Add-hand form these two tests used to drive is gone. The Sessions
+# "Add hands" tab is now compact solver-spot entry (``create_hand_form`` ->
+# ``_create_single_hand_form``), which renders no Source and no Review status
+# control at all, so there is no widget left to assert an option list on.
+#
+# The invariant those tests protected is now structural rather than presentational,
+# and is asserted that way below: ``ManualSpotInput`` has no field that can declare
+# either value, and ``build_manual_spot`` hardcodes the safe pair. A UI test could
+# only prove that one form withholds the choice; this proves the entry path cannot
+# express it.
 
 
-def _run_add_hand_form(path: Path, monkeypatch) -> AppTest:
-    """The manual Add-hands form lives in the Sessions workspace's "Add hands" tab."""
-    _isolate(path, monkeypatch)
-    app = AppTest.from_file(APP_PATH, default_timeout=30).run()
-    app.radio[0].set_value(Page.SESSIONS)
-    app.run()
-    assert not list(app.exception)
-    return app
+def _manual_spot() -> ManualSpotInput:
+    """One valid single-raised-pot spot; only the stamped labels matter here."""
+    return ManualSpotInput(
+        hand_number=2,
+        hero_cards="Ah Qs",
+        board_cards="Qd 7s 2c",
+        hero_position="BB",
+        villain_position="BTN",
+        table_size=6,
+        starting_stack=100.0,
+        pot_type="single_raised",
+        opener="villain",
+        open_to=2.5,
+        postflop_actions=(
+            PostflopActionInput("flop", "hero", "check"),
+            PostflopActionInput("flop", "villain", "bet", 3.75),
+            PostflopActionInput("flop", "hero", "call", 3.75),
+        ),
+        winner="hero",
+    )
 
 
-def test_add_hand_form_never_offers_reviewed_as_a_starting_status(
-    tmp_path, monkeypatch
-) -> None:
-    path = tmp_path / "add-hand.sqlite3"
-    _seed_ready_manual_hand(path)
+def test_manual_spot_entry_cannot_declare_a_review_status_or_source() -> None:
+    """The entry surface offers no field for either label, so neither can be forged."""
+    fields = {field.name for field in dataclasses.fields(ManualSpotInput)}
 
-    app = _run_add_hand_form(path, monkeypatch)
+    assert "review_status" not in fields
+    assert "source_type" not in fields
+    assert "completion_status" not in fields
+    assert "completion_evidence" not in fields
 
-    assert _status_widget(app).options == ["unreviewed", "needs_correction"]
 
+def test_manual_spot_entry_always_lands_unreviewed_and_manual(tmp_path) -> None:
+    """A typed-in spot is stamped unreviewed/manual on the way to SQLite."""
+    built = build_manual_spot(_manual_spot())
 
-def test_add_hand_form_forces_a_declared_cv_source_to_be_unproven(
-    tmp_path, monkeypatch
-) -> None:
-    """A hand typed in by hand but declared reconstructed carries no evidence."""
-    path = tmp_path / "add-hand-cv.sqlite3"
-    _seed_ready_manual_hand(path)
+    assert built.hand.review_status == "unreviewed"
+    assert built.hand.source_type == "manual"
+    assert built.hand.completion_status == "not_applicable"
 
-    app = _run_add_hand_form(path, monkeypatch)
-    next(item for item in app.number_input if item.label == "Hand number").set_value(2)
-    next(item for item in app.selectbox if item.label == "Source").set_value("cv_import")
-    _status_widget(app).set_value("unreviewed")
-    app.run()
-    next(
-        item for item in app.button if item.label == "Save hand"
-    ).click()
-    app.run()
+    path = tmp_path / "manual-spot.sqlite3"
+    db = PokerDatabase(path)
+    db.init_db()
+    session = db.create_session(Session(name="Manual entry"))
+    saved, _reconciliation, _warnings = save_manual_spot(db, session.id, _manual_spot())
+    db.close()
 
-    assert not list(app.exception)
     verifier = PokerDatabase(path)
     verifier.init_db()
-    created = next(
-        hand for hand in verifier.fetch_all_hands() if hand.hand_number == 2
+    persisted = next(
+        hand for hand in verifier.fetch_all_hands() if hand.id == saved.id
     )
     verifier.close()
-    assert created.source_type == "cv_import"
-    assert created.completion_status == "uncertain"
-    assert created.review_status == "needs_correction"
-    assert created.completion_evidence == {}
+
+    assert persisted.review_status == "unreviewed"
+    assert persisted.source_type == "manual"
+    assert persisted.completion_status == "not_applicable"

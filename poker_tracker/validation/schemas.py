@@ -4,20 +4,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 MANIFEST_SCHEMA_VERSION = 1
 ANSWER_KEY_SCHEMA_VERSION = 1
-
-SplitName = Literal["development", "validation", "locked_test"]
-CompletionClass = Literal["complete", "partial", "uncertain"]
-TerminalEvent = Literal[
-    "showdown",
-    "fold_win",
-    "unobserved",
-    "recording_end",
-    "unsupported",
-]
 
 VALID_SPLITS: frozenset[str] = frozenset({"development", "validation", "locked_test"})
 VALID_COMPLETION_CLASSES: frozenset[str] = frozenset(
