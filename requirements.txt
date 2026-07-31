@@ -1,4 +1,4 @@
-streamlit>=1.36
+streamlit>=1.55
 altair>=5.3,<7
 Flask>=3.0
 pydantic>=2.7

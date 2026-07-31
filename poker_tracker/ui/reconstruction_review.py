@@ -19,6 +19,66 @@ class KeyFrame:
     image_path: str
     timestamp_s: float | None = None
 
+
+@dataclass(frozen=True)
+class TimelineActionRef:
+    """One reconstructed action line tied to a retained source frame."""
+
+    street: str
+    action_type: str
+    player_name: str
+    position: str
+    amount: float | None
+    source_image: str
+    seat: int | None = None
+
+    def label(self) -> str:
+        actor = " ".join(part for part in (self.position, self.player_name) if part)
+        if not actor and self.seat is not None:
+            actor = f"Seat {self.seat}"
+        actor = actor or "Unknown"
+        amount = "" if self.amount is None else f" {self.amount:g} BB"
+        return (
+            f"{self.street.title()} · {actor} · "
+            f"{self.action_type.replace('_', ' ')}{amount}"
+        )
+
+
+@dataclass(frozen=True)
+class FrameIssueTarget:
+    """A frame that blocks clean validation, plus the actions it produced."""
+
+    frame_index: int
+    source_image: str
+    timestamp_seconds: float
+    status: str  # "incorrect" | "unreviewed"
+    issue_types: tuple[str, ...]
+    notes: str
+    actions: tuple[TimelineActionRef, ...]
+
+    def summary(self) -> str:
+        when = f"{self.timestamp_seconds:.2f}s"
+        if self.status == "incorrect":
+            issues = ", ".join(self.issue_types) or "flagged"
+            return f"Frame {self.frame_index + 1} @ {when} · {issues}"
+        return f"Frame {self.frame_index + 1} @ {when} · unreviewed"
+
+    def action_labels(self) -> tuple[str, ...]:
+        return tuple(action.label() for action in self.actions)
+
+
+@dataclass(frozen=True)
+class ValidationFrameContext:
+    """Frame-review context needed beside the Import edit/approve panel."""
+
+    job_id: int
+    hand_number: int
+    timeline_hand: dict[str, Any]
+    states: list[dict[str, Any]]
+    reviews_by_image: dict[str, Any]
+    cursor_key: str
+    pending_hand_key: str
+
 ISSUE_GUIDANCE: dict[str, tuple[str, str]] = {
     "Cards / board": (
         "Card classifier",
@@ -337,6 +397,130 @@ def first_unreviewed_frame_index(
     return len(states) - 1
 
 
+def timeline_actions_for_image(
+    hand: dict[str, Any], source_image: str
+) -> tuple[TimelineActionRef, ...]:
+    """Return reconstructed action lines attributed to one source frame."""
+
+    refs: list[TimelineActionRef] = []
+    for action in hand.get("actions") or []:
+        if str(action.get("source_image") or "") != source_image:
+            continue
+        amount = action.get("amount")
+        seat = action.get("seat")
+        refs.append(
+            TimelineActionRef(
+                street=str(action.get("street") or "unknown"),
+                action_type=str(action.get("action_type") or "unknown"),
+                player_name=str(action.get("player_name") or ""),
+                position=str(action.get("position") or ""),
+                amount=None if amount is None else float(amount),
+                source_image=source_image,
+                seat=None if seat is None else int(seat),
+            )
+        )
+    return tuple(refs)
+
+
+def frame_issue_targets(
+    hand: dict[str, Any],
+    states: list[dict[str, Any]],
+    reviews_by_image: dict[str, Any],
+) -> list[FrameIssueTarget]:
+    """Frames that still need attention (flagged or unreviewed), with linked actions."""
+
+    targets: list[FrameIssueTarget] = []
+    for index, state in enumerate(states):
+        image = str(state.get("image") or "")
+        if not image:
+            continue
+        review = reviews_by_image.get(image)
+        status = _review_status(review)
+        if status == "correct":
+            continue
+        if status == "incorrect":
+            issue_types = tuple(_review_issue_types(review))
+            notes = _review_notes(review)
+            frame_status = "incorrect"
+        else:
+            issue_types = ()
+            notes = ""
+            frame_status = "unreviewed"
+        targets.append(
+            FrameIssueTarget(
+                frame_index=index,
+                source_image=image,
+                timestamp_seconds=float(state.get("time_s", 0)),
+                status=frame_status,
+                issue_types=issue_types,
+                notes=notes,
+                actions=timeline_actions_for_image(hand, image),
+            )
+        )
+    return targets
+
+
+def match_db_action_to_frame_target(
+    *,
+    street: str,
+    action_type: str,
+    player_name: str,
+    position: str,
+    amount: float | None,
+    targets: list[FrameIssueTarget],
+) -> FrameIssueTarget | None:
+    """Match a saved DB action to a flagged/unreviewed frame via timeline actions.
+
+    Street and action type are required. Identity must also agree via position or
+    player name so two same-street folds by different seats cannot collide. When
+    both sides declare an amount, the amounts must match.
+    """
+
+    normalized_type = action_type.replace("-", "_")
+    street_key = street.lower()
+    candidates: list[tuple[int, FrameIssueTarget]] = []
+    for target in targets:
+        for action in target.actions:
+            if action.street.lower() != street_key:
+                continue
+            if action.action_type.replace("-", "_") != normalized_type:
+                continue
+            position_match = bool(position and action.position and action.position == position)
+            player_match = bool(
+                player_name and action.player_name and action.player_name == player_name
+            )
+            if not position_match and not player_match:
+                continue
+            if (
+                amount is not None
+                and action.amount is not None
+                and abs(float(amount) - float(action.amount)) >= 1e-6
+            ):
+                continue
+            score = 8
+            if position_match:
+                score += 3
+            if player_match:
+                score += 2
+            if amount is None and action.amount is None:
+                score += 1
+            elif (
+                amount is not None
+                and action.amount is not None
+                and abs(float(amount) - float(action.amount)) < 1e-6
+            ):
+                score += 2
+            candidates.append((score, target))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], item[1].frame_index))
+    # Ambiguous equal-score matches are unsafe for jump/badge wiring.
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        if candidates[0][1].source_image != candidates[1][1].source_image:
+            return None
+    return candidates[0][1]
+
+
 def _review_status(review: Any) -> str | None:
     if review is None:
         return None
@@ -344,6 +528,26 @@ def _review_status(review: Any) -> str | None:
     if status is None and isinstance(review, dict):
         status = review.get("status")
     return str(status) if status is not None else None
+
+
+def _review_issue_types(review: Any) -> list[str]:
+    if review is None:
+        return []
+    raw = getattr(review, "issue_types", None)
+    if raw is None and isinstance(review, dict):
+        raw = review.get("issue_types")
+    if not raw:
+        return []
+    return [str(item) for item in raw]
+
+
+def _review_notes(review: Any) -> str:
+    if review is None:
+        return ""
+    raw = getattr(review, "notes", None)
+    if raw is None and isinstance(review, dict):
+        raw = review.get("notes")
+    return str(raw or "").strip()
 
 
 def job_id_from_hand_notes(notes: str | None) -> int | None:

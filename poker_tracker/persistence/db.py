@@ -349,6 +349,22 @@ def _assert_supported_schema_version(version: int | None) -> None:
         )
 
 
+def _finalize_correction_notes(
+    notes: str, *, rejection_codes: tuple[str, ...]
+) -> str:
+    """Audit text for operator finalize; blank notes stay informative when rejecting."""
+
+    cleaned = notes.strip()
+    if cleaned:
+        return cleaned
+    if rejection_codes:
+        return (
+            "Operator finalized incomplete hand after filling blanks; "
+            "overrode rejection_codes: " + ", ".join(rejection_codes)
+        )
+    return "Operator finalized incomplete hand after filling blanks."
+
+
 class PokerDatabase:
     def __init__(
         self,
@@ -1464,11 +1480,7 @@ class PokerDatabase:
         # Rejection codes stay in evidence for audit, but finalize may override
         # them: a late-joined recording often rejects on coverage/OCR gaps even
         # when the operator reconstructed the whole action line by observation.
-        if previous.rejection_codes and not notes.strip():
-            raise ValueError(
-                "Add finalize notes explaining how you reconstructed the "
-                "pipeline-rejected gaps (for example late join on preflop)."
-            )
+        # Finalize notes are optional; blank notes keep the default audit text.
         # Preserve every pipeline observation. Attestation is additive only.
         payload = dump_completion_evidence(previous)
         payload[OPERATOR_MANUAL_COMPLETION_KEY] = True
@@ -1521,9 +1533,8 @@ class PokerDatabase:
                         "operator_terminal_event": terminal_event,
                         OPERATOR_MANUAL_COMPLETION_KEY: "true",
                     },
-                    notes=(
-                        notes.strip()
-                        or "Operator finalized incomplete hand after filling blanks."
+                    notes=_finalize_correction_notes(
+                        notes, rejection_codes=previous.rejection_codes
                     ),
                 )
             )

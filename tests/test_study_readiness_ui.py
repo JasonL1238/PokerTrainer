@@ -378,8 +378,8 @@ def test_validation_editors_surface_is_mounted_for_ready_hand(
     rendered = "\n".join(item.value for item in app.markdown)
     captions = "\n".join(item.value for item in app.caption)
 
-    assert "### Edit this hand" in rendered
-    assert "Edit while validating frames" in captions
+    assert "### Fix this hand" in rendered
+    assert "Jump a blocker" in captions
     assert any(
         button.label == "Finish validation — send to Study" for button in app.button
     )

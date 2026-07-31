@@ -3,11 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import date
 from html import escape
 from pathlib import Path
-from typing import Iterator
 
 import streamlit as st
 from pydantic import ValidationError
@@ -189,15 +189,20 @@ from poker_tracker.ui.poker_visuals import (
 )
 from poker_tracker.ui.reconstruction_review import (
     ISSUE_GUIDANCE,
+    FrameIssueTarget,
+    ValidationFrameContext,
     empty_hands_review_message,
     first_unreviewed_frame_index,
+    frame_issue_targets,
     hand_frame_progress,
     hand_validation_label,
     history_impacts,
     job_id_from_hand_notes,
     load_timeline_for_job,
+    match_db_action_to_frame_target,
     observed_facts,
     states_for_hand,
+    timeline_actions_for_image,
     timeline_path_for_job,
 )
 from poker_tracker.ui.roi import ROI_TYPES, validate_roi_bounds
@@ -1741,15 +1746,72 @@ def render_study_replay(
         )
 
 
-def study_action_label(action: Action, index: int) -> str:
+def study_action_label(
+    action: Action,
+    index: int,
+    *,
+    issue_badge: str = "",
+) -> str:
     """Return a compact but complete label for an action-replay control."""
 
     actor = actor_label(action.player_name, action.position) or "Unknown player"
     amount = "" if action.amount is None else f" · {action.amount:g} BB"
+    badge = f" · ⚑ {issue_badge}" if issue_badge else ""
     return (
         f"{index + 1:02d} · {action.street.title()} · {actor} · "
-        f"{action.action_type.replace('-', ' ').title()}{amount}"
+        f"{action.action_type.replace('-', ' ').title()}{amount}{badge}"
     )
+
+
+_BLOCKER_OTHER_FIX_LABELS: dict[str, str] = {
+    "STUDY_EXCLUDED_BY_OPERATOR": "Study inclusion",
+    "COMPLETION_NOT_COMPLETE": "Finalize incomplete hand",
+    "UNRESOLVED_SOURCE_WARNING": "Source warnings",
+    "INVALID_HERO_OR_BOARD_CARDS": "Cards, board, or pot",
+    "UNREADABLE_HAND_COLUMNS": "Cards, board, or pot",
+    "UNSUPPORTED_TABLE_LAYOUT": "Cards, board, or pot",
+    "ACCOUNTING_NOT_AUTHORITATIVE": "Chip stacks / accounting",
+    "ACCOUNTING_ASSUMPTION_DEPENDENT": "Chip stacks / accounting",
+}
+
+
+def _validation_focus_action_key(hand_id: int) -> str:
+    return f"validation_focus_action_{hand_id}"
+
+
+def _validation_other_fix_key(hand_id: int) -> str:
+    return f"validation_fc_tool_{hand_id}"
+
+
+def _jump_to_frame(frame_context: ValidationFrameContext, frame_index: int) -> None:
+    st.session_state[frame_context.pending_hand_key] = frame_context.hand_number
+    st.session_state[frame_context.cursor_key] = frame_index
+    states = frame_context.states
+    if 0 <= frame_index < len(states):
+        when = float(states[frame_index].get("time_s", 0))
+        flash(
+            f"Showing frame {frame_index + 1} @ {when:.2f}s — scroll up to the "
+            "frame evidence panel."
+        )
+
+
+def _validation_other_fixes_expander_key(hand_id: int) -> str:
+    return f"validation_other_fixes_expander_{hand_id}"
+
+
+def _validation_action_expander_key(hand_id: int, action_id: int) -> str:
+    return f"validation_action_expander_{hand_id}_{action_id}"
+
+
+def _jump_to_other_fix(hand_id: int, tool_label: str) -> None:
+    st.session_state[_validation_other_fix_key(hand_id)] = tool_label
+    st.session_state[_validation_other_fixes_expander_key(hand_id)] = True
+
+
+def _jump_to_action(hand_id: int, action_id: int) -> None:
+    # One-shot: open the expander once; do not keep re-forcing it open on reruns.
+    st.session_state[_validation_focus_action_key(hand_id)] = action_id
+    st.session_state[_validation_action_expander_key(hand_id, action_id)] = True
 
 
 def _study_other_fix_options(
@@ -1898,6 +1960,7 @@ def render_validation_edit_and_approve(
     hand: Hand,
     *,
     frames_validated: bool,
+    frame_context: ValidationFrameContext | None = None,
 ) -> None:
     """Edit the session draft beside frame review; approve when validation finishes."""
 
@@ -1919,35 +1982,73 @@ def render_validation_edit_and_approve(
         user_confirmed=True,
     )
     open_issues = [issue for issue in hand_issues if issue.status == "open"]
+    issue_targets: list[FrameIssueTarget] = []
+    if frame_context is not None:
+        issue_targets = frame_issue_targets(
+            frame_context.timeline_hand,
+            frame_context.states,
+            frame_context.reviews_by_image,
+        )
 
-    st.markdown("### Edit this hand")
+    st.markdown("### Fix this hand")
     st.caption(
-        "Edit while validating frames. Mark a debugging issue to hold the hand "
-        "out of Study without fixing it now. When validation finishes with no "
-        "open issues, the hand is approved for Study automatically."
+        "Jump a blocker to open its frame, action, or other-fix control. "
+        "Finish with no open debugging issues to send to Study."
     )
 
     if open_issues:
         st.error(
-            f"{len(open_issues)} open issue(s) — this hand stays out of Study "
-            "until you resolve them here or from the Hands Issues inbox."
+            f"{len(open_issues)} open debugging issue(s) — held out of Study."
         )
-    if hand.review_status == "reviewed" and readiness.is_ready:
+    approved_ready = hand.review_status == "reviewed" and readiness.is_ready
+    if approved_ready:
         st.success("Approved for Study. Open Study to replay and analyze.")
-    elif not readiness.is_ready:
-        if hand.review_status == "reviewed":
-            st.warning(
-                "This hand is marked reviewed but new trust blockers appeared. "
-                "Clear them here before studying."
+        if not frames_validated and issue_targets:
+            flagged_n = sum(1 for t in issue_targets if t.status == "incorrect")
+            unreviewed_n = sum(1 for t in issue_targets if t.status == "unreviewed")
+            parts = []
+            if flagged_n:
+                parts.append(f"{flagged_n} flagged")
+            if unreviewed_n:
+                parts.append(f"{unreviewed_n} unreviewed")
+            st.caption(
+                (" / ".join(parts) if parts else f"{len(issue_targets)} frame(s)")
+                + " — optional cleanup, not a Study blocker."
             )
-        with st.expander(
-            f"What's blocking Study · {len(readiness.blockers)} check(s)",
-            expanded=True,
-        ):
-            render_study_readiness(readiness)
+    else:
+        if hand.review_status == "reviewed" and not readiness.is_ready:
+            st.warning(
+                "Marked reviewed, but new trust blockers appeared. Clear them below."
+            )
+        _render_validation_fix_targets(
+            hand_id=hand.id,
+            readiness=readiness,
+            frames_validated=frames_validated,
+            issue_targets=issue_targets,
+            frame_context=frame_context,
+            actions=actions,
+            open_issue_count=len(open_issues),
+            other_tool_labels={
+                label
+                for _tool_id, label in _study_other_fix_options(
+                    readiness,
+                    is_reconstructed=is_reconstructed,
+                    hand=hand,
+                    hand_issues=hand_issues,
+                )
+                if _tool_id not in {"frames", "issues"}
+            },
+        )
 
-    st.markdown("#### Edit each action")
-    show_action_editor(db, actions, players, force_open=True)
+    show_action_editor(
+        db,
+        actions,
+        players,
+        force_open=True,
+        issue_targets=issue_targets,
+        frame_context=frame_context,
+        hand_id=hand.id,
+    )
 
     # Issues are hosted once below (not also under Other fixes) to avoid duplicate forms.
     other_tools = [
@@ -1960,13 +2061,17 @@ def render_validation_edit_and_approve(
         )
         if tool_id not in {"frames", "issues"}
     ]
+    other_expander_key = _validation_other_fixes_expander_key(hand.id)
+    if other_expander_key not in st.session_state:
+        st.session_state[other_expander_key] = _other_fixes_should_expand(readiness)
     with st.expander(
-        "Other fixes (cards, players, chips…)",
-        expanded=_other_fixes_should_expand(readiness),
+        "Other fixes (cards, players, chips, finalize…)",
+        key=other_expander_key,
+        on_change="rerun",
     ):
         tool_labels = [label for _tool_id, label in other_tools]
         label_to_tool = {label: tool_id for tool_id, label in other_tools}
-        tool_key = f"validation_fc_tool_{hand.id}"
+        tool_key = _validation_other_fix_key(hand.id)
         if st.session_state.get(tool_key) not in tool_labels:
             st.session_state[tool_key] = tool_labels[0]
         selected_label = st.selectbox(
@@ -1988,8 +2093,11 @@ def render_validation_edit_and_approve(
                 completion_evidence,
             )
 
-    st.markdown("#### Hold out of Study")
-    show_hand_issue_controls(db, hand, hand_issues, force_open=True)
+    with st.expander(
+        f"Hold out of Study · {len(open_issues)} open",
+        expanded=bool(open_issues),
+    ):
+        show_hand_issue_controls(db, hand, hand_issues, force_open=True)
 
     auto_key = f"validation_auto_approve_attempted_{hand.id}"
     if (
@@ -2009,17 +2117,17 @@ def render_validation_edit_and_approve(
     if hand.review_status == "reviewed":
         return
     if open_issues:
-        st.warning(
+        st.caption(
             "Resolve open issues or leave them for the Issues inbox — "
-            "this hand will not enter Study while they remain open."
+            "this hand stays out of Study while they remain open."
         )
         return
     finish_help = (
         "Frames are all Correct. Send to Study if the edited hand looks right."
         if frames_validated
         else (
-            "You can still send to Study after filling missing chunks yourself, "
-            "even if some frames were incomplete — readiness checks still apply."
+            "You can send to Study after clearing trust checks above — "
+            "frame labels can stay incomplete."
         )
     )
     st.caption(finish_help)
@@ -2032,6 +2140,201 @@ def render_validation_edit_and_approve(
         if try_approve_hand_after_validation(db, hand):
             flash(f"Hand #{hand.hand_number} approved for Study.")
             st.rerun()
+
+
+def _render_validation_fix_targets(
+    *,
+    hand_id: int,
+    readiness: StudyReadiness,
+    frames_validated: bool,
+    issue_targets: list[FrameIssueTarget],
+    frame_context: ValidationFrameContext | None,
+    actions: list[Action],
+    open_issue_count: int,
+    other_tool_labels: set[str] | None = None,
+) -> None:
+    """Compact, clickable list of what blocks Study and where to fix it."""
+
+    flagged = [target for target in issue_targets if target.status == "incorrect"]
+    unreviewed = [target for target in issue_targets if target.status == "unreviewed"]
+    available_tools = other_tool_labels or set()
+    blocker_count = len(readiness.blockers)
+    # Frame labels help editing but do not gate Study approval.
+    if blocker_count == 0 and open_issue_count == 0:
+        st.success("No Study blockers. Finish validation when the hand looks right.")
+        if not frames_validated and (flagged or unreviewed):
+            st.caption(
+                f"{len(flagged)} flagged / {len(unreviewed)} unreviewed frame(s) — "
+                "optional cleanup; open a row below to jump there."
+            )
+            with st.expander("Frame cleanup shortcuts", expanded=bool(flagged)):
+                for target in flagged:
+                    _render_frame_fix_row(
+                        hand_id=hand_id,
+                        target=target,
+                        frame_context=frame_context,
+                        actions=actions,
+                        show_thumbnail=True,
+                    )
+                for target in unreviewed:
+                    _render_frame_fix_row(
+                        hand_id=hand_id,
+                        target=target,
+                        frame_context=frame_context,
+                        actions=actions,
+                        show_thumbnail=False,
+                    )
+        return
+
+    title_bits = []
+    if blocker_count:
+        title_bits.append(f"{blocker_count} check(s)")
+    if open_issue_count:
+        title_bits.append(f"{open_issue_count} issue(s)")
+    heading = "What's blocking Study · " + " · ".join(title_bits)
+    # Markdown keeps AppTest/readiness assertions able to see the heading; the
+    # expander label stays short so the title is not duplicated in the chrome.
+    st.markdown(f"**{heading}**")
+    with st.expander("Jump to the frame, action, or other fix", expanded=True):
+        if not frames_validated and (flagged or unreviewed):
+            st.markdown("**Frames (optional cleanup)**")
+            for target in flagged:
+                _render_frame_fix_row(
+                    hand_id=hand_id,
+                    target=target,
+                    frame_context=frame_context,
+                    actions=actions,
+                    show_thumbnail=True,
+                )
+            if unreviewed:
+                st.caption(f"{len(unreviewed)} unreviewed frame(s)")
+                for target in unreviewed:
+                    _render_frame_fix_row(
+                        hand_id=hand_id,
+                        target=target,
+                        frame_context=frame_context,
+                        actions=actions,
+                        show_thumbnail=False,
+                    )
+        if readiness.blockers:
+            for category, blockers in readiness.by_category().items():
+                st.markdown(
+                    status_badge(
+                        "needs_correction",
+                        label=(
+                            f"{BLOCKER_CATEGORY_LABELS[category]} · "
+                            f"{len(blockers)} blocker(s)"
+                        ),
+                    ),
+                    unsafe_allow_html=True,
+                )
+                for blocker in blockers:
+                    st.markdown(f"**{blocker.reason}**")
+                    st.caption(f"Clears when: {blocker.clearing_action}")
+                    for item in blocker.detail:
+                        st.caption(f"· {item}")
+                    tool_label = _BLOCKER_OTHER_FIX_LABELS.get(blocker.code)
+                    cols = st.columns([1.2, 1.2, 2])
+                    if tool_label and tool_label in available_tools:
+                        if cols[0].button(
+                            f"Open {tool_label}",
+                            key=f"validation_jump_blocker_{hand_id}_{blocker.code}",
+                            width="stretch",
+                        ):
+                            _jump_to_other_fix(hand_id, tool_label)
+                            st.rerun()
+                    elif tool_label:
+                        cols[0].caption(f"{tool_label} is not available on this hand.")
+                    if blocker.code == "ACCOUNTING_NOT_AUTHORITATIVE" and actions:
+                        first = next((a for a in actions if a.id is not None), None)
+                        if first is not None and cols[1].button(
+                            "Edit first action",
+                            key=f"validation_jump_acct_action_{hand_id}",
+                            width="stretch",
+                        ):
+                            _jump_to_action(hand_id, first.id)
+                            st.rerun()
+                    if blocker.code == "OPEN_DEBUGGING_ISSUE":
+                        cols[0].caption("Use Hold out of Study below.")
+                    if blocker.code == "USER_CONFIRMATION_MISSING":
+                        cols[0].caption("Use Finish validation at the bottom.")
+
+
+def _linked_db_actions_for_frame(
+    target: FrameIssueTarget, actions: list[Action]
+) -> list[Action]:
+    """All saved actions that match timeline lines on this frame."""
+
+    linked: list[Action] = []
+    for action in actions:
+        if action.id is None:
+            continue
+        if (
+            match_db_action_to_frame_target(
+                street=action.street,
+                action_type=action.action_type,
+                player_name=action.player_name,
+                position=action.position,
+                amount=action.amount,
+                targets=[target],
+            )
+            is not None
+        ):
+            linked.append(action)
+    return linked
+
+
+def _render_frame_fix_row(
+    *,
+    hand_id: int,
+    target: FrameIssueTarget,
+    frame_context: ValidationFrameContext | None,
+    actions: list[Action],
+    show_thumbnail: bool = True,
+) -> None:
+    """One flagged/unreviewed frame with jump controls and linked actions."""
+
+    if show_thumbnail:
+        thumb_col, body_col = st.columns([0.7, 2.3], gap="small")
+        with thumb_col:
+            if Path(target.source_image).is_file():
+                st.image(target.source_image, width=120)
+            else:
+                st.caption(f"Frame {target.frame_index + 1}")
+    else:
+        body_col = st.container()
+    with body_col:
+        st.markdown(f"**{target.summary()}**")
+        if target.notes:
+            st.caption(target.notes)
+        if target.action_labels():
+            st.caption("Actions from this frame: " + " · ".join(target.action_labels()))
+        else:
+            st.caption("No action line attributed to this frame.")
+        if frame_context is not None and st.button(
+            f"Open frame {target.frame_index + 1}",
+            key=(
+                f"validation_jump_frame_{frame_context.job_id}_"
+                f"{hand_id}_{target.frame_index}"
+            ),
+            width="stretch",
+            type="primary" if target.status == "incorrect" else "secondary",
+        ):
+            _jump_to_frame(frame_context, target.frame_index)
+            st.rerun()
+        linked_actions = _linked_db_actions_for_frame(target, actions)
+        for action in linked_actions:
+            label = study_action_label(action, max(0, (action.action_index or 1) - 1))
+            if st.button(
+                f"Edit · {label}",
+                key=(
+                    f"validation_jump_frame_action_{hand_id}_"
+                    f"{target.frame_index}_{action.id}"
+                ),
+                width="stretch",
+            ):
+                _jump_to_action(hand_id, action.id)
+                st.rerun()
 
 
 def render_study_analysis(
@@ -2326,13 +2629,12 @@ def show_finalize_incomplete_hand(
             format_func=lambda value: value.replace("_", " ").title(),
             key=f"finalize_terminal_{hand.id}",
         )
-        notes_required = bool(evidence.rejection_codes)
         notes = st.text_input(
-            "Finalize notes" + (" (required)" if notes_required else " (optional)"),
+            "Finalize notes (optional)",
             key=f"finalize_notes_{hand.id}",
             placeholder=(
                 "Example: joined mid-preflop; reconstructed full action from the table"
-                if notes_required
+                if evidence.rejection_codes
                 else "Example: folded preflop after reviewing the video"
             ),
         )
@@ -2342,12 +2644,6 @@ def show_finalize_incomplete_hand(
             type="primary",
             disabled=not (hand.hero_cards or "").strip(),
         ):
-            if notes_required and not notes.strip():
-                st.error(
-                    "Add a short note explaining how you reconstructed the "
-                    "rejected gaps before finalizing."
-                )
-                return
             try:
                 finalized = db.finalize_incomplete_hand(
                     hand.id,
@@ -5137,13 +5433,23 @@ def show_action_editor(
     players: list[HandPlayer],
     *,
     force_open: bool = False,
+    issue_targets: list[FrameIssueTarget] | None = None,
+    frame_context: ValidationFrameContext | None = None,
+    hand_id: int | None = None,
 ) -> None:
     with _study_panel(
-        "Actions",
+        "Edit each action",
         force_open=force_open,
         expanded=False,
     ):
-        show_action_editor_contents(db, actions, players)
+        show_action_editor_contents(
+            db,
+            actions,
+            players,
+            issue_targets=issue_targets,
+            frame_context=frame_context,
+            hand_id=hand_id,
+        )
 
 
 def _action_player_options(players: list[HandPlayer]) -> dict[str, HandPlayer]:
@@ -5161,7 +5467,17 @@ def show_action_editor_contents(
     db: PokerDatabase,
     actions: list[Action],
     players: list[HandPlayer],
+    *,
+    issue_targets: list[FrameIssueTarget] | None = None,
+    frame_context: ValidationFrameContext | None = None,
+    hand_id: int | None = None,
 ) -> None:
+    targets = issue_targets or []
+    focus_key = (
+        _validation_focus_action_key(hand_id) if hand_id is not None else None
+    )
+    # One-shot focus from a jump button: open once, then clear so collapse sticks.
+    focus_id = st.session_state.pop(focus_key, None) if focus_key else None
     editable = [
         (index, action)
         for index, action in enumerate(actions)
@@ -5171,11 +5487,80 @@ def show_action_editor_contents(
         st.info("No actions saved yet. Add the missing lines below.")
     else:
         for index, action in editable:
-            with st.expander(study_action_label(action, index), expanded=False):
+            linked = match_db_action_to_frame_target(
+                street=action.street,
+                action_type=action.action_type,
+                player_name=action.player_name,
+                position=action.position,
+                amount=action.amount,
+                targets=targets,
+            )
+            badge = ""
+            if linked is not None and linked.status == "incorrect":
+                badge = ", ".join(linked.issue_types) or "flagged frame"
+            elif linked is not None and linked.status == "unreviewed":
+                badge = "unreviewed frame"
+            label = study_action_label(action, index, issue_badge=badge)
+            is_focused = action.id == focus_id
+            show_association = linked is not None and (
+                is_focused or linked.status == "incorrect"
+            )
+            if hand_id is not None:
+                expander_key = _validation_action_expander_key(hand_id, action.id)
+                if is_focused:
+                    st.session_state[expander_key] = True
+                elif expander_key not in st.session_state:
+                    st.session_state[expander_key] = False
+                action_expander = st.expander(
+                    label,
+                    key=expander_key,
+                    on_change="rerun",
+                )
+            else:
+                action_expander = st.expander(label, expanded=is_focused)
+            with action_expander:
+                if show_association and linked is not None:
+                    _render_action_frame_association(
+                        hand_id=hand_id,
+                        action_id=action.id,
+                        target=linked,
+                        frame_context=frame_context,
+                    )
+                elif linked is not None:
+                    st.caption(linked.summary())
                 _render_edit_one_action(db, action, players)
 
     with st.expander("Add a missing action", expanded=not editable):
         _show_add_corrected_action(db, players)
+
+
+def _render_action_frame_association(
+    *,
+    hand_id: int | None,
+    action_id: int,
+    target: FrameIssueTarget,
+    frame_context: ValidationFrameContext | None,
+) -> None:
+    """Show the source frame and issue types that produced this action line."""
+
+    visual_col, text_col = st.columns([0.75, 2.25], gap="small")
+    with visual_col:
+        if Path(target.source_image).is_file():
+            st.image(target.source_image, width=132)
+        else:
+            st.caption(f"Frame {target.frame_index + 1}")
+    with text_col:
+        st.caption(target.summary())
+        if target.notes:
+            st.caption(f"Correction note: {target.notes}")
+        if frame_context is not None and hand_id is not None:
+            if st.button(
+                f"Jump to frame {target.frame_index + 1}",
+                key=f"action_jump_frame_{hand_id}_{action_id}_{target.frame_index}",
+                width="stretch",
+            ):
+                _jump_to_frame(frame_context, target.frame_index)
+                st.rerun()
 
 
 def _render_edit_one_action(
@@ -6879,8 +7264,7 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
 
     st.markdown("#### Frame evidence review")
     st.caption(
-        "Labels save permanently — stop anytime. Opening a hand drafts it for "
-        "editing; finish with no open issues to send it to Study."
+        "Label frames, then fix linked actions below. Progress saves permanently."
     )
     video = db.fetch_video(job.video_id)
     session_id = video.session_id if video is not None else None
@@ -7317,6 +7701,15 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
             db,
             db_hand,
             frames_validated=frames_ok,
+            frame_context=ValidationFrameContext(
+                job_id=job.id,
+                hand_number=selected_hand_number,
+                timeline_hand=hand,
+                states=states,
+                reviews_by_image=hand_reviews,
+                cursor_key=cursor_key,
+                pending_hand_key=pending_key,
+            ),
         )
 
     # Count only navigable frames so the expander matches the summary metrics.
@@ -7333,39 +7726,38 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
     ]
     if flagged:
         with st.expander(f"Improvement queue · {len(flagged)} flagged frame(s)"):
-            st.dataframe(
-                [
-                    {
-                        "Hand": f"#{review.hand_number}",
-                        "Time": f"{review.timestamp_seconds:.2f}s",
-                        "Issue": ", ".join(review.issue_types),
-                        "Correction": review.notes or "No correction note",
-                    }
-                    for review in flagged
-                ],
-                hide_index=True,
-                width="stretch",
-            )
-            st.caption("Open a flagged frame to change its label.")
             for index, review in enumerate(flagged):
-                open_col, detail_col = st.columns([0.8, 2.4])
-                detail_col.caption(
-                    f"Hand #{review.hand_number} · {review.timestamp_seconds:.2f}s · "
-                    + (", ".join(review.issue_types) or "unspecified")
+                target_hand = next(
+                    (
+                        item
+                        for item in hands
+                        if int(item.get("hand_number", 0)) == review.hand_number
+                    ),
+                    None,
                 )
+                action_bits = []
+                if target_hand is not None:
+                    action_bits = [
+                        ref.label()
+                        for ref in timeline_actions_for_image(
+                            target_hand, review.source_image
+                        )
+                    ]
+                open_col, detail_col = st.columns([0.7, 2.5])
+                detail_col.markdown(
+                    f"**Hand #{review.hand_number} · {review.timestamp_seconds:.2f}s · "
+                    + (", ".join(review.issue_types) or "unspecified")
+                    + "**"
+                )
+                if action_bits:
+                    detail_col.caption("Actions: " + " · ".join(action_bits))
+                if review.notes:
+                    detail_col.caption(review.notes)
                 if open_col.button(
-                    "Open",
+                    "Open frame",
                     key=f"evidence_open_flag_{job.id}_{index}",
                     width="stretch",
                 ):
-                    target_hand = next(
-                        (
-                            item
-                            for item in hands
-                            if int(item.get("hand_number", 0)) == review.hand_number
-                        ),
-                        None,
-                    )
                     target_states = (
                         states_for_hand(timeline, target_hand)
                         if target_hand is not None
@@ -7394,12 +7786,16 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
             for review in flagged:
                 for issue in review.issue_types:
                     counts[issue] = counts.get(issue, 0) + 1
-            for issue, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
-                module, next_step = ISSUE_GUIDANCE.get(
-                    issue, ("Reconstruction pipeline", "Inspect the flagged source frames.")
-                )
-                st.markdown(f"**{issue} · {count}**")
-                st.caption(f"{module} — {next_step}")
+            if counts:
+                st.markdown("**Issue types**")
+                for issue, count in sorted(
+                    counts.items(), key=lambda item: (-item[1], item[0])
+                ):
+                    module, next_step = ISSUE_GUIDANCE.get(
+                        issue,
+                        ("Reconstruction pipeline", "Inspect the flagged source frames."),
+                    )
+                    st.caption(f"{issue} · {count} — {module}: {next_step}")
 
 
 def _move_evidence_cursor(cursor_key: str, delta: int, frame_count: int) -> None:

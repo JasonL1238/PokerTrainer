@@ -3,8 +3,10 @@ from pathlib import Path
 
 from poker_tracker.persistence.completion import parse_completion_evidence
 from poker_tracker.ui.reconstruction_review import (
+    frame_issue_targets,
     history_impacts,
     key_frames_from_completion_evidence,
+    match_db_action_to_frame_target,
     observed_facts,
     resolve_study_approve_key_frames,
     select_key_frames_for_review,
@@ -82,6 +84,134 @@ def test_frame_review_pairs_observations_with_history_impacts() -> None:
     assert any("BTN Seat4 raise 3 BB" in impact["text"] for impact in impacts)
     assert any(impact["source"] == "stack delta" for impact in impacts)
     assert any(impact["kind"] == "Settlement" for impact in impacts)
+
+
+def test_frame_issue_targets_link_flagged_frames_to_actions() -> None:
+    timeline, hand = _fixture()
+    states = states_for_hand(timeline, hand)
+    reviews = {
+        "/tmp/a.jpg": {"status": "correct", "issue_types": [], "notes": ""},
+        "/tmp/b.jpg": {
+            "status": "incorrect",
+            "issue_types": ["Action / player"],
+            "notes": "Should be a call",
+        },
+    }
+
+    targets = frame_issue_targets(hand, states, reviews)
+    assert len(targets) == 1
+    assert targets[0].frame_index == 1
+    assert targets[0].issue_types == ("Action / player",)
+    assert targets[0].action_labels() == (
+        "Preflop · BTN Seat4 · raise 3 BB",
+    )
+    matched = match_db_action_to_frame_target(
+        street="preflop",
+        action_type="raise",
+        player_name="Seat4",
+        position="BTN",
+        amount=3.0,
+        targets=targets,
+    )
+    assert matched is not None
+    assert matched.source_image == "/tmp/b.jpg"
+
+
+def test_match_db_action_requires_actor_identity() -> None:
+    targets = frame_issue_targets(
+        {
+            "actions": [
+                {
+                    "street": "preflop",
+                    "seat": 4,
+                    "position": "BTN",
+                    "player_name": "Seat4",
+                    "action_type": "fold",
+                    "amount": None,
+                    "source_image": "/tmp/b.jpg",
+                }
+            ]
+        },
+        [
+            {"image": "/tmp/b.jpg", "time_s": 1.0},
+        ],
+        {
+            "/tmp/b.jpg": {
+                "status": "incorrect",
+                "issue_types": ["Action / player"],
+                "notes": "",
+            }
+        },
+    )
+    assert (
+        match_db_action_to_frame_target(
+            street="preflop",
+            action_type="fold",
+            player_name="Hero",
+            position="SB",
+            amount=None,
+            targets=targets,
+        )
+        is None
+    )
+    assert (
+        match_db_action_to_frame_target(
+            street="preflop",
+            action_type="raise",
+            player_name="Seat4",
+            position="BTN",
+            amount=3.0,
+            targets=targets,
+        )
+        is None
+    )
+    assert (
+        match_db_action_to_frame_target(
+            street="preflop",
+            action_type="fold",
+            player_name="Seat4",
+            position="BTN",
+            amount=None,
+            targets=targets,
+        )
+        is not None
+    )
+
+
+def test_match_db_action_rejects_amount_mismatch() -> None:
+    targets = frame_issue_targets(
+        {
+            "actions": [
+                {
+                    "street": "preflop",
+                    "position": "BTN",
+                    "player_name": "Seat4",
+                    "action_type": "raise",
+                    "amount": 3.0,
+                    "source_image": "/tmp/b.jpg",
+                }
+            ]
+        },
+        [{"image": "/tmp/b.jpg", "time_s": 1.0}],
+        {
+            "/tmp/b.jpg": {
+                "status": "incorrect",
+                "issue_types": ["Amount / stack"],
+                "notes": "",
+            }
+        },
+    )
+    assert (
+        match_db_action_to_frame_target(
+            street="preflop",
+            action_type="raise",
+            player_name="Seat4",
+            position="BTN",
+            amount=7.0,
+            targets=targets,
+        )
+        is None
+    )
 
 
 def test_select_key_frames_picks_hero_streets_and_terminal() -> None:

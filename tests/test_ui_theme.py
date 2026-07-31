@@ -6,8 +6,10 @@ from poker_tracker.ui.ui_theme import _THEME_CSS, brand_header
 def test_theme_uses_product_tokens_and_responsive_breakpoints() -> None:
     assert "--pt-bg: #121418" in _THEME_CSS
     assert "--pt-accent: #D9A441" in _THEME_CSS
-    assert "--pt-font-display: \"Syne\"" in _THEME_CSS
+    assert "--pt-font-display: \"IBM Plex Sans\"" in _THEME_CSS
     assert "--pt-font-sans: \"IBM Plex Sans\"" in _THEME_CSS
+    assert "Syne" not in _THEME_CSS
+    assert "Arial Narrow" not in _THEME_CSS
     assert "max-width: 1560px" in _THEME_CSS
     assert "@media (max-width: 1100px)" in _THEME_CSS
     assert "@media (max-width: 900px)" in _THEME_CSS

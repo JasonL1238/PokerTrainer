@@ -249,14 +249,8 @@ def test_finalize_overrides_rejection_when_operator_reconstructed_late_join(
             completion_evidence=evidence,
         )
     )
-    with pytest.raises(ValueError, match="finalize notes"):
-        db.finalize_incomplete_hand(hand.id, terminal_event="fold_win")
-
-    finalized = db.finalize_incomplete_hand(
-        hand.id,
-        terminal_event="fold_win",
-        notes="Joined mid-preflop; reconstructed full action from the table.",
-    )
+    # Notes are optional even when rejection codes remain in the audit trail.
+    finalized = db.finalize_incomplete_hand(hand.id, terminal_event="fold_win")
     assert finalized.completion_status == "complete"
     parsed = parse_completion_evidence(finalized.completion_evidence)
     assert parsed.partial_start is True
@@ -266,6 +260,10 @@ def test_finalize_overrides_rejection_when_operator_reconstructed_late_join(
         "starting_stack_unknown",
     )
     assert parsed.extra.get(OPERATOR_MANUAL_COMPLETION_KEY) is True
+    corrections = db.fetch_hand_corrections(hand.id)
+    assert corrections
+    assert "overrode rejection_codes:" in corrections[-1].notes
+    assert "amounts_unknown_in_ledger" in corrections[-1].notes
     readiness = evaluate_study_readiness(
         finalized, accounting=None, user_confirmed=True
     )
