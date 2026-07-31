@@ -1747,8 +1747,46 @@ def _upscale_crop(crop_bgr: np.ndarray, factor: float) -> np.ndarray:
 def _small_render_variants(crop_bgr: np.ndarray) -> list[np.ndarray]:
     # Green-chip blanking only. Left-fraction masking was removed after it
     # blanked the leading ``0`` in ``0.50`` and let free consensus ship ``50.0``.
+    # Skip the duplicate when blanking changed nothing -- same vote set, less work.
     green = _mask_green_chip(crop_bgr)
+    if green is crop_bgr or (
+        green.shape == crop_bgr.shape and bool(np.array_equal(green, crop_bgr))
+    ):
+        return [crop_bgr]
     return [crop_bgr, green]
+
+
+def _unbeatable_amount_consensus(
+    votes: dict[float, dict[float, AmountRead]],
+    *,
+    min_agree: int,
+    margin: int,
+    remaining_factors: int,
+) -> AmountRead | None:
+    """Consensus that remaining factors cannot overturn, even if they all dissent."""
+    got = _pick_amount_consensus(votes, min_agree=min_agree, margin=margin)
+    if got is None:
+        return None
+    ranked = sorted(votes.items(), key=lambda item: -len(item[1]))
+    best = len(ranked[0][1])
+    second = len(ranked[1][1]) if len(ranked) > 1 else 0
+    if best >= second + margin + remaining_factors:
+        return got
+    return None
+
+
+def _accepted_recovered_amount(
+    bank: TemplateOCR,
+    crop_bgr: np.ndarray,
+    digits_for_votes: str,
+    got: AmountRead | None,
+) -> AmountRead | None:
+    if got is None:
+        return None
+    if _short_equality_is_clipped_fragment(bank, crop_bgr, digits_for_votes, got):
+        return None
+    reinterpreted = _reinterpret_integer_as_bb_decimal(digits_for_votes, got)
+    return reinterpreted if reinterpreted is not None else got
 
 
 def _short_equality_is_clipped_fragment(
@@ -1831,11 +1869,15 @@ def _recover_small_render_amount(
                 raw_for_votes = expanded_native.raw
 
         # value -> {factor: AmountRead}. skip_ink / b8 retries share the factor
-        # key so they cannot alone satisfy min_agree.
+        # key so they cannot alone satisfy min_agree. Factor-outer order lets us
+        # stop once remaining scales cannot overturn consensus; that is the same
+        # accept/reject set as scanning every scale, just less work on easy wins.
         compat_votes: dict[float, dict[float, AmountRead]] = {}
         free_votes: dict[float, dict[float, AmountRead]] = {}
-        for variant in _small_render_variants(base):
-            for factor in _SMALL_RENDER_UPSCALE_FACTORS:
+        variants = _small_render_variants(base)
+        factors = _SMALL_RENDER_UPSCALE_FACTORS
+        for factor_index, factor in enumerate(factors):
+            for variant in variants:
                 up = _upscale_crop(variant, factor)
                 for skip_ink, allow_b8 in (
                     (False, False),
@@ -1869,38 +1911,36 @@ def _recover_small_render_amount(
                         compat_votes.setdefault(retried.value, {}).setdefault(
                             factor, retried
                         )
-
-        got = _pick_amount_consensus(
-            compat_votes, min_agree=_SMALL_RENDER_MIN_AGREEING_SCALES
-        )
-        if got is not None:
-            if _short_equality_is_clipped_fragment(
-                bank, base, digits_for_votes, got
-            ):
-                got = None
-            else:
-                reinterpreted = _reinterpret_integer_as_bb_decimal(
-                    digits_for_votes, got
-                )
-                return reinterpreted if reinterpreted is not None else got
-        # Stricter free consensus for truncated/confused native digits: more
-        # independent factors and a clear margin. Zero wrong values on the
-        # frozen adversarial fixture scale sweep with these gates.
-        got = _pick_amount_consensus(
-            free_votes,
-            min_agree=_SMALL_RENDER_FREE_MIN_AGREEING,
-            margin=_SMALL_RENDER_FREE_MARGIN,
-        )
-        if got is not None:
-            if _short_equality_is_clipped_fragment(
-                bank, base, digits_for_votes, got
-            ):
-                got = None
-            else:
-                reinterpreted = _reinterpret_integer_as_bb_decimal(
-                    digits_for_votes, got
-                )
-                return reinterpreted if reinterpreted is not None else got
+            remaining = len(factors) - factor_index - 1
+            accepted = _accepted_recovered_amount(
+                bank,
+                base,
+                digits_for_votes,
+                _unbeatable_amount_consensus(
+                    compat_votes,
+                    min_agree=_SMALL_RENDER_MIN_AGREEING_SCALES,
+                    margin=1,
+                    remaining_factors=remaining,
+                ),
+            )
+            if accepted is not None:
+                return accepted
+            # Stricter free consensus for truncated/confused native digits: more
+            # independent factors and a clear margin. Zero wrong values on the
+            # frozen adversarial fixture scale sweep with these gates.
+            accepted = _accepted_recovered_amount(
+                bank,
+                base,
+                digits_for_votes,
+                _unbeatable_amount_consensus(
+                    free_votes,
+                    min_agree=_SMALL_RENDER_FREE_MIN_AGREEING,
+                    margin=_SMALL_RENDER_FREE_MARGIN,
+                    remaining_factors=remaining,
+                ),
+            )
+            if accepted is not None:
+                return accepted
         # Exact digit-complete decimal: one upscale proved a decimal whose digit
         # string equals the under-floor native run (``46280`` -> ``462.80``).
         # Requires a 3+ digit integer part so ``080`` cannot become ``0.80``.

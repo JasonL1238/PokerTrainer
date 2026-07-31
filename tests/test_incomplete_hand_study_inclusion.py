@@ -214,6 +214,66 @@ def test_study_inclusion_blocks_and_clears(tmp_path) -> None:
     db.close()
 
 
+def test_finalize_overrides_rejection_when_operator_reconstructed_late_join(
+    tmp_path,
+) -> None:
+    """Late-join footage may reject on coverage gaps; finalize still completes it."""
+
+    db = PokerDatabase(tmp_path / "finalize-reject.db")
+    db.init_db()
+    session = db.create_session(Session(name="S"))
+    evidence = {
+        "evidence_version": EVIDENCE_SCHEMA_VERSION,
+        "partial_start": True,
+        "partial_end": False,
+        "terminal_event": "fold_win",
+        "boundary_confidence": 0.0,
+        "warning_codes": [],
+        "rejection_codes": [
+            "amounts_unknown_in_ledger",
+            "mid_hand_coverage_gap",
+            "starting_stack_unknown",
+        ],
+        "acknowledged_codes": [],
+        "source_frames": ["a.jpg"],
+    }
+    hand = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=1,
+            hero_cards="2h 9s",
+            board_cards="3h 5h 7h 4h 5s",
+            source_type="cv_import",
+            review_status="needs_correction",
+            completion_status="partial",
+            completion_evidence=evidence,
+        )
+    )
+    with pytest.raises(ValueError, match="finalize notes"):
+        db.finalize_incomplete_hand(hand.id, terminal_event="fold_win")
+
+    finalized = db.finalize_incomplete_hand(
+        hand.id,
+        terminal_event="fold_win",
+        notes="Joined mid-preflop; reconstructed full action from the table.",
+    )
+    assert finalized.completion_status == "complete"
+    parsed = parse_completion_evidence(finalized.completion_evidence)
+    assert parsed.partial_start is True
+    assert parsed.rejection_codes == (
+        "amounts_unknown_in_ledger",
+        "mid_hand_coverage_gap",
+        "starting_stack_unknown",
+    )
+    assert parsed.extra.get(OPERATOR_MANUAL_COMPLETION_KEY) is True
+    readiness = evaluate_study_readiness(
+        finalized, accounting=None, user_confirmed=True
+    )
+    assert readiness.has("COMPLETION_NOT_COMPLETE") is False
+    assert readiness.has("UNRESOLVED_SOURCE_WARNING") is False
+    db.close()
+
+
 def test_finalize_incomplete_hand_clears_sticky_partial(tmp_path) -> None:
     db = PokerDatabase(tmp_path / "finalize.db")
     db.init_db()

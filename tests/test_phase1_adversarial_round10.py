@@ -1081,9 +1081,14 @@ def test_the_fact_editor_never_writes_the_derived_result_into_the_observation(
     app = AppTest.from_file(
         str(Path(__file__).resolve().parent.parent / "app.py"), default_timeout=60
     ).run()
-    app.radio[0].set_value(Page.STUDY)
+    next(item for item in app.radio if "Study" in list(item.options)).set_value(
+        Page.STUDY
+    )
     app.run()
     assert not list(app.exception)
+    from tests.test_study_readiness_ui import _open_fix_tool
+
+    app = _open_fix_tool(app, "Cards, board, or pot")
 
     widget = next(item for item in app.number_input if item.label == "Hero result (BB)")
     assert widget.value is None, "the form shows the observation, never the derivation"

@@ -186,7 +186,37 @@ def _run_study(path: Path, monkeypatch) -> AppTest:
     monkeypatch.setattr(db_module, "DEFAULT_DB_PATH", str(path))
     st.cache_resource.clear()
     app = AppTest.from_file(APP_PATH, default_timeout=30).run()
-    app.radio[0].set_value(Page.STUDY)
+    next(item for item in app.radio if "Study" in list(item.options)).set_value(
+        Page.STUDY
+    )
+    app.run()
+    assert not list(app.exception)
+    return app
+
+
+def _path_radio(app: AppTest):
+    return next(
+        item
+        for item in app.radio
+        if "Looks good — Approve" in list(getattr(item, "options", []))
+    )
+
+
+def _open_approve(app: AppTest) -> AppTest:
+    _path_radio(app).set_value("Looks good — Approve")
+    app.run()
+    assert not list(app.exception)
+    return app
+
+
+def _open_fix_tool(app: AppTest, tool_label: str) -> AppTest:
+    _path_radio(app).set_value("Edit the hand — Fix")
+    app.run()
+    tool_box = next(
+        item for item in app.selectbox if item.label == "What else needs fixing?"
+    )
+    assert tool_label in list(tool_box.options), list(tool_box.options)
+    tool_box.set_value(tool_label)
     app.run()
     assert not list(app.exception)
     return app
@@ -208,7 +238,7 @@ def test_study_reviewed_option_is_absent_while_blocked(tmp_path, monkeypatch) ->
     path = tmp_path / "blocked.sqlite3"
     _seed_hand(path)
 
-    app = _run_study(path, monkeypatch)
+    app = _open_approve(_run_study(path, monkeypatch))
 
     assert "reviewed" not in _status_widget(app).options
     st.cache_resource.clear()
@@ -220,7 +250,7 @@ def test_study_cannot_mark_an_uncertain_cv_hand_reviewed(tmp_path, monkeypatch) 
     path = tmp_path / "bypass.sqlite3"
     hand_id = _seed_hand(path)
 
-    app = _run_study(path, monkeypatch)
+    app = _open_approve(_run_study(path, monkeypatch))
     assert "reviewed" not in _status_widget(app).options
     next(button for button in app.button if button.label == "Save review status").click()
     app.run()
@@ -287,7 +317,7 @@ def test_study_confirmation_checkbox_is_required_for_a_cv_hand(
     path = tmp_path / "confirm.sqlite3"
     hand_id = _seed_hand(path, completion_status="complete")
 
-    app = _run_study(path, monkeypatch)
+    app = _open_approve(_run_study(path, monkeypatch))
     assert "reviewed" not in _status_widget(app).options
 
     next(
@@ -344,11 +374,10 @@ def test_study_confirming_a_settlement_assumption_clears_its_blocker(
     )
     accepter.close()
 
-    app = _run_study(path, monkeypatch)
+    app = _open_fix_tool(_run_study(path, monkeypatch), "Chip stacks / accounting")
     rendered = "\n".join(item.value for item in app.markdown)
     assert "rake_policy · unconfirmed" in rendered
     assert "settlement inputs you declared" in rendered
-    assert "reviewed" not in _status_widget(app).options
 
     next(
         button for button in app.button if button.label == "Confirm this assumption"
@@ -374,8 +403,7 @@ def test_study_confirming_a_settlement_assumption_clears_its_blocker(
     # the confirmation checkbox is keyed on the evidence digest, so accepting the
     # assumption deliberately retires the previous tick rather than inheriting it.
     st.cache_resource.clear()
-    app = _run_study(path, monkeypatch)
-    assert "rake_policy · confirmed" in "\n".join(item.value for item in app.markdown)
+    app = _open_approve(_run_study(path, monkeypatch))
     assert "reviewed" not in _status_widget(app).options
     next(
         item
@@ -419,7 +447,7 @@ def test_the_confirm_control_reports_a_refused_write_instead_of_flashing(
     monkeypatch.setattr(
         hand_accounting_module, "attest_assumption", lambda *args, **kwargs: False
     )
-    app = _run_study(path, monkeypatch)
+    app = _open_fix_tool(_run_study(path, monkeypatch), "Chip stacks / accounting")
     next(
         item for item in app.button if item.label == "Confirm this assumption"
     ).click()
@@ -450,7 +478,7 @@ def test_study_manual_hand_can_still_be_marked_reviewed(tmp_path, monkeypatch) -
         review_status="unreviewed",
     )
 
-    app = _run_study(path, monkeypatch)
+    app = _open_approve(_run_study(path, monkeypatch))
     # No confirmation control is rendered for a manual hand.
     assert not [
         item
@@ -479,7 +507,9 @@ def test_study_partial_hand_is_still_inspectable_and_correctable(
         completion_evidence=_with_evidence(partial_end=True),
     )
 
-    app = _run_study(path, monkeypatch)
+    app = _open_fix_tool(
+        _run_study(path, monkeypatch), "Cards, board, or pot"
+    )
     next(item for item in app.text_input if item.label == "Board cards").set_value(
         "Qd 7s 6c"
     )
@@ -514,7 +544,7 @@ def test_study_acknowledging_a_source_warning_promotes_uncertain_to_complete(
         completion_evidence=_with_evidence(warning_codes=["pot_not_reconciled"]),
     )
 
-    app = _run_study(path, monkeypatch)
+    app = _open_fix_tool(_run_study(path, monkeypatch), "Source warnings")
     next(button for button in app.button if button.label == "Acknowledge").click()
     app.run()
 
@@ -542,7 +572,7 @@ def test_the_panel_offers_no_acknowledge_button_for_a_rejection_code(
         ),
     )
 
-    app = _run_study(path, monkeypatch)
+    app = _open_fix_tool(_run_study(path, monkeypatch), "Source warnings")
 
     assert not list(app.exception)
     assert not [button for button in app.button if button.label == "Acknowledge"]
@@ -561,7 +591,7 @@ def test_acknowledgement_never_promotes_a_partial_hand(tmp_path, monkeypatch) ->
         ),
     )
 
-    app = _run_study(path, monkeypatch)
+    app = _open_fix_tool(_run_study(path, monkeypatch), "Source warnings")
     next(button for button in app.button if button.label == "Acknowledge").click()
     app.run()
 

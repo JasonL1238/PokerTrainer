@@ -1107,12 +1107,9 @@ _UNRESOLVED_CODES_CONSUMERS = {
     # The two derived splits, which are defined in terms of the mixed property.
     ("poker_tracker/persistence/completion.py", "unresolved_rejection_codes"),
     ("poker_tracker/persistence/completion.py", "unresolved_warning_codes"),
-    # "Is anything outstanding?" -- a count, prescribing nothing.
-    ("poker_tracker/persistence/completion.py", "derive_completion_status"),
     ("app.py", "show_source_warning_controls"),
-    # Both branches below reach it only to say there is nothing to acknowledge.
+    # Reaches it only to say there is nothing to acknowledge.
     ("poker_tracker/services/study_readiness.py", "_completion_clearing_action"),
-    ("poker_tracker/services/study_readiness.py", "_source_warning_blockers"),
 }
 
 

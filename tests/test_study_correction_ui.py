@@ -8,6 +8,24 @@ from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import CoachingResponse, Hand, Session
 from poker_tracker.ui.navigation import Page
 
+def _open_study_fix_tool(app: AppTest, tool_label: str) -> AppTest:
+    """Switch Fix & confirm to Fix and open one Other-fixes tool."""
+
+    path_radio = next(
+        item
+        for item in app.radio
+        if "Looks good — Approve" in list(getattr(item, "options", []))
+    )
+    path_radio.set_value("Edit the hand — Fix")
+    app.run()
+
+    tool_box = next(
+        item for item in app.selectbox if item.label == "What else needs fixing?"
+    )
+    assert tool_label in list(tool_box.options), list(tool_box.options)
+    tool_box.set_value(tool_label)
+    return app.run()
+
 
 def test_study_fact_correction_updates_database_and_audit(
     tmp_path,
@@ -46,7 +64,9 @@ def test_study_fact_correction_updates_database_and_audit(
     st.cache_resource.clear()
 
     app = AppTest.from_file("app.py", default_timeout=20).run()
-    app.radio[0].set_value(Page.STUDY)
+    next(item for item in app.radio if "Study" in list(item.options)).set_value(
+        Page.STUDY
+    )
     app.run()
 
     assert not list(app.exception)
@@ -54,8 +74,14 @@ def test_study_fact_correction_updates_database_and_audit(
     assert "Start with Replay, then fix, then analyze" in rendered
     assert "TexasSolver postflop analysis" in rendered
     assert any(item.label == "How to use TexasSolver" for item in app.expander)
-    assert any(item.label == "Correct hand facts" for item in app.expander)
-    assert any(item.label == "Edit or add actions" for item in app.expander)
+    assert any(
+        "Looks good — Approve" in list(getattr(item, "options", []))
+        for item in app.radio
+    )
+
+    app = _open_study_fix_tool(app, "Cards, board, or pot")
+    assert not list(app.exception)
+
     next(item for item in app.text_input if item.label == "Board cards").set_value(
         "Qd 7s 6c"
     )
@@ -109,8 +135,13 @@ def test_study_can_save_hand_to_future_debugging_queue(
     st.cache_resource.clear()
 
     app = AppTest.from_file("app.py", default_timeout=20).run()
-    app.radio[0].set_value(Page.STUDY)
+    next(item for item in app.radio if "Study" in list(item.options)).set_value(
+        Page.STUDY
+    )
     app.run()
+
+    app = _open_study_fix_tool(app, "Debugging issues")
+    assert not list(app.exception)
 
     next(item for item in app.multiselect if item.label == "What looks wrong?").set_value(
         ["cards", "actions"]

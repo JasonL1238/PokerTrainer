@@ -85,10 +85,10 @@ As of July 28, 2026, the repository contains:
   hand selection compact, presents saved actions as a readable vertical history
   with expanded decision context, lets any saved action drive one shared
   reconstructed table replay with explicit BB units on every stack, pot, and
-  result, groups failing trust checks into concrete fix steps, hides advanced
-  corrections until opened, and includes inline TexasSolver setup/use guidance
-  while retaining before/after correction history and staling derived
-  coaching/solver evidence;
+  result, splits Fix & confirm into Approve vs Edit-the-hand Fix so the Fix path
+  edits each action inline (Who / Action / Amount) with cards/players/chips under
+  Other fixes, and includes inline TexasSolver setup/use guidance while retaining
+  before/after correction history and staling derived coaching/solver evidence;
 - a persistent cross-session issue inbox that freezes debugging evidence and
   retains resolution notes;
 - authenticated local/container operation, a non-root Docker runtime, pinned
@@ -2550,6 +2550,9 @@ Newly discovered release blockers, none of them closed:
   skipped.
   Completeness still requires ``derive_completion_status`` (or an explicit
   operator finalize attestation) — incomplete never lands as ``complete``.
+  Finalize is the path for late-joined recordings where the operator still
+  reconstructed the whole hand; rejection codes stay in the audit trail but no
+  longer permanently block that attestation.
 - Make completed/partial classification a separately scored output.
 
 ### Action reconstruction

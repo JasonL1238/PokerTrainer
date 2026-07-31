@@ -267,7 +267,7 @@ def test_evidence_missing_suppresses_the_duplicate_warning_blocker() -> None:
 # control must be a label the running app actually renders. The two assertions
 # together are what make "the exact clearing action" checkable rather than prose.
 _NAMED_CONTROLS: tuple[str, ...] = (
-    "Correct hand facts",
+    "Hand facts",
     "Accounting reconciliation",
     "Saved debugging issue queue",
     "Source warnings",
@@ -275,19 +275,19 @@ _NAMED_CONTROLS: tuple[str, ...] = (
     "Analyze → TexasSolver",
     "ROI calibration",
     "Run CV reconstruction",
-    "Confirm the saved hand",
+    "Looks good — Approve",
     "Re-import this hand",
 )
 
 # The literal widget labels behind those names, as rendered by app.py.
 _APP_CONTROL_LABELS: tuple[str, ...] = (
-    "Correct hand facts",
+    "Hand facts",
     "Accounting reconciliation",
     "Saved debugging issue queue",
     "Source warnings",
     "AI coach",
     "TexasSolver",
-    "Confirm the saved hand",
+    "Looks good — Approve",
     "ROI calibration",
     "Run CV reconstruction",
     "Videos",

@@ -711,7 +711,7 @@ def test_the_layout_blocker_names_correct_hand_facts_for_a_missing_table_size() 
 
     assert blocker is not None
     assert blocker.detail == ("hand.table_size is not recorded",)
-    assert "Correct hand facts" in blocker.clearing_action
+    assert "Hand facts" in blocker.clearing_action
     assert "does not clear it" not in blocker.clearing_action
 
     corrected = blocked.model_copy(update={"table_size": 6})
@@ -983,6 +983,8 @@ def test_a_pinned_snapshot_behind_the_live_schema_still_passes_the_audit(
 
 def _seed_ui_hand(path: Path) -> int:
     """One reconciled, study-ready reconstructed hand with full pipeline evidence."""
+    from tests.conftest import attest_declared_assumptions
+
     db = PokerDatabase(str(path))
     db.init_db()
     session = db.create_session(Session(name="Round 8 UI", date_played=date(2026, 1, 1)))
@@ -1053,6 +1055,7 @@ def _seed_ui_hand(path: Path) -> int:
         ],
     )
     persist_reconciliation(db, hand.id)
+    attest_declared_assumptions(db, hand.id, only="declared_pot_awards")
     hand_id = hand.id
     db.close()
     return hand_id
@@ -1083,9 +1086,14 @@ def test_the_study_page_renders_the_evidence_the_checkbox_names(
     app = AppTest.from_file(
         str(Path(__file__).resolve().parent.parent / "app.py"), default_timeout=30
     ).run()
-    app.radio[0].set_value(Page.STUDY)
+    next(item for item in app.radio if "Study" in list(item.options)).set_value(
+        Page.STUDY
+    )
     app.run()
     assert not list(app.exception)
+    from tests.test_study_readiness_ui import _open_approve
+
+    app = _open_approve(app)
 
     rendered = "\n".join(item.value for item in app.markdown)
     labels = [item.label for item in app.checkbox]
@@ -1168,38 +1176,28 @@ def test_the_landing_hero_says_marked_reviewed(tmp_path: Path, monkeypatch) -> N
 def test_a_hand_typed_in_as_reconstructed_is_stored_unproven(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The Add-hand writer's own column value, read raw.
+    """A reconstructed hand without completion evidence stays unproven on disk.
 
     ``_hand_from_row`` repairs the ``cv_import``/``not_applicable`` pair on every
-    read, so the existing form test could not see the writer regress; the stored
+    read, so a model-only assertion cannot see the writer regress; the stored
     row still has to be written correctly, because the repair is defence in depth
-    and not the contract.
+    and not the contract. Sessions no longer offers a Source picker — assert the
+    persistence writer directly.
     """
-    import streamlit as st
-    from streamlit.testing.v1 import AppTest
-
-    import poker_tracker.persistence.db as db_module
-    from poker_tracker.ui.navigation import Page
-
     path = tmp_path / "round8-add-hand.sqlite3"
-    _seed_ui_hand(path)
-    monkeypatch.delenv("APP_PASSWORD", raising=False)
-    monkeypatch.delenv("POKERTRAINER_REQUIRE_AUTH", raising=False)
-    monkeypatch.setenv("POKER_DB_PATH", str(path))
-    monkeypatch.setattr(db_module, "DEFAULT_DB_PATH", str(path))
-    st.cache_resource.clear()
-    app = AppTest.from_file(
-        str(Path(__file__).resolve().parent.parent / "app.py"), default_timeout=30
-    ).run()
-    app.radio[0].set_value(Page.SESSIONS)
-    app.run()
-    assert not list(app.exception)
-    next(item for item in app.number_input if item.label == "Hand number").set_value(2)
-    next(item for item in app.selectbox if item.label == "Source").set_value("cv_import")
-    app.run()
-    next(item for item in app.button if item.label == "Save hand").click()
-    app.run()
-    assert not list(app.exception)
+    db = PokerDatabase(str(path))
+    db.init_db()
+    session = db.create_session(Session(name="Round 8 writer", date_played=date(2026, 1, 1)))
+    assert session.id is not None
+    created = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=2,
+            source_type="cv_import",
+        )
+    )
+    assert created.id is not None
+    db.close()
 
     connection = sqlite3.connect(str(path))
     stored = connection.execute(

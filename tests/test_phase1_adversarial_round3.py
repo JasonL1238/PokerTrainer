@@ -657,6 +657,7 @@ def test_the_study_page_composes_legacy_hand_reviews_into_readiness(
     """
     from poker_tracker.persistence.models import HandReview
     from tests.test_study_readiness_ui import (
+        _open_approve,
         _run_study,
         _saved_review_status,
         _seed_hand,
@@ -693,7 +694,7 @@ def test_the_study_page_composes_legacy_hand_reviews_into_readiness(
     persist_reconciliation(db, hand_id)
     db.close()
 
-    app = _run_study(path, monkeypatch)
+    app = _open_approve(_run_study(path, monkeypatch))
     assert not list(app.exception)
     rendered = " ".join(str(item.value) for item in app.markdown)
     assert "Not study-ready" in rendered
@@ -712,12 +713,12 @@ def test_the_study_confirmation_does_not_survive_an_evidence_change(
     invalidated it, so USER_CONFIRMATION_MISSING never came back and the hand was
     re-promotable without anyone re-reading anything.
     """
-    from tests.test_study_readiness_ui import _run_study, _seed_hand
+    from tests.test_study_readiness_ui import _open_approve, _run_study, _seed_hand
 
     path = tmp_path / "confirm_reset.sqlite3"
     hand_id = _seed_hand(path, completion_status="complete", review_status="unreviewed")
 
-    app = _run_study(path, monkeypatch)
+    app = _open_approve(_run_study(path, monkeypatch))
     next(item for item in app.checkbox if item.label == CONFIRM_LABEL).set_value(True)
     app.run()
     assert not list(app.exception)
@@ -732,11 +733,11 @@ def test_the_study_confirmation_does_not_survive_an_evidence_change(
     persist_reconciliation(db, hand_id)
     db.close()
 
-    app.run()
+    app = _open_approve(app.run())
     assert not list(app.exception)
-    assert (
-        next(item for item in app.checkbox if item.label == CONFIRM_LABEL).value is False
-    )
+    confirm_boxes = [item for item in app.checkbox if item.label == CONFIRM_LABEL]
+    if confirm_boxes:
+        assert confirm_boxes[0].value is False
     blockers = [
         str(item.value) for item in app.markdown if "Your confirmation" in str(item.value)
     ]

@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import date
 from pathlib import Path
+from typing import Iterator
 
 import streamlit as st
 from pydantic import ValidationError
@@ -527,19 +529,19 @@ def study_fix_groups(
     definitions = {
         "study_preference": (
             "Choose study vs non-study",
-            "Fix & confirm → Study inclusion",
+            "Fix & confirm → Edit the hand — Fix → Other fixes → Study inclusion",
         ),
         "evidence": (
             "Verify the reconstructed hand",
-            "Fix & confirm → Correct hand facts / Source warnings",
+            "Fix & confirm → Edit the hand — Fix → Other fixes → Cards / Source warnings",
         ),
         "accounting": (
             "Reconcile the chips",
-            "Fix & confirm → Accounting reconciliation",
+            "Fix & confirm → Edit the hand — Fix → edit actions or Other fixes → Chip stacks",
         ),
         "issues": (
             "Resolve saved debugging issues",
-            "Fix & confirm → Saved debugging issue",
+            "Fix & confirm → Edit the hand — Fix → Other fixes → Debugging issues",
         ),
         "coaching": (
             "Refresh coaching",
@@ -551,7 +553,7 @@ def study_fix_groups(
         ),
         "confirmation": (
             "Confirm the saved hand",
-            "Fix & confirm → Confirm the saved hand",
+            "Fix & confirm → Looks good — Approve",
         ),
     }
     evidence_codes = {
@@ -603,6 +605,8 @@ def show_source_warning_controls(
     db: PokerDatabase,
     hand: Hand,
     evidence: CompletionEvidence,
+    *,
+    force_open: bool = False,
 ) -> None:
     """Acknowledge pipeline source codes; the only user path from uncertain to complete."""
 
@@ -618,11 +622,16 @@ def show_source_warning_controls(
         if not is_assumption_dependence_code(code)
     ]
     if hand.id is None or not codes:
+        if force_open:
+            st.caption("No source warnings on this hand.")
         return
     acknowledged = set(evidence.acknowledged_codes)
     rejections = set(evidence.rejection_codes)
     unresolved = len(evidence.unresolved_codes)
-    with st.expander(f"Source warnings · {unresolved} unresolved of {len(codes)}"):
+    with _study_panel(
+        f"Source warnings · {unresolved} unresolved of {len(codes)}",
+        force_open=force_open,
+    ):
         st.caption(
             "Acknowledging records the accepted warning as an auditable correction. "
             "It can never make a partial recording complete, and it is not offered "
@@ -1564,6 +1573,239 @@ def study_action_label(action: Action, index: int) -> str:
     )
 
 
+def _study_fix_path_default(readiness: StudyReadiness) -> str:
+    """Prefer Approve when only confirmation remains; otherwise start on Fix."""
+
+    if readiness.is_ready:
+        return "approve"
+    remaining = {blocker.category for blocker in readiness.blockers}
+    if remaining <= {"confirmation"}:
+        return "approve"
+    return "fix"
+
+
+def _study_other_fix_options(
+    readiness: StudyReadiness,
+    *,
+    is_reconstructed: bool,
+    hand: Hand,
+    hand_issues: list[HandIssue],
+) -> list[tuple[str, str]]:
+    """Return non-action Fix tools. Actions are always edited on the main Fix surface."""
+
+    suggested: list[tuple[str, str]] = []
+    codes = set(readiness.codes())
+    if "STUDY_EXCLUDED_BY_OPERATOR" in codes:
+        suggested.append(("inclusion", "Study inclusion"))
+    if {
+        "COMPLETION_NOT_COMPLETE",
+        "COMPLETION_EVIDENCE_MISSING",
+    } & codes:
+        suggested.append(("finalize", "Finalize incomplete hand"))
+    if "UNRESOLVED_SOURCE_WARNING" in codes:
+        suggested.append(("warnings", "Source warnings"))
+    if {
+        "INVALID_HERO_OR_BOARD_CARDS",
+        "UNREADABLE_HAND_COLUMNS",
+        "UNSUPPORTED_TABLE_LAYOUT",
+        "COMPLETION_NOT_COMPLETE",
+        "COMPLETION_EVIDENCE_MISSING",
+    } & codes:
+        suggested.append(("facts", "Cards, board, or pot"))
+    if {
+        "ACCOUNTING_NOT_AUTHORITATIVE",
+        "ACCOUNTING_ASSUMPTION_DEPENDENT",
+    } & codes:
+        suggested.append(("accounting", "Chip stacks / accounting"))
+    if "OPEN_DEBUGGING_ISSUE" in codes or hand_issues:
+        suggested.append(("issues", "Debugging issues"))
+
+    always: list[tuple[str, str]] = [
+        ("facts", "Cards, board, or pot"),
+        ("players", "Players / seats"),
+        ("accounting", "Chip stacks / accounting"),
+        ("inclusion", "Study inclusion"),
+    ]
+    if is_reconstructed:
+        always.extend(
+            [
+                ("warnings", "Source warnings"),
+                ("finalize", "Finalize incomplete hand"),
+                ("frames", "Jump to frame validation"),
+            ]
+        )
+    always.extend(
+        [
+            ("issues", "Debugging issues"),
+            ("history", "Correction history"),
+        ]
+    )
+    seen: set[str] = set()
+    ordered: list[tuple[str, str]] = []
+    for tool_id, label in [*suggested, *always]:
+        if tool_id in seen:
+            continue
+        if tool_id == "finalize" and hand.completion_status not in {
+            "partial",
+            "uncertain",
+        }:
+            continue
+        seen.add(tool_id)
+        ordered.append((tool_id, label))
+    return ordered
+
+
+def _other_fixes_should_expand(readiness: StudyReadiness) -> bool:
+    """Open Other fixes when blockers are not action-line edits."""
+
+    return bool(
+        {
+            "STUDY_EXCLUDED_BY_OPERATOR",
+            "COMPLETION_NOT_COMPLETE",
+            "COMPLETION_EVIDENCE_MISSING",
+            "INVALID_HERO_OR_BOARD_CARDS",
+            "UNREADABLE_HAND_COLUMNS",
+            "UNSUPPORTED_TABLE_LAYOUT",
+            "ACCOUNTING_NOT_AUTHORITATIVE",
+            "ACCOUNTING_ASSUMPTION_DEPENDENT",
+            "OPEN_DEBUGGING_ISSUE",
+            "UNRESOLVED_SOURCE_WARNING",
+            "STALE_COACHING_EVIDENCE",
+            "STALE_SOLVER_EVIDENCE",
+        }
+        & set(readiness.codes())
+    )
+
+
+def _render_study_saved_action_snapshot(actions: list[Action]) -> None:
+    """Show a compact read-only action list for the Approve path."""
+
+    st.markdown("#### Saved action line")
+    if not actions:
+        st.caption("No actions saved for this hand.")
+        return
+    for index, action in enumerate(actions):
+        st.markdown(study_action_label(action, index))
+    st.caption(
+        "If this matches the recording, confirm below. "
+        "If any line is wrong, switch to Edit the hand — Fix."
+    )
+
+
+def _render_study_approve_path(
+    db: PokerDatabase,
+    hand: Hand,
+    accounting: AccountingReconciliation | None,
+    readiness: StudyReadiness,
+    is_reconstructed: bool,
+    completion_evidence: CompletionEvidence,
+    ordered_hands: list[Hand] | None,
+) -> None:
+    """Approve-only surface: confirm when the saved hand looks right."""
+
+    fix_groups = [
+        group
+        for group in study_fix_groups(readiness)
+        if group[0] != "Confirm the saved hand"
+    ]
+    if readiness.is_ready:
+        st.success("Everything required is confirmed. This hand is ready to analyze.")
+    elif fix_groups:
+        st.warning(
+            "Approve is blocked until the items below are fixed. "
+            "Switch to Edit the hand — Fix, clear them, then come back here."
+        )
+        for title, _destination, blockers in fix_groups:
+            st.markdown(f"**{title}**")
+            for blocker in blockers:
+                st.write(f"• {blocker.reason}")
+    else:
+        st.info("Looks good? Confirm below to unlock trusted analysis.")
+
+    can_confirm = not fix_groups
+    if can_confirm and is_reconstructed:
+        show_reconstruction_evidence(hand, completion_evidence)
+        _offer_frame_validation_link(db, hand)
+    if can_confirm and hand_requires_user_confirmation(hand):
+        st.checkbox(
+            "I have read the evidence above and confirm this hand is correct",
+            key=study_confirmation_key(hand, accounting),
+        )
+    with st.expander("Set review status", expanded=readiness.is_ready):
+        status_options, status_index = review_status_options(hand, readiness)
+        status_key = f"study_status_{hand.id}"
+        if st.session_state.get(status_key) not in status_options:
+            st.session_state.pop(status_key, None)
+        status = st.selectbox(
+            "Review status",
+            status_options,
+            index=status_index,
+            key=status_key,
+        )
+        if st.button(
+            "Save review status",
+            key=f"study_save_{hand.id}",
+            width="stretch",
+        ):
+            if guarded_update_hand_status(db, hand, readiness, status):
+                flash("Review status updated.")
+                st.rerun()
+    if ordered_hands is not None:
+        render_study_hand_advance(
+            ordered_hands,
+            hand,
+            ready=readiness.is_ready,
+        )
+
+
+def _render_study_fix_tool(
+    tool_id: str,
+    db: PokerDatabase,
+    hand: Hand,
+    players: list[HandPlayer],
+    accounting: AccountingReconciliation | None,
+    accounting_error: str | None,
+    hand_issues: list[HandIssue],
+    is_reconstructed: bool,
+    completion_evidence: CompletionEvidence,
+) -> None:
+    """Render one Other-fixes tool. Actions are edited on the main Fix surface."""
+
+    if tool_id == "inclusion":
+        show_study_inclusion_controls(db, hand, force_open=True)
+    elif tool_id == "finalize":
+        show_finalize_incomplete_hand(db, hand, completion_evidence, force_open=True)
+    elif tool_id == "warnings":
+        show_source_warning_controls(
+            db, hand, completion_evidence, force_open=True
+        )
+    elif tool_id == "facts":
+        show_hand_fact_editor(db, hand, force_open=True)
+    elif tool_id == "players":
+        show_player_editor(db, players, force_open=True)
+    elif tool_id == "accounting":
+        _render_accounting_status(accounting, accounting_error)
+        show_accounting_editor(
+            db,
+            hand,
+            players,
+            accounting,
+            accounting_error,
+            force_open=True,
+        )
+    elif tool_id == "issues":
+        show_hand_issue_controls(db, hand, hand_issues, force_open=True)
+    elif tool_id == "history":
+        show_correction_history(db, hand.id, force_open=True)
+    elif tool_id == "frames":
+        if is_reconstructed:
+            _offer_frame_validation_link(db, hand)
+        else:
+            st.caption("Frame validation is only available for reconstructed hands.")
+    else:
+        st.caption("Unknown fix tool.")
+
+
 def render_study_fix_and_confirm(
     db: PokerDatabase,
     hand: Hand,
@@ -1577,89 +1819,101 @@ def render_study_fix_and_confirm(
     completion_evidence: CompletionEvidence,
     ordered_hands: list[Hand] | None = None,
 ) -> None:
-    """Present blocker resolution first and keep technical editors opt-in."""
+    """Approve when the hand looks right, or edit the action line directly."""
 
     st.markdown("### Fix & confirm")
     st.caption(
-        "Check the short list below. Open a correction tool only when that part "
-        "of the saved hand is wrong."
+        "Approve if the hand looks right. Otherwise edit any wrong action below — "
+        "cards, players, and chips live under Other fixes."
     )
-    if readiness.is_ready:
-        st.success("Everything required is confirmed. This hand is ready to analyze.")
-    else:
-        fix_groups = study_fix_groups(readiness)
-        st.warning(
-            f"{len(readiness.blockers)} trust check(s) are failing across "
-            f"{len(fix_groups)} fix step(s)."
-        )
-        blocker_columns = st.columns(min(2, len(fix_groups)))
-        for index, (title, destination, blockers) in enumerate(fix_groups):
-            with blocker_columns[index % len(blocker_columns)]:
-                with st.container(border=True):
-                    st.markdown(f"**{index + 1}. {title}**")
-                    for blocker in blockers:
-                        st.write(f"• {blocker.reason}")
-                    st.caption(f"Use: {destination}")
-        with st.expander("Show exact requirements"):
+
+    path_labels = {
+        "approve": "Looks good — Approve",
+        "fix": "Edit the hand — Fix",
+    }
+    path_key = f"study_fc_path_{hand.id}"
+    default_path = path_labels[_study_fix_path_default(readiness)]
+    if st.session_state.get(path_key) not in path_labels.values():
+        st.session_state[path_key] = default_path
+    path_label = st.radio(
+        "Choose a path",
+        list(path_labels.values()),
+        horizontal=True,
+        key=path_key,
+        label_visibility="collapsed",
+    )
+    path = "approve" if path_label == path_labels["approve"] else "fix"
+
+    if not readiness.is_ready:
+        with st.expander(
+            f"What's blocking study · {len(readiness.blockers)} check(s)",
+            expanded=False,
+        ):
             render_study_readiness(readiness)
 
-    status_col, tools_col = st.columns([0.9, 1.45], gap="large")
-    with status_col:
-        st.markdown("#### Confirm the saved hand")
-        show_study_inclusion_controls(db, hand)
-        if is_reconstructed:
-            show_reconstruction_evidence(hand, completion_evidence)
-            show_source_warning_controls(db, hand, completion_evidence)
-            show_finalize_incomplete_hand(db, hand, completion_evidence)
-            _offer_frame_validation_link(db, hand)
-        if hand_requires_user_confirmation(hand):
-            st.checkbox(
-                "I have read the evidence above and confirm this hand is correct",
-                key=study_confirmation_key(hand, accounting),
-            )
-        with st.expander("Set review status", expanded=readiness.is_ready):
-            status_options, status_index = review_status_options(hand, readiness)
-            status_key = f"study_status_{hand.id}"
-            if st.session_state.get(status_key) not in status_options:
-                st.session_state.pop(status_key, None)
-            status = st.selectbox(
-                "Review status",
-                status_options,
-                index=status_index,
-                key=status_key,
-            )
-            if st.button(
-                "Save review status",
-                key=f"study_save_{hand.id}",
-                width="stretch",
-            ):
-                if guarded_update_hand_status(db, hand, readiness, status):
-                    flash("Review status updated.")
-                    st.rerun()
-        if ordered_hands is not None:
-            render_study_hand_advance(
-                ordered_hands,
-                hand,
-                ready=readiness.is_ready,
-            )
-        show_hand_issue_controls(db, hand, hand_issues)
-
-    with tools_col:
-        st.markdown("#### Correction tools")
-        st.caption("These are closed by default. Open only the section you need.")
-        with st.expander("Accounting status"):
-            _render_accounting_status(accounting, accounting_error)
-        show_accounting_editor(
+    if path == "approve":
+        _render_study_saved_action_snapshot(actions)
+        _render_study_approve_path(
             db,
             hand,
-            players,
             accounting,
-            accounting_error,
+            readiness,
+            is_reconstructed,
+            completion_evidence,
+            ordered_hands,
         )
-        show_hand_fact_editor(db, hand)
-        show_player_editor(db, players)
-        show_action_editor(db, actions, players)
-        show_correction_history(db, hand.id)
+        return
+
+    st.markdown("#### Edit each action")
+    st.caption(
+        "Open a wrong line, change who acted / what they did / the amount, then Save. "
+        "Add a missing line at the bottom."
+    )
+    show_action_editor(db, actions, players, force_open=True)
+
+    other_tools = _study_other_fix_options(
+        readiness,
+        is_reconstructed=is_reconstructed,
+        hand=hand,
+        hand_issues=hand_issues,
+    )
+    with st.expander(
+        "Other fixes (cards, players, chips…)",
+        expanded=_other_fixes_should_expand(readiness),
+    ):
+        st.caption(
+            "Use this when the action line is fine but cards, seats, chip "
+            "totals, or warnings still block Approve."
+        )
+        tool_labels = [label for _tool_id, label in other_tools]
+        label_to_tool = {label: tool_id for tool_id, label in other_tools}
+        tool_key = f"study_fc_tool_{hand.id}"
+        if st.session_state.get(tool_key) not in tool_labels:
+            st.session_state[tool_key] = tool_labels[0]
+        selected_label = st.selectbox(
+            "What else needs fixing?",
+            tool_labels,
+            key=tool_key,
+        )
+        selected_tool = label_to_tool[selected_label]
+        with st.container(border=True):
+            _render_study_fix_tool(
+                selected_tool,
+                db,
+                hand,
+                players,
+                accounting,
+                accounting_error,
+                hand_issues,
+                is_reconstructed,
+                completion_evidence,
+            )
+    if ordered_hands is not None:
+        render_study_hand_advance(
+            ordered_hands,
+            hand,
+            ready=readiness.is_ready,
+        )
 
 
 def render_study_analysis(
@@ -1681,7 +1935,7 @@ def render_study_analysis(
     else:
         st.warning(
             f"Analysis is limited while {len(readiness.blockers)} trust check(s) "
-            "remain. Open Fix & confirm and follow the grouped checklist."
+            "remain. Open Fix & confirm, edit wrong actions, then Approve."
         )
 
     math_tab, solver_tab, coach_tab, notes_tab = st.tabs(
@@ -1746,13 +2000,35 @@ def render_study_analysis(
     with notes_tab:
         st.markdown("##### Hand notes")
         st.write(hand.notes or "No notes recorded.")
-        st.caption("Edit notes in Fix & confirm → Correct hand facts.")
+        st.caption(
+            "Edit notes in Fix & confirm → Edit the hand — Fix → Other fixes → "
+            "Cards, board, or pot."
+        )
+
+
+@contextmanager
+def _study_panel(
+    title: str,
+    *,
+    force_open: bool = False,
+    expanded: bool = False,
+) -> Iterator[None]:
+    """Expander when browsing; plain panel when Fix already chose this tool."""
+
+    if force_open:
+        st.markdown(f"##### {title}")
+        yield
+        return
+    with st.expander(title, expanded=expanded):
+        yield
 
 
 def show_hand_issue_controls(
     db: PokerDatabase,
     hand: Hand,
     issues: list[HandIssue],
+    *,
+    force_open: bool = False,
 ) -> None:
     """Flag a hand now and leave a self-contained report for future debugging."""
 
@@ -1762,7 +2038,11 @@ def show_hand_issue_controls(
     if open_issues:
         st.error(f"This hand has {len(open_issues)} unresolved debugging issue(s).")
 
-    with st.expander("Flag this hand for future debugging", expanded=False):
+    with _study_panel(
+        "Flag this hand for future debugging",
+        force_open=force_open,
+        expanded=False,
+    ):
         st.caption(
             "This does not require you to diagnose or fix it now. The current hand, "
             "players, actions, and correction history are saved as a snapshot."
@@ -1835,11 +2115,20 @@ def show_hand_issue_controls(
                     st.rerun()
 
 
-def show_study_inclusion_controls(db: PokerDatabase, hand: Hand) -> None:
+def show_study_inclusion_controls(
+    db: PokerDatabase,
+    hand: Hand,
+    *,
+    force_open: bool = False,
+) -> None:
     """Let the operator mark any hand as study or non-study."""
     if hand.id is None:
         return
-    with st.expander("Study inclusion", expanded=hand.study_inclusion != "auto"):
+    with _study_panel(
+        "Study inclusion",
+        force_open=force_open,
+        expanded=hand.study_inclusion != "auto",
+    ):
         st.caption(
             "Study keeps this hand in the study queue. Non-study excludes it from "
             "coaching. Auto follows the usual readiness checks."
@@ -1864,7 +2153,11 @@ def show_study_inclusion_controls(db: PokerDatabase, hand: Hand) -> None:
 
 
 def show_finalize_incomplete_hand(
-    db: PokerDatabase, hand: Hand, evidence: CompletionEvidence
+    db: PokerDatabase,
+    hand: Hand,
+    evidence: CompletionEvidence,
+    *,
+    force_open: bool = False,
 ) -> None:
     """Allow the operator to complete an incomplete/partial CV draft by hand."""
     if hand.id is None:
@@ -1875,15 +2168,35 @@ def show_finalize_incomplete_hand(
         st.caption("This draft was finalized by operator attestation.")
         return
     if hand.completion_status not in {"partial", "uncertain"}:
+        if force_open:
+            st.caption("This hand is already complete — nothing to finalize.")
         return
-    with st.expander("Finalize incomplete hand", expanded=True):
+    with _study_panel(
+        "Finalize incomplete hand",
+        force_open=force_open,
+        expanded=True,
+    ):
         st.caption(
-            "Incomplete CV segments import as draft hands under this session. "
-            "Fill blanks in Correct hand facts (hero cards required), then attest "
-            "the terminal outcome. Preflop folds are valid study hands."
+            "Use this when the recording missed the start or end, but you still "
+            "reconstructed the whole hand (for example you joined late on preflop "
+            "and filled every action). Fill hero cards, edit missing actions, "
+            "acknowledge remaining source warnings, then attest how the hand ended. "
+            "Pipeline rejection codes stay in the audit trail; finalize overrides "
+            "them for study."
         )
+        if evidence.rejection_codes:
+            st.info(
+                "Pipeline rejected: "
+                + ", ".join(evidence.rejection_codes)
+                + ". Finalize is allowed if you filled those gaps yourself."
+            )
         if not (hand.hero_cards or "").strip():
             st.warning("Fill in hero cards before finalizing.")
+        if evidence.unresolved_warning_codes:
+            st.warning(
+                "Acknowledge remaining source warnings first: "
+                + ", ".join(evidence.unresolved_warning_codes)
+            )
         default_terminal = (
             evidence.terminal_event
             if evidence.terminal_event in TERMINAL_EVENT_OPTIONS
@@ -1896,10 +2209,15 @@ def show_finalize_incomplete_hand(
             format_func=lambda value: value.replace("_", " ").title(),
             key=f"finalize_terminal_{hand.id}",
         )
+        notes_required = bool(evidence.rejection_codes)
         notes = st.text_input(
-            "Finalize notes (optional)",
+            "Finalize notes" + (" (required)" if notes_required else " (optional)"),
             key=f"finalize_notes_{hand.id}",
-            placeholder="Example: folded preflop after reviewing the video",
+            placeholder=(
+                "Example: joined mid-preflop; reconstructed full action from the table"
+                if notes_required
+                else "Example: folded preflop after reviewing the video"
+            ),
         )
         if st.button(
             "Mark complete from my fill-in",
@@ -1907,6 +2225,12 @@ def show_finalize_incomplete_hand(
             type="primary",
             disabled=not (hand.hero_cards or "").strip(),
         ):
+            if notes_required and not notes.strip():
+                st.error(
+                    "Add a short note explaining how you reconstructed the "
+                    "rejected gaps before finalizing."
+                )
+                return
             try:
                 finalized = db.finalize_incomplete_hand(
                     hand.id,
@@ -1929,7 +2253,12 @@ def show_finalize_incomplete_hand(
                 st.rerun()
 
 
-def show_hand_fact_editor(db: PokerDatabase, hand: Hand) -> None:
+def show_hand_fact_editor(
+    db: PokerDatabase,
+    hand: Hand,
+    *,
+    force_open: bool = False,
+) -> None:
     """Edit reconstructed evidence in place and retain the original values.
 
     Reads the STORED hand rather than the one it was handed. Every Study surface
@@ -1950,7 +2279,7 @@ def show_hand_fact_editor(db: PokerDatabase, hand: Hand) -> None:
         stored = db.fetch_hand(hand.id)
         if stored is not None:
             hand = stored
-    with st.expander("Correct hand facts", expanded=False):
+    with _study_panel("Hand facts", force_open=force_open, expanded=False):
         st.caption(
             "Saving changes updates this hand in SQLite, records before/after evidence, "
             "and marks prior coaching stale."
@@ -2029,9 +2358,17 @@ def show_hand_fact_editor(db: PokerDatabase, hand: Hand) -> None:
                 st.rerun()
 
 
-def show_correction_history(db: PokerDatabase, hand_id: int) -> None:
+def show_correction_history(
+    db: PokerDatabase,
+    hand_id: int,
+    *,
+    force_open: bool = False,
+) -> None:
     corrections = db.fetch_hand_corrections(hand_id)
-    with st.expander(f"Correction history ({len(corrections)})"):
+    with _study_panel(
+        f"Correction history ({len(corrections)})",
+        force_open=force_open,
+    ):
         if not corrections:
             st.caption("No corrections recorded yet.")
             return
@@ -2834,10 +3171,16 @@ def show_accounting_editor(
     players: list[HandPlayer],
     accounting: AccountingReconciliation | None,
     accounting_error: str | None,
+    *,
+    force_open: bool = False,
 ) -> None:
     if hand.id is None:
         return
-    with st.expander("Accounting reconciliation", expanded=False):
+    with _study_panel(
+        "Accounting reconciliation",
+        force_open=force_open,
+        expanded=False,
+    ):
         if accounting_error is not None:
             st.error(accounting_error)
             st.caption(
@@ -4575,74 +4918,111 @@ def show_saved_hands(db: PokerDatabase, session: Session) -> None:
                 st.rerun()
 
 
-def show_player_editor(db: PokerDatabase, players: list[HandPlayer]) -> None:
-    with st.expander("Edit players and starting stacks", expanded=False):
-        for player in players:
-            if player.id is None:
-                continue
-            with st.form(f"edit_player_{player.id}"):
-                cols = st.columns([0.6, 1.2, 0.8, 1, 0.55, 1.4])
-                seat_index = cols[0].number_input(
-                    "Seat",
-                    min_value=0,
-                    max_value=9,
-                    value=player.seat_index,
-                    placeholder="Unknown",
-                )
-                player_name = cols[1].text_input("Player", value=player.player_name)
-                position = cols[2].selectbox(
-                    "Position",
-                    POSITIONS,
-                    index=(POSITIONS.index(player.position) if player.position in POSITIONS else 0),
-                )
-                starting_stack = cols[3].number_input(
-                    "Starting stack",
-                    min_value=0.0,
-                    value=player.starting_stack,
-                    placeholder="Unknown",
-                )
-                is_hero = cols[4].checkbox("Hero", value=player.is_hero)
-                notes = cols[5].text_input("Notes", value=player.notes)
-                correction_reason = st.text_input(
-                    "Correction reason",
-                    placeholder="What did reconstruction get wrong?",
-                    key=f"player_correction_reason_{player.id}",
-                )
-                submitted = st.form_submit_button("Update player")
-            if not submitted:
-                continue
-            if not correction_reason.strip():
-                st.error("Add a correction reason so this example can be learned from.")
-                continue
-            try:
-                db.update_hand_player(
-                    player.model_copy(
-                        update={
-                            "seat_index": (None if seat_index is None else int(seat_index)),
-                            "player_name": player_name.strip(),
-                            "position": position,
-                            "starting_stack": _optional_float(starting_stack),
-                            "is_hero": is_hero,
-                            "notes": notes.strip(),
-                        }
-                    ),
-                    correction_notes=correction_reason,
-                )
-                st.rerun()
-            except (sqlite3.IntegrityError, ValidationError, ValueError) as exc:
-                st.error(f"Could not update player: {exc}")
+def show_player_editor(
+    db: PokerDatabase,
+    players: list[HandPlayer],
+    *,
+    force_open: bool = False,
+) -> None:
+    editable = [player for player in players if player.id is not None]
+    with _study_panel(
+        "Players / seats",
+        force_open=force_open,
+        expanded=False,
+    ):
+        if not editable:
+            st.caption("No players saved.")
+            return
+        hand_id = editable[0].hand_id
+        options = {player.id: player for player in editable}
+        selected_id = st.selectbox(
+            "Which player needs a fix?",
+            list(options),
+            format_func=lambda player_id: (
+                f"{options[player_id].player_name or 'Unknown'} · "
+                f"{options[player_id].position or 'no seat'}"
+                + (" · hero" if options[player_id].is_hero else "")
+            ),
+            key=f"study_edit_player_{hand_id}",
+        )
+        player = options[selected_id]
+        with st.form(f"edit_player_{player.id}"):
+            cols = st.columns([0.6, 1.2, 0.8, 1, 0.55, 1.4])
+            seat_index = cols[0].number_input(
+                "Seat",
+                min_value=0,
+                max_value=9,
+                value=player.seat_index,
+                placeholder="Unknown",
+            )
+            player_name = cols[1].text_input("Player", value=player.player_name)
+            position = cols[2].selectbox(
+                "Position",
+                POSITIONS,
+                index=(POSITIONS.index(player.position) if player.position in POSITIONS else 0),
+            )
+            starting_stack = cols[3].number_input(
+                "Starting stack",
+                min_value=0.0,
+                value=player.starting_stack,
+                placeholder="Unknown",
+            )
+            is_hero = cols[4].checkbox("Hero", value=player.is_hero)
+            notes = cols[5].text_input("Notes", value=player.notes)
+            correction_reason = st.text_input(
+                "Correction reason",
+                placeholder="What did reconstruction get wrong?",
+                key=f"player_correction_reason_{player.id}",
+            )
+            submitted = st.form_submit_button("Update player")
+        if not submitted:
+            return
+        if not correction_reason.strip():
+            st.error("Add a correction reason so this example can be learned from.")
+            return
+        try:
+            db.update_hand_player(
+                player.model_copy(
+                    update={
+                        "seat_index": (None if seat_index is None else int(seat_index)),
+                        "player_name": player_name.strip(),
+                        "position": position,
+                        "starting_stack": _optional_float(starting_stack),
+                        "is_hero": is_hero,
+                        "notes": notes.strip(),
+                    }
+                ),
+                correction_notes=correction_reason,
+            )
+            st.rerun()
+        except (sqlite3.IntegrityError, ValidationError, ValueError) as exc:
+            st.error(f"Could not update player: {exc}")
 
 
 def show_action_editor(
     db: PokerDatabase,
     actions: list[Action],
     players: list[HandPlayer],
+    *,
+    force_open: bool = False,
 ) -> None:
-    with st.expander("Edit or add actions", expanded=False):
-        st.caption(
-            "Use this only when the saved action history does not match the recording."
-        )
+    with _study_panel(
+        "Actions",
+        force_open=force_open,
+        expanded=False,
+    ):
         show_action_editor_contents(db, actions, players)
+
+
+def _action_player_options(players: list[HandPlayer]) -> dict[str, HandPlayer]:
+    """Stable Who-select labels for action editing."""
+
+    labels: dict[str, HandPlayer] = {}
+    for player in players:
+        base = f"{player.player_name} · {player.position or 'unknown'}"
+        label = base if base not in labels else f"{base} · {player.player_key[:8]}"
+        labels[label] = player
+    return labels
 
 
 def show_action_editor_contents(
@@ -4650,47 +5030,137 @@ def show_action_editor_contents(
     actions: list[Action],
     players: list[HandPlayer],
 ) -> None:
-    st.markdown("##### Edit / Delete Actions")
-    if not actions:
-        st.caption("No actions saved.")
+    editable = [
+        (index, action)
+        for index, action in enumerate(actions)
+        if action.id is not None
+    ]
+    if not editable:
+        st.info("No actions saved yet. Add the missing lines below.")
+    else:
+        for index, action in editable:
+            with st.expander(study_action_label(action, index), expanded=False):
+                _render_edit_one_action(db, action, players)
 
-    for action in actions:
-        if action.id is None:
-            continue
-        with st.form(f"edit_action_{action.id}"):
-            cols = st.columns([0.9, 0.8, 1, 1, 0.8, 0.8, 1.2])
-            street = cols[0].selectbox("Street", STREETS, index=STREETS.index(action.street))
-            position = cols[1].selectbox(
-                "Position",
-                POSITIONS,
-                index=POSITIONS.index(action.position) if action.position in POSITIONS else 0,
+    with st.expander("Add a missing action", expanded=not editable):
+        _show_add_corrected_action(db, players)
+
+
+def _render_edit_one_action(
+    db: PokerDatabase,
+    action: Action,
+    players: list[HandPlayer],
+) -> None:
+    """Simple per-action editor: Who / What / Amount first; advanced fields optional."""
+
+    if action.id is None:
+        return
+    player_options = _action_player_options(players)
+    if not player_options:
+        st.warning("Add the hand's players before editing actions.")
+        return
+
+    labels = list(player_options)
+    current_label = next(
+        (
+            label
+            for label, player in player_options.items()
+            if player.player_key == action.player_key
+        ),
+        next(
+            (
+                label
+                for label, player in player_options.items()
+                if player.player_name == action.player_name
+                and (
+                    not action.position
+                    or player.position == action.position
+                )
+            ),
+            labels[0],
+        ),
+    )
+    advanced_key = f"action_advanced_{action.id}"
+    show_advanced = st.checkbox(
+        "More fields (order, pot/stack before, forced posts)",
+        key=advanced_key,
+    )
+
+    with st.form(f"edit_action_{action.id}"):
+        street_col, who_col, did_col, amount_col = st.columns(4)
+        street = street_col.selectbox(
+            "Street",
+            STREETS,
+            index=STREETS.index(action.street) if action.street in STREETS else 0,
+        )
+        who_label = who_col.selectbox(
+            "Who",
+            labels,
+            index=labels.index(current_label),
+        )
+        action_type = did_col.selectbox(
+            "Action",
+            ACTION_TYPES,
+            index=(
+                ACTION_TYPES.index(action.action_type)
+                if action.action_type in ACTION_TYPES
+                else 0
+            ),
+        )
+        amount = amount_col.number_input(
+            "Amount (BB)",
+            min_value=0.0,
+            value=action.amount,
+            placeholder="Not applicable",
+        )
+
+        action_index = action.action_index or 1
+        notes = action.notes or ""
+        semantics = action.amount_semantics
+        pot_before = action.pot_before
+        stack_before = action.stack_before
+        forced_bet_type = action.forced_bet_type or ""
+        live_post_value = (
+            "unspecified"
+            if action.is_live_post is None
+            else "live"
+            if action.is_live_post
+            else "dead"
+        )
+        if show_advanced:
+            st.caption("Usually leave these alone unless the ledger still fails.")
+            order_col, notes_col = st.columns([1, 2])
+            action_index = order_col.number_input(
+                "Order",
+                min_value=1,
+                value=int(action.action_index or 1),
+                step=1,
             )
-            player_name = cols[2].text_input("Player", value=action.player_name)
-            action_type = cols[3].selectbox(
-                "Action", ACTION_TYPES, index=ACTION_TYPES.index(action.action_type)
-            )
-            amount = cols[4].number_input(
-                "Amount (BB)",
-                min_value=0.0,
-                value=action.amount,
-                placeholder="Not applicable",
-            )
-            action_index = cols[5].number_input(
-                "Order", min_value=1, value=action.action_index or 1, step=1
-            )
-            notes = cols[6].text_input("Notes", value=action.notes)
-            semantics_col, pot_col, stack_col, post_col = st.columns(4)
+            notes = notes_col.text_input("Notes", value=action.notes or "")
+            semantics_col, pot_col, stack_col = st.columns(3)
             semantics = semantics_col.selectbox(
                 "Amount meaning",
                 ["incremental", "raise_to", "unknown"],
-                index=["incremental", "raise_to", "unknown"].index(action.amount_semantics),
-                help="Incremental means chips added now. Raise-to means the total committed this street.",
+                index=["incremental", "raise_to", "unknown"].index(
+                    action.amount_semantics
+                    if action.amount_semantics
+                    in {"incremental", "raise_to", "unknown"}
+                    else "unknown"
+                ),
+                help=(
+                    "Incremental = chips added now. "
+                    "Raise-to = total committed this street."
+                ),
             )
             pot_before = pot_col.number_input(
-                "Pot before (BB)", min_value=0.0, value=action.pot_before
+                "Pot before (BB)",
+                min_value=0.0,
+                value=action.pot_before,
             )
             stack_before = stack_col.number_input(
-                "Stack before (BB)", min_value=0.0, value=action.stack_before
+                "Stack before (BB)",
+                min_value=0.0,
+                value=action.stack_before,
             )
             forced_options = [
                 "",
@@ -4702,6 +5172,7 @@ def show_action_editor_contents(
                 "dead_blind",
                 "bring_in",
             ]
+            post_col, status_col = st.columns(2)
             forced_bet_type = post_col.selectbox(
                 "Forced post",
                 forced_options,
@@ -4711,127 +5182,114 @@ def show_action_editor_contents(
                     else 0
                 ),
             )
-            live_post_value = post_col.selectbox(
+            live_post_value = status_col.selectbox(
                 "Post status",
                 ["unspecified", "live", "dead"],
-                index=(0 if action.is_live_post is None else 1 if action.is_live_post else 2),
+                index=(
+                    0
+                    if action.is_live_post is None
+                    else 1
+                    if action.is_live_post
+                    else 2
+                ),
             )
-            correction_reason = st.text_input(
-                "Correction reason",
-                placeholder="What did reconstruction get wrong?",
-                key=f"action_correction_reason_{action.id}",
-            )
-            update, delete = st.columns(2)
-            submitted_update = update.form_submit_button("Update action")
-            submitted_delete = delete.form_submit_button("Delete action")
 
-        if submitted_update:
-            if not correction_reason.strip():
-                st.error("Add a correction reason so this example can be learned from.")
-                continue
-            matches = [
-                player
-                for player in players
-                if player.player_name == player_name
-                and (not position or player.position == position)
-            ]
-            if len(matches) != 1:
-                matches = [player for player in players if player.player_name == player_name]
-            if len(matches) != 1:
-                st.error("The action must match exactly one saved player.")
-                continue
-            try:
-                db.update_action(
-                    Action(
-                        id=action.id,
-                        hand_id=action.hand_id,
-                        player_key=matches[0].player_key,
-                        street=street,
-                        action_index=int(action_index),
-                        player_name=player_name,
-                        position=position,
-                        action_type=action_type,
-                        amount=amount,
-                        amount_semantics=semantics,
-                        forced_bet_type=forced_bet_type or None,
-                        is_live_post=(
-                            None if live_post_value == "unspecified" else live_post_value == "live"
-                        ),
-                        pot_before=pot_before,
-                        stack_before=stack_before,
-                        notes=notes,
-                    ),
-                    correction_notes=correction_reason,
-                )
-            except (ValidationError, ValueError) as exc:
-                st.error(f"Could not update action: {exc}")
-            else:
-                st.rerun()
-        if submitted_delete:
-            if not correction_reason.strip():
-                st.error("Add a correction reason before deleting this action.")
-                continue
-            db.delete_action(action.id, correction_notes=correction_reason)
-            st.rerun()
+        correction_reason = st.text_input(
+            "Why are you changing this?",
+            placeholder="e.g. video shows a call, not a fold",
+            key=f"action_correction_reason_{action.id}",
+        )
+        save_col, delete_col = st.columns(2)
+        submitted_update = save_col.form_submit_button("Save", type="primary")
+        submitted_delete = delete_col.form_submit_button("Delete this action")
 
-    with st.expander("Add missing action"):
-        if not players:
-            st.warning("Add the hand's players before adding a corrected action.")
+    player = player_options[who_label]
+    if submitted_update:
+        if not correction_reason.strip():
+            st.error("Say briefly why this line is wrong so the change is auditable.")
             return
-        player_labels = {
-            f"{player.player_name} · {player.position or 'unknown'} · {player.player_key[:8]}": player
-            for player in players
-        }
-        with st.form(f"add_corrected_action_{players[0].hand_id}"):
-            player_label = st.selectbox("Player", list(player_labels))
-            player = player_labels[player_label]
-            first, second, third = st.columns(3)
-            street = first.selectbox("Street", STREETS)
-            action_type = second.selectbox("Action", ACTION_TYPES)
-            amount = third.number_input(
-                "Amount (BB)", min_value=0.0, value=None, placeholder="Not applicable"
-            )
-            semantics = st.selectbox(
-                "Amount meaning", ["incremental", "raise_to", "unknown"]
-            )
-            pot_before = st.number_input(
-                "Pot before (BB)", min_value=0.0, value=None, placeholder="Unknown"
-            )
-            stack_before = st.number_input(
-                "Stack before (BB)", min_value=0.0, value=None, placeholder="Unknown"
-            )
-            notes = st.text_input("Action notes")
-            correction_reason = st.text_input(
-                "Correction reason",
-                placeholder="Example: missed Hero call between the flop bet and turn",
-            )
-            submitted = st.form_submit_button("Add corrected action")
-        if submitted:
-            if not correction_reason.strip():
-                st.error("Add a correction reason so this example can be learned from.")
-                return
-            try:
-                db.create_corrected_action(
-                    Action(
-                        hand_id=player.hand_id,
-                        player_key=player.player_key,
-                        street=street,
-                        player_name=player.player_name,
-                        position=player.position,
-                        action_type=action_type,
-                        amount=_optional_float(amount),
-                        amount_semantics=semantics,
-                        pot_before=_optional_float(pot_before),
-                        stack_before=_optional_float(stack_before),
-                        notes=notes.strip(),
+        try:
+            db.update_action(
+                Action(
+                    id=action.id,
+                    hand_id=action.hand_id,
+                    player_key=player.player_key,
+                    street=street,
+                    action_index=int(action_index),
+                    player_name=player.player_name,
+                    position=player.position,
+                    action_type=action_type,
+                    amount=amount,
+                    amount_semantics=semantics,
+                    forced_bet_type=forced_bet_type or None,
+                    is_live_post=(
+                        None
+                        if live_post_value == "unspecified"
+                        else live_post_value == "live"
                     ),
-                    correction_notes=correction_reason,
-                )
-            except (sqlite3.IntegrityError, ValidationError, ValueError) as exc:
-                st.error(f"Could not add action: {exc}")
-            else:
-                flash("Corrected action added.")
-                st.rerun()
+                    pot_before=pot_before,
+                    stack_before=stack_before,
+                    notes=notes,
+                ),
+                correction_notes=correction_reason,
+            )
+        except (ValidationError, ValueError) as exc:
+            st.error(f"Could not update action: {exc}")
+        else:
+            flash("Action updated.")
+            st.rerun()
+    if submitted_delete:
+        if not correction_reason.strip():
+            st.error("Say briefly why you are deleting this action.")
+            return
+        db.delete_action(action.id, correction_notes=correction_reason)
+        flash("Action deleted.")
+        st.rerun()
+
+
+def _show_add_corrected_action(db: PokerDatabase, players: list[HandPlayer]) -> None:
+    if not players:
+        st.warning("Add the hand's players before adding a corrected action.")
+        return
+    player_options = _action_player_options(players)
+    with st.form(f"add_corrected_action_{players[0].hand_id}"):
+        street_col, who_col, did_col, amount_col = st.columns(4)
+        street = street_col.selectbox("Street", STREETS)
+        who_label = who_col.selectbox("Who", list(player_options))
+        action_type = did_col.selectbox("Action", ACTION_TYPES)
+        amount = amount_col.number_input(
+            "Amount (BB)", min_value=0.0, value=None, placeholder="Not applicable"
+        )
+        correction_reason = st.text_input(
+            "Why are you adding this?",
+            placeholder="e.g. missed Hero call between the flop bet and turn",
+        )
+        submitted = st.form_submit_button("Add action", type="primary")
+    if submitted:
+        if not correction_reason.strip():
+            st.error("Say briefly why this action was missing.")
+            return
+        player = player_options[who_label]
+        try:
+            db.create_corrected_action(
+                Action(
+                    hand_id=player.hand_id,
+                    player_key=player.player_key,
+                    street=street,
+                    player_name=player.player_name,
+                    position=player.position,
+                    action_type=action_type,
+                    amount=_optional_float(amount),
+                    amount_semantics="unknown",
+                    notes="",
+                ),
+                correction_notes=correction_reason,
+            )
+        except (sqlite3.IntegrityError, ValidationError, ValueError) as exc:
+            st.error(f"Could not add action: {exc}")
+        else:
+            flash("Action added.")
+            st.rerun()
 
 
 def show_import_export(db: PokerDatabase, session: Session) -> None:

@@ -32,7 +32,9 @@ Study shows one task at a time:
    to update the single table replay to that moment, including the street board,
    pot, remaining stacks, folded seats, and highlighted actor. Table stacks, pot,
    and results always show an explicit **BB** unit.
-2. **Fix & confirm** — resolve blockers and open only the correction tool needed.
+2. **Fix & confirm** — **Approve** if the hand looks right, or **Edit the hand —
+   Fix** to open each action and change Who / Action / Amount. Cards, players,
+   and chips live under **Other fixes**.
 3. **Analyze** — use quick math, TexasSolver, coaching, or notes.
 
 ## Local setup
@@ -98,7 +100,7 @@ The Import workflow connects a saved video to the existing two-model CV pipeline
 9. Retain before/after audit records, reconcile the ledger, and rerun coaching
    before marking the hand reviewed.
 
-Only one local processing job can run at a time. On restart, dead or stale workers are marked failed instead of remaining stuck. SQLite uses WAL mode so the UI can continue reading while the worker writes.
+Only one local processing job can run at a time. On restart, dead or stale workers are marked failed instead of remaining stuck. SQLite uses WAL mode so the UI can continue reading while the worker writes. Reconstruction uses Apple MPS or CUDA when available (same models/weights); set `POKER_CV_DEVICE=cpu` to force CPU.
 
 Corrections are written transactionally to SQLite. Editing hand facts, players,
 or actions changes CV imports to `corrected_cv`, records the original and
@@ -339,9 +341,12 @@ remaining postflop ranges.
 ### Using the integration
 
 1. Open **Study** and choose a completed hand.
-2. In **Fix & confirm**, correct any cards, positions, players, or actions and
-   reconcile the chip ledger. **Show exact requirements** explains each blocker.
-3. Confirm imported/reconstructed evidence after it matches the recording.
+2. In **Fix & confirm**, choose **Edit the hand — Fix** and open any wrong
+   action to change Who / Action / Amount. Use **Other fixes** for cards,
+   players, or chip accounting. A late-joined recording can still be finalized
+   if you reconstructed the whole hand — use **Finalize incomplete hand**.
+   What's blocking study lists each remaining check.
+3. When the line looks right, choose **Looks good — Approve** and confirm.
 4. Open **Analyze → TexasSolver**. The app checks eligibility and explains every
    item that still needs correction.
 5. Confirm the automatically selected heads-up street, pot, and effective stack.

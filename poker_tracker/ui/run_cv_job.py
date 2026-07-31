@@ -35,6 +35,23 @@ HEARTBEAT_INTERVAL_SECONDS = 2
 __all__ = ["BACKUP_KEEP_COUNT", "backup_database", "run_job", "main"]
 
 
+def _pipeline_device() -> str:
+    """Prefer Apple MPS / CUDA when present; same weights, less wall time."""
+    forced = (os.environ.get("POKER_CV_DEVICE") or "").strip().lower()
+    if forced in {"cpu", "mps", "cuda"}:
+        return forced
+    try:
+        import torch
+
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
 class JobCancelled(Exception):
     """Raised when the operator cancels an active reconstruction job."""
 
@@ -90,7 +107,7 @@ def run_job(
             "--interval",
             "1",
             "--device",
-            "cpu",
+            _pipeline_device(),
             "--out",
             str(timeline_path),
             "--frame-dir",

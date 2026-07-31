@@ -340,7 +340,7 @@ def evaluate_study_readiness(
                 ),
                 clearing_action=(
                     "Tick 'I have read the evidence above and confirm this hand is "
-                    "correct' under Fix & confirm → Confirm the saved hand."
+                    "correct' under Fix & confirm → Looks good — Approve."
                 ),
             )
         )
@@ -452,7 +452,11 @@ def _completion_reason(status: CompletionStatus, evidence: CompletionEvidence) -
                 "not agree: it records neither a truncated start nor a truncated "
                 "end. The more restrictive classification stands."
             )
-        return f"The recording does not contain the whole hand; {truncation}."
+        return (
+            f"The recording does not contain the whole hand; {truncation}. "
+            "That is fine if you reconstructed every action yourself — finalize "
+            "the draft after filling facts."
+        )
     if status == "not_applicable":
         return "This hand claims a reconstructed source but declares no completion evidence."
     return "The pipeline could not prove this hand was fully reconstructed."
@@ -473,12 +477,13 @@ def _completion_clearing_action(
                 "corrected in the meantime."
             )
         return (
-            "Fill in the missing facts under Fix & confirm → Correct hand facts, "
-            "then use Fix & confirm → Finalize incomplete hand to attest that you "
-            "completed this draft yourself. A partial hand never becomes complete "
-            "from footage that is not in the recording — only an explicit operator "
-            "finalize clears sticky truncation. Alternatively, "
-            f"{NEW_RECONSTRUCTION_STEPS}"
+            "Fill in the missing facts under Fix & confirm → Edit the hand — Fix → "
+            "Other fixes → Hand facts (and edit any missing actions), acknowledge "
+            "remaining source warnings, then use Other fixes → Finalize incomplete "
+            "hand to attest that you reconstructed the whole hand yourself — even "
+            "when the recording joined late. Sticky truncation and pipeline "
+            "rejection codes stay in the audit trail; only this finalize clears "
+            f"them for study. Alternatively, {NEW_RECONSTRUCTION_STEPS}"
         )
     if status == "not_applicable":
         return (
@@ -487,15 +492,17 @@ def _completion_clearing_action(
             f"manual after the fact. To rebuild it, {NEW_RECONSTRUCTION_STEPS}"
         )
     if evidence.rejection_codes:
-        # A rejection is the pipeline refusing the hand. acknowledge_codes will not
-        # accept one and no correction writer rewrites rejection_codes, so telling
-        # the operator to correct fields and acknowledge warnings was a false
-        # promise: they could do exactly that and stay blocked forever.
+        # Acknowledge cannot clear a rejection. Operator finalize can, once the
+        # operator has reconstructed the gaps (late join, OCR holes, etc.).
         return (
-            "Only a new reconstruction clears this. The pipeline rejected "
-            f"{', '.join(evidence.rejection_codes)}, and a rejection cannot be "
-            f"acknowledged or corrected away — {NEW_RECONSTRUCTION_STEPS} If the "
-            "reconstruction reproduces the same code, record a debugging issue "
+            "The pipeline rejected "
+            f"{', '.join(evidence.rejection_codes)}. A rejection cannot be "
+            "acknowledged away. If you reconstructed the whole hand yourself, "
+            "acknowledge any remaining source warnings, then use Fix & confirm → "
+            "Edit the hand — Fix → Other fixes → Finalize incomplete hand. "
+            f"Alternatively, only a new reconstruction clears this: "
+            f"{NEW_RECONSTRUCTION_STEPS} If the reconstruction reproduces the "
+            "same code and you cannot fill the gaps, record a debugging issue "
             "instead of promoting the hand."
         )
     if not evidence.is_known:
@@ -503,7 +510,7 @@ def _completion_clearing_action(
         # completion_evidence at '{}' rather than fabricating evidence for
         # historical hands. There is nothing to correct and nothing to
         # acknowledge, and no writer reachable from the UI can attach evidence to
-        # an existing hand, so naming Correct hand facts and the Source warnings
+        # an existing hand, so naming Hand facts and the Source warnings
         # panel promised two actions that cannot clear it -- and the panel is not
         # even drawn, because it renders only when the evidence carries a code.
         return (
@@ -525,7 +532,7 @@ def _completion_clearing_action(
             f"reconstruction writes those: {NEW_RECONSTRUCTION_STEPS}"
         )
     return (
-        "Fix the flagged fields in Correct hand facts, then acknowledge each remaining "
+        "Fix the flagged fields in Hand facts, then acknowledge each remaining "
         "source warning in the Source warnings panel. The hand becomes complete when "
         "both boundaries are observed and no unresolved warning remains."
     )
@@ -569,7 +576,7 @@ def _card_blockers(
             category="cards",
             reason="The hero and board cards are not a valid, unique set.",
             clearing_action=(
-                "Open Correct hand facts and fix the hero and board cards; every "
+                "Open Hand facts and fix the hero and board cards; every "
                 "visible card must appear exactly once and the board must hold 0, 3, "
                 "4, or 5 cards."
             ),
@@ -606,7 +613,7 @@ def _unreadable_column_blockers(evidence: CompletionEvidence) -> list[StudyBlock
                 "conservative fallbacks, not the stored record."
             ),
             clearing_action=(
-                "Open Correct hand facts and re-enter the listed fields; saving "
+                "Open Hand facts and re-enter the listed fields; saving "
                 "the correction rewrites every editable column. A listed column "
                 "that form does not edit (for example confidence_score or "
                 "created_at) cannot be repaired in the product: keep the hand "
@@ -716,7 +723,7 @@ def _layout_blockers(hand: Hand, evidence: CompletionEvidence) -> list[StudyBloc
     if hand.table_size is None:
         detail.append("hand.table_size is not recorded")
         actions.append(
-            "Record the table size in Correct hand facts: that column is the "
+            "Record the table size in Hand facts: that column is the "
             "hand's own, and typing it clears this line."
         )
     elif evidence.table_size is not None and hand.table_size != evidence.table_size:
@@ -726,7 +733,7 @@ def _layout_blockers(hand: Hand, evidence: CompletionEvidence) -> list[StudyBloc
         )
         actions.append(
             "The recorded table size and the reconstructed one disagree. Set the "
-            "table size in Correct hand facts to the seat count the recording "
+            "table size in Hand facts to the seat count the recording "
             "shows, or re-run the reconstruction if the evidence is the wrong one."
         )
     if "hero_seat_mismatch" in evidence.unresolved_warning_codes:
@@ -773,16 +780,16 @@ def _accounting_blockers(
     # blocker used to name that panel for both branches, so following it literally
     # could not clear the blocker; the panel's own inline caption already said so.
     clearing_action = (
-        "Open the session's hand editor and correct the stack sizes, action "
-        "amounts, or player identities the ledger rejected — the Accounting "
-        "reconciliation panel cannot change them. Reopen Fix & confirm → "
-        "Accounting reconciliation afterwards and save the settlement until its "
+        "Open Fix & confirm → Edit the hand — Fix and correct the stack sizes, "
+        "action amounts, or players the ledger rejected — the Accounting "
+        "reconciliation panel cannot change them. Reopen Other fixes → "
+        "Chip stacks / accounting afterwards and save the settlement until its "
         "status reads reconciled."
         if accounting_error
         else (
-            "Open Fix & confirm → Accounting reconciliation, fix the flagged "
-            "contributions or awards, and save the settlement until its status "
-            "reads reconciled."
+            "Open Fix & confirm → Edit the hand — Fix → Other fixes → "
+            "Chip stacks / accounting, fix the flagged contributions or awards, "
+            "and save the settlement until its status reads reconciled."
         )
     )
     return [
@@ -861,9 +868,10 @@ def _assumption_blockers(
                 "hero result are not established by the recording alone."
             ),
             clearing_action=(
-                "Open Fix & confirm → Accounting reconciliation and press "
+                "Open Fix & confirm → Edit the hand — Fix → Other fixes → "
+                "Chip stacks / accounting (Accounting reconciliation) and press "
                 "'Confirm this assumption' beside each listed assumption, which "
-                "records the exact chip movement you are attesting to. Confirming "
+                "records the exact chip movement you are attesting to. Approving "
                 "the hand as a whole does not clear this. If the chips did not "
                 "move that way, correct the declared winner, the rake policy or "
                 "the dead money there instead and save the settlement — a "
@@ -910,12 +918,20 @@ def _source_warning_blockers(evidence: CompletionEvidence) -> list[StudyBlocker]
     button. It also directly contradicted COMPLETION_NOT_COMPLETE, rendered on
     the same page, which reports the same code correctly. The blocker still fires
     on exactly the same evidence; only what it says about it is now true.
+
+    After operator finalize, rejection codes remain in the audit trail but no
+    longer block study — that attestation is the override for late-join /
+    operator-filled reconstructions.
     """
-    unresolved = evidence.unresolved_codes
+    warnings = evidence.unresolved_warning_codes
+    rejections = (
+        ()
+        if has_operator_manual_completion(evidence)
+        else evidence.unresolved_rejection_codes
+    )
+    unresolved = tuple([*rejections, *warnings])
     if not unresolved:
         return []
-    rejections = evidence.unresolved_rejection_codes
-    warnings = evidence.unresolved_warning_codes
 
     reasons: list[str] = []
     actions: list[str] = []
@@ -925,9 +941,10 @@ def _source_warning_blockers(evidence: CompletionEvidence) -> list[StudyBlocker]
             "fact(s), which is a refusal rather than a note you can accept."
         )
         actions.append(
-            "Only a new reconstruction clears "
-            f"{', '.join(rejections)}: {NEW_RECONSTRUCTION_STEPS} A rejection cannot "
-            "be acknowledged or corrected away."
+            "A rejection cannot be acknowledged away. If you reconstructed the "
+            "whole hand yourself, acknowledge remaining warnings then use "
+            "Finalize incomplete hand. Alternatively, only a new reconstruction "
+            f"clears {', '.join(rejections)}: {NEW_RECONSTRUCTION_STEPS}"
         )
     if warnings:
         reasons.append(

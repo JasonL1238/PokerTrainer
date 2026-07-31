@@ -1407,11 +1407,14 @@ class PokerDatabase:
     ) -> Hand:
         """Operator attestation that an incomplete CV draft is now complete.
 
-        This is the only writer allowed to clear sticky partial truncation. The
-        operator must already have filled hero cards. Pipeline observation fields
-        (partial flags, boundary confidence, evidence_version, terminal_event) are
-        preserved; the operator claim lives under ``operator_manual_completion``
-        and ``operator_terminal_event``.
+        This is the only writer allowed to clear sticky partial truncation and to
+        override pipeline rejection codes by reconstructing gaps by hand (for
+        example a recording that joined late on preflop). The operator must
+        already have filled hero cards and acknowledged remaining warnings.
+        Pipeline observation fields (partial flags, rejection codes, boundary
+        confidence, evidence_version, terminal_event) are preserved; the operator
+        claim lives under ``operator_manual_completion`` and
+        ``operator_terminal_event``.
         """
         if terminal_event not in {"showdown", "fold_win", "hero_fold"}:
             raise ValueError(
@@ -1458,11 +1461,13 @@ class PokerDatabase:
             )
         if has_operator_manual_completion(previous):
             raise ValueError("This hand has already been finalized by the operator.")
-        if previous.rejection_codes:
+        # Rejection codes stay in evidence for audit, but finalize may override
+        # them: a late-joined recording often rejects on coverage/OCR gaps even
+        # when the operator reconstructed the whole action line by observation.
+        if previous.rejection_codes and not notes.strip():
             raise ValueError(
-                "This reconstruction was refused by the pipeline. Re-run "
-                "reconstruction or enter the hand manually; finalize cannot "
-                "override a rejection."
+                "Add finalize notes explaining how you reconstructed the "
+                "pipeline-rejected gaps (for example late join on preflop)."
             )
         # Preserve every pipeline observation. Attestation is additive only.
         payload = dump_completion_evidence(previous)

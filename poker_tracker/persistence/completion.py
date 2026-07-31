@@ -512,12 +512,16 @@ def derive_completion_status(
         # those are a measurement that satisfies this gate, so they fail closed
         # the same way NaN (unreadable, parsed to None) already did.
         return "uncertain"
-    if evidence.rejection_codes:
-        # A rejection code is the pipeline refusing the hand, not a note the user
-        # may accept. It is checked before unresolved_codes so that a hand-edited
-        # acknowledged_codes list cannot launder one into a promotion.
+    if not operator_completed and evidence.rejection_codes:
+        # A rejection is a pipeline refusal, not an acknowledgeable note. An
+        # edited acknowledged_codes list cannot launder one into a promotion.
+        # Operator finalize is the deliberate override: late-join footage can
+        # still yield a full reconstructed hand once the operator fills gaps.
         return "uncertain"
-    if evidence.unresolved_codes:
+    if evidence.unresolved_warning_codes:
+        # Warnings stay operator-acknowledgeable even after finalize. Rejections
+        # are intentionally excluded here so attestation is not undone by the
+        # permanently-unresolved rejection half of unresolved_codes.
         return "uncertain"
     return "complete"
 
