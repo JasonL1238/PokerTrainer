@@ -50,3 +50,10 @@ This is a local-first post-session poker study and review platform.
 - Install: pip install -r requirements.txt
 - Test: pytest
 - App: streamlit run app.py
+
+## Cursor Cloud specific instructions
+- Dependencies live in a virtualenv at `.venv` (the system Python 3.12 is externally managed, so a venv is used). Run tools through it: `.venv/bin/pytest -q`, `.venv/bin/ruff check .`, `.venv/bin/mypy`, and `.venv/bin/streamlit run app.py`.
+- The env installs the full CV/video stack (`requirements-cv.txt` plus `ultralytics==8.3.203 --no-deps`) and system `ffmpeg`, not just base `requirements.txt`. The CV/video tests (`tests/test_cv_jobs.py`, `tests/test_video_ingest.py`, etc.) hard-fail with `ModuleNotFoundError: av` without this stack, so keep it installed.
+- The app serves on `:8501` with health at `/_stcore/health`. The SQLite DB and `data/` subdirs are created lazily on the first browser load of the UI (not by the health check). Override locations with `POKER_DB_PATH` / `POKER_DATA_DIR`; no password is needed locally.
+- Pre-existing repo state (not an environment problem): `main` currently fails CI at the `ruff check .` lint step (10 errors) before tests run, and a handful of tests fail on the current loose-pinned dependency set (resolves to streamlit 1.60, ruff 0.16, torch 2.8). The multi-hand paste "Save hands" flow raises a `StreamlitAPIException` under streamlit 1.60, though the hand still persists. Do not treat these as setup regressions.
+- End-to-end CV video reconstruction additionally needs model weights under `cv_lab/models/` (`region_spine_v1.pt`, `card_cls_v1.pt`, `card_templates.npz`, `pot_digits.npz`); these are gitignored and absent from a fresh clone (only `ocr_templates.npz` is committed), so the Import video pipeline cannot run fully without supplying them.
