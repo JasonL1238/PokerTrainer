@@ -276,6 +276,7 @@ _NAMED_CONTROLS: tuple[str, ...] = (
     "ROI calibration",
     "Run CV reconstruction",
     "Looks good — Approve",
+    "Approve and next",
     "Re-import this hand",
 )
 
@@ -288,6 +289,7 @@ _APP_CONTROL_LABELS: tuple[str, ...] = (
     "AI coach",
     "TexasSolver",
     "Looks good — Approve",
+    "Approve and next",
     "ROI calibration",
     "Run CV reconstruction",
     "Videos",

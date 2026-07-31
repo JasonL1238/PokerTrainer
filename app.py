@@ -402,30 +402,56 @@ def hand_study_readiness(
     )
 
 
+def _readiness_allows_reviewed(readiness: StudyReadiness) -> bool:
+    return readiness.is_ready or (
+        readiness.codes() == ("STUDY_EXCLUDED_BY_OPERATOR",)
+    )
+
+
+def approve_hand_for_study(
+    db: PokerDatabase,
+    hand: Hand,
+    readiness: StudyReadiness,
+    *,
+    announce: bool = True,
+) -> bool:
+    """Promote one hand to reviewed through the same guard as every other surface.
+
+    Caller must pass readiness evaluated with ``user_confirmed=True`` when the
+    hand requires confirmation — Approve and next / batch approve are that click.
+    """
+    return guarded_update_hand_status(
+        db, hand, readiness, "reviewed", announce=announce
+    )
+
+
 def guarded_update_hand_status(
     db: PokerDatabase,
     hand: Hand,
     readiness: StudyReadiness,
     status: str,
+    *,
+    announce: bool = True,
 ) -> bool:
     """Single choke point for review-status writes; refuses to promote a blocked hand."""
 
-    trust_ready = readiness.is_ready or (
-        readiness.codes() == ("STUDY_EXCLUDED_BY_OPERATOR",)
-    )
+    trust_ready = _readiness_allows_reviewed(readiness)
     if status == "reviewed" and not trust_ready:
-        st.error(
-            "This hand is not study-ready. Clear the blockers listed above before "
-            "marking it reviewed."
-        )
+        if announce:
+            st.error(
+                "This hand is not study-ready. Clear the blockers listed above before "
+                "marking it reviewed."
+            )
         return False
     if hand.id is None:
-        st.error("This hand has not been saved yet.")
+        if announce:
+            st.error("This hand has not been saved yet.")
         return False
     try:
         db.update_hand_status(hand.id, status)
     except ValueError as exc:
-        st.error(str(exc))
+        if announce:
+            st.error(str(exc))
         return False
     return True
 
@@ -442,9 +468,7 @@ def review_status_options(hand: Hand, readiness: StudyReadiness) -> tuple[list[s
     Non-study preference alone does not block archival review: exclusion from
     coaching is not the same as "this hand's facts are untrustworthy."
     """
-    trust_ready = readiness.is_ready or (
-        readiness.codes() == ("STUDY_EXCLUDED_BY_OPERATOR",)
-    )
+    trust_ready = _readiness_allows_reviewed(readiness)
     options = [
         item for item in REVIEW_STATUSES if item != "reviewed" or trust_ready
     ]
@@ -553,7 +577,7 @@ def study_fix_groups(
         ),
         "confirmation": (
             "Confirm the saved hand",
-            "Fix & confirm → Looks good — Approve",
+            "Fix & confirm → Looks good — Approve → Approve and next",
         ),
     }
     evidence_codes = {
@@ -1109,56 +1133,9 @@ def show_hand_issue_queue(
                 st.rerun()
 
 
-def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
-    page_header(
-        "Study",
-        "Replay the hand, inspect the evidence, and turn one completed decision into a reusable lesson.",
-    )
-    sessions = db.fetch_sessions()
-    accounting_cache = new_accounting_cache()
-    all_hands = _hands_with_accounting_results(db, db.fetch_all_hands(), accounting_cache)
-    if not all_hands:
-        empty_state("Nothing queued for study", "Import or add a completed hand first.")
-        return
-    # Non-study hands stay in the library but drop out of the Study queue.
-    # Marking a hand as Study pins it ahead of Auto hands in navigation.
-    study_queue = [
-        hand for hand in all_hands
-        if hand.id is not None and hand.study_inclusion != "skip"
-    ]
-    if not study_queue:
-        empty_state(
-            "No study hands queued",
-            "Every hand is marked non-study. Change Study inclusion on a hand to reopen it here.",
-        )
-        return
-    available_ids = {hand.id for hand in study_queue}
-    requested = st.session_state.get("study_hand_id")
-    if requested not in available_ids:
-        # Keep an explicitly requested non-study hand visible so the operator
-        # can change Study inclusion without the picker silently swapping hands.
-        requested_hand = next((item for item in all_hands if item.id == requested), None)
-        if (
-            requested_hand is not None
-            and requested_hand.study_inclusion == "skip"
-            and requested_hand.id is not None
-        ):
-            study_queue = [requested_hand]
-            available_ids = {requested_hand.id}
-            st.warning(
-                f"Hand #{requested_hand.hand_number} is marked non-study. "
-                "Change Study inclusion below to return it to the queue."
-            )
-        else:
-            session_hands = [
-                hand for hand in study_queue if session and hand.session_id == session.id
-            ]
-            requested = (session_hands or study_queue)[0].id
-            _set_study_hand_id(requested)
-    hand = next(item for item in study_queue if item.id == requested)
-    hand_session = next(item for item in sessions if item.id == hand.session_id)
-    ordered = sorted(
-        (item for item in study_queue if item.session_id == hand.session_id),
+def _sort_study_queue(hands: list[Hand]) -> list[Hand]:
+    return sorted(
+        (hand for hand in hands if hand.id is not None),
         key=lambda item: (
             0 if item.study_inclusion == "study" else 1,
             item.hand_number,
@@ -1166,19 +1143,192 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
         ),
     )
 
+
+def _study_queue_for_session(hands: list[Hand]) -> list[Hand]:
+    """Session hands in the Study queue (non-skip). No accounting substitution."""
+
+    return _sort_study_queue(
+        [
+            hand
+            for hand in hands
+            if hand.id is not None and hand.study_inclusion != "skip"
+        ]
+    )
+
+
+def load_study_session_hands(
+    db: PokerDatabase,
+    sessions: list[Session],
+    preferred_session: Session | None,
+    requested_hand_id: int | None,
+) -> tuple[Session | None, list[Hand], Hand | None]:
+    """Load one session's Study queue without reconciling every hand in the DB.
+
+    Returns ``(hand_session, ordered_queue, forced_skip_hand)``. When the
+    operator opened a non-study hand, ``forced_skip_hand`` is that row so
+    inclusion can be changed without silently swapping hands.
+    """
+
+    if requested_hand_id is not None:
+        requested_hand = db.fetch_hand(requested_hand_id)
+        if requested_hand is not None and requested_hand.study_inclusion == "skip":
+            hand_session = next(
+                (item for item in sessions if item.id == requested_hand.session_id),
+                None,
+            )
+            return hand_session, [requested_hand], requested_hand
+
+    session_order: list[Session] = []
+    if preferred_session is not None:
+        session_order.append(preferred_session)
+    session_order.extend(
+        item
+        for item in sessions
+        if preferred_session is None or item.id != preferred_session.id
+    )
+    if requested_hand_id is not None:
+        requested_hand = db.fetch_hand(requested_hand_id)
+        if requested_hand is not None:
+            match = next(
+                (item for item in sessions if item.id == requested_hand.session_id),
+                None,
+            )
+            if match is not None:
+                session_order = [match] + [
+                    item for item in session_order if item.id != match.id
+                ]
+
+    for candidate in session_order:
+        if candidate.id is None:
+            continue
+        ordered = _study_queue_for_session(db.fetch_hands_by_session(candidate.id))
+        if ordered:
+            return candidate, ordered, None
+    return preferred_session or (sessions[0] if sessions else None), [], None
+
+
+def _next_study_hand_id(ordered: list[Hand], current: Hand) -> int | None:
+    """Prefer the next unreviewed hand; otherwise the next hand in order."""
+
+    if current.id is None:
+        return None
+    indexed = [hand for hand in ordered if hand.id is not None]
+    try:
+        active_index = next(
+            index for index, hand in enumerate(indexed) if hand.id == current.id
+        )
+    except StopIteration:
+        return None
+    for hand in indexed[active_index + 1 :]:
+        if hand.review_status != "reviewed":
+            return hand.id
+    for hand in indexed[:active_index]:
+        if hand.review_status != "reviewed":
+            return hand.id
+    if active_index + 1 < len(indexed):
+        return indexed[active_index + 1].id
+    return None
+
+
+def _batch_approve_candidates(ordered: list[Hand]) -> list[Hand]:
+    return [
+        hand
+        for hand in ordered
+        if hand.id is not None
+        and hand.study_inclusion != "skip"
+        and hand.review_status != "reviewed"
+        and hand.completion_status in {"complete", "not_applicable"}
+    ]
+
+
+def _session_hands_ready_to_approve(
+    db: PokerDatabase,
+    candidates: list[Hand],
+    cache: AccountingCache,
+) -> list[tuple[Hand, StudyReadiness]]:
+    """Evaluate batch candidates once; confirmation is implied by the approve action."""
+
+    ready: list[tuple[Hand, StudyReadiness]] = []
+    for hand in candidates:
+        if hand.id is None:
+            continue
+        accounting, accounting_error = _reconcile_cached(db, hand.id, cache)
+        readiness = hand_study_readiness(
+            db,
+            hand,
+            accounting,
+            accounting_error,
+            user_confirmed=True,
+        )
+        if readiness.is_ready:
+            ready.append((hand, readiness))
+    return ready
+
+
+def approve_ready_hands_in_session(
+    db: PokerDatabase,
+    candidates: list[Hand],
+    cache: AccountingCache,
+) -> tuple[int, int]:
+    """Approve session hands that are study-ready with confirmation implied."""
+
+    ready = _session_hands_ready_to_approve(db, candidates, cache)
+    approved = 0
+    for hand, readiness in ready:
+        if approve_hand_for_study(db, hand, readiness, announce=False):
+            approved += 1
+    skipped = len(candidates) - approved
+    return approved, skipped
+
+
+def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
+    page_header(
+        "Study",
+        "Replay the hand, inspect the evidence, and turn one completed decision into a reusable lesson.",
+    )
+    sessions = db.fetch_sessions()
+    if not sessions:
+        empty_state("Nothing queued for study", "Import or add a completed hand first.")
+        return
+    accounting_cache = new_accounting_cache()
+    requested = st.session_state.get("study_hand_id")
+    hand_session, ordered, forced_skip = load_study_session_hands(
+        db, sessions, session, requested if isinstance(requested, int) else None
+    )
+    if forced_skip is not None:
+        st.warning(
+            f"Hand #{forced_skip.hand_number} is marked non-study. "
+            "Change Study inclusion below to return it to the queue."
+        )
+    if not ordered:
+        empty_state(
+            "No study hands queued",
+            "Every hand is marked non-study, or this session has no hands yet. "
+            "Change Study inclusion or pick another session.",
+        )
+        return
+    available_ids = {hand.id for hand in ordered if hand.id is not None}
+    if requested not in available_ids:
+        requested = ordered[0].id
+        _set_study_hand_id(requested)
+    hand = next(item for item in ordered if item.id == requested)
+    if hand_session is None:
+        hand_session = next(item for item in sessions if item.id == hand.session_id)
+
     actions = db.fetch_actions_by_hand(hand.id)
     players = db.fetch_players_by_hand(hand.id)
-    # The list above already reconciled this hand; a second build would be the
-    # same two ledgers over the same records.
+    # Reconcile only the open hand — not every hand in the database.
     accounting, accounting_error = _reconcile_cached(db, hand.id, accounting_cache)
     coaching_reviews = db.fetch_coaching_reviews_by_hand(hand.id)
     hand_issues = db.fetch_hand_issues(hand_id=hand.id)
     solver_runs = db.fetch_solver_runs_by_hand(hand.id)
     completion_evidence = parse_completion_evidence(hand.completion_evidence)
     is_reconstructed = is_reconstructed_hand(hand)
-    # Read before the widget renders: on the rerun after the tick, session state
-    # already holds the value, which is what makes the checkbox gate effective.
-    user_confirmed = bool(st.session_state.get(study_confirmation_key(hand, accounting), False))
+    # Legacy checkbox key still counts if present; Approve and next supplies
+    # confirmation without requiring that widget on the happy path.
+    user_confirmed = bool(
+        st.session_state.get(study_confirmation_key(hand, accounting), False)
+    )
     readiness = evaluate_study_readiness(
         hand,
         accounting=accounting,
@@ -1212,6 +1362,7 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
                 readiness,
             )
         with fix_tab:
+            render_study_session_batch_approve(db, ordered, accounting_cache)
             render_study_fix_and_confirm(
                 db,
                 hand,
@@ -1687,30 +1838,73 @@ def _render_study_saved_action_snapshot(actions: list[Action]) -> None:
     for index, action in enumerate(actions):
         st.markdown(study_action_label(action, index))
     st.caption(
-        "If this matches the recording, confirm below. "
+        "If this matches the recording, use Approve and next. "
         "If any line is wrong, switch to Edit the hand — Fix."
     )
+
+
+def render_study_session_batch_approve(
+    db: PokerDatabase,
+    ordered: list[Hand],
+    cache: AccountingCache,
+) -> None:
+    """Bulk-approve session hands that are already study-ready."""
+
+    candidates = _batch_approve_candidates(ordered)
+    if not candidates:
+        return
+    ready = _session_hands_ready_to_approve(db, candidates, cache)
+    if not ready:
+        st.caption(
+            f"{len(candidates)} unreviewed hand(s) in this session still have "
+            "blockers — fix them one at a time below."
+        )
+        return
+    st.info(
+        f"{len(ready)} hand(s) in this session are ready to approve "
+        f"({len(candidates)} unreviewed complete candidates checked)."
+    )
+    if st.button(
+        "Approve all ready in this session",
+        key="study_batch_approve_session",
+        type="primary",
+        width="stretch",
+    ):
+        approved = 0
+        for hand, readiness in ready:
+            if approve_hand_for_study(db, hand, readiness, announce=False):
+                approved += 1
+        flash(
+            f"Approved {approved} · skipped {len(candidates) - approved} still blocked."
+        )
+        st.rerun()
 
 
 def _render_study_approve_path(
     db: PokerDatabase,
     hand: Hand,
     accounting: AccountingReconciliation | None,
+    accounting_error: str | None,
     readiness: StudyReadiness,
     is_reconstructed: bool,
     completion_evidence: CompletionEvidence,
     ordered_hands: list[Hand] | None,
 ) -> None:
-    """Approve-only surface: confirm when the saved hand looks right."""
+    """Approve-only surface: one click confirms, marks reviewed, and advances."""
 
     fix_groups = [
         group
         for group in study_fix_groups(readiness)
         if group[0] != "Confirm the saved hand"
     ]
-    if readiness.is_ready:
-        st.success("Everything required is confirmed. This hand is ready to analyze.")
-    elif fix_groups:
+    if readiness.is_ready and hand.review_status == "reviewed":
+        st.success("This hand is approved and ready to analyze.")
+    elif not fix_groups:
+        st.info(
+            "Action line looks right? Approve and next confirms the hand, marks it "
+            "reviewed, and opens the next unreviewed hand."
+        )
+    else:
         st.warning(
             "Approve is blocked until the items below are fixed. "
             "Switch to Edit the hand — Fix, clear them, then come back here."
@@ -1719,20 +1913,66 @@ def _render_study_approve_path(
             st.markdown(f"**{title}**")
             for blocker in blockers:
                 st.write(f"• {blocker.reason}")
-    else:
-        st.info("Looks good? Confirm below to unlock trusted analysis.")
 
     can_confirm = not fix_groups
     if can_confirm and is_reconstructed:
         show_reconstruction_evidence(hand, completion_evidence)
         _offer_frame_validation_link(db, hand)
-    if can_confirm and hand_requires_user_confirmation(hand):
-        st.checkbox(
-            "I have read the evidence above and confirm this hand is correct",
-            key=study_confirmation_key(hand, accounting),
+
+    if can_confirm:
+        already_reviewed = hand.review_status == "reviewed"
+        approve_label = (
+            "Next unreviewed hand →"
+            if already_reviewed
+            else "Approve and next"
         )
-    with st.expander("Set review status", expanded=readiness.is_ready):
-        status_options, status_index = review_status_options(hand, readiness)
+        if st.button(
+            approve_label,
+            key=f"study_approve_next_{hand.id}",
+            type="primary",
+            width="stretch",
+        ):
+            if not already_reviewed:
+                confirmed_readiness = hand_study_readiness(
+                    db,
+                    hand,
+                    accounting,
+                    accounting_error,
+                    user_confirmed=True,
+                )
+                if not approve_hand_for_study(db, hand, confirmed_readiness):
+                    return
+                flash(f"Hand #{hand.hand_number} approved.")
+            if ordered_hands is not None:
+                next_id = _next_study_hand_id(ordered_hands, hand)
+                if next_id is not None and next_id != hand.id:
+                    _set_study_hand_id(next_id)
+            st.rerun()
+
+    with st.expander("Advanced review status", expanded=False):
+        st.caption(
+            "Escape hatch for status-only edits. Prefer Approve and next above."
+        )
+        if can_confirm and hand_requires_user_confirmation(hand):
+            st.checkbox(
+                "I have read the evidence above and confirm this hand is correct",
+                key=study_confirmation_key(hand, accounting),
+            )
+        confirmed_for_status = bool(
+            st.session_state.get(study_confirmation_key(hand, accounting), False)
+        )
+        status_readiness = (
+            hand_study_readiness(
+                db,
+                hand,
+                accounting,
+                accounting_error,
+                user_confirmed=True,
+            )
+            if confirmed_for_status
+            else readiness
+        )
+        status_options, status_index = review_status_options(hand, status_readiness)
         status_key = f"study_status_{hand.id}"
         if st.session_state.get(status_key) not in status_options:
             st.session_state.pop(status_key, None)
@@ -1747,10 +1987,10 @@ def _render_study_approve_path(
             key=f"study_save_{hand.id}",
             width="stretch",
         ):
-            if guarded_update_hand_status(db, hand, readiness, status):
+            if guarded_update_hand_status(db, hand, status_readiness, status):
                 flash("Review status updated.")
                 st.rerun()
-    if ordered_hands is not None:
+    if ordered_hands is not None and not can_confirm:
         render_study_hand_advance(
             ordered_hands,
             hand,
@@ -1857,6 +2097,7 @@ def render_study_fix_and_confirm(
             db,
             hand,
             accounting,
+            accounting_error,
             readiness,
             is_reconstructed,
             completion_evidence,

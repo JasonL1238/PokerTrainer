@@ -32,9 +32,10 @@ Study shows one task at a time:
    to update the single table replay to that moment, including the street board,
    pot, remaining stacks, folded seats, and highlighted actor. Table stacks, pot,
    and results always show an explicit **BB** unit.
-2. **Fix & confirm** — **Approve** if the hand looks right, or **Edit the hand —
-   Fix** to open each action and change Who / Action / Amount. Cards, players,
-   and chips live under **Other fixes**.
+2. **Fix & confirm** — **Approve and next** confirms a ready hand, marks it
+   reviewed, and advances. **Approve all ready in this session** bulk-approves
+   hands that already pass trust checks. **Edit the hand — Fix** edits Who /
+   Action / Amount; cards, players, and chips live under **Other fixes**.
 3. **Analyze** — use quick math, TexasSolver, coaching, or notes.
 
 ## Local setup
@@ -346,7 +347,8 @@ remaining postflop ranges.
    players, or chip accounting. A late-joined recording can still be finalized
    if you reconstructed the whole hand — use **Finalize incomplete hand**.
    What's blocking study lists each remaining check.
-3. When the line looks right, choose **Looks good — Approve** and confirm.
+3. When the line looks right, choose **Looks good — Approve** → **Approve and
+   next** (or **Approve all ready in this session** for a batch).
 4. Open **Analyze → TexasSolver**. The app checks eligibility and explains every
    item that still needs correction.
 5. Confirm the automatically selected heads-up street, pot, and effective stack.

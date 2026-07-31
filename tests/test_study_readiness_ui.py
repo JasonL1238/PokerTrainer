@@ -311,27 +311,17 @@ def test_study_never_renders_a_confidence_percentage(tmp_path, monkeypatch) -> N
     st.cache_resource.clear()
 
 
-def test_study_confirmation_checkbox_is_required_for_a_cv_hand(
-    tmp_path, monkeypatch
-) -> None:
+def test_study_approve_and_next_confirms_a_cv_hand(tmp_path, monkeypatch) -> None:
     path = tmp_path / "confirm.sqlite3"
     hand_id = _seed_hand(path, completion_status="complete")
 
     app = _open_approve(_run_study(path, monkeypatch))
     assert "reviewed" not in _status_widget(app).options
+    assert any(button.label == "Approve and next" for button in app.button)
 
     next(
-        item
-        for item in app.checkbox
-        if item.label == "I have read the evidence above and confirm this hand is correct"
-    ).set_value(True)
-    app.run()
-
-    assert not list(app.exception)
-    assert "reviewed" in _status_widget(app).options
-    _status_widget(app).set_value("reviewed")
-    app.run()
-    next(button for button in app.button if button.label == "Save review status").click()
+        button for button in app.button if button.label == "Approve and next"
+    ).click()
     app.run()
 
     assert not list(app.exception)
@@ -398,21 +388,18 @@ def test_study_confirming_a_settlement_assumption_clears_its_blocker(
         is False
     )
 
-    # ...and the page agrees. Reopened, the assumption reads confirmed and the
-    # whole-hand tick is the only thing left, which it was NOT before the press:
-    # the confirmation checkbox is keyed on the evidence digest, so accepting the
-    # assumption deliberately retires the previous tick rather than inheriting it.
+    # ...and the page agrees. Reopened, only confirmation remains — Approve and
+    # next supplies that click (the Advanced checkbox is still available).
     st.cache_resource.clear()
     app = _open_approve(_run_study(path, monkeypatch))
     assert "reviewed" not in _status_widget(app).options
+    assert any(button.label == "Approve and next" for button in app.button)
     next(
-        item
-        for item in app.checkbox
-        if item.label == "I have read the evidence above and confirm this hand is correct"
-    ).set_value(True)
+        button for button in app.button if button.label == "Approve and next"
+    ).click()
     app.run()
     assert not list(app.exception)
-    assert "reviewed" in _status_widget(app).options
+    assert _saved_review_status(path, hand_id) == "reviewed"
     st.cache_resource.clear()
 
 
@@ -486,10 +473,9 @@ def test_study_manual_hand_can_still_be_marked_reviewed(tmp_path, monkeypatch) -
         if item.label
         == "I have read the evidence above and confirm this hand is correct"
     ]
-    assert "reviewed" in _status_widget(app).options
-    _status_widget(app).set_value("reviewed")
-    app.run()
-    next(button for button in app.button if button.label == "Save review status").click()
+    next(
+        button for button in app.button if button.label == "Approve and next"
+    ).click()
     app.run()
 
     assert not list(app.exception)
@@ -789,3 +775,105 @@ def test_every_review_status_write_is_routed_through_the_guard() -> None:
     assert "db.update_hand_status(" in source[guard_start:guard_end]
     # Every remaining promotion site must call the guard rather than the store.
     assert source.count("guarded_update_hand_status(") >= 6
+    assert "def approve_hand_for_study(" in source
+    assert "def load_study_session_hands(" in source
+
+
+def test_load_study_session_hands_scopes_to_one_session_without_all_hands(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "scoped.sqlite3"
+    db = PokerDatabase(path)
+    db.init_db()
+    first = db.create_session(Session(name="First"))
+    second = db.create_session(Session(name="Second"))
+    db.create_hand(
+        Hand(
+            session_id=first.id,
+            hand_number=1,
+            source_type="manual",
+            completion_status="not_applicable",
+            study_inclusion="auto",
+        )
+    )
+    db.create_hand(
+        Hand(
+            session_id=second.id,
+            hand_number=1,
+            source_type="manual",
+            completion_status="not_applicable",
+            study_inclusion="auto",
+        )
+    )
+    sessions = db.fetch_sessions()
+    calls: list[str] = []
+    original = db.fetch_all_hands
+
+    def _boom() -> list[Hand]:
+        calls.append("fetch_all_hands")
+        return original()
+
+    monkeypatch.setattr(db, "fetch_all_hands", _boom)
+    import app as app_module
+
+    hand_session, ordered, forced = app_module.load_study_session_hands(
+        db, sessions, second, None
+    )
+    db.close()
+    assert forced is None
+    assert hand_session is not None and hand_session.id == second.id
+    assert len(ordered) == 1
+    assert ordered[0].session_id == second.id
+    assert calls == []
+
+
+def test_batch_approve_promotes_ready_and_skips_blocked(tmp_path) -> None:
+    path = tmp_path / "batch.sqlite3"
+    ready_id = _seed_hand(
+        path,
+        source_type="manual",
+        completion_status="not_applicable",
+        completion_evidence={},
+        review_status="unreviewed",
+    )
+    db = PokerDatabase(path)
+    db.init_db()
+    ready = db.fetch_hand(ready_id)
+    assert ready is not None
+    blocked = db.create_hand(
+        Hand(
+            session_id=ready.session_id,
+            hand_number=2,
+            source_type="manual",
+            hero_cards="Ah Kd",
+            board_cards="2c 3d 4h",
+            review_status="unreviewed",
+            completion_status="not_applicable",
+            completion_evidence={},
+        )
+    )
+    db.create_hand_issue(
+        HandIssue(
+            hand_id=blocked.id,
+            issue_types=["cards"],
+            description="Board looks wrong on the recording.",
+        )
+    )
+    ordered = [
+        hand
+        for hand in db.fetch_hands_by_session(ready.session_id)
+        if hand.study_inclusion != "skip"
+    ]
+    import app as app_module
+
+    cache = app_module.new_accounting_cache()
+    candidates = app_module._batch_approve_candidates(ordered)
+    assert {hand.id for hand in candidates} == {ready_id, blocked.id}
+    approved, skipped = app_module.approve_ready_hands_in_session(
+        db, candidates, cache
+    )
+    assert approved == 1
+    assert skipped == 1
+    assert db.fetch_hand(ready_id).review_status == "reviewed"
+    assert db.fetch_hand(blocked.id).review_status != "reviewed"
+    db.close()

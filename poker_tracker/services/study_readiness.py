@@ -339,8 +339,8 @@ def evaluate_study_readiness(
                     )
                 ),
                 clearing_action=(
-                    "Tick 'I have read the evidence above and confirm this hand is "
-                    "correct' under Fix & confirm → Looks good — Approve."
+                    "Press 'Approve and next' under Fix & confirm → "
+                    "Looks good — Approve."
                 ),
             )
         )
