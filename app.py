@@ -193,6 +193,7 @@ from poker_tracker.ui.reconstruction_review import (
     job_id_from_hand_notes,
     load_timeline_for_job,
     observed_facts,
+    resolve_study_approve_key_frames,
     states_for_hand,
     timeline_path_for_job,
 )
@@ -1365,6 +1366,7 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
             render_study_session_batch_approve(db, ordered, accounting_cache)
             render_study_fix_and_confirm(
                 db,
+                hand_session,
                 hand,
                 actions,
                 players,
@@ -1838,9 +1840,76 @@ def _render_study_saved_action_snapshot(actions: list[Action]) -> None:
     for index, action in enumerate(actions):
         st.markdown(study_action_label(action, index))
     st.caption(
-        "If this matches the recording, use Approve and next. "
-        "If any line is wrong, switch to Edit the hand — Fix."
+        "Compare this line and the table to the source frames. "
+        "If they match, use Approve and next. "
+        "If anything is wrong, switch to Edit the hand — Fix."
     )
+
+
+def _render_study_approve_side_by_side(
+    db: PokerDatabase,
+    session: Session,
+    hand: Hand,
+    actions: list[Action],
+    players: list[HandPlayer],
+    accounting: AccountingReconciliation | None,
+    completion_evidence: CompletionEvidence,
+    is_reconstructed: bool,
+) -> None:
+    """Show reconstructed table + actions beside key source frames on Approve."""
+
+    table_col, frames_col = st.columns([1.35, 1], gap="large")
+    with table_col:
+        section_header_with_meta(
+            f"Hand #{hand.hand_number}",
+            "Reconstructed table for approval",
+            hand.game_type.upper() if hand.game_type else "FINAL HAND",
+        )
+        render_poker_table(
+            hero_cards=hand.hero_cards,
+            board_cards=hand.board_cards,
+            pot_size=(
+                accounting.ledger.gross_pot
+                if _accounting_is_established(hand, accounting)
+                else hand.pot_size
+            ),
+            players=players,
+            result_bb=_hero_ledger_result(
+                hand, accounting, players, hand.hero_bb_won
+            ),
+            label=f"{session.name} · {hand.hero_position or 'Position not recorded'}",
+        )
+        _render_study_saved_action_snapshot(actions)
+
+    with frames_col:
+        st.markdown("#### Source frames")
+        if not is_reconstructed:
+            st.caption(
+                "Source frames are only available for reconstructed hands. "
+                "Approve from the table and action line when the hand looks right."
+            )
+            return
+        key_frames = resolve_study_approve_key_frames(
+            job_id=job_id_from_hand_notes(hand.notes),
+            hand_number=hand.hand_number,
+            evidence=completion_evidence,
+        )
+        if key_frames:
+            st.caption(
+                "Key frames from the recording. Compare cards, streets, and "
+                "the terminal result to the reconstructed table."
+            )
+            for frame in key_frames:
+                caption = frame.label
+                if frame.timestamp_s is not None:
+                    caption = f"{frame.label} · {frame.timestamp_s:.2f}s"
+                _safe_image(frame.image_path, caption=caption)
+        else:
+            st.caption(
+                "No source frames are attached to this hand yet. "
+                "Open Import frame validation if you need the full carousel."
+            )
+        _offer_frame_validation_link(db, hand)
 
 
 def render_study_session_batch_approve(
@@ -1901,8 +1970,8 @@ def _render_study_approve_path(
         st.success("This hand is approved and ready to analyze.")
     elif not fix_groups:
         st.info(
-            "Action line looks right? Approve and next confirms the hand, marks it "
-            "reviewed, and opens the next unreviewed hand."
+            "Table and source frames look right? Approve and next confirms the "
+            "hand, marks it reviewed, and opens the next unreviewed hand."
         )
     else:
         st.warning(
@@ -1917,7 +1986,6 @@ def _render_study_approve_path(
     can_confirm = not fix_groups
     if can_confirm and is_reconstructed:
         show_reconstruction_evidence(hand, completion_evidence)
-        _offer_frame_validation_link(db, hand)
 
     if can_confirm:
         already_reviewed = hand.review_status == "reviewed"
@@ -2048,6 +2116,7 @@ def _render_study_fix_tool(
 
 def render_study_fix_and_confirm(
     db: PokerDatabase,
+    session: Session,
     hand: Hand,
     actions: list[Action],
     players: list[HandPlayer],
@@ -2063,8 +2132,9 @@ def render_study_fix_and_confirm(
 
     st.markdown("### Fix & confirm")
     st.caption(
-        "Approve if the hand looks right. Otherwise edit any wrong action below — "
-        "cards, players, and chips live under Other fixes."
+        "Approve if the reconstructed table matches the source frames. "
+        "Otherwise edit any wrong action below — cards, players, and chips live "
+        "under Other fixes."
     )
 
     path_labels = {
@@ -2092,7 +2162,16 @@ def render_study_fix_and_confirm(
             render_study_readiness(readiness)
 
     if path == "approve":
-        _render_study_saved_action_snapshot(actions)
+        _render_study_approve_side_by_side(
+            db,
+            session,
+            hand,
+            actions,
+            players,
+            accounting,
+            completion_evidence,
+            is_reconstructed,
+        )
         _render_study_approve_path(
             db,
             hand,
@@ -6852,11 +6931,6 @@ def _show_live_cv_job_status(db: PokerDatabase, video_id: int) -> None:
     st.caption("Updating automatically — you can leave this page open.")
 
 
-def _job_id_from_hand_notes(notes: str | None) -> int | None:
-    """Parse ``job_<id>_timeline`` out of CV draft notes when present."""
-    return job_id_from_hand_notes(notes)
-
-
 def _offer_frame_validation_link(db: PokerDatabase, hand: Hand) -> None:
     """Study can jump to Import frame review without hunting the sidebar path."""
     if hand.session_id is None:
@@ -6867,7 +6941,7 @@ def _offer_frame_validation_link(db: PokerDatabase, hand: Hand) -> None:
             "Frame validation lives on Import once a recording is attached to this session."
         )
         return
-    job_id = _job_id_from_hand_notes(hand.notes)
+    job_id = job_id_from_hand_notes(hand.notes)
     preferred = videos[0]
     matched_job = False
     if job_id is not None:

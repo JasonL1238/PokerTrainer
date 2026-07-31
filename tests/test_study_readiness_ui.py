@@ -329,6 +329,34 @@ def test_study_approve_and_next_confirms_a_cv_hand(tmp_path, monkeypatch) -> Non
     st.cache_resource.clear()
 
 
+def test_study_approve_shows_side_by_side_table_and_source_frames(
+    tmp_path, monkeypatch
+) -> None:
+    """Approve puts reconstruction and key frames on one surface for judgment."""
+
+    path = tmp_path / "side_by_side.sqlite3"
+    _seed_hand(path, completion_status="complete")
+
+    app = _open_approve(_run_study(path, monkeypatch))
+    rendered = "\n".join(item.value for item in app.markdown)
+    captions = "\n".join(item.value for item in app.caption)
+    text = "\n".join((rendered, captions))
+
+    assert "#### Source frames" in rendered
+    assert "#### Saved action line" in rendered
+    assert "Reconstructed table for approval" in text
+    assert "Compare this line and the table to the source frames" in captions
+    # No recording is attached in this fixture, so Approve still points operators
+    # at Import rather than mounting a dead jump button.
+    assert "Frame validation lives on Import" in captions
+    # Completion evidence falls back to stored frame refs when no timeline exists.
+    assert any(
+        "Hand start" in warning.value or "Terminal" in warning.value
+        for warning in app.warning
+    ) or "Key frames from the recording" in captions
+    st.cache_resource.clear()
+
+
 def test_study_confirming_a_settlement_assumption_clears_its_blocker(
     tmp_path, monkeypatch
 ) -> None:

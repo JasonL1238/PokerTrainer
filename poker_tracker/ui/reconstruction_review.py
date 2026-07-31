@@ -3,10 +3,21 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from poker_tracker.persistence.completion import CompletionEvidence
 from poker_tracker.ui.video_storage import CV_TIMELINES_DIR
+
+
+@dataclass(frozen=True)
+class KeyFrame:
+    """One representative source frame for Study Approve side-by-side review."""
+
+    label: str
+    image_path: str
+    timestamp_s: float | None = None
 
 ISSUE_GUIDANCE: dict[str, tuple[str, str]] = {
     "Cards / board": (
@@ -343,6 +354,144 @@ def job_id_from_hand_notes(notes: str | None) -> int | None:
     if match is None:
         return None
     return int(match.group(1))
+
+
+def select_key_frames_for_review(
+    states: list[dict[str, Any]],
+    *,
+    max_frames: int = 6,
+) -> list[KeyFrame]:
+    """Pick representative frames: hero cards, each board street, and terminal."""
+
+    if not states or max_frames <= 0:
+        return []
+
+    selected: list[KeyFrame] = []
+    seen_images: set[str] = set()
+
+    def add(label: str, state: dict[str, Any]) -> None:
+        image = str(state.get("image") or "").strip()
+        if not image or image in seen_images or len(selected) >= max_frames:
+            return
+        seen_images.add(image)
+        timestamp = state.get("time_s")
+        selected.append(
+            KeyFrame(
+                label=label,
+                image_path=image,
+                timestamp_s=None if timestamp is None else float(timestamp),
+            )
+        )
+
+    hero_state = next(
+        (state for state in states if state.get("hero_cards")),
+        states[0],
+    )
+    add(
+        "Hero cards" if hero_state.get("hero_cards") else "Hand start",
+        hero_state,
+    )
+
+    seen_board_lens: set[int] = set()
+    for state in states:
+        board_len = len(state.get("board_cards") or [])
+        # Skip preflop (0); keep Flop/Turn/River from the shared street map.
+        if board_len < 3 or board_len in seen_board_lens:
+            continue
+        label = _STREET_BY_BOARD_COUNT.get(board_len)
+        if label is None:
+            continue
+        add(label, state)
+        seen_board_lens.add(board_len)
+
+    add("Terminal", states[-1])
+    return selected
+
+
+def key_frames_from_completion_evidence(
+    evidence: CompletionEvidence,
+    *,
+    max_frames: int = 6,
+) -> list[KeyFrame]:
+    """Fall back to stored completion evidence frame refs when no timeline is open."""
+
+    if max_frames <= 0:
+        return []
+
+    selected: list[KeyFrame] = []
+    seen: set[str] = set()
+
+    def add(label: str, path: str, timestamp_s: float | None = None) -> None:
+        image = path.strip()
+        if not image or image in seen or len(selected) >= max_frames:
+            return
+        seen.add(image)
+        selected.append(
+            KeyFrame(label=label, image_path=image, timestamp_s=timestamp_s)
+        )
+
+    preceding = evidence.preceding_boundary
+    if preceding.frame_ref:
+        add("Hand start", preceding.frame_ref, preceding.timestamp_s)
+
+    following = evidence.following_boundary
+    middle = [
+        path
+        for path in evidence.source_frames
+        if path
+        and path != preceding.frame_ref
+        and path != following.frame_ref
+    ]
+    if middle:
+        # Keep a small spread when many source frames exist.
+        if len(middle) == 1:
+            picks = middle
+        else:
+            picks = [middle[0], middle[len(middle) // 2], middle[-1]]
+            # Preserve order while dropping duplicates from the sample.
+            picks = list(dict.fromkeys(picks))
+        for index, path in enumerate(picks):
+            add(f"Source {index + 1}", path)
+    elif evidence.source_frames and not preceding.frame_ref and not following.frame_ref:
+        for index, path in enumerate(evidence.source_frames):
+            add(f"Source {index + 1}", path)
+
+    if following.frame_ref:
+        add("Terminal", following.frame_ref, following.timestamp_s)
+    return selected
+
+
+def resolve_study_approve_key_frames(
+    *,
+    job_id: int | None,
+    hand_number: int,
+    evidence: CompletionEvidence,
+    timeline_dir: Path = CV_TIMELINES_DIR,
+    max_frames: int = 6,
+) -> list[KeyFrame]:
+    """Prefer timeline states; fall back to completion-evidence frame refs."""
+
+    if job_id is not None:
+        try:
+            timeline = load_timeline_for_job(job_id, timeline_dir)
+        except (OSError, ValueError, json.JSONDecodeError):
+            timeline = None
+        if timeline is not None:
+            hand_payload = next(
+                (
+                    hand
+                    for hand in timeline.get("hands", [])
+                    if int(hand.get("hand_number", -1)) == hand_number
+                ),
+                None,
+            )
+            if hand_payload is not None:
+                states = states_for_hand(timeline, hand_payload)
+                if states:
+                    return select_key_frames_for_review(
+                        states, max_frames=max_frames
+                    )
+    return key_frames_from_completion_evidence(evidence, max_frames=max_frames)
 
 
 def _cards(cards: Any) -> str:

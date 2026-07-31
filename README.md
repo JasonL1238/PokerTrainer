@@ -32,10 +32,13 @@ Study shows one task at a time:
    to update the single table replay to that moment, including the street board,
    pot, remaining stacks, folded seats, and highlighted actor. Table stacks, pot,
    and results always show an explicit **BB** unit.
-2. **Fix & confirm** — **Approve and next** confirms a ready hand, marks it
-   reviewed, and advances. **Approve all ready in this session** bulk-approves
-   hands that already pass trust checks. **Edit the hand — Fix** edits Who /
-   Action / Amount; cards, players, and chips live under **Other fixes**.
+2. **Fix & confirm** — **Looks good — Approve** shows the reconstructed table
+   and saved action line beside key source frames (hero, board streets, terminal)
+   so you can judge the hand without leaving Study. **Approve and next** confirms
+   a ready hand, marks it reviewed, and advances. **Approve all ready in this
+   session** bulk-approves hands that already pass trust checks. **Edit the hand
+   — Fix** edits Who / Action / Amount; cards, players, and chips live under
+   **Other fixes**.
 3. **Analyze** — use quick math, TexasSolver, coaching, or notes.
 
 ## Local setup
@@ -95,7 +98,8 @@ The Import workflow connects a saved video to the existing two-model CV pipeline
    observed, and the hand did not start mid-recording; incomplete or mid-start
    hands stay out until you click **Add draft** (or **Add to session now** when
    the auto gate already passes).
-7. Edit session hands in Study (Fix & confirm / finalize). Study readiness and
+7. Edit session hands in Study (Fix & confirm / finalize). On Approve, compare
+   the reconstructed table to key source frames side by side. Study readiness and
    study inclusion stay separate — being in the session is not study-ready.
 8. Either flag the hand for later debugging or correct it immediately in Study.
 9. Retain before/after audit records, reconcile the ledger, and rerun coaching
@@ -347,8 +351,9 @@ remaining postflop ranges.
    players, or chip accounting. A late-joined recording can still be finalized
    if you reconstructed the whole hand — use **Finalize incomplete hand**.
    What's blocking study lists each remaining check.
-3. When the line looks right, choose **Looks good — Approve** → **Approve and
-   next** (or **Approve all ready in this session** for a batch).
+3. When the reconstructed table matches the source frames, choose **Looks good
+   — Approve** → **Approve and next** (or **Approve all ready in this session**
+   for a batch).
 4. Open **Analyze → TexasSolver**. The app checks eligibility and explains every
    item that still needs correction.
 5. Confirm the automatically selected heads-up street, pot, and effective stack.

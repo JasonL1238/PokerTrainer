@@ -85,12 +85,14 @@ As of July 28, 2026, the repository contains:
   hand selection compact, presents saved actions as a readable vertical history
   with expanded decision context, lets any saved action drive one shared
   reconstructed table replay with explicit BB units on every stack, pot, and
-  result, splits Fix & confirm into Approve vs Edit-the-hand Fix so the Fix path
-  edits each action inline (Who / Action / Amount) with cards/players/chips under
-  Other fixes, one-click Approve and next plus session batch-approve for ready
-  hands, session-scoped Study loading without reconciling the whole database each
-  render, and includes inline TexasSolver setup/use guidance while retaining
-  before/after correction history and staling derived coaching/solver evidence;
+  result, splits Fix & confirm into Approve vs Edit-the-hand Fix so Approve shows
+  the reconstructed table and action line beside key source frames for
+  side-by-side judgment, the Fix path edits each action inline (Who / Action /
+  Amount) with cards/players/chips under Other fixes, one-click Approve and next
+  plus session batch-approve for ready hands, session-scoped Study loading
+  without reconciling the whole database each render, and includes inline
+  TexasSolver setup/use guidance while retaining before/after correction history
+  and staling derived coaching/solver evidence;
 - a persistent cross-session issue inbox that freezes debugging evidence and
   retains resolution notes;
 - authenticated local/container operation, a non-root Docker runtime, pinned
