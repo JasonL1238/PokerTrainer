@@ -1054,10 +1054,6 @@ def test_the_fact_editor_never_writes_the_derived_result_into_the_observation(
     independent evidence of what the hero won.
     """
     import streamlit as st
-    from streamlit.testing.v1 import AppTest
-
-    import poker_tracker.persistence.db as db_module
-    from poker_tracker.ui.navigation import Page
 
     path = tmp_path / "facteditor_ui.db"
     db = _open_db(tmp_path, "facteditor_ui.db")
@@ -1073,22 +1069,16 @@ def test_the_fact_editor_never_writes_the_derived_result_into_the_observation(
         db.acknowledge_accounting_assumption(hand_id, dependence.code)
     db.close()
 
-    monkeypatch.delenv("APP_PASSWORD", raising=False)
-    monkeypatch.delenv("POKERTRAINER_REQUIRE_AUTH", raising=False)
-    monkeypatch.setenv("POKER_DB_PATH", str(path))
-    monkeypatch.setattr(db_module, "DEFAULT_DB_PATH", str(path))
-    st.cache_resource.clear()
-    app = AppTest.from_file(
-        str(Path(__file__).resolve().parent.parent / "app.py"), default_timeout=60
-    ).run()
-    next(item for item in app.radio if "Study" in list(item.options)).set_value(
-        Page.STUDY
+    from tests.test_study_readiness_ui import (
+        _open_fix_tool,
+        _run_validation_editors,
     )
-    app.run()
-    assert not list(app.exception)
-    from tests.test_study_readiness_ui import _open_fix_tool
 
-    app = _open_fix_tool(app, "Cards, board, or pot")
+    app = _open_fix_tool(
+        _run_validation_editors(path, monkeypatch, hand_id, frames_validated=False),
+        "Cards, board, or pot",
+    )
+    assert not list(app.exception)
 
     widget = next(item for item in app.number_input if item.label == "Hero result (BB)")
     assert widget.value is None, "the form shows the observation, never the derivation"

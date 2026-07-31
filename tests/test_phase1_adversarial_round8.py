@@ -1061,44 +1061,49 @@ def _seed_ui_hand(path: Path) -> int:
     return hand_id
 
 
-def test_the_study_page_renders_the_evidence_the_checkbox_names(
+def test_reconstruction_evidence_surface_renders_the_fields_confirmation_names(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """The label says "I have read the evidence above" and nothing drew it.
+    """Confirmation attests to concrete evidence fields — they must be drawn.
 
-    On this hand the tick is the only remaining gate, so before the fix the entire
-    content rendered above the checkbox was the one sentence saying it had not
-    been ticked.
+    On this hand confirmation is the only remaining gate, so before the fix the
+    entire content above the control was the one sentence saying it had not been
+    confirmed.
     """
     import streamlit as st
     from streamlit.testing.v1 import AppTest
 
     import poker_tracker.persistence.db as db_module
-    from poker_tracker.ui.navigation import Page
+    from poker_tracker.persistence.completion import parse_completion_evidence
 
     path = tmp_path / "round8-ui.sqlite3"
-    _seed_ui_hand(path)
+    hand_id = _seed_ui_hand(path)
     monkeypatch.delenv("APP_PASSWORD", raising=False)
     monkeypatch.delenv("POKERTRAINER_REQUIRE_AUTH", raising=False)
     monkeypatch.setenv("POKER_DB_PATH", str(path))
     monkeypatch.setattr(db_module, "DEFAULT_DB_PATH", str(path))
     st.cache_resource.clear()
-    app = AppTest.from_file(
-        str(Path(__file__).resolve().parent.parent / "app.py"), default_timeout=30
-    ).run()
-    next(item for item in app.radio if "Study" in list(item.options)).set_value(
-        Page.STUDY
+    script = path.parent / "_round8_evidence.py"
+    script.write_text(
+        "\n".join(
+            [
+                "from poker_tracker.persistence.db import PokerDatabase",
+                "from poker_tracker.persistence.completion import parse_completion_evidence",
+                "import app as app_module",
+                f"db = PokerDatabase(r'{path}')",
+                "db.init_db()",
+                f"hand = db.fetch_hand({hand_id})",
+                "app_module.show_reconstruction_evidence(",
+                "    hand, parse_completion_evidence(hand.completion_evidence)",
+                ")",
+            ]
+        ),
+        encoding="utf-8",
     )
-    app.run()
+    app = AppTest.from_file(str(script), default_timeout=30).run()
     assert not list(app.exception)
-    from tests.test_study_readiness_ui import _open_approve
-
-    app = _open_approve(app)
 
     rendered = "\n".join(item.value for item in app.markdown)
-    labels = [item.label for item in app.checkbox]
-
-    assert "I have read the evidence above and confirm this hand is correct" in labels
     for expected in ("showdown", "two-model-v7", "clubwpt_6max", "detector=v7"):
         assert expected in rendered, expected
 

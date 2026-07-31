@@ -5,6 +5,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import date
+from html import escape
 from pathlib import Path
 from typing import Iterator
 
@@ -116,9 +117,12 @@ from poker_tracker.services.study_readiness import (
     unattested_assumption_dependence,
 )
 from poker_tracker.services.validated_hand_import import (
+    CV_TIMELINE_IDENTITY_KEY,
     autonomous_import_blockers,
+    ensure_draft_for_review,
     ensure_hand_imported,
     find_existing_imported_hand,
+    hand_frames_validated,
     import_all_autonomous_eligible,
     related_cv_job_ids,
 )
@@ -193,7 +197,6 @@ from poker_tracker.ui.reconstruction_review import (
     job_id_from_hand_notes,
     load_timeline_for_job,
     observed_facts,
-    resolve_study_approve_key_frames,
     states_for_hand,
     timeline_path_for_job,
 )
@@ -419,11 +422,94 @@ def approve_hand_for_study(
     """Promote one hand to reviewed through the same guard as every other surface.
 
     Caller must pass readiness evaluated with ``user_confirmed=True`` when the
-    hand requires confirmation — Approve and next / batch approve are that click.
+    hand requires confirmation — finishing Import validation is that confirmation.
     """
     return guarded_update_hand_status(
         db, hand, readiness, "reviewed", announce=announce
     )
+
+
+def _cv_timeline_identity(hand: Hand) -> tuple[int | None, int | None]:
+    """Return ``(job_id, timeline_hand_number)`` from stamped evidence or notes."""
+    evidence = parse_completion_evidence(hand.completion_evidence)
+    identity = evidence.extra.get(CV_TIMELINE_IDENTITY_KEY)
+    job_id: int | None = None
+    timeline_hand_number: int | None = None
+    if isinstance(identity, dict):
+        try:
+            job_id = int(identity["job_id"])
+        except (KeyError, TypeError, ValueError):
+            job_id = None
+        try:
+            timeline_hand_number = int(identity["timeline_hand_number"])
+        except (KeyError, TypeError, ValueError):
+            timeline_hand_number = None
+    if job_id is None:
+        job_id = job_id_from_hand_notes(hand.notes)
+    if timeline_hand_number is None:
+        from cv_lab.scripts.pipeline.export_yolo_card_hands_for_app import (
+            timeline_hand_number_from_notes,
+        )
+
+        timeline_hand_number = timeline_hand_number_from_notes(hand.notes)
+    if timeline_hand_number is None:
+        timeline_hand_number = hand.hand_number
+    return job_id, timeline_hand_number
+
+
+def try_approve_hand_after_validation(
+    db: PokerDatabase,
+    hand: Hand,
+    *,
+    announce: bool = True,
+) -> bool:
+    """Confirm + promote after Import validation when readiness clears.
+
+    Finishing validation (with or without edits) is user confirmation. Open
+    HandIssue rows and other readiness blockers still refuse promotion.
+    """
+    if hand.id is None:
+        return False
+    if hand.review_status == "reviewed":
+        return True
+    accounting, accounting_error = _reconcile_cached(db, hand.id, None)
+    readiness = hand_study_readiness(
+        db,
+        hand,
+        accounting,
+        accounting_error,
+        user_confirmed=True,
+    )
+    return approve_hand_for_study(db, hand, readiness, announce=announce)
+
+
+def _open_hand_for_validation(db: PokerDatabase, hand: Hand) -> None:
+    """Deep-link Issues / library openers to Import frame validation for a hand."""
+    if hand.session_id is None:
+        _open_hand_for_study(hand)
+        return
+    job_id, timeline_hand_number = _cv_timeline_identity(hand)
+    videos = db.fetch_videos(session_id=hand.session_id)
+    preferred = videos[0] if videos else None
+    if job_id is not None and videos:
+        for video in videos:
+            jobs = [
+                item
+                for item in db.fetch_jobs_by_video(video.id)
+                if item.job_type == "cv_reconstruction" and item.id == job_id
+            ]
+            if jobs:
+                preferred = video
+                break
+    _activate_session(hand.session_id)
+    if preferred is not None and preferred.id is not None:
+        st.session_state["video_context_id"] = preferred.id
+        if job_id is not None:
+            st.session_state[f"cv_review_job_{preferred.id}"] = job_id
+            if timeline_hand_number is not None:
+                st.session_state[f"evidence_hand_pending_{job_id}"] = timeline_hand_number
+    navigate_to(Page.IMPORT)
+    flash("Opened Import validation for this hand.")
 
 
 def guarded_update_hand_status(
@@ -522,18 +608,18 @@ def render_study_readiness(readiness: StudyReadiness) -> None:
 
 
 def render_study_workflow(readiness: StudyReadiness) -> None:
-    """Explain readiness as concrete checks and grouped fix steps."""
+    """Explain readiness as concrete checks and where to clear them."""
 
     with st.container(key="study_workflow_guide"):
-        st.markdown("#### Start with Replay, then fix, then analyze")
+        st.markdown("#### Replay, then analyze")
         if readiness.is_ready:
             st.caption("This hand passed every trust check and is ready to analyze.")
             return
         fix_groups = study_fix_groups(readiness)
         st.caption(
-            f"{len(readiness.blockers)} trust check(s) are failing. Some clear "
-            f"together, so there are {len(fix_groups)} concrete fix step(s). "
-            "Replay still works; trusted analysis waits until these checks pass."
+            f"{len(readiness.blockers)} trust check(s) are failing. Clear them on "
+            f"Import validation ({len(fix_groups)} step group(s)), then return here "
+            "to study. Replay still works; trusted analysis waits."
         )
         with st.expander(
             f"What needs fixing · {len(fix_groups)} step(s)",
@@ -554,19 +640,21 @@ def study_fix_groups(
     definitions = {
         "study_preference": (
             "Choose study vs non-study",
-            "Fix & confirm → Edit the hand — Fix → Other fixes → Study inclusion",
+            "Import validation → Edit this hand → Study inclusion "
+            "(or Hands library inclusion)",
         ),
         "evidence": (
             "Verify the reconstructed hand",
-            "Fix & confirm → Edit the hand — Fix → Other fixes → Cards / Source warnings",
+            "Import validation → Edit this hand → Cards / Source warnings",
         ),
         "accounting": (
             "Reconcile the chips",
-            "Fix & confirm → Edit the hand — Fix → edit actions or Other fixes → Chip stacks",
+            "Import validation → Edit this hand → actions or Chip stacks",
         ),
         "issues": (
             "Resolve saved debugging issues",
-            "Fix & confirm → Edit the hand — Fix → Other fixes → Debugging issues",
+            "Import validation → Edit this hand → Debugging issues "
+            "(or Hands Issues inbox)",
         ),
         "coaching": (
             "Refresh coaching",
@@ -577,8 +665,8 @@ def study_fix_groups(
             "Analyze → TexasSolver",
         ),
         "confirmation": (
-            "Confirm the saved hand",
-            "Fix & confirm → Looks good — Approve → Approve and next",
+            "Finish Import validation",
+            "Import validation → Finish validation — send to Study",
         ),
     }
     evidence_codes = {
@@ -1106,7 +1194,9 @@ def show_hand_issue_queue(
 
     with st.expander(f"Saved debugging issue queue ({len(issues)} open)", expanded=bool(issues)):
         if not issues:
-            st.caption("No unresolved hand issues. Flag one from its Study page.")
+            st.caption(
+                "No unresolved hand issues. Flag one during Import validation."
+            )
             return
         for issue in issues:
             hand = hands_by_id.get(issue.hand_id)
@@ -1130,7 +1220,7 @@ def show_hand_issue_queue(
                 key=f"issue_queue_open_{issue.id}",
                 width="stretch",
             ):
-                _open_hand_for_study(hand)
+                _open_hand_for_validation(db, hand)
                 st.rerun()
 
 
@@ -1146,13 +1236,15 @@ def _sort_study_queue(hands: list[Hand]) -> list[Hand]:
 
 
 def _study_queue_for_session(hands: list[Hand]) -> list[Hand]:
-    """Session hands in the Study queue (non-skip). No accounting substitution."""
+    """Approved Study hands only — validation owns editing and promotion."""
 
     return _sort_study_queue(
         [
             hand
             for hand in hands
-            if hand.id is not None and hand.study_inclusion != "skip"
+            if hand.id is not None
+            and hand.study_inclusion != "skip"
+            and hand.review_status == "reviewed"
         ]
     )
 
@@ -1172,7 +1264,10 @@ def load_study_session_hands(
 
     if requested_hand_id is not None:
         requested_hand = db.fetch_hand(requested_hand_id)
-        if requested_hand is not None and requested_hand.study_inclusion == "skip":
+        if requested_hand is not None and (
+            requested_hand.study_inclusion == "skip"
+            or requested_hand.review_status != "reviewed"
+        ):
             hand_session = next(
                 (item for item in sessions if item.id == requested_hand.session_id),
                 None,
@@ -1206,29 +1301,6 @@ def load_study_session_hands(
         if ordered:
             return candidate, ordered, None
     return preferred_session or (sessions[0] if sessions else None), [], None
-
-
-def _next_study_hand_id(ordered: list[Hand], current: Hand) -> int | None:
-    """Prefer the next unreviewed hand; otherwise the next hand in order."""
-
-    if current.id is None:
-        return None
-    indexed = [hand for hand in ordered if hand.id is not None]
-    try:
-        active_index = next(
-            index for index, hand in enumerate(indexed) if hand.id == current.id
-        )
-    except StopIteration:
-        return None
-    for hand in indexed[active_index + 1 :]:
-        if hand.review_status != "reviewed":
-            return hand.id
-    for hand in indexed[:active_index]:
-        if hand.review_status != "reviewed":
-            return hand.id
-    if active_index + 1 < len(indexed):
-        return indexed[active_index + 1].id
-    return None
 
 
 def _batch_approve_candidates(ordered: list[Hand]) -> list[Hand]:
@@ -1285,27 +1357,40 @@ def approve_ready_hands_in_session(
 def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
     page_header(
         "Study",
-        "Replay the hand, inspect the evidence, and turn one completed decision into a reusable lesson.",
+        "Replay approved hands and turn one completed decision into a reusable lesson.",
     )
     sessions = db.fetch_sessions()
     if not sessions:
-        empty_state("Nothing queued for study", "Import or add a completed hand first.")
+        empty_state(
+            "Nothing queued for study",
+            "Validate hands on Import first — Study only shows approved hands.",
+        )
         return
     accounting_cache = new_accounting_cache()
     requested = st.session_state.get("study_hand_id")
-    hand_session, ordered, forced_skip = load_study_session_hands(
+    hand_session, ordered, forced_hand = load_study_session_hands(
         db, sessions, session, requested if isinstance(requested, int) else None
     )
-    if forced_skip is not None:
+    if forced_hand is not None and forced_hand.study_inclusion == "skip":
         st.warning(
-            f"Hand #{forced_skip.hand_number} is marked non-study. "
-            "Change Study inclusion below to return it to the queue."
+            f"Hand #{forced_hand.hand_number} is marked non-study. "
+            "Change Study inclusion below to return it to the queue after approval."
         )
+        show_study_inclusion_controls(db, forced_hand, force_open=True)
+        return
+    if forced_hand is not None and forced_hand.review_status != "reviewed":
+        st.warning(
+            f"Hand #{forced_hand.hand_number} is not approved for study yet. "
+            "Finish editing and validation on Import — Study is study-only."
+        )
+        _offer_frame_validation_link(db, forced_hand)
+        show_study_inclusion_controls(db, forced_hand, force_open=True)
+        return
     if not ordered:
         empty_state(
-            "No study hands queued",
-            "Every hand is marked non-study, or this session has no hands yet. "
-            "Change Study inclusion or pick another session.",
+            "No approved study hands queued",
+            "Finish Import validation to send hands here, or pick another session. "
+            "Hands with open issues stay in the Hands Issues inbox.",
         )
         return
     available_ids = {hand.id for hand in ordered if hand.id is not None}
@@ -1323,13 +1408,8 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
     coaching_reviews = db.fetch_coaching_reviews_by_hand(hand.id)
     hand_issues = db.fetch_hand_issues(hand_id=hand.id)
     solver_runs = db.fetch_solver_runs_by_hand(hand.id)
-    completion_evidence = parse_completion_evidence(hand.completion_evidence)
-    is_reconstructed = is_reconstructed_hand(hand)
-    # Legacy checkbox key still counts if present; Approve and next supplies
-    # confirmation without requiring that widget on the happy path.
-    user_confirmed = bool(
-        st.session_state.get(study_confirmation_key(hand, accounting), False)
-    )
+    # Approved Study hands are already confirmed during Import validation.
+    user_confirmed = True
     readiness = evaluate_study_readiness(
         hand,
         accounting=accounting,
@@ -1338,20 +1418,24 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
         coaching_reviews=coaching_reviews,
         # Legacy hand_reviews rows are staled by the same correction path and are
         # blocking evidence too. Omitting them here made this page -- which feeds
-        # three of the five review-status writers -- report "Study-ready · 0
-        # blockers" on a hand every other surface refused.
+        # review-status writers -- report "Study-ready · 0 blockers" on a hand
+        # every other surface refused.
         hand_reviews=db.fetch_reviews_by_hand(hand.id),
         solver_runs=solver_runs,
         user_confirmed=user_confirmed,
     )
 
     render_study_workflow(readiness)
+    if not readiness.is_ready:
+        st.info(
+            "This approved hand picked up new trust blockers. "
+            "Return to Import validation to edit or resolve issues."
+        )
+        _offer_frame_validation_link(db, hand)
     render_study_hand_navigation(ordered, hand, hand_session)
 
     with st.container(key="study_workspace"):
-        replay_tab, fix_tab, analyze_tab = st.tabs(
-            ["1 · Replay", "2 · Fix & confirm", "3 · Analyze"]
-        )
+        replay_tab, analyze_tab = st.tabs(["1 · Replay", "2 · Analyze"])
         with replay_tab:
             render_study_replay(
                 hand_session,
@@ -1361,22 +1445,6 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
                 accounting,
                 accounting_error,
                 readiness,
-            )
-        with fix_tab:
-            render_study_session_batch_approve(db, ordered, accounting_cache)
-            render_study_fix_and_confirm(
-                db,
-                hand_session,
-                hand,
-                actions,
-                players,
-                accounting,
-                accounting_error,
-                readiness,
-                hand_issues,
-                is_reconstructed,
-                completion_evidence,
-                ordered_hands=ordered,
             )
         with analyze_tab:
             render_study_analysis(
@@ -1469,48 +1537,6 @@ def _set_study_hand_id(hand_id: int | None) -> None:
         return
     st.session_state["study_hand_id"] = hand_id
     st.session_state["study_hand_picker"] = hand_id
-
-
-def render_study_hand_advance(
-    ordered: list[Hand],
-    hand: Hand,
-    *,
-    ready: bool,
-) -> None:
-    """After confirm, offer an obvious next-hand control without forcing the dropdown."""
-
-    if len(ordered) < 2 or hand.id is None:
-        return
-    active_index = next(index for index, item in enumerate(ordered) if item.id == hand.id)
-    has_prev = active_index > 0
-    has_next = active_index < len(ordered) - 1
-    if not has_prev and not has_next:
-        return
-    label = (
-        "This hand is ready. Move on when you want."
-        if ready
-        else "Switch hands any time — progress on this hand stays saved."
-    )
-    st.markdown("#### Next hand")
-    st.caption(label)
-    prev_col, next_col = st.columns(2)
-    prev_col.button(
-        "← Previous hand",
-        key="study_advance_previous",
-        disabled=not has_prev,
-        width="stretch",
-        on_click=_set_study_hand_id,
-        args=(ordered[active_index - 1].id if has_prev else hand.id,),
-    )
-    next_col.button(
-        "Next hand →",
-        key="study_advance_next",
-        disabled=not has_next,
-        width="stretch",
-        type="primary",
-        on_click=_set_study_hand_id,
-        args=(ordered[active_index + 1].id if has_next else hand.id,),
-    )
 
 
 def render_study_replay(
@@ -1666,7 +1692,7 @@ def render_study_replay(
                 "Replay is available. Trusted analysis is paused until the "
                 "checklist above is cleared."
             )
-        st.caption("Next: open the Fix & confirm tab.")
+        st.caption("Next: open Analyze when you want post-session tools.")
 
     section_header_with_meta(
         "Decision history",
@@ -1724,17 +1750,6 @@ def study_action_label(action: Action, index: int) -> str:
         f"{index + 1:02d} · {action.street.title()} · {actor} · "
         f"{action.action_type.replace('-', ' ').title()}{amount}"
     )
-
-
-def _study_fix_path_default(readiness: StudyReadiness) -> str:
-    """Prefer Approve when only confirmation remains; otherwise start on Fix."""
-
-    if readiness.is_ready:
-        return "approve"
-    remaining = {blocker.category for blocker in readiness.blockers}
-    if remaining <= {"confirmation"}:
-        return "approve"
-    return "fix"
 
 
 def _study_other_fix_options(
@@ -1830,242 +1845,6 @@ def _other_fixes_should_expand(readiness: StudyReadiness) -> bool:
     )
 
 
-def _render_study_saved_action_snapshot(actions: list[Action]) -> None:
-    """Show a compact read-only action list for the Approve path."""
-
-    st.markdown("#### Saved action line")
-    if not actions:
-        st.caption("No actions saved for this hand.")
-        return
-    for index, action in enumerate(actions):
-        st.markdown(study_action_label(action, index))
-    st.caption(
-        "Compare this line and the table to the source frames. "
-        "If they match, use Approve and next. "
-        "If anything is wrong, switch to Edit the hand — Fix."
-    )
-
-
-def _render_study_approve_side_by_side(
-    db: PokerDatabase,
-    session: Session,
-    hand: Hand,
-    actions: list[Action],
-    players: list[HandPlayer],
-    accounting: AccountingReconciliation | None,
-    completion_evidence: CompletionEvidence,
-    is_reconstructed: bool,
-) -> None:
-    """Show reconstructed table + actions beside key source frames on Approve."""
-
-    table_col, frames_col = st.columns([1.35, 1], gap="large")
-    with table_col:
-        section_header_with_meta(
-            f"Hand #{hand.hand_number}",
-            "Reconstructed table for approval",
-            hand.game_type.upper() if hand.game_type else "FINAL HAND",
-        )
-        render_poker_table(
-            hero_cards=hand.hero_cards,
-            board_cards=hand.board_cards,
-            pot_size=(
-                accounting.ledger.gross_pot
-                if _accounting_is_established(hand, accounting)
-                else hand.pot_size
-            ),
-            players=players,
-            result_bb=_hero_ledger_result(
-                hand, accounting, players, hand.hero_bb_won
-            ),
-            label=f"{session.name} · {hand.hero_position or 'Position not recorded'}",
-        )
-        _render_study_saved_action_snapshot(actions)
-
-    with frames_col:
-        st.markdown("#### Source frames")
-        if not is_reconstructed:
-            st.caption(
-                "Source frames are only available for reconstructed hands. "
-                "Approve from the table and action line when the hand looks right."
-            )
-            return
-        key_frames = resolve_study_approve_key_frames(
-            job_id=job_id_from_hand_notes(hand.notes),
-            hand_number=hand.hand_number,
-            evidence=completion_evidence,
-        )
-        if key_frames:
-            st.caption(
-                "Key frames from the recording. Compare cards, streets, and "
-                "the terminal result to the reconstructed table."
-            )
-            for frame in key_frames:
-                caption = frame.label
-                if frame.timestamp_s is not None:
-                    caption = f"{frame.label} · {frame.timestamp_s:.2f}s"
-                _safe_image(frame.image_path, caption=caption)
-        else:
-            st.caption(
-                "No source frames are attached to this hand yet. "
-                "Open Import frame validation if you need the full carousel."
-            )
-        _offer_frame_validation_link(db, hand)
-
-
-def render_study_session_batch_approve(
-    db: PokerDatabase,
-    ordered: list[Hand],
-    cache: AccountingCache,
-) -> None:
-    """Bulk-approve session hands that are already study-ready."""
-
-    candidates = _batch_approve_candidates(ordered)
-    if not candidates:
-        return
-    ready = _session_hands_ready_to_approve(db, candidates, cache)
-    if not ready:
-        st.caption(
-            f"{len(candidates)} unreviewed hand(s) in this session still have "
-            "blockers — fix them one at a time below."
-        )
-        return
-    st.info(
-        f"{len(ready)} hand(s) in this session are ready to approve "
-        f"({len(candidates)} unreviewed complete candidates checked)."
-    )
-    if st.button(
-        "Approve all ready in this session",
-        key="study_batch_approve_session",
-        type="primary",
-        width="stretch",
-    ):
-        approved = 0
-        for hand, readiness in ready:
-            if approve_hand_for_study(db, hand, readiness, announce=False):
-                approved += 1
-        flash(
-            f"Approved {approved} · skipped {len(candidates) - approved} still blocked."
-        )
-        st.rerun()
-
-
-def _render_study_approve_path(
-    db: PokerDatabase,
-    hand: Hand,
-    accounting: AccountingReconciliation | None,
-    accounting_error: str | None,
-    readiness: StudyReadiness,
-    is_reconstructed: bool,
-    completion_evidence: CompletionEvidence,
-    ordered_hands: list[Hand] | None,
-) -> None:
-    """Approve-only surface: one click confirms, marks reviewed, and advances."""
-
-    fix_groups = [
-        group
-        for group in study_fix_groups(readiness)
-        if group[0] != "Confirm the saved hand"
-    ]
-    if readiness.is_ready and hand.review_status == "reviewed":
-        st.success("This hand is approved and ready to analyze.")
-    elif not fix_groups:
-        st.info(
-            "Table and source frames look right? Approve and next confirms the "
-            "hand, marks it reviewed, and opens the next unreviewed hand."
-        )
-    else:
-        st.warning(
-            "Approve is blocked until the items below are fixed. "
-            "Switch to Edit the hand — Fix, clear them, then come back here."
-        )
-        for title, _destination, blockers in fix_groups:
-            st.markdown(f"**{title}**")
-            for blocker in blockers:
-                st.write(f"• {blocker.reason}")
-
-    can_confirm = not fix_groups
-    if can_confirm and is_reconstructed:
-        show_reconstruction_evidence(hand, completion_evidence)
-
-    if can_confirm:
-        already_reviewed = hand.review_status == "reviewed"
-        approve_label = (
-            "Next unreviewed hand →"
-            if already_reviewed
-            else "Approve and next"
-        )
-        if st.button(
-            approve_label,
-            key=f"study_approve_next_{hand.id}",
-            type="primary",
-            width="stretch",
-        ):
-            if not already_reviewed:
-                confirmed_readiness = hand_study_readiness(
-                    db,
-                    hand,
-                    accounting,
-                    accounting_error,
-                    user_confirmed=True,
-                )
-                if not approve_hand_for_study(db, hand, confirmed_readiness):
-                    return
-                flash(f"Hand #{hand.hand_number} approved.")
-            if ordered_hands is not None:
-                next_id = _next_study_hand_id(ordered_hands, hand)
-                if next_id is not None and next_id != hand.id:
-                    _set_study_hand_id(next_id)
-            st.rerun()
-
-    with st.expander("Advanced review status", expanded=False):
-        st.caption(
-            "Escape hatch for status-only edits. Prefer Approve and next above."
-        )
-        if can_confirm and hand_requires_user_confirmation(hand):
-            st.checkbox(
-                "I have read the evidence above and confirm this hand is correct",
-                key=study_confirmation_key(hand, accounting),
-            )
-        confirmed_for_status = bool(
-            st.session_state.get(study_confirmation_key(hand, accounting), False)
-        )
-        status_readiness = (
-            hand_study_readiness(
-                db,
-                hand,
-                accounting,
-                accounting_error,
-                user_confirmed=True,
-            )
-            if confirmed_for_status
-            else readiness
-        )
-        status_options, status_index = review_status_options(hand, status_readiness)
-        status_key = f"study_status_{hand.id}"
-        if st.session_state.get(status_key) not in status_options:
-            st.session_state.pop(status_key, None)
-        status = st.selectbox(
-            "Review status",
-            status_options,
-            index=status_index,
-            key=status_key,
-        )
-        if st.button(
-            "Save review status",
-            key=f"study_save_{hand.id}",
-            width="stretch",
-        ):
-            if guarded_update_hand_status(db, hand, status_readiness, status):
-                flash("Review status updated.")
-                st.rerun()
-    if ordered_hands is not None and not can_confirm:
-        render_study_hand_advance(
-            ordered_hands,
-            hand,
-            ready=readiness.is_ready,
-        )
-
-
 def _render_study_fix_tool(
     tool_id: str,
     db: PokerDatabase,
@@ -2114,100 +1893,80 @@ def _render_study_fix_tool(
         st.caption("Unknown fix tool.")
 
 
-def render_study_fix_and_confirm(
+def render_validation_edit_and_approve(
     db: PokerDatabase,
-    session: Session,
     hand: Hand,
-    actions: list[Action],
-    players: list[HandPlayer],
-    accounting: AccountingReconciliation | None,
-    accounting_error: str | None,
-    readiness: StudyReadiness,
-    hand_issues: list[HandIssue],
-    is_reconstructed: bool,
-    completion_evidence: CompletionEvidence,
-    ordered_hands: list[Hand] | None = None,
+    *,
+    frames_validated: bool,
 ) -> None:
-    """Approve when the hand looks right, or edit the action line directly."""
+    """Edit the session draft beside frame review; approve when validation finishes."""
 
-    st.markdown("### Fix & confirm")
+    if hand.id is None:
+        return
+    # Always re-fetch so edits from this same render cycle are visible next rerun.
+    hand = db.fetch_hand(hand.id) or hand
+    actions = db.fetch_actions_by_hand(hand.id)
+    players = db.fetch_players_by_hand(hand.id)
+    accounting, accounting_error = _reconcile_cached(db, hand.id, None)
+    hand_issues = db.fetch_hand_issues(hand_id=hand.id)
+    completion_evidence = parse_completion_evidence(hand.completion_evidence)
+    is_reconstructed = is_reconstructed_hand(hand)
+    readiness = hand_study_readiness(
+        db,
+        hand,
+        accounting,
+        accounting_error,
+        user_confirmed=True,
+    )
+    open_issues = [issue for issue in hand_issues if issue.status == "open"]
+
+    st.markdown("### Edit this hand")
     st.caption(
-        "Approve if the reconstructed table matches the source frames. "
-        "Otherwise edit any wrong action below — cards, players, and chips live "
-        "under Other fixes."
+        "Edit while validating frames. Mark a debugging issue to hold the hand "
+        "out of Study without fixing it now. When validation finishes with no "
+        "open issues, the hand is approved for Study automatically."
     )
 
-    path_labels = {
-        "approve": "Looks good — Approve",
-        "fix": "Edit the hand — Fix",
-    }
-    path_key = f"study_fc_path_{hand.id}"
-    default_path = path_labels[_study_fix_path_default(readiness)]
-    if st.session_state.get(path_key) not in path_labels.values():
-        st.session_state[path_key] = default_path
-    path_label = st.radio(
-        "Choose a path",
-        list(path_labels.values()),
-        horizontal=True,
-        key=path_key,
-        label_visibility="collapsed",
-    )
-    path = "approve" if path_label == path_labels["approve"] else "fix"
-
-    if not readiness.is_ready:
+    if open_issues:
+        st.error(
+            f"{len(open_issues)} open issue(s) — this hand stays out of Study "
+            "until you resolve them here or from the Hands Issues inbox."
+        )
+    if hand.review_status == "reviewed" and readiness.is_ready:
+        st.success("Approved for Study. Open Study to replay and analyze.")
+    elif not readiness.is_ready:
+        if hand.review_status == "reviewed":
+            st.warning(
+                "This hand is marked reviewed but new trust blockers appeared. "
+                "Clear them here before studying."
+            )
         with st.expander(
-            f"What's blocking study · {len(readiness.blockers)} check(s)",
-            expanded=False,
+            f"What's blocking Study · {len(readiness.blockers)} check(s)",
+            expanded=True,
         ):
             render_study_readiness(readiness)
 
-    if path == "approve":
-        _render_study_approve_side_by_side(
-            db,
-            session,
-            hand,
-            actions,
-            players,
-            accounting,
-            completion_evidence,
-            is_reconstructed,
-        )
-        _render_study_approve_path(
-            db,
-            hand,
-            accounting,
-            accounting_error,
-            readiness,
-            is_reconstructed,
-            completion_evidence,
-            ordered_hands,
-        )
-        return
-
     st.markdown("#### Edit each action")
-    st.caption(
-        "Open a wrong line, change who acted / what they did / the amount, then Save. "
-        "Add a missing line at the bottom."
-    )
     show_action_editor(db, actions, players, force_open=True)
 
-    other_tools = _study_other_fix_options(
-        readiness,
-        is_reconstructed=is_reconstructed,
-        hand=hand,
-        hand_issues=hand_issues,
-    )
+    # Issues are hosted once below (not also under Other fixes) to avoid duplicate forms.
+    other_tools = [
+        (tool_id, label)
+        for tool_id, label in _study_other_fix_options(
+            readiness,
+            is_reconstructed=is_reconstructed,
+            hand=hand,
+            hand_issues=hand_issues,
+        )
+        if tool_id not in {"frames", "issues"}
+    ]
     with st.expander(
         "Other fixes (cards, players, chips…)",
         expanded=_other_fixes_should_expand(readiness),
     ):
-        st.caption(
-            "Use this when the action line is fine but cards, seats, chip "
-            "totals, or warnings still block Approve."
-        )
         tool_labels = [label for _tool_id, label in other_tools]
         label_to_tool = {label: tool_id for tool_id, label in other_tools}
-        tool_key = f"study_fc_tool_{hand.id}"
+        tool_key = f"validation_fc_tool_{hand.id}"
         if st.session_state.get(tool_key) not in tool_labels:
             st.session_state[tool_key] = tool_labels[0]
         selected_label = st.selectbox(
@@ -2228,12 +1987,51 @@ def render_study_fix_and_confirm(
                 is_reconstructed,
                 completion_evidence,
             )
-    if ordered_hands is not None:
-        render_study_hand_advance(
-            ordered_hands,
-            hand,
-            ready=readiness.is_ready,
+
+    st.markdown("#### Hold out of Study")
+    show_hand_issue_controls(db, hand, hand_issues, force_open=True)
+
+    auto_key = f"validation_auto_approve_attempted_{hand.id}"
+    if (
+        frames_validated
+        and not open_issues
+        and hand.review_status != "reviewed"
+        and readiness.is_ready
+        and not st.session_state.get(auto_key)
+    ):
+        st.session_state[auto_key] = True
+        if try_approve_hand_after_validation(db, hand, announce=False):
+            flash(
+                f"Hand #{hand.hand_number} validated and approved for Study."
+            )
+            st.rerun()
+
+    if hand.review_status == "reviewed":
+        return
+    if open_issues:
+        st.warning(
+            "Resolve open issues or leave them for the Issues inbox — "
+            "this hand will not enter Study while they remain open."
         )
+        return
+    finish_help = (
+        "Frames are all Correct. Send to Study if the edited hand looks right."
+        if frames_validated
+        else (
+            "You can still send to Study after filling missing chunks yourself, "
+            "even if some frames were incomplete — readiness checks still apply."
+        )
+    )
+    st.caption(finish_help)
+    if st.button(
+        "Finish validation — send to Study",
+        key=f"validation_finish_approve_{hand.id}",
+        type="primary",
+        width="stretch",
+    ):
+        if try_approve_hand_after_validation(db, hand):
+            flash(f"Hand #{hand.hand_number} approved for Study.")
+            st.rerun()
 
 
 def render_study_analysis(
@@ -2255,7 +2053,7 @@ def render_study_analysis(
     else:
         st.warning(
             f"Analysis is limited while {len(readiness.blockers)} trust check(s) "
-            "remain. Open Fix & confirm, edit wrong actions, then Approve."
+            "remain. Return to Import validation to edit or resolve issues."
         )
 
     math_tab, solver_tab, coach_tab, notes_tab = st.tabs(
@@ -2321,8 +2119,7 @@ def render_study_analysis(
         st.markdown("##### Hand notes")
         st.write(hand.notes or "No notes recorded.")
         st.caption(
-            "Edit notes in Fix & confirm → Edit the hand — Fix → Other fixes → "
-            "Cards, board, or pot."
+            "Edit notes on Import validation → Edit this hand → Cards, board, or pot."
         )
 
 
@@ -2568,7 +2365,7 @@ def show_finalize_incomplete_hand(
                 else:
                     flash(
                         f"Finalize saved (status: {finalized.completion_status}). "
-                        "Clear remaining blockers under Fix & confirm before study."
+                        "Clear remaining blockers under Import validation before study."
                     )
                 st.rerun()
 
@@ -2903,8 +2700,8 @@ def show_solver_review(
         workflow_step(
             1,
             "Make the hand eligible",
-            "In Fix & confirm, correct the cards, players, positions, and actions; "
-            "then reconcile the chip ledger.",
+            "On Import validation, correct the cards, players, positions, and "
+            "actions; then reconcile the chip ledger.",
         )
         workflow_step(
             2,
@@ -2929,7 +2726,7 @@ def show_solver_review(
     runs = db.fetch_solver_runs_by_hand(hand.id) if hand.id is not None else []
     if not prepared.eligibility.eligible or prepared.spot is None:
         st.warning("This hand is not ready for TexasSolver yet.")
-        st.markdown("**Fix these items in Fix & confirm:**")
+        st.markdown("**Fix these items on Import validation:**")
         for reason in prepared.eligibility.reasons:
             st.markdown(f"- {reason}")
         _show_solver_runs(
@@ -3842,28 +3639,30 @@ def show_insights_workspace(db: PokerDatabase) -> None:
 
 
 def show_import_workspace(db: PokerDatabase, session: Session | None) -> None:
-    page_header(
-        "Import a completed session",
-        "Keep every recording from the same completed session together, then reconstruct its hands.",
-    )
-    sessions = db.fetch_sessions()
-    if not sessions:
-        empty_state(
-            "Create a session for these recordings",
-            "Every session needs a played date (defaults to today). You can change it any time.",
+    with st.container(key="import_workspace"):
+        page_header(
+            "Import",
+            "Add recordings for one completed session, reconstruct hands, then validate frames.",
+            eyebrow="SESSION INGEST",
         )
-        create_session_form(db, form_key="create_import_session")
-        return
+        sessions = db.fetch_sessions()
+        if not sessions:
+            empty_state(
+                "Create a session for these recordings",
+                "Every session needs a played date (defaults to today). You can change it any time.",
+            )
+            create_session_form(db, form_key="create_import_session")
+            return
 
-    session = _choose_import_session(db, sessions, session)
-    if session is None:
-        empty_state(
-            "Select or create a session",
-            "Pick a session below, or create one with a played date before importing.",
-        )
-        create_session_form(db, form_key="create_import_session")
-        return
-    show_video_processing(db, session)
+        session = _choose_import_session(db, sessions, session)
+        if session is None:
+            empty_state(
+                "Select or create a session",
+                "Pick a session below, or create one with a played date before importing.",
+            )
+            create_session_form(db, form_key="create_import_session")
+            return
+        show_video_processing(db, session)
 
 
 def show_settings_workspace(db: PokerDatabase, session: Session | None) -> None:
@@ -4307,10 +4106,10 @@ def _save_video_upload(
         help="A session can contain as many recordings as you need.",
     )
     notes = st.text_area(
-        "Source notes",
-        height=70,
+        "Source notes (optional)",
+        height=68,
         key=f"{key_prefix}_notes",
-        placeholder="Optional: table, time range, or what this recording contains",
+        placeholder="Table, time range, or what this recording contains",
     )
     if uploaded is None:
         return
@@ -4604,13 +4403,26 @@ def _choose_import_session(
         return None
 
     with st.container(border=True, key="import_session_target"):
-        st.markdown(f"**Import into:** {current.name}")
-        st.caption(
-            f"Date played · {current.date_played.strftime('%A, %b')} "
-            f"{current.date_played.day}, {current.date_played.year}"
-            + (f" · {current.stakes}" if current.stakes else "")
+        title_col, change_col, new_col = st.columns([3.2, 1, 1])
+        with title_col:
+            st.markdown(f"**{current.name}**")
+            st.caption(
+                f"{current.date_played.strftime('%b')} {current.date_played.day}, "
+                f"{current.date_played.year}"
+                + (f" · {current.stakes}" if current.stakes else "")
+                + " · target session"
+            )
+        change_open = change_col.toggle(
+            "Change",
+            value=False,
+            key=f"import_change_session_toggle_{current.id}",
         )
-        with st.expander("Change session", expanded=False):
+        new_open = new_col.toggle(
+            "New",
+            value=False,
+            key=f"import_new_session_toggle_{current.id}",
+        )
+        if change_open:
             recent_tab, calendar_tab = st.tabs(["Recent", "Calendar"])
             active_id = current.id
             with calendar_tab:
@@ -4632,7 +4444,7 @@ def _choose_import_session(
                     ):
                         _activate_session(item.id)
                         st.rerun()
-        with st.expander("New session for this import", expanded=False):
+        if new_open:
             create_session_form(db, form_key="create_import_target_session")
     return current
 
@@ -5080,7 +4892,7 @@ def _flash_manual_save_results(
     for saved_hand, accounting, warnings in results:
         for warning in warnings:
             st.warning(f"Hand #{saved_hand.hand_number}: {warning}")
-        if accounting.is_authoritative:
+        if _accounting_is_established(saved_hand, accounting):
             ready += 1
         elif accounting.issues:
             st.caption(
@@ -5088,12 +4900,12 @@ def _flash_manual_save_results(
             )
     if len(results) == 1:
         saved_hand, accounting, _ = results[0]
-        if accounting.is_authoritative:
+        if _accounting_is_established(saved_hand, accounting):
             flash(f"Hand #{saved_hand.hand_number} saved and ready for Study / solver.")
         else:
             flash(
-                f"Hand #{saved_hand.hand_number} saved. Finish accounting in "
-                "Study → Fix & confirm before running the solver."
+                f"Hand #{saved_hand.hand_number} saved. Finish accounting on "
+                "Import validation before running the solver."
             )
         return
     flash(
@@ -6641,65 +6453,63 @@ def show_video_processing(db: PokerDatabase, session: Session) -> None:
     has_videos = bool(all_videos)
     collect_open = _import_collect_is_open(session.id, has_videos=has_videos)
 
-    if has_videos and not collect_open:
-        st.success(
-            f"{len(all_videos)} recording{'s' if len(all_videos) != 1 else ''} "
-            f"validated for **{session.name}**. Import panel is hidden."
-        )
-        reopen, picker = st.columns([1, 2])
-        if reopen.button(
-            "Add or change recordings",
-            key=f"reopen_import_collect_{session.id}",
-        ):
-            st.session_state[_import_collect_panel_key(session.id)] = True
-            st.rerun()
-        labels = {
-            video.id: (
-                f"{video.original_filename} · "
-                f"{_format_optional_seconds(video.duration_seconds)}"
+    with st.container(key="import_collect_bar"):
+        if has_videos and not collect_open:
+            picker, reopen = st.columns([3.2, 1])
+            labels = {
+                video.id: (
+                    f"{video.original_filename} · "
+                    f"{_format_optional_seconds(video.duration_seconds)}"
+                )
+                for video in all_videos
+                if video.id is not None
+            }
+            available_ids = set(labels)
+            selected_video_id = st.session_state.get("video_context_id")
+            if selected_video_id not in available_ids:
+                selected_video_id = next(iter(labels))
+                st.session_state["video_context_id"] = selected_video_id
+            chosen = picker.selectbox(
+                f"{len(all_videos)} recording{'s' if len(all_videos) != 1 else ''}",
+                options=list(labels),
+                format_func=lambda video_id: labels[video_id],
+                index=list(labels).index(selected_video_id),
+                key=f"collapsed_video_select_{session.id}",
             )
-            for video in all_videos
-            if video.id is not None
-        }
-        available_ids = set(labels)
-        selected_video_id = st.session_state.get("video_context_id")
-        if selected_video_id not in available_ids:
-            selected_video_id = next(iter(labels))
-            st.session_state["video_context_id"] = selected_video_id
-        chosen = picker.selectbox(
-            "Recording",
-            options=list(labels),
-            format_func=lambda video_id: labels[video_id],
-            index=list(labels).index(selected_video_id),
-            key=f"collapsed_video_select_{session.id}",
-            label_visibility="collapsed",
-        )
-        if chosen != selected_video_id:
-            st.session_state["video_context_id"] = chosen
+            if chosen != selected_video_id:
+                st.session_state["video_context_id"] = chosen
+                st.rerun()
+            if reopen.button(
+                "Add video",
+                key=f"reopen_import_collect_{session.id}",
+                width="stretch",
+            ):
+                st.session_state[_import_collect_panel_key(session.id)] = True
+                st.rerun()
+            video = next(video for video in all_videos if video.id == chosen)
+            show_video_metadata(video)
+            show_video_jobs_and_frames(db, video)
+            return
+
+        upload_col, hide_col = st.columns([3.2, 1])
+        with upload_col:
+            with st.expander(
+                "Add recording" if has_videos else "Add first recording",
+                expanded=not has_videos,
+            ):
+                _save_video_upload(db, session, key_prefix=f"import_{session.id}")
+        if has_videos and hide_col.button(
+            "Done",
+            key=f"hide_import_collect_{session.id}",
+            type="primary",
+            width="stretch",
+            help="Hide the upload panel and keep validating.",
+        ):
+            st.session_state[_import_collect_panel_key(session.id)] = False
             st.rerun()
-        video = next(video for video in all_videos if video.id == chosen)
-        show_video_jobs_and_frames(db, video)
-        return
 
-    workflow_step(
-        1,
-        "Collect the session recordings",
-        "Add one or several finished videos to the same session.",
-        state="active",
-    )
-    st.caption(
-        f"Adding to **{session.name}** · this workflow never captures or analyzes a live table."
-    )
-    with st.expander("Add another recording", expanded=not has_videos):
-        _save_video_upload(db, session, key_prefix=f"import_{session.id}")
-
-    workflow_step(
-        2,
-        "Validate the source",
-        "Choose a recording with one click and confirm its metadata.",
-    )
     if not all_videos:
-        st.info("No videos are linked to this session yet.")
+        st.caption("No videos linked yet — upload a completed-session recording above.")
         return
 
     video = _select_session_video(all_videos, key_prefix="import")
@@ -6707,14 +6517,6 @@ def show_video_processing(db: PokerDatabase, session: Session) -> None:
         st.error("Selected video no longer exists.")
         return
     show_video_metadata(video)
-    done_col, _ = st.columns([1, 3])
-    if done_col.button(
-        "Done — hide import panel",
-        key=f"hide_import_collect_{session.id}",
-        type="primary",
-    ):
-        st.session_state[_import_collect_panel_key(session.id)] = False
-        st.rerun()
     show_video_jobs_and_frames(db, video)
 
 
@@ -6730,37 +6532,42 @@ def _select_session_video(
     if selected_video_id not in available_ids:
         selected_video_id = all_videos[0].id
         st.session_state["video_context_id"] = selected_video_id
-    st.caption(f"{len(all_videos)} recording{'s' if len(all_videos) != 1 else ''} in this session")
-    source_columns = st.columns(min(3, len(all_videos)))
-    for index, item in enumerate(all_videos):
-        if item.id is None:
-            continue
-        label = (
-            f"{'✓ ' if item.id == selected_video_id else ''}"
-            f"{item.original_filename}\n{_format_optional_seconds(item.duration_seconds)}"
+    labels = {
+        video.id: (
+            f"{video.original_filename} · "
+            f"{_format_optional_seconds(video.duration_seconds)}"
         )
-        if source_columns[index % len(source_columns)].button(
-            label,
-            key=f"{key_prefix}_choose_video_{item.id}",
-            type="primary" if item.id == selected_video_id else "secondary",
-            disabled=item.id == selected_video_id,
-            width="stretch",
-        ):
-            st.session_state["video_context_id"] = item.id
-            st.rerun()
-    return next((video for video in all_videos if video.id == selected_video_id), None)
+        for video in all_videos
+        if video.id is not None
+    }
+    chosen = st.selectbox(
+        f"{len(all_videos)} recording{'s' if len(all_videos) != 1 else ''}",
+        options=list(labels),
+        format_func=lambda video_id: labels[video_id],
+        index=list(labels).index(selected_video_id),
+        key=f"{key_prefix}_video_select",
+    )
+    if chosen != selected_video_id:
+        st.session_state["video_context_id"] = chosen
+        st.rerun()
+    return next((video for video in all_videos if video.id == chosen), None)
 
 
 def show_video_metadata(video: VideoRecord) -> None:
-    metadata = st.columns(4)
-    metadata[0].metric("Duration", _format_optional_seconds(video.duration_seconds))
-    metadata[1].metric("Resolution", _format_resolution(video.width, video.height))
-    metadata[2].metric("Frame rate", "—" if video.fps is None else f"{video.fps:g} FPS")
-    metadata[3].metric("File size", _format_bytes(video.file_size_bytes))
-    st.caption(f"{video.original_filename} · uploaded {video.uploaded_at.isoformat()}")
-    with st.expander("Source provenance"):
+    fps = "—" if video.fps is None else f"{video.fps:g} FPS"
+    st.markdown(
+        '<div class="pt-import-meta">'
+        f"<span><strong>{escape(_format_optional_seconds(video.duration_seconds))}</strong> duration</span>"
+        f"<span><strong>{escape(_format_resolution(video.width, video.height))}</strong></span>"
+        f"<span><strong>{escape(fps)}</strong></span>"
+        f"<span><strong>{escape(_format_bytes(video.file_size_bytes))}</strong></span>"
+        f"<span>{escape(video.original_filename)}</span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    with st.expander("Source path & notes", expanded=False):
         st.code(video.stored_path, language="text")
-        st.write(video.notes or "No source notes recorded.")
+        st.caption(video.notes or "No source notes recorded.")
 
 
 def show_video_jobs_and_frames(db: PokerDatabase, video: VideoRecord) -> None:
@@ -6777,9 +6584,9 @@ def show_cv_reconstruction(db: PokerDatabase, video: VideoRecord) -> None:
     if video.id is None:
         return
     workflow_step(
-        3,
+        1,
         "Reconstruct completed hands",
-        "Export a timeline for frame validation. Hands join the session only when "
+        "Export a timeline, then validate frames. Hands join the session only when "
         "validated or when you add a draft.",
         state="active",
     )
@@ -6787,9 +6594,8 @@ def show_cv_reconstruction(db: PokerDatabase, video: VideoRecord) -> None:
     if linked_session is not None:
         session_name = linked_session.name
         target_session_id = linked_session.id
-        st.info(
-            f"Validated and draft hands will be added to **{linked_session.name}**. "
-            "Existing hand numbers are preserved when possible and collisions are renumbered."
+        st.caption(
+            f"Hands go to **{linked_session.name}** · numbers kept when possible."
         )
     else:
         target_session_id = None
@@ -6806,19 +6612,21 @@ def show_cv_reconstruction(db: PokerDatabase, video: VideoRecord) -> None:
         (job for job in latest_jobs if job.status in {"queued", "running", "cancelling"}),
         None,
     )
-    start_col, cancel_col = st.columns([3, 1])
+    start_col, cancel_col = st.columns([3.2, 1])
     with start_col:
         start_clicked = st.button(
             "Run CV reconstruction",
             type="primary",
             disabled=active is not None,
             key=f"cv_start_{video.id}",
+            width="stretch",
         )
     with cancel_col:
         cancel_clicked = st.button(
             "Cancel",
             disabled=active is None,
             key=f"cv_cancel_{video.id}",
+            width="stretch",
         )
     if start_clicked:
         try:
@@ -6903,15 +6711,11 @@ def show_cv_reconstruction(db: PokerDatabase, video: VideoRecord) -> None:
         else "pending"
     )
     workflow_step(
-        4,
+        2,
         "Validate or add drafts",
-        "Mark every frame Correct to auto-add full hands, or Add draft for incomplete ones. "
+        "Mark frames Correct to auto-add full hands, or Add draft for incomplete ones. "
         "Study stays separate until you confirm.",
         state=step4_state,
-    )
-    st.caption(
-        "Completed jobs export timelines for review. Session hands appear only after "
-        "autonomous validation or an explicit draft add."
     )
 
 
@@ -7073,19 +6877,10 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
         st.warning(empty_hands_review_message(timeline))
         return
 
-    st.success(
-        "Reconstruction finished. Frame labels save permanently — validate "
-        "part of a hand now and resume the rest any time from this page."
-    )
     st.markdown("#### Frame evidence review")
     st.caption(
-        "Validate one frame at a time. Every verdict is saved permanently to this "
-        "job — stop anytime and return here later to change or continue."
-    )
-    st.caption(
-        "A full hand with every frame Correct and a clean start/end is added to the "
-        "session automatically. Incomplete or mid-start hands stay out until you "
-        "click Add draft. Study still requires separate confirmation."
+        "Labels save permanently — stop anytime. Opening a hand drafts it for "
+        "editing; finish with no open issues to send it to Study."
     )
     video = db.fetch_video(job.video_id)
     session_id = video.session_id if video is not None else None
@@ -7180,13 +6975,13 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
             reviews_by_image=reviews_by_hand_image.get(number, {}),
         )
         if in_session:
-            session_status = "in session"
+            session_status = "in session — edit here"
         elif session_id is None:
             session_status = "no destination session"
         elif gate.ok:
             session_status = "ready to auto-add"
         elif progress["flagged"]:
-            session_status = "flagged — add draft to edit"
+            session_status = "flagged — open hand to edit"
         elif progress["remaining"]:
             session_status = "frames remaining"
         else:
@@ -7288,74 +7083,50 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
     )
 
     hand = next(item for item in hands if int(item.get("hand_number", 0)) == selected_hand_number)
-    selected_in_session = (
-        session_id is not None
-        and find_existing_imported_hand(
-            db,
-            session_id=session_id,
-            job_id=job.id,
-            timeline_hand_number=selected_hand_number,
-            related_job_ids=related_jobs,
-        )
-        is not None
-    )
-    selected_gate = autonomous_import_blockers(
-        timeline,
-        hand,
-        timeline_path=timeline_path_for_job(job.id),
-        reviews_by_image=reviews_by_hand_image.get(selected_hand_number, {}),
-    )
-    draft_col, status_col = st.columns([1, 2])
+    db_hand: Hand | None = None
+    draft_result = None
     if session_id is None:
-        status_col.warning(
-            "Link this video to a destination session before adding hands."
-        )
-    elif selected_in_session:
-        status_col.success(
-            "This hand is in the session. Edit facts in Study → Fix & confirm. "
-            "It is not study-ready until you confirm and set study inclusion."
+        st.warning(
+            "Link this video to a destination session before validating hands."
         )
     else:
-        add_label = (
-            "Add to session now"
-            if selected_gate.ok
-            else "Add draft to session"
-        )
-        if draft_col.button(
-            add_label,
-            key=f"evidence_add_draft_{job.id}_{selected_hand_number}",
-            width="stretch",
-            help=(
-                "Save this timeline hand into the destination session for editing."
-            ),
-        ):
-            try:
-                result = ensure_hand_imported(
-                    db,
-                    job.id,
-                    selected_hand_number,
-                    mode="auto" if selected_gate.ok else "draft",
-                )
-            except Exception as exc:  # noqa: BLE001 - keep the review UI usable
-                st.error(f"Could not add hand: {exc}")
-            else:
-                if result.status in {"imported", "already_present"}:
-                    flash(
-                        f"{result.message} Edit in Study when ready — not study material yet."
-                    )
-                    st.rerun()
-                else:
-                    st.error(result.message or "Could not add draft.")
-        if selected_gate.ok:
-            status_col.info(
-                "All frames Correct and the hand is full — it will auto-add when "
-                "you mark the last frame, or use Add to session now."
+        try:
+            draft_result = ensure_draft_for_review(
+                db, job.id, selected_hand_number
             )
+        except Exception as exc:  # noqa: BLE001 - keep the review UI usable
+            st.error(f"Could not open session draft for editing: {exc}")
         else:
-            status_col.warning(
-                "Not auto-added yet: "
-                + ("; ".join(selected_gate.reasons) or "validation incomplete")
-                + ". Use Add draft to edit incomplete or mid-start hands."
+            if draft_result.status in {"imported", "already_present"}:
+                if draft_result.status == "imported":
+                    flash(
+                        f"{draft_result.message} Edit beside the frames below."
+                    )
+                if draft_result.hand_id is not None:
+                    db_hand = db.fetch_hand(draft_result.hand_id)
+            else:
+                st.warning(
+                    draft_result.message
+                    or "Could not draft this hand into the session for editing."
+                )
+        if db_hand is None:
+            db_hand = find_existing_imported_hand(
+                db,
+                session_id=session_id,
+                job_id=job.id,
+                timeline_hand_number=selected_hand_number,
+                related_job_ids=related_jobs,
+            )
+        if db_hand is not None:
+            if db_hand.review_status == "reviewed":
+                st.caption("Approved for Study.")
+            else:
+                st.caption(
+                    "Draft ready — edit beside frames; finish with no open issues for Study."
+                )
+        elif draft_result is not None and draft_result.status == "blocked":
+            st.caption(
+                "Reasons: " + ("; ".join(draft_result.reasons) or "blocked")
             )
 
     states = states_for_hand(timeline, hand)
@@ -7402,9 +7173,9 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
             "Saved progress is fine — click Jump to first unreviewed to resume grading."
         )
     else:
-        done_col.info(
+        done_col.caption(
             f"Hand #{selected_hand_number}: {hand_progress['reviewed']}/"
-            f"{hand_progress['total']} saved. Done for now is fine — progress stays."
+            f"{hand_progress['total']} saved · progress stays if you leave"
         )
 
     verdict_label = (
@@ -7536,6 +7307,18 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
                     flash("Frame issue saved. You can leave and resume later.")
                     st.rerun()
 
+    if db_hand is not None:
+        frames_ok = hand_frames_validated(
+            hand,
+            hand_reviews,
+            countable_images=navigable_images_by_hand.get(selected_hand_number, []),
+        )
+        render_validation_edit_and_approve(
+            db,
+            db_hand,
+            frames_validated=frames_ok,
+        )
+
     # Count only navigable frames so the expander matches the summary metrics.
     navigable_images = {
         (number, image)
@@ -7664,28 +7447,67 @@ def _mark_evidence_correct(
             return
         _move_evidence_cursor(cursor_key, 1, frame_count)
         try:
-            result = ensure_hand_imported(db, job_id, hand_number, mode="auto")
+            draft = ensure_draft_for_review(db, job_id, hand_number)
         except Exception as exc:  # noqa: BLE001
             flash(
-                f"Frame marked correct, but session import failed: {exc}. "
-                "Use Add draft if you want to retry."
+                f"Frame marked correct, but session draft failed: {exc}."
             )
             return
-        if result.status == "imported":
+        if draft.status == "imported":
+            flash(f"Frame marked correct. {draft.message}")
+        elif draft.status == "already_present":
+            flash("Frame marked correct. Hand draft is in the session.")
+        elif draft.status == "blocked" and draft.reasons:
             flash(
-                f"Frame marked correct. {result.message} "
-                "Not study-ready until you confirm in Study."
-            )
-        elif result.status == "already_present":
-            flash("Frame marked correct. Hand already in the session.")
-        elif result.status == "blocked" and result.reasons:
-            flash(
-                "Frame marked correct. Not auto-added yet: "
-                + "; ".join(result.reasons)
-                + ". Use Add draft if you want to edit it now."
+                "Frame marked correct. Draft not available yet: "
+                + "; ".join(draft.reasons)
             )
         else:
             flash("Frame marked correct. Progress is saved — stop anytime.")
+        # Auto-import path remains for full hands that were never drafted early.
+        try:
+            ensure_hand_imported(db, job_id, hand_number, mode="auto")
+        except Exception:
+            pass
+        if draft.hand_id is not None:
+            hand = db.fetch_hand(draft.hand_id)
+            if hand is not None and hand.review_status != "reviewed":
+                reviews = {
+                    review.source_image: review
+                    for review in db.fetch_reconstruction_frame_reviews(
+                        job_id, hand_number=hand_number
+                    )
+                }
+                timeline = load_timeline_for_job(job_id)
+                timeline_hand = None
+                if timeline is not None:
+                    timeline_hand = next(
+                        (
+                            item
+                            for item in timeline.get("hands") or []
+                            if int(item.get("hand_number", 0)) == hand_number
+                        ),
+                        None,
+                    )
+                if timeline_hand is not None and hand_frames_validated(
+                    timeline_hand, reviews
+                ):
+                    open_issues = [
+                        issue
+                        for issue in db.fetch_hand_issues(hand_id=hand.id)
+                        if issue.status == "open"
+                    ]
+                    if not open_issues:
+                        auto_key = f"validation_auto_approve_attempted_{hand.id}"
+                        if not st.session_state.get(auto_key):
+                            st.session_state[auto_key] = True
+                            if try_approve_hand_after_validation(
+                                db, hand, announce=False
+                            ):
+                                flash(
+                                    f"Hand #{hand_number} validated and "
+                                    "approved for Study."
+                                )
     finally:
         st.session_state.pop(lock_key, None)
 

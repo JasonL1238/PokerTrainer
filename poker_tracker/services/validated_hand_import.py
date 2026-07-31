@@ -199,6 +199,31 @@ def related_cv_job_ids(db: PokerDatabase, video_id: int) -> set[int]:
         if job.job_type == "cv_reconstruction" and job.id is not None
     }
 
+def ensure_draft_for_review(
+    db: PokerDatabase,
+    job_id: int,
+    timeline_hand_number: int,
+    *,
+    timeline_dir: Path | None = None,
+    data_dir: Path | None = None,
+    reviews_by_image: dict[str, Any] | None = None,
+) -> HandImportResult:
+    """Land a draft session hand so Import can edit while reviewing frames.
+
+    Treats ``imported`` and ``already_present`` as success. Does not promote the
+    hand to study-ready; that happens only after validation finishes cleanly.
+    """
+    return ensure_hand_imported(
+        db,
+        job_id,
+        timeline_hand_number,
+        mode="draft",
+        timeline_dir=timeline_dir,
+        data_dir=data_dir,
+        reviews_by_image=reviews_by_image,
+    )
+
+
 def ensure_hand_imported(
     db: PokerDatabase,
     job_id: int,

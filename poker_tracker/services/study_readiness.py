@@ -339,8 +339,7 @@ def evaluate_study_readiness(
                     )
                 ),
                 clearing_action=(
-                    "Press 'Approve and next' under Fix & confirm → "
-                    "Looks good — Approve."
+                    "Press 'Finish validation — send to Study' on Import validation."
                 ),
             )
         )
@@ -477,8 +476,8 @@ def _completion_clearing_action(
                 "corrected in the meantime."
             )
         return (
-            "Fill in the missing facts under Fix & confirm → Edit the hand — Fix → "
-            "Other fixes → Hand facts (and edit any missing actions), acknowledge "
+            "Fill in the missing facts under Import validation → Edit this hand → "
+            "Cards, board, or pot (and edit any missing actions), acknowledge "
             "remaining source warnings, then use Other fixes → Finalize incomplete "
             "hand to attest that you reconstructed the whole hand yourself — even "
             "when the recording joined late. Sticky truncation and pipeline "
@@ -498,8 +497,8 @@ def _completion_clearing_action(
             "The pipeline rejected "
             f"{', '.join(evidence.rejection_codes)}. A rejection cannot be "
             "acknowledged away. If you reconstructed the whole hand yourself, "
-            "acknowledge any remaining source warnings, then use Fix & confirm → "
-            "Edit the hand — Fix → Other fixes → Finalize incomplete hand. "
+            "acknowledge any remaining source warnings, then use Import "
+            "validation → Edit this hand → Finalize incomplete hand. "
             f"Alternatively, only a new reconstruction clears this: "
             f"{NEW_RECONSTRUCTION_STEPS} If the reconstruction reproduces the "
             "same code and you cannot fill the gaps, record a debugging issue "
@@ -780,14 +779,14 @@ def _accounting_blockers(
     # blocker used to name that panel for both branches, so following it literally
     # could not clear the blocker; the panel's own inline caption already said so.
     clearing_action = (
-        "Open Fix & confirm → Edit the hand — Fix and correct the stack sizes, "
+        "Open Import validation → Edit this hand and correct the stack sizes, "
         "action amounts, or players the ledger rejected — the Accounting "
         "reconciliation panel cannot change them. Reopen Other fixes → "
         "Chip stacks / accounting afterwards and save the settlement until its "
         "status reads reconciled."
         if accounting_error
         else (
-            "Open Fix & confirm → Edit the hand — Fix → Other fixes → "
+            "Open Import validation → Edit this hand → Other fixes → "
             "Chip stacks / accounting, fix the flagged contributions or awards, "
             "and save the settlement until its status reads reconciled."
         )
@@ -868,11 +867,11 @@ def _assumption_blockers(
                 "hero result are not established by the recording alone."
             ),
             clearing_action=(
-                "Open Fix & confirm → Edit the hand — Fix → Other fixes → "
+                "Open Import validation → Edit this hand → Other fixes → "
                 "Chip stacks / accounting (Accounting reconciliation) and press "
                 "'Confirm this assumption' beside each listed assumption, which "
-                "records the exact chip movement you are attesting to. Approving "
-                "the hand as a whole does not clear this. If the chips did not "
+                "records the exact chip movement you are attesting to. Finishing "
+                "validation as a whole does not clear this. If the chips did not "
                 "move that way, correct the declared winner, the rake policy or "
                 "the dead money there instead and save the settlement — a "
                 "declaration that changes nothing is never disclosed."

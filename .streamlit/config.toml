@@ -1,10 +1,10 @@
 [theme]
 base = "dark"
-# PokerTrainer product palette: near-black felt, graphite surfaces, emerald action.
-primaryColor = "#35D07F"
-backgroundColor = "#080B0A"
-secondaryBackgroundColor = "#0D1311"
-textColor = "#F1F3ED"
+# PokerTrainer product palette: warm ink charcoal, brass action, muted felt wins.
+primaryColor = "#D9A441"
+backgroundColor = "#121418"
+secondaryBackgroundColor = "#1A1E24"
+textColor = "#F2EFE8"
 font = "sans serif"
 
 [server]

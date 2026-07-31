@@ -1453,12 +1453,19 @@ def _run_page(path: Path, page: str, monkeypatch: pytest.MonkeyPatch) -> AppTest
     return app
 
 
-def _seed_unattested_hand(path: Path) -> int:
+def _seed_unattested_hand(path: Path, *, review_status: str = "unreviewed") -> int:
     db = PokerDatabase(str(path))
     db.init_db()
     hand = _seed_hand(db, rake_rate=0.5, hero_bb_won=0.0)
     assert hand.id is not None
     persist_reconciliation(db, hand.id)
+    if review_status != hand.review_status:
+        # Study queues only reviewed hands; keep the assumption blocker for coaching.
+        db._execute(
+            "UPDATE hands SET review_status = ? WHERE id = ?",
+            (review_status, hand.id),
+        )
+        db._commit()
     hand_id = hand.id
     db.close()
     return hand_id
@@ -1479,7 +1486,10 @@ def test_both_coaching_surfaces_name_the_unattested_assumption(
     and no message at all.
     """
     path = tmp_path / f"coach_{page}.sqlite3"
-    _seed_unattested_hand(path)
+    # Study is approved-hands-only; mark reviewed so Analyze still mounts.
+    _seed_unattested_hand(
+        path, review_status="reviewed" if page == Page.STUDY else "unreviewed"
+    )
 
     app = _run_page(path, page, monkeypatch)
     rendered = " ".join(

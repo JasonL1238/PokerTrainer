@@ -815,20 +815,36 @@ def test_study_never_offers_reviewed_for_a_stored_reviewed_but_blocked_hand(
 ) -> None:
     """The filter stripped 'reviewed', then a fallback re-appended the stored value."""
 
-    import streamlit as st
-
-    from poker_tracker.ui.navigation import Page
+    import app as app_module
+    from poker_tracker.services.hand_accounting import reconcile_persisted_hand
+    from poker_tracker.services.study_readiness import evaluate_study_readiness
+    from tests.test_study_readiness_ui import _run_validation_editors
 
     path = tmp_path / "sticky.sqlite3"
-    _seed_promoted_then_broken(path)
+    hand_id = _seed_promoted_then_broken(path)
 
-    app = _run_page(path, Page.STUDY, monkeypatch)
-    widget = next(item for item in app.selectbox if item.label == "Review status")
+    db = PokerDatabase(path)
+    db.init_db()
+    hand = db.fetch_hand(hand_id)
+    accounting = reconcile_persisted_hand(db, hand_id)
+    readiness = evaluate_study_readiness(
+        hand,
+        accounting=accounting,
+        hand_issues=db.fetch_hand_issues(hand_id=hand_id),
+        user_confirmed=True,
+    )
+    options, index = app_module.review_status_options(hand, readiness)
+    assert "reviewed" not in options
+    assert options[index] != "reviewed"
+    db.close()
+
+    app = _run_validation_editors(
+        path, monkeypatch, hand_id, frames_validated=False
+    )
     rendered = "\n".join(item.value for item in app.markdown)
+    assert "What's blocking Study" in rendered or "Not study-ready" in rendered
+    import streamlit as st
 
-    assert "Not study-ready" in rendered
-    assert "reviewed" not in widget.options
-    assert widget.value != "reviewed"
     st.cache_resource.clear()
 
 

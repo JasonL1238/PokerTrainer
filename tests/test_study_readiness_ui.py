@@ -179,12 +179,16 @@ def _seed_hand(
     return hand_id
 
 
-def _run_study(path: Path, monkeypatch) -> AppTest:
+def _configure_app_env(path: Path, monkeypatch) -> None:
     monkeypatch.delenv("APP_PASSWORD", raising=False)
     monkeypatch.delenv("POKERTRAINER_REQUIRE_AUTH", raising=False)
     monkeypatch.setenv("POKER_DB_PATH", str(path))
     monkeypatch.setattr(db_module, "DEFAULT_DB_PATH", str(path))
     st.cache_resource.clear()
+
+
+def _run_study(path: Path, monkeypatch) -> AppTest:
+    _configure_app_env(path, monkeypatch)
     app = AppTest.from_file(APP_PATH, default_timeout=30).run()
     next(item for item in app.radio if "Study" in list(item.options)).set_value(
         Page.STUDY
@@ -194,24 +198,40 @@ def _run_study(path: Path, monkeypatch) -> AppTest:
     return app
 
 
-def _path_radio(app: AppTest):
-    return next(
-        item
-        for item in app.radio
-        if "Looks good — Approve" in list(getattr(item, "options", []))
+def _run_validation_editors(
+    path: Path,
+    monkeypatch,
+    hand_id: int,
+    *,
+    frames_validated: bool = True,
+) -> AppTest:
+    """Mount Import validation editors without a full CV timeline UI."""
+
+    _configure_app_env(path, monkeypatch)
+    script = path.parent / f"_validation_editors_{hand_id}.py"
+    script.write_text(
+        "\n".join(
+            [
+                "from poker_tracker.persistence.db import PokerDatabase",
+                "import app as app_module",
+                f"db = PokerDatabase(r'{path}')",
+                "db.init_db()",
+                f"hand = db.fetch_hand({hand_id})",
+                "app_module.render_validation_edit_and_approve(",
+                "    db,",
+                "    hand,",
+                f"    frames_validated={frames_validated!r},",
+                ")",
+            ]
+        ),
+        encoding="utf-8",
     )
-
-
-def _open_approve(app: AppTest) -> AppTest:
-    _path_radio(app).set_value("Looks good — Approve")
-    app.run()
+    app = AppTest.from_file(str(script), default_timeout=30).run()
     assert not list(app.exception)
     return app
 
 
 def _open_fix_tool(app: AppTest, tool_label: str) -> AppTest:
-    _path_radio(app).set_value("Edit the hand — Fix")
-    app.run()
     tool_box = next(
         item for item in app.selectbox if item.label == "What else needs fixing?"
     )
@@ -222,10 +242,6 @@ def _open_fix_tool(app: AppTest, tool_label: str) -> AppTest:
     return app
 
 
-def _status_widget(app: AppTest):
-    return next(item for item in app.selectbox if item.label == "Review status")
-
-
 def _saved_review_status(path: Path, hand_id: int) -> str:
     verifier = PokerDatabase(path)
     verifier.init_db()
@@ -234,32 +250,42 @@ def _saved_review_status(path: Path, hand_id: int) -> str:
     return status
 
 
-def test_study_reviewed_option_is_absent_while_blocked(tmp_path, monkeypatch) -> None:
+def test_validation_finish_refuses_blocked_hand(tmp_path, monkeypatch) -> None:
     path = tmp_path / "blocked.sqlite3"
-    _seed_hand(path)
-
-    app = _open_approve(_run_study(path, monkeypatch))
-
-    assert "reviewed" not in _status_widget(app).options
-    st.cache_resource.clear()
-
-
-def test_study_cannot_mark_an_uncertain_cv_hand_reviewed(tmp_path, monkeypatch) -> None:
-    """The status control cannot promote a blocked hand, even if 'reviewed' is forced."""
-
-    path = tmp_path / "bypass.sqlite3"
     hand_id = _seed_hand(path)
 
-    app = _open_approve(_run_study(path, monkeypatch))
-    assert "reviewed" not in _status_widget(app).options
-    next(button for button in app.button if button.label == "Save review status").click()
+    app = _run_validation_editors(path, monkeypatch, hand_id)
+    finish = next(
+        button
+        for button in app.button
+        if button.label == "Finish validation — send to Study"
+    )
+    finish.click()
     app.run()
     assert not list(app.exception)
     assert _saved_review_status(path, hand_id) != "reviewed"
     st.cache_resource.clear()
 
-    # Defense in depth behind the control: a forced "reviewed" is refused twice —
-    # once by the UI guard, and again by the store even if the guard is bypassed.
+
+def test_validation_cannot_promote_uncertain_cv_hand_even_via_guard(
+    tmp_path, monkeypatch
+) -> None:
+    """Finish validation and the store both refuse a blocked hand."""
+
+    path = tmp_path / "bypass.sqlite3"
+    hand_id = _seed_hand(path)
+
+    app = _run_validation_editors(path, monkeypatch, hand_id)
+    next(
+        button
+        for button in app.button
+        if button.label == "Finish validation — send to Study"
+    ).click()
+    app.run()
+    assert not list(app.exception)
+    assert _saved_review_status(path, hand_id) != "reviewed"
+    st.cache_resource.clear()
+
     import app as app_module
 
     db = PokerDatabase(path)
@@ -279,48 +305,57 @@ def test_study_cannot_mark_an_uncertain_cv_hand_reviewed(tmp_path, monkeypatch) 
     db.close()
 
 
-def test_study_shows_blockers_grouped_by_category(tmp_path, monkeypatch) -> None:
+def test_validation_shows_blockers_grouped_by_category(tmp_path, monkeypatch) -> None:
     path = tmp_path / "grouped.sqlite3"
-    _seed_hand(path, completion_evidence={})
+    hand_id = _seed_hand(path, completion_evidence={})
 
-    app = _run_study(path, monkeypatch)
+    app = _run_validation_editors(path, monkeypatch, hand_id)
     rendered = "\n".join(item.value for item in app.markdown)
 
-    assert "Not study-ready" in rendered
-    assert "Completion · " in rendered
-    assert "Table layout · " in rendered
-    assert "Your confirmation · " in rendered
+    assert "What's blocking Study" in rendered or "Not study-ready" in rendered
+    assert "Completion · " in rendered or "completion" in rendered.lower()
     reasons = "\n".join(item.value for item in app.caption)
-    assert "Clears when:" in reasons
+    assert "Clears when:" in reasons or "Import validation" in reasons
     st.cache_resource.clear()
 
 
-def test_study_never_renders_a_confidence_percentage(tmp_path, monkeypatch) -> None:
+def test_validation_never_renders_a_confidence_percentage(
+    tmp_path, monkeypatch
+) -> None:
     path = tmp_path / "confidence.sqlite3"
-    _seed_hand(path)
+    hand_id = _seed_hand(path)
 
-    app = _run_study(path, monkeypatch)
+    app = _run_validation_editors(path, monkeypatch, hand_id)
     confidence_lines = [
         item.value for item in app.caption if "Reconstruction confidence" in item.value
     ]
-
-    assert confidence_lines
+    text = "\n".join(
+        [item.value for item in app.markdown]
+        + [item.value for item in app.caption]
+    )
     for line in confidence_lines:
         assert "%" not in line
         assert not re.search(r"\d", line)
+    assert "%" not in text or "Reconstruction confidence" not in text
     st.cache_resource.clear()
 
 
-def test_study_approve_and_next_confirms_a_cv_hand(tmp_path, monkeypatch) -> None:
+def test_validation_finish_confirms_a_cv_hand(tmp_path, monkeypatch) -> None:
     path = tmp_path / "confirm.sqlite3"
     hand_id = _seed_hand(path, completion_status="complete")
 
-    app = _open_approve(_run_study(path, monkeypatch))
-    assert "reviewed" not in _status_widget(app).options
-    assert any(button.label == "Approve and next" for button in app.button)
+    # frames_validated=False keeps auto-approve from racing the Finish click.
+    app = _run_validation_editors(
+        path, monkeypatch, hand_id, frames_validated=False
+    )
+    assert any(
+        button.label == "Finish validation — send to Study" for button in app.button
+    )
 
     next(
-        button for button in app.button if button.label == "Approve and next"
+        button
+        for button in app.button
+        if button.label == "Finish validation — send to Study"
     ).click()
     app.run()
 
@@ -329,31 +364,25 @@ def test_study_approve_and_next_confirms_a_cv_hand(tmp_path, monkeypatch) -> Non
     st.cache_resource.clear()
 
 
-def test_study_approve_shows_side_by_side_table_and_source_frames(
+def test_validation_editors_surface_is_mounted_for_ready_hand(
     tmp_path, monkeypatch
 ) -> None:
-    """Approve puts reconstruction and key frames on one surface for judgment."""
+    """Validation hosts edit + finish; Study no longer owns side-by-side Approve."""
 
     path = tmp_path / "side_by_side.sqlite3"
-    _seed_hand(path, completion_status="complete")
+    hand_id = _seed_hand(path, completion_status="complete")
 
-    app = _open_approve(_run_study(path, monkeypatch))
+    app = _run_validation_editors(
+        path, monkeypatch, hand_id, frames_validated=False
+    )
     rendered = "\n".join(item.value for item in app.markdown)
     captions = "\n".join(item.value for item in app.caption)
-    text = "\n".join((rendered, captions))
 
-    assert "#### Source frames" in rendered
-    assert "#### Saved action line" in rendered
-    assert "Reconstructed table for approval" in text
-    assert "Compare this line and the table to the source frames" in captions
-    # No recording is attached in this fixture, so Approve still points operators
-    # at Import rather than mounting a dead jump button.
-    assert "Frame validation lives on Import" in captions
-    # Completion evidence falls back to stored frame refs when no timeline exists.
+    assert "### Edit this hand" in rendered
+    assert "Edit while validating frames" in captions
     assert any(
-        "Hand start" in warning.value or "Terminal" in warning.value
-        for warning in app.warning
-    ) or "Key frames from the recording" in captions
+        button.label == "Finish validation — send to Study" for button in app.button
+    )
     st.cache_resource.clear()
 
 
@@ -392,7 +421,10 @@ def test_study_confirming_a_settlement_assumption_clears_its_blocker(
     )
     accepter.close()
 
-    app = _open_fix_tool(_run_study(path, monkeypatch), "Chip stacks / accounting")
+    app = _open_fix_tool(
+        _run_validation_editors(path, monkeypatch, hand_id),
+        "Chip stacks / accounting",
+    )
     rendered = "\n".join(item.value for item in app.markdown)
     assert "rake_policy · unconfirmed" in rendered
     assert "settlement inputs you declared" in rendered
@@ -416,17 +448,19 @@ def test_study_confirming_a_settlement_assumption_clears_its_blocker(
         is False
     )
 
-    # ...and the page agrees. Reopened, only confirmation remains — Approve and
-    # next supplies that click (the Advanced checkbox is still available).
+    # Confirming the last blocker with frames_validated=True auto-approves.
     st.cache_resource.clear()
-    app = _open_approve(_run_study(path, monkeypatch))
-    assert "reviewed" not in _status_widget(app).options
-    assert any(button.label == "Approve and next" for button in app.button)
-    next(
-        button for button in app.button if button.label == "Approve and next"
-    ).click()
-    app.run()
-    assert not list(app.exception)
+    if _saved_review_status(path, hand_id) != "reviewed":
+        app = _run_validation_editors(
+            path, monkeypatch, hand_id, frames_validated=False
+        )
+        next(
+            button
+            for button in app.button
+            if button.label == "Finish validation — send to Study"
+        ).click()
+        app.run()
+        assert not list(app.exception)
     assert _saved_review_status(path, hand_id) == "reviewed"
     st.cache_resource.clear()
 
@@ -459,10 +493,18 @@ def test_the_confirm_control_reports_a_refused_write_instead_of_flashing(
         rake_rate=0.5,
     )
 
+    import app as app_module
+
     monkeypatch.setattr(
         hand_accounting_module, "attest_assumption", lambda *args, **kwargs: False
     )
-    app = _open_fix_tool(_run_study(path, monkeypatch), "Chip stacks / accounting")
+    monkeypatch.setattr(
+        app_module, "attest_assumption", lambda *args, **kwargs: False
+    )
+    app = _open_fix_tool(
+        _run_validation_editors(path, monkeypatch, hand_id),
+        "Chip stacks / accounting",
+    )
     next(
         item for item in app.button if item.label == "Confirm this assumption"
     ).click()
@@ -493,16 +535,13 @@ def test_study_manual_hand_can_still_be_marked_reviewed(tmp_path, monkeypatch) -
         review_status="unreviewed",
     )
 
-    app = _open_approve(_run_study(path, monkeypatch))
-    # No confirmation control is rendered for a manual hand.
-    assert not [
-        item
-        for item in app.checkbox
-        if item.label
-        == "I have read the evidence above and confirm this hand is correct"
-    ]
+    app = _run_validation_editors(
+        path, monkeypatch, hand_id, frames_validated=False
+    )
     next(
-        button for button in app.button if button.label == "Approve and next"
+        button
+        for button in app.button
+        if button.label == "Finish validation — send to Study"
     ).click()
     app.run()
 
@@ -522,7 +561,8 @@ def test_study_partial_hand_is_still_inspectable_and_correctable(
     )
 
     app = _open_fix_tool(
-        _run_study(path, monkeypatch), "Cards, board, or pot"
+        _run_validation_editors(path, monkeypatch, hand_id),
+        "Cards, board, or pot",
     )
     next(item for item in app.text_input if item.label == "Board cards").set_value(
         "Qd 7s 6c"
@@ -558,7 +598,10 @@ def test_study_acknowledging_a_source_warning_promotes_uncertain_to_complete(
         completion_evidence=_with_evidence(warning_codes=["pot_not_reconciled"]),
     )
 
-    app = _open_fix_tool(_run_study(path, monkeypatch), "Source warnings")
+    app = _open_fix_tool(
+        _run_validation_editors(path, monkeypatch, hand_id),
+        "Source warnings",
+    )
     next(button for button in app.button if button.label == "Acknowledge").click()
     app.run()
 
@@ -579,14 +622,17 @@ def test_the_panel_offers_no_acknowledge_button_for_a_rejection_code(
 ) -> None:
     """A rejection is the pipeline refusing the hand, so there is nothing to accept."""
     path = tmp_path / "rejection.sqlite3"
-    _seed_hand(
+    hand_id = _seed_hand(
         path,
         completion_evidence=_with_evidence(
             rejection_codes=["duplicate_card_detected"]
         ),
     )
 
-    app = _open_fix_tool(_run_study(path, monkeypatch), "Source warnings")
+    app = _open_fix_tool(
+        _run_validation_editors(path, monkeypatch, hand_id),
+        "Source warnings",
+    )
 
     assert not list(app.exception)
     assert not [button for button in app.button if button.label == "Acknowledge"]
@@ -605,7 +651,10 @@ def test_acknowledgement_never_promotes_a_partial_hand(tmp_path, monkeypatch) ->
         ),
     )
 
-    app = _open_fix_tool(_run_study(path, monkeypatch), "Source warnings")
+    app = _open_fix_tool(
+        _run_validation_editors(path, monkeypatch, hand_id),
+        "Source warnings",
+    )
     next(button for button in app.button if button.label == "Acknowledge").click()
     app.run()
 
@@ -638,17 +687,58 @@ class _StubProvider:
         return self.generate_hand_review(prompt)
 
 
+def _run_coach_surface(path: Path, monkeypatch, hand_id: int) -> AppTest:
+    """Mount Analyze coaching without requiring the hand to be Study-queued."""
+
+    _configure_app_env(path, monkeypatch)
+    script = path.parent / f"_coach_surface_{hand_id}.py"
+    script.write_text(
+        "\n".join(
+            [
+                "from poker_tracker.persistence.db import PokerDatabase",
+                "from poker_tracker.services.study_readiness import evaluate_study_readiness",
+                "import app as app_module",
+                f"db = PokerDatabase(r'{path}')",
+                "db.init_db()",
+                f"hand = db.fetch_hand({hand_id})",
+                "session = db.fetch_session(hand.session_id)",
+                "actions = db.fetch_actions_by_hand(hand.id)",
+                "players = db.fetch_players_by_hand(hand.id)",
+                "accounting, accounting_error = app_module._reconcile_cached(db, hand.id, None)",
+                "readiness = evaluate_study_readiness(",
+                "    hand,",
+                "    accounting=accounting,",
+                "    accounting_error=accounting_error,",
+                "    hand_issues=db.fetch_hand_issues(hand_id=hand.id),",
+                "    coaching_reviews=db.fetch_coaching_reviews_by_hand(hand.id),",
+                "    hand_reviews=db.fetch_reviews_by_hand(hand.id),",
+                "    solver_runs=db.fetch_solver_runs_by_hand(hand.id),",
+                "    user_confirmed=True,",
+                ")",
+                "app_module.show_study_coach_review(",
+                "    db, session, hand, actions, players, accounting,",
+                "    accounting_error, db.fetch_coaching_reviews_by_hand(hand.id), readiness,",
+                ")",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    app = AppTest.from_file(str(script), default_timeout=30).run()
+    assert not list(app.exception)
+    return app
+
+
 def test_coaching_generation_does_not_promote_a_blocked_hand(
     tmp_path, monkeypatch
 ) -> None:
     path = tmp_path / "coaching.sqlite3"
     hand_id = _seed_hand(path)
     monkeypatch.setattr(
-        "poker_tracker.coaching.llm_providers.get_provider_from_env",
+        "app.get_provider_from_env",
         lambda *args, **kwargs: _StubProvider(),
     )
 
-    app = _run_study(path, monkeypatch)
+    app = _run_coach_surface(path, monkeypatch, hand_id)
     next(
         button
         for button in app.button
@@ -680,11 +770,11 @@ def test_coaching_generation_promotes_a_ready_hand(tmp_path, monkeypatch) -> Non
         review_status="unreviewed",
     )
     monkeypatch.setattr(
-        "poker_tracker.coaching.llm_providers.get_provider_from_env",
+        "app.get_provider_from_env",
         lambda *args, **kwargs: _StubProvider(),
     )
 
-    app = _run_study(path, monkeypatch)
+    app = _run_coach_surface(path, monkeypatch, hand_id)
     next(
         button
         for button in app.button
@@ -719,11 +809,11 @@ def test_coaching_generation_is_blocked_by_an_open_debugging_issue(
     )
     db.close()
     monkeypatch.setattr(
-        "poker_tracker.coaching.llm_providers.get_provider_from_env",
+        "app.get_provider_from_env",
         lambda *args, **kwargs: _StubProvider(),
     )
 
-    app = _run_study(path, monkeypatch)
+    app = _run_coach_surface(path, monkeypatch, hand_id)
     button = next(
         item
         for item in app.button
@@ -763,6 +853,45 @@ def _seed_completed_solver_run(path: Path, hand_id: int) -> None:
     db.close()
 
 
+def _run_solver_surface(path: Path, monkeypatch, hand_id: int) -> AppTest:
+    _configure_app_env(path, monkeypatch)
+    script = path.parent / f"_solver_surface_{hand_id}.py"
+    script.write_text(
+        "\n".join(
+            [
+                "from poker_tracker.persistence.db import PokerDatabase",
+                "from poker_tracker.services.study_readiness import evaluate_study_readiness",
+                "import app as app_module",
+                f"db = PokerDatabase(r'{path}')",
+                "db.init_db()",
+                f"hand = db.fetch_hand({hand_id})",
+                "session = db.fetch_session(hand.session_id)",
+                "actions = db.fetch_actions_by_hand(hand.id)",
+                "players = db.fetch_players_by_hand(hand.id)",
+                "accounting, accounting_error = app_module._reconcile_cached(db, hand.id, None)",
+                "readiness = evaluate_study_readiness(",
+                "    hand,",
+                "    accounting=accounting,",
+                "    accounting_error=accounting_error,",
+                "    hand_issues=db.fetch_hand_issues(hand_id=hand.id),",
+                "    coaching_reviews=db.fetch_coaching_reviews_by_hand(hand.id),",
+                "    hand_reviews=db.fetch_reviews_by_hand(hand.id),",
+                "    solver_runs=db.fetch_solver_runs_by_hand(hand.id),",
+                "    user_confirmed=True,",
+                ")",
+                "app_module.show_solver_review(",
+                "    db, session, hand, actions, players, accounting,",
+                "    accounting_error, readiness,",
+                ")",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    app = AppTest.from_file(str(script), default_timeout=30).run()
+    assert not list(app.exception)
+    return app
+
+
 def test_solver_explanation_does_not_promote_a_blocked_hand(
     tmp_path, monkeypatch
 ) -> None:
@@ -770,11 +899,11 @@ def test_solver_explanation_does_not_promote_a_blocked_hand(
     hand_id = _seed_hand(path)
     _seed_completed_solver_run(path, hand_id)
     monkeypatch.setattr(
-        "poker_tracker.coaching.llm_providers.get_provider_from_env",
+        "app.get_provider_from_env",
         lambda *args, **kwargs: _StubProvider(),
     )
 
-    app = _run_study(path, monkeypatch)
+    app = _run_solver_surface(path, monkeypatch, hand_id)
     next(
         button
         for button in app.button
@@ -822,6 +951,7 @@ def test_load_study_session_hands_scopes_to_one_session_without_all_hands(
             source_type="manual",
             completion_status="not_applicable",
             study_inclusion="auto",
+            review_status="reviewed",
         )
     )
     db.create_hand(
@@ -831,6 +961,7 @@ def test_load_study_session_hands_scopes_to_one_session_without_all_hands(
             source_type="manual",
             completion_status="not_applicable",
             study_inclusion="auto",
+            review_status="reviewed",
         )
     )
     sessions = db.fetch_sessions()

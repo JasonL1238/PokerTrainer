@@ -882,46 +882,34 @@ def test_the_session_hand_list_performs_the_deletion_the_blockers_name(
     verifier.close()
 
 
-def test_the_study_page_draws_the_confirmation_checkbox_for_an_imported_manual_hand(
+def test_validation_finish_is_the_confirmation_control_for_an_imported_manual_hand(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The blocker's clearing action must be performable on the hand it names.
 
-    USER_CONFIRMATION_MISSING now fires for every imported hand, so the checkbox
-    it names has to be drawn under exactly the same condition -- an emitted
-    blocker naming a control that is not on the page is the round-13 HIGH's
-    defect class in a second place. The control: an existing UI test pins that a
-    manual hand entered HERE still draws no checkbox.
+    USER_CONFIRMATION_MISSING fires for every imported hand; finishing Import
+    validation is the control that clears it. A manual hand entered here still
+    does not require that confirmation.
     """
     import streamlit as st
-    from streamlit.testing.v1 import AppTest
 
-    import poker_tracker.persistence.db as db_module
-    from poker_tracker.ui.navigation import Page
+    from tests.test_study_readiness_ui import _run_validation_editors
 
     path = tmp_path / "imported_manual_ui.db"
     db = PokerDatabase(str(path))
     db.init_db()
     import_session(db, _forged_manual_payload(completion_evidence={}))
+    hand_id = db.fetch_all_hands()[0].id
+    assert hand_id is not None
     db.close()
 
-    monkeypatch.delenv("APP_PASSWORD", raising=False)
-    monkeypatch.delenv("POKERTRAINER_REQUIRE_AUTH", raising=False)
-    monkeypatch.setenv("POKER_DB_PATH", str(path))
-    monkeypatch.setattr(db_module, "DEFAULT_DB_PATH", str(path))
-    st.cache_resource.clear()
-
-    app_path = str(Path(__file__).resolve().parent.parent / "app.py")
-    app = AppTest.from_file(app_path, default_timeout=30).run()
-    app.radio[0].set_value(Page.STUDY)
-    app.run()
+    app = _run_validation_editors(
+        path, monkeypatch, hand_id, frames_validated=False
+    )
     assert not list(app.exception)
-    assert [
-        item
-        for item in app.checkbox
-        if item.label
-        == "I have read the evidence above and confirm this hand is correct"
-    ]
+    assert any(
+        button.label == "Finish validation — send to Study" for button in app.button
+    )
     st.cache_resource.clear()
 
 

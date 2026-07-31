@@ -76,31 +76,31 @@ As of July 28, 2026, the repository contains:
   eligibility checks, exact ranges, retained assumptions, convergence, logs,
   strategy JSON, stale-result handling, and solver-grounded explanation checks;
 - offline video upload, metadata validation, frame extraction, detached CV
-  jobs, heartbeat/recovery behavior, timelines, and validate-then-import
-  (auto-add full validated hands; explicit draft add for incomplete segments);
+  jobs, heartbeat/recovery behavior, timelines, and validate-then-edit-import
+  (draft on hand select; edit beside frames; auto-approve for Study when
+  validation finishes with no open HandIssue);
 - an eight-region reconstruction model plus card recognition/OCR readers,
   temporal reconstruction, labeling tools, hard-example queues, and evaluation
   scripts;
-- a guided three-mode Study workflow (Replay, Fix & confirm, Analyze) that keeps
-  hand selection compact, presents saved actions as a readable vertical history
-  with expanded decision context, lets any saved action drive one shared
-  reconstructed table replay with explicit BB units on every stack, pot, and
-  result, splits Fix & confirm into Approve vs Edit-the-hand Fix so Approve shows
-  the reconstructed table and action line beside key source frames for
-  side-by-side judgment, the Fix path edits each action inline (Who / Action /
-  Amount) with cards/players/chips under Other fixes, one-click Approve and next
-  plus session batch-approve for ready hands, session-scoped Study loading
-  without reconciling the whole database each render, and includes inline
-  TexasSolver setup/use guidance while retaining before/after correction history
-  and staling derived coaching/solver evidence;
-- a persistent cross-session issue inbox that freezes debugging evidence and
-  retains resolution notes;
+- a guided two-mode Study workflow (Replay, Analyze) for approved hands only
+  that keeps hand selection compact, presents saved actions as a readable
+  vertical history with expanded decision context, lets any saved action drive
+  one shared reconstructed table replay with explicit BB units on every stack,
+  pot, and result, session-scoped Study loading without reconciling the whole
+  database each render, and includes inline TexasSolver setup/use guidance while
+  retaining before/after correction history and staling derived coaching/solver
+  evidence; editing, finalize, issue flagging, and study approval live on Import
+  validation;
+- a persistent cross-session issue inbox that freezes debugging evidence,
+  retains resolution notes, and deep-links back to Import validation;
 - authenticated local/container operation, a non-root Docker runtime, pinned
   CV dependencies, healthchecks, and CI;
-- 1510 passing tests with one intentionally skipped test at the latest inventory
+- 1638 passing tests with one intentionally skipped test at the latest inventory
   (see "Verification record" below, which is the authoritative count and which
   this bullet must be updated to match), with Ruff and the configured MyPy target
-  green.
+  green. Nine failures remain outside this inventory (CV recording regressions
+  and two pre-existing Add-hand form UI tests) and are not part of the
+  validate-and-edit / Study study-only gate.
 
 These checks establish a strong component baseline. They do not yet prove that
 real recordings reconstruct reliably across a representative held-out set.
@@ -1800,7 +1800,7 @@ now capped below 5; the result below uses OpenCV 4.11 and NumPy 2.2.6.
 
 | Command | Result |
 | --- | --- |
-| `python -m pytest -q` | `1510 passed, 1 skipped` |
+| `python -m pytest -q` | `1638 passed, 1 skipped` (9 unrelated failures: CV recording regressions + Add-hand form UI) |
 | `python -m ruff check .` | `All checks passed!` |
 | `python -m mypy` | `Success: no issues found in 11 source files` |
 | `git diff --check` | no output, exit 0 |
@@ -1822,7 +1822,7 @@ unchanged, no table added or dropped; the real file was SHA-256-hashed before an
 after and is byte-identical. Reading its version stamp still leaves `-shm`/`-wal`
 sidecars beside it, which is the documented gap below, not a write to the database.
 
-The suite grew from the 442 tests of the Phase 0 baseline to 1510. That count
+The suite grew from the 442 tests of the Phase 0 baseline to 1638. That count
 includes the CV suites, so the number will drift; the Phase 1 files in it are
 `test_study_readiness*.py`,
 `test_completion_evidence.py`, `test_schema_v13_migration_paths.py`,

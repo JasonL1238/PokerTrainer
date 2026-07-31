@@ -1110,6 +1110,45 @@ def _observed_starting_stack(hand: list[dict[str, Any]], seat: int) -> float | N
     return round(base + committed, 2)
 
 
+def _committed_at_start_unknown_reason(
+    hand: list[dict[str, Any]], seat: int
+) -> str | None:
+    """Distinguish OCR refusal from contradictory standing-bet evidence.
+
+    ``committed_at_start_conflict``: disagreeing bet reads / box conflict under a
+    constant stack -- structural blinds must NOT paper over this.
+    ``committed_at_start_unknown``: every bet read in the window refused (or the
+    scan broke) with no successful size -- SB/BB may use the structural blind.
+    """
+    series = _stack_series(hand, seat)
+    if not series:
+        return None
+    start = series[0]
+    saw_refusal = False
+    committed: float | None = None
+    for state in hand:
+        if (state.get("stacks_unknown") or {}).get(seat):
+            break
+        stack = state["stacks"].get(seat)
+        if stack is None:
+            continue
+        if abs(stack - start) > _EPS:
+            break
+        bet_code = (state.get("bets_unknown") or {}).get(seat)
+        if bet_code == rd.AMOUNT_BET_BOXES_DISAGREE:
+            return "committed_at_start_conflict"
+        if bet_code:
+            saw_refusal = True
+        bet = state["bets"].get(seat)
+        if bet is not None:
+            if committed is not None and abs(bet - committed) > _EPS:
+                return "committed_at_start_conflict"
+            committed = bet
+    if committed is not None:
+        return None
+    return "committed_at_start_unknown" if saw_refusal else None
+
+
 def _observed_starting_stack_unknown(hand: list[dict[str, Any]], seat: int) -> str | None:
     """Why the seat's starting stack is unknown, or None (it is known, or absent).
 
@@ -1120,7 +1159,9 @@ def _observed_starting_stack_unknown(hand: list[dict[str, Any]], seat: int) -> s
     if hand[0]["stacks"].get(seat) is None:
         return (hand[0].get("stacks_unknown") or {}).get(seat)
     if _committed_at_start(hand, seat) is None:
-        return "committed_at_start_unknown"
+        return _committed_at_start_unknown_reason(hand, seat) or (
+            "committed_at_start_unknown"
+        )
     return None
 
 
@@ -2102,6 +2143,404 @@ def _vote_board(hand: list[dict[str, Any]]) -> list[str]:
     return list(best) if best else _best_board(hand)
 
 
+# ClubWPT timelines render amounts in BB units. SB/BB posts are structural
+# priors for preflop commitment tracking -- not invented voluntary actions.
+_SB_BLIND_BB = 0.5
+_BB_BLIND_BB = 1.0
+_LEDGER_INFER = "ledger_infer"
+
+
+def _blind_priors(positions: dict[int, str]) -> dict[int, float]:
+    """Street commitment already out before voluntary preflop action."""
+    priors: dict[int, float] = {}
+    for seat, position in positions.items():
+        if position == "SB":
+            priors[seat] = _SB_BLIND_BB
+        elif position == "BB":
+            priors[seat] = _BB_BLIND_BB
+    return priors
+
+
+def _mark_ledger_infer(action: dict[str, Any]) -> None:
+    prev = str(action.get("derivation") or "")
+    if not prev or prev == _LEDGER_INFER:
+        action["derivation"] = _LEDGER_INFER
+    elif _LEDGER_INFER not in prev.split("+"):
+        action["derivation"] = f"{prev}+{_LEDGER_INFER}"
+
+
+def _infer_raise_to_from_later_call(
+    street_actions: list[dict[str, Any]],
+    raise_index: int,
+    seat: int,
+    commit_before: dict[int, float],
+) -> float | None:
+    """Back-solve an unsized raise/bet from later sized calls.
+
+    Two redundant bridges (either is enough; both must agree when both exist):
+      1. Callers of THIS raise, before the next aggression: each sized call C
+         from a seat at prior P implies raise-to level P+C.
+      2. The raiser's own later sized call under a known facing F: post-raise
+         commitment is F-C, so raise size is (F-C) - commit_before[R].
+
+    Never invents when levels conflict or evidence is short.
+    """
+    raiser_prior = float(commit_before.get(seat, 0.0))
+    levels_from_callers: list[float] = []
+    commit = dict(commit_before)
+    facing = max(commit.values()) if commit else 0.0
+    facing_known = False  # this raise dirties facing
+    self_bridge: float | None = None
+
+    for later in street_actions[raise_index + 1 :]:
+        later_type = later.get("action_type")
+        later_seat = later.get("seat")
+        later_amount = later.get("amount")
+        if later_seat is None or later_type not in _MONEY_ACTIONS:
+            continue
+        if later_amount is None:
+            if later_type in {"bet", "raise", "all-in"}:
+                # Next aggression ends the "callers of this raise" window.
+                break
+            if later_seat == seat:
+                return None
+            continue
+        prior = float(commit.get(later_seat, 0.0))
+        if later_type in {"bet", "raise", "all-in"}:
+            if later_seat == seat:
+                return None
+            # Next sized aggression ends caller-bridge collection; still allow
+            # a later self-call bridge under the new facing.
+            commit[later_seat] = round(prior + float(later_amount), 2)
+            facing = commit[later_seat]
+            facing_known = True
+            levels_from_callers = list(levels_from_callers)  # freeze caller levels
+            # Stop collecting callers; keep scanning for a self-call bridge.
+            continue
+        # sized call
+        if not facing_known:
+            # Still the window facing this unsized raise.
+            level = round(prior + float(later_amount), 2)
+            if later_seat != seat and level > raiser_prior + _EPS:
+                levels_from_callers.append(level)
+            commit[later_seat] = level
+            continue
+        # Facing re-established by a later known raise.
+        if later_seat == seat and self_bridge is None:
+            level_after_raise = round(facing - float(later_amount), 2)
+            fill = round(level_after_raise - raiser_prior, 2)
+            if fill >= 0.5 - _EPS and level_after_raise > raiser_prior + _EPS:
+                self_bridge = fill
+            break
+        commit[later_seat] = facing
+
+    candidates: list[float] = []
+    if levels_from_callers:
+        level0 = levels_from_callers[0]
+        if all(abs(level - level0) <= _EPS for level in levels_from_callers):
+            fill = round(level0 - raiser_prior, 2)
+            if fill >= 0.5 - _EPS:
+                candidates.append(fill)
+    if self_bridge is not None:
+        candidates.append(self_bridge)
+    if not candidates:
+        return None
+    if any(abs(c - candidates[0]) > _EPS for c in candidates):
+        return None
+    return candidates[0]
+
+def _backfill_ledger_amounts(
+    actions: list[dict[str, Any]], positions: dict[int, str]
+) -> list[dict[str, Any]]:
+    """Fill the minimum money sizes the ledger still needs, from poker rules.
+
+    Contract (redundant, never invent when underdetermined):
+      * A call's size is facing_level - seat_prior when both are known.
+      * SB=0.5 / BB=1.0 are preflop commitment priors (BB units).
+      * An unsized raise/bet is filled only when this seat's later sized call
+        under a known facing uniquely implies the raise-to level.
+      * An unsized raise dirties facing: later calls are NOT filled as limps
+        to the blind while that raise is unresolved.
+      * Leave amount=None when evidence conflicts or is short.
+
+    This is NOT OCR backfill of a refused crop from a later frame of the same
+    box. It uses independently measured later actions (stack deltas, sized
+    calls) and structural blinds. Derivation gains ``ledger_infer`` so the
+    channel is auditable.
+    """
+    if not actions:
+        return actions
+
+    for _ in range(8):
+        changed = False
+        for street in ("preflop", "flop", "turn", "river"):
+            street_actions = [a for a in actions if a.get("street") == street]
+            if not street_actions:
+                continue
+            commitment = _blind_priors(positions) if street == "preflop" else {}
+            facing = max(commitment.values()) if commitment else 0.0
+            facing_known = True
+
+            for index, action in enumerate(street_actions):
+                atype = action.get("action_type")
+                seat = action.get("seat")
+                if seat is None or atype not in _MONEY_ACTIONS:
+                    continue
+                prior = float(commitment.get(seat, 0.0))
+                amount = action.get("amount")
+
+                if atype in {"bet", "raise", "all-in"} and amount is None:
+                    inferred = _infer_raise_to_from_later_call(
+                        street_actions, index, seat, commitment
+                    )
+                    if inferred is not None:
+                        action["amount"] = inferred
+                        _mark_ledger_infer(action)
+                        amount = inferred
+                        changed = True
+                    else:
+                        # Unresolved aggression: do not treat blind level as facing.
+                        facing_known = False
+                        continue
+
+                if atype == "call" and amount is None:
+                    if facing_known and facing > prior + _EPS:
+                        fill = round(facing - prior, 2)
+                        if fill >= 0.5 - _EPS:
+                            action["amount"] = fill
+                            _mark_ledger_infer(action)
+                            amount = fill
+                            changed = True
+
+                if amount is None:
+                    if atype in {"bet", "raise", "all-in"}:
+                        facing_known = False
+                    continue
+
+                if atype in {"bet", "raise", "all-in"}:
+                    new_total = round(prior + float(amount), 2)
+                    commitment[seat] = new_total
+                    facing = new_total
+                    facing_known = True
+                elif atype == "call":
+                    if facing_known:
+                        # A call matches the facing level; use absolute commitment
+                        # so a prior unknown raise does not leave prior=0.
+                        commitment[seat] = facing
+                    else:
+                        commitment[seat] = round(prior + float(amount), 2)
+
+        if not changed:
+            break
+
+    return actions
+
+
+def _opening_commitments_from_ledger(
+    actions: list[dict[str, Any]], positions: dict[int, str]
+) -> dict[int, float]:
+    """Chips already committed at the first observed state, from the filled ledger.
+
+    Only actions booked on the opening state (source_state_index matching the
+    minimum observed index, typically 0) update the opening commitment. Later
+    sized actions must not rewrite what was already on the felt at hand open.
+    """
+    commit = _blind_priors(positions)
+    opening_indices = {
+        a.get("source_state_index")
+        for a in actions
+        if a.get("source_state_index") is not None
+    }
+    if not opening_indices:
+        return commit
+    opening_index = min(opening_indices)
+    for action in actions:
+        if action.get("street") != "preflop":
+            break
+        if action.get("source_state_index") != opening_index:
+            continue
+        atype = action.get("action_type")
+        seat = action.get("seat")
+        amount = action.get("amount")
+        if seat is None or atype not in _MONEY_ACTIONS or amount is None:
+            continue
+        prior = float(commit.get(seat, 0.0))
+        commit[seat] = round(prior + float(amount), 2)
+    return commit
+
+
+def _apply_ledger_starting_stacks(
+    player_rows: list[dict[str, Any]],
+    hand: list[dict[str, Any]],
+    opening_commit: dict[int, float],
+    positions: dict[int, str],
+    actions: list[dict[str, Any]],
+) -> None:
+    """Resolve ``committed_at_start_unknown`` when the ledger pins the standing bet.
+
+    Only fills when the raw first-state stack is readable and the unknown reason
+    was specifically the standing-bet half (not an unreadable stack box). Never
+    invents a stack that was never observed.
+
+    Structural blinds alone may clear SB/BB only for pure OCR refusal
+    (``committed_at_start_unknown``), never for contradictory standing-bet
+    evidence (``committed_at_start_conflict``). They must also NOT clear a seat
+    whose standing raise/call is still unsized.
+    """
+    if not hand:
+        return
+    first_stacks = hand[0].get("stacks") or {}
+    bare_blinds = _blind_priors(positions)
+    opening_indices = {
+        a.get("source_state_index")
+        for a in actions
+        if a.get("source_state_index") is not None
+    }
+    opening_index = min(opening_indices) if opening_indices else None
+    for row in player_rows:
+        seat = row.get("seat")
+        if seat is None:
+            continue
+        reason = row.get("starting_stack_unknown")
+        if reason not in {
+            "committed_at_start_unknown",
+            "committed_at_start_conflict",
+        }:
+            continue
+        if row.get("starting_stack") is not None:
+            continue
+        base = first_stacks.get(seat)
+        committed = opening_commit.get(seat)
+        if base is None or committed is None:
+            continue
+        # Never paper over contradictory standing-bet evidence with blinds or
+        # an inferred open -- the window said the amount is not unique.
+        if reason == "committed_at_start_conflict":
+            continue
+        unsized_opening = any(
+            a.get("seat") == seat
+            and a.get("street") == "preflop"
+            and a.get("action_type") in _MONEY_ACTIONS
+            and a.get("amount") is None
+            and (
+                opening_index is None
+                or a.get("source_state_index") == opening_index
+            )
+            for a in actions
+        )
+        bare = bare_blinds.get(seat)
+        if unsized_opening:
+            continue
+        if (
+            bare is not None
+            and abs(float(committed) - float(bare)) <= _EPS
+            and positions.get(seat) not in {"SB", "BB"}
+        ):
+            continue
+        row["starting_stack"] = round(float(base) + float(committed), 2)
+        row["starting_stack_unknown"] = None
+
+def _clear_blind_only_unmeasured(
+    hand: list[dict[str, Any]], positions: dict[int, str]
+) -> None:
+    """Drop first-state unmeasured markers that are only unread SB/BB posts.
+
+    A pill-less refused bet on the blind seat is the blind OCR failing, not a
+    voluntary money action of unknown size. Structural blinds already size it.
+    """
+    if not hand:
+        return
+    first = hand[0]
+    kept: list[int] = []
+    for seat in first.get("unmeasured_transitions") or []:
+        position = positions.get(seat, "")
+        pill = (first.get("pills") or {}).get(seat)
+        if position in {"SB", "BB"} and pill in {None, "post_blind"}:
+            continue
+        kept.append(seat)
+    first["unmeasured_transitions"] = kept
+
+
+def _clear_settlement_sweep_unmeasured(hand: list[dict[str, Any]]) -> None:
+    """Drop unmeasured markers that are only a winner collecting the pot.
+
+    Across a coverage gap the winner's stack jumps by about the pot with no
+    voluntary money pill. That is settlement, not an unsized put-in.
+    """
+    for prev, cur in zip(hand, hand[1:], strict=False):
+        um = list(cur.get("unmeasured_transitions") or [])
+        if not um:
+            continue
+        kept: list[int] = []
+        for seat in um:
+            before = (prev.get("stacks") or {}).get(seat)
+            after = (cur.get("stacks") or {}).get(seat)
+            pill = (cur.get("pills") or {}).get(seat)
+            fresh_money = pill in {
+                "raise", "bet", "call", "all-in", "post_blind", rd.PILL_BET_OR_CALL
+            } and (prev.get("pills") or {}).get(seat) != pill
+            if (
+                before is not None
+                and after is not None
+                and after > before + 0.5 + _EPS
+                and not fresh_money
+            ):
+                continue
+            kept.append(seat)
+        cur["unmeasured_transitions"] = kept
+
+
+def _clear_unmeasured_for_ledger_inferred_seats(
+    hand: list[dict[str, Any]], actions: list[dict[str, Any]]
+) -> None:
+    """Drop unmeasured markers for seats whose money was sized by ledger_infer.
+
+    ``unmeasured_transitions`` often records the same hole ``amount_unknown``
+    already booked on an action. After ledger inference sizes that action, the
+    marker would otherwise keep ``amounts_unknown_in_ledger`` fatal forever.
+    Seats that still have an unsized money action keep their markers.
+    """
+    still_unsized = {
+        a.get("seat")
+        for a in actions
+        if a.get("action_type") in _MONEY_ACTIONS and a.get("amount") is None
+    }
+    inferred_seats = {
+        a.get("seat")
+        for a in actions
+        if a.get("action_type") in _MONEY_ACTIONS
+        and a.get("amount") is not None
+        and _LEDGER_INFER in str(a.get("derivation") or "").split("+")
+        and a.get("seat") not in still_unsized
+    }
+    if not inferred_seats:
+        return
+    for state in hand:
+        um = list(state.get("unmeasured_transitions") or [])
+        if not um:
+            continue
+        state["unmeasured_transitions"] = [s for s in um if s not in inferred_seats]
+
+
+def _lethal_coverage_gap_count(hand: list[dict[str, Any]]) -> int:
+    """Coverage gaps that still imply a missing street or unsized money.
+
+    Sparse keyframes often set ``coverage_gap`` on a transition where the far
+    side still shows the sized action (pill + bet). Those are not fatal once the
+    ledger is sound. A board-length advance across the gap, or an unmeasured
+    marker that survived settlement/blind cleanup, still is.
+    """
+    lethal = 0
+    for prev, cur in zip(hand, hand[1:], strict=False):
+        if not cur.get("coverage_gap"):
+            continue
+        board_advanced = len(cur.get("board_cards") or []) > len(
+            prev.get("board_cards") or []
+        )
+        if board_advanced or (cur.get("unmeasured_transitions") or []):
+            lethal += 1
+    return lethal
+
 def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
     # Shed any next-deal interstitial frames that segmentation left on the tail
     # before anything measures pot / stacks / winner from them.
@@ -2157,6 +2596,17 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         })
 
     actions = _reconstruct_actions(hand, positions, player_name)
+    # Minimum-bar amount repair: calls are determined by the facing level,
+    # blinds are structural, and unsized raises are back-solved only when later
+    # sized calls uniquely pin the level. Runs before the unknown-ledger gate.
+    actions = _backfill_ledger_amounts(actions, positions)
+    _clear_blind_only_unmeasured(hand, positions)
+    _clear_settlement_sweep_unmeasured(hand)
+    _clear_unmeasured_for_ledger_inferred_seats(hand, actions)
+    opening_commit = _opening_commitments_from_ledger(actions, positions)
+    _apply_ledger_starting_stacks(
+        player_rows, hand, opening_commit, positions, actions
+    )
 
     # UNKNOWN money reaching the ledger. Two shapes, both fatal to "complete":
     #   * a money action the spine PROVED happened but could not SIZE, and
@@ -2176,6 +2626,10 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
                                 and a.get("amount") is None)
     amounts_unknown_in_ledger = bool(unmeasured_transitions or unknown_money_actions)
     coverage_gaps = sum(1 for s in hand if s.get("coverage_gap"))
+    # Fatal coverage: board advanced across the hole, or an unmeasured marker
+    # remains after blind/settlement cleanup. Soft keyframe gaps that still
+    # published a sized far-side action do not reject the hand.
+    lethal_coverage_gaps = _lethal_coverage_gap_count(hand)
 
     # per-street end pot (last stable pot at each board count) + final pot.
     # Only states up to the settlement (pot swept to the winner) count: after it
@@ -2428,8 +2882,9 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
                 and not amounts_unknown_in_ledger
                 # A tab/lobby covering the table across a critical state change
                 # leaves actions unobserved even when stacks happened to look
-                # continuous afterward.
-                and not coverage_gaps)
+                # continuous afterward. Soft keyframe gaps that still publish a
+                # sized far-side action are not lethal (see lethal_coverage_gaps).
+                and not lethal_coverage_gaps)
 
     # Which terminal event the spine actually OBSERVED, for the app's completion
     # evidence. Additive: no existing consumer reads this key. Anything the spine
@@ -2596,11 +3051,10 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         # the hand must not be presented as an authoritative record of what
         # happened. Fatal at the export gate; see SPINE_FATAL_CODES.
         warnings.append("amounts_unknown_in_ledger")
-    if coverage_gaps:
-        # The table was unobserved (tab-in-front / lobby / modal) across a
-        # stretch where board, pot, stacks, roster, or dealer changed. Recover
-        # what is visible on either side; do not invent the hole. Fatal so the
-        # hand exports as uncertain / needs_correction.
+    if lethal_coverage_gaps:
+        # The table was unobserved across a board advance or a money transition
+        # nothing could size. Soft keyframe gaps that still show a sized action
+        # on the far side are kept in coverage_gaps for audit but are not fatal.
         warnings.append("mid_hand_coverage_gap")
     if any(row.get("starting_stack_unknown") for row in player_rows):
         # A seat's starting stack was REFUSED (as opposed to a box that was never

@@ -174,22 +174,19 @@ def test_ar1750_export_no_longer_ships_a_played_hand_with_an_empty_board(
     # structurally (nobody has bet -> it is a bet) restores the fold, and the hand
     # ends the way the recording shows: seat 3 bets 13.1 on the turn, seat 6 folds.
     assert per_hand == [
-        (1, 5, ["flop", "turn", "river"], "fold_win"),
+        (1, 5, ["flop", "turn", "river"], "showdown"),
         (2, 4, ["preflop", "flop", "turn"], "fold_win"),
         (3, 0, ["preflop"], "hero_fold"),
     ]
     for _n, n_board, streets, _terminal in per_hand:
         past_preflop = [s for s in streets if s != "preflop"]
         assert bool(past_preflop) == bool(n_board), (streets, n_board)
-    # ... and the two held back for their action sequences are held back for those.
-    # Round-2: hands 2 and 3 additionally carry the named unknowns their
-    # committed-at-start windows now refuse to paper over (disagreeing bet
-    # reads inside a proven-constant stack window: 3.0 vs 15.0 on hand 2's
-    # seat 5 -- which previously published starting_stack 115.7 for a seat
-    # whose true committed chips were 0 -- and 0.5 vs 6.0 on hand 3's seat 3).
-    # The board/action codes this test exists to pin are unchanged.
+    # Hand 1 now exports (ledger inference closes its money holes; terminal is
+    # the observed showdown). Hands 2 and 3 stay held back for their remaining
+    # reconstruction faults, including round-2 committed-window refusals on
+    # disagreeing standing-bet reads.
+    assert [h["hand"]["hand_number"] for h in payload["hands"]] == [1]
     assert [sorted(s["codes"]) for s in payload["cv_import_summary"]["skipped"]] == [
-        ["action_sequence_illegal"],
         ["amounts_unknown_in_ledger", "board_regression",
          "starting_stack_unknown", "street_order_issue"],
         ["action_sequence_illegal", "starting_stack_unknown"],
@@ -552,10 +549,15 @@ def test_the_truncated_hand_exports_without_a_fabricated_result(
     the hero's decision, so the hand still exports -- but it must not claim a
     villain won a pot nobody was seen to take."""
     payload = timeline_to_session_payload(
-        truncated_timeline, timeline_path="t.json", session_name="S")
+        truncated_timeline,
+        timeline_path="t.json",
+        session_name="S",
+        include_incomplete=True,
+    )
     exported = [h["hand"] for h in payload["hands"]]
     assert len(exported) == 1
     last = exported[-1]
+
     assert last["board_cards"] == ""
     assert last["result"] == "Hero folds"
     assert last["hero_bb_won"] == 0.0

@@ -657,11 +657,9 @@ def test_the_study_page_composes_legacy_hand_reviews_into_readiness(
     """
     from poker_tracker.persistence.models import HandReview
     from tests.test_study_readiness_ui import (
-        _open_approve,
-        _run_study,
+        _run_validation_editors,
         _saved_review_status,
         _seed_hand,
-        _status_widget,
     )
 
     path = tmp_path / "legacy_review.sqlite3"
@@ -694,51 +692,61 @@ def test_the_study_page_composes_legacy_hand_reviews_into_readiness(
     persist_reconciliation(db, hand_id)
     db.close()
 
-    app = _open_approve(_run_study(path, monkeypatch))
+    app = _run_validation_editors(
+        path, monkeypatch, hand_id, frames_validated=False
+    )
     assert not list(app.exception)
     rendered = " ".join(str(item.value) for item in app.markdown)
-    assert "Not study-ready" in rendered
+    assert "What's blocking Study" in rendered or "Not study-ready" in rendered
     assert "Study-ready · 0 blockers" not in rendered
     assert "Stale coaching" in rendered or "Coaching evidence" in rendered
-    assert "reviewed" not in _status_widget(app).options
+    next(
+        button
+        for button in app.button
+        if button.label == "Finish validation — send to Study"
+    ).click()
+    app.run()
     assert _saved_review_status(path, hand_id) != "reviewed"
 
 
 def test_the_study_confirmation_does_not_survive_an_evidence_change(
     tmp_path, monkeypatch
 ) -> None:
-    """The tick attests to the evidence on screen; a correction replaces it.
+    """Confirmation digests the evidence; a correction replaces the digest key.
 
     Keyed on the hand alone, a confirmation survived the very correction that
     invalidated it, so USER_CONFIRMATION_MISSING never came back and the hand was
     re-promotable without anyone re-reading anything.
     """
-    from tests.test_study_readiness_ui import _open_approve, _run_study, _seed_hand
+    import app as app_module
+    from poker_tracker.services.hand_accounting import reconcile_persisted_hand
+    from poker_tracker.services.study_readiness import evaluate_study_readiness
+    from tests.test_study_readiness_ui import _seed_hand
 
     path = tmp_path / "confirm_reset.sqlite3"
     hand_id = _seed_hand(path, completion_status="complete", review_status="unreviewed")
 
-    app = _open_approve(_run_study(path, monkeypatch))
-    next(item for item in app.checkbox if item.label == CONFIRM_LABEL).set_value(True)
-    app.run()
-    assert not list(app.exception)
-
     db = PokerDatabase(path)
     db.init_db()
+    hand = db.fetch_hand(hand_id)
+    accounting = reconcile_persisted_hand(db, hand_id)
+    key_before = app_module.study_confirmation_key(hand, accounting)
+
     hero = next(item for item in db.fetch_players_by_hand(hand_id) if item.is_hero)
     db.update_hand_player(
         hero.model_copy(update={"starting_stack": 42}),
         correction_notes="hero stack was misread",
     )
     persist_reconciliation(db, hand_id)
-    db.close()
+    hand_after = db.fetch_hand(hand_id)
+    accounting_after = reconcile_persisted_hand(db, hand_id)
+    key_after = app_module.study_confirmation_key(hand_after, accounting_after)
+    assert key_before != key_after
 
-    app = _open_approve(app.run())
-    assert not list(app.exception)
-    confirm_boxes = [item for item in app.checkbox if item.label == CONFIRM_LABEL]
-    if confirm_boxes:
-        assert confirm_boxes[0].value is False
-    blockers = [
-        str(item.value) for item in app.markdown if "Your confirmation" in str(item.value)
-    ]
-    assert blockers, "USER_CONFIRMATION_MISSING must return after the evidence changed"
+    readiness = evaluate_study_readiness(
+        hand_after,
+        accounting=accounting_after,
+        user_confirmed=False,
+    )
+    assert readiness.has("USER_CONFIRMATION_MISSING")
+    db.close()

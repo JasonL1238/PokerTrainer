@@ -27,7 +27,7 @@ def test_product_shell_navigation_smoke(monkeypatch) -> None:
         Page.HANDS: "Hand library",
         Page.STUDY: "Study",
         Page.INSIGHTS: "Insights",
-        Page.IMPORT: "Import a completed session",
+        Page.IMPORT: "Import",
         Page.SETTINGS: "Settings",
     }
     for page, heading in expected_headings.items():

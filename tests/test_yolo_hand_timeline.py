@@ -1133,27 +1133,101 @@ def test_a_money_action_with_an_unknown_amount_is_emitted_not_dropped():
     """A pill PROVES the act happened even when nothing can size it. The action is
     emitted with amount=None and derivation "amount_unknown" -- never dropped
     (the hand would then describe a ledger that never happened) and never given a
-    fabricated number."""
+    fabricated number from OCR. Ledger inference may later size a call when the
+    facing level is known; this fixture refuses BOTH stacks on the call so the
+    facing raise is also unsized and the hole must survive."""
+    hero = rd.SEAT_ANCHORS_BY_CLASS["stack_text"][0]
     villain = rd.SEAT_ANCHORS_BY_CLASS["stack_text"][4]
     fixture = _refuse(_hand_fixture(), "stack_text", villain, "run_clipped", {5.0})
+    fixture = _refuse(fixture, "stack_text", hero, "run_clipped", {4.0})
     hand = build_hand_timeline(rd.frames_from_fixture(fixture))["hands"][0]
-    unknown = [a for a in hand["actions"] if a["derivation"] == "amount_unknown"]
-    assert unknown, "the villain's call is proved by its pill and must survive"
-    assert all(a["amount"] is None for a in unknown)
-    assert all(a["action_type"] in {"bet", "raise", "call", "all-in"} for a in unknown)
+    unknown = [
+        a for a in hand["actions"]
+        if a["amount"] is None and a["action_type"] in {"bet", "raise", "call", "all-in"}
+    ]
+    assert unknown, "unsized money actions must survive when nothing can pin them"
     assert hand["unknown_money_actions"] == len(unknown)
     assert "amounts_unknown_in_ledger" in hand["warnings"]
+
+
+def test_ledger_infer_fills_call_and_open_from_later_sized_actions():
+    """Min-bar reconstruction: a call amount is facing - prior; an unsized open
+    is back-solved from a later sized call under a known re-raise."""
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import _backfill_ledger_amounts
+
+    positions = {0: "UTG", 1: "UTG+1", 6: "SB", 7: "BB"}
+    actions = [
+        {"street": "preflop", "action_type": "fold", "seat": 0, "amount": None,
+         "derivation": "hero_dim"},
+        {"street": "preflop", "action_type": "raise", "seat": 1, "amount": None,
+         "derivation": "action_pill"},
+        {"street": "preflop", "action_type": "call", "seat": 6, "amount": None,
+         "derivation": "action_pill"},
+        {"street": "preflop", "action_type": "raise", "seat": 7, "amount": 12.0,
+         "derivation": "stack_delta"},
+        {"street": "preflop", "action_type": "call", "seat": 1, "amount": 10.0,
+         "derivation": "stack_delta"},
+        {"street": "preflop", "action_type": "call", "seat": 6, "amount": 10.0,
+         "derivation": "stack_delta"},
+    ]
+    filled = _backfill_ledger_amounts(actions, positions)
+    by_key = {(a["seat"], a["action_type"], a.get("amount")): a for a in filled}
+    assert by_key[(1, "raise", 3.0)]["derivation"].endswith("ledger_infer")
+    assert by_key[(6, "call", 2.5)]["derivation"].endswith("ledger_infer")
+    assert filled[3]["amount"] == 12.0
+
+
+def test_ledger_infer_does_not_limp_fill_while_an_open_is_unsized():
+    """Adversary: an unsized raise must dirty facing so the next call is not
+    filled as a limp to the big blind."""
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import _backfill_ledger_amounts
+
+    positions = {1: "UTG+1", 6: "SB", 7: "BB"}
+    actions = [
+        {"street": "preflop", "action_type": "raise", "seat": 1, "amount": None,
+         "derivation": "action_pill"},
+        {"street": "preflop", "action_type": "call", "seat": 6, "amount": None,
+         "derivation": "action_pill"},
+    ]
+    filled = _backfill_ledger_amounts(actions, positions)
+    assert filled[0]["amount"] is None
+    assert filled[1]["amount"] is None
+
+
+def test_ledger_infer_refuses_conflicting_caller_levels():
+    """Adversary: two later calls that imply different raise-to levels must not
+    invent a compromise open."""
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import _backfill_ledger_amounts
+
+    positions = {1: "UTG+1", 5: "BTN", 6: "SB", 7: "BB"}
+    actions = [
+        {"street": "preflop", "action_type": "raise", "seat": 1, "amount": None,
+         "derivation": "action_pill"},
+        {"street": "preflop", "action_type": "call", "seat": 6, "amount": 2.5,
+         "derivation": "stack_delta"},
+        {"street": "preflop", "action_type": "call", "seat": 5, "amount": 5.0,
+         "derivation": "stack_delta"},
+    ]
+    filled = _backfill_ledger_amounts(actions, positions)
+    assert filled[0]["amount"] is None
 
 
 def test_a_hand_with_an_unmeasured_transition_is_not_complete():
     """`complete` required a pot, actions and a resolved outcome, and a hand can
     have all three while a money movement inside it went unmeasured. PLAN.md:
-    "Mark an incomplete sequence non-authoritative"."""
+    "Mark an incomplete sequence non-authoritative".
+
+    Refuse BOTH the facing bet and the call so ledger_infer cannot size the hole
+    from a known facing level -- the remaining unmeasured money must keep the
+    hand incomplete.
+    """
+    hero = rd.SEAT_ANCHORS_BY_CLASS["stack_text"][0]
     villain = rd.SEAT_ANCHORS_BY_CLASS["stack_text"][4]
     clean = build_hand_timeline(rd.frames_from_fixture(_hand_fixture()))["hands"][0]
     assert clean["complete"] is True and clean["unmeasured_transitions"] == 0
 
     fixture = _refuse(_hand_fixture(), "stack_text", villain, "run_clipped", {5.0})
+    fixture = _refuse(fixture, "stack_text", hero, "run_clipped", {4.0})
     hand = build_hand_timeline(rd.frames_from_fixture(fixture))["hands"][0]
     assert hand["unmeasured_transitions"] >= 1
     assert hand["complete"] is False
@@ -1356,27 +1430,30 @@ def test_bet_text_flicker_on_the_first_state_is_still_filled_from_the_window():
     assert "amounts_unknown_in_ledger" not in hand["warnings"]
 
 
-def test_a_refused_first_state_bet_is_unknown_money_not_a_backfill():
-    """THE B1 REGRESSION. `first["bets"].get(seat)` returns None for a REFUSED
-    read exactly as for an absent box, and the branch fell through to
-    _committed_at_start, which published a number as this action's amount while
-    `unknown_money_actions` stayed 0 (live on g0723a hand 1 seat 6 and g0723b
-    hand 1 seat 0). The refusal now keeps amount=None -- an unknown money action
-    that makes the hand visibly non-authoritative -- even though a proven read
-    exists one state later (the pixels at t=0 declined to supply the number and
-    the ACTION amount is not backfilled; the starting stack, which the window
-    read PROVES under a constant stack, still resolves)."""
+def test_a_refused_first_state_bet_is_not_ocr_backfilled_from_later_frame():
+    """THE B1 REGRESSION (updated channel split).
+
+    A refused first-state bet must NOT be filled from a later OCR read of the
+    same box via ``_committed_at_start``. That silent OCR backfill is what B1
+    killed. Independently, ledger inference MAY size the raise from a later
+    measured call (stack delta) -- that is poker arithmetic, not crop backfill,
+    and is marked ``ledger_infer``.
+    """
     hand = build_hand_timeline(
         rd.frames_from_fixture(_standing_bet_fixture(("unknown", "suffix_not_bb"))))["hands"][0]
     hero_raises = [a for a in hand["actions"]
                    if a["seat"] == 0 and a["action_type"] == "raise"]
-    assert hero_raises and all(a["amount"] is None for a in hero_raises), hero_raises
-    assert hand["unknown_money_actions"] >= 1
-    assert "amounts_unknown_in_ledger" in hand["warnings"]
-    assert hand["complete"] is False
+    assert hero_raises, hero_raises
+    assert all("ledger_infer" in str(a.get("derivation")) for a in hero_raises), hero_raises
+    assert all(a["amount"] is not None for a in hero_raises), hero_raises
+    # Must not claim a bare action_pill amount with no infer mark (OCR backfill).
+    assert not any(
+        a.get("derivation") == "action_pill" and a.get("amount") is not None
+        for a in hero_raises
+    )
     by_seat = {p["seat"]: p for p in hand["players"]}
     assert by_seat[0]["starting_stack"] == 100.0, (
-        "the standing amount is proven by the t=1 read under a constant stack")
+        "standing chips resolve from the constancy window and/or ledger infer")
 
 
 def test_committed_scan_stops_at_a_refused_stack_read():
@@ -1613,10 +1690,9 @@ def test_an_all_refused_committed_window_is_unknown_not_zero():
     """THE ROUND-2 C2 KILL. `return None if saw_refusal else 0.0` survived a
     mutation to `return 0.0` because the only pinning fixture contained a later
     PROVEN read. Here EVERY bet read inside the constant-stack window is a
-    named refusal: the standing amount is UNKNOWN, the published starting stack
-    is unknown with the committed_at_start_unknown reason, and the fatal
-    starting_stack_unknown code fires. The mutant publishes 96.0 (the raw
-    pre-debited read) for a true 100.0 stack and suppresses the fatal code."""
+    named refusal: the OCR standing amount is UNKNOWN. The raw helper must not
+    publish 0.0/96.0. End-to-end, a later sized call may still ledger-infer the
+    open; without that call the starting stack stays unknown."""
     from cv_lab.scripts.pipeline.build_yolo_hand_timeline import (
         _committed_at_start,
         _observed_starting_stack,
@@ -1635,12 +1711,26 @@ def test_an_all_refused_committed_window_is_unknown_not_zero():
         "a refusal answered by no read is UNKNOWN, never 0.0")
     assert _observed_starting_stack(window, 0) is None
     assert _observed_starting_stack_unknown(window, 0) == "committed_at_start_unknown"
-    # end to end: every bet read in the standing-raise window refused
+    # end to end with the later call removed: nothing pins the open.
     frames = _standing_bet_fixture(("unknown", "suffix_not_bb"))
     for det in frames[1]["detections"]:
         if det["cls"] == "bet_text":
             det["attr"] = None
             det["attr_source"] = "suffix_not_bb"
+    # Keep villain at 100 forever and strip call pills so ledger_infer cannot pin.
+    v_stack = rd.SEAT_ANCHORS_BY_CLASS["stack_text"][4]
+    for frame in frames:
+        frame["detections"] = [
+            d for d in frame["detections"]
+            if not (d["cls"] == "action_pill" and d.get("attr") == "call")
+        ]
+        for det in frame["detections"]:
+            if det["cls"] != "stack_text":
+                continue
+            cx = (det["xyxy"][0] + det["xyxy"][2]) / 2.0 / W
+            cy = (det["xyxy"][1] + det["xyxy"][3]) / 2.0 / H
+            if abs(cx - v_stack[0]) < 0.02 and abs(cy - v_stack[1]) < 0.02:
+                det["attr"] = 100
     hand = build_hand_timeline(rd.frames_from_fixture(frames))["hands"][0]
     by_seat = {p["seat"]: p for p in hand["players"]}
     assert by_seat[0]["starting_stack"] is None

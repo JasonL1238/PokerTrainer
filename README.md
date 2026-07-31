@@ -25,21 +25,14 @@ CV, equity, solver, and coaching output remain separately labeled by source and
 confidence. The application does not turn approximate inputs into a universal
 GTO score.
 
-Study shows one task at a time:
+Study shows approved hands only (edit and approve happen on Import validation):
 
 1. **Replay** — inspect the full saved action history in a readable vertical
    action list with expanded pot, stack, SPR, and note details. Choose any action
    to update the single table replay to that moment, including the street board,
    pot, remaining stacks, folded seats, and highlighted actor. Table stacks, pot,
    and results always show an explicit **BB** unit.
-2. **Fix & confirm** — **Looks good — Approve** shows the reconstructed table
-   and saved action line beside key source frames (hero, board streets, terminal)
-   so you can judge the hand without leaving Study. **Approve and next** confirms
-   a ready hand, marks it reviewed, and advances. **Approve all ready in this
-   session** bulk-approves hands that already pass trust checks. **Edit the hand
-   — Fix** edits Who / Action / Amount; cards, players, and chips live under
-   **Other fixes**.
-3. **Analyze** — use quick math, TexasSolver, coaching, or notes.
+2. **Analyze** — use quick math, TexasSolver, coaching, or notes.
 
 ## Local setup
 
@@ -93,17 +86,15 @@ The Import workflow connects a saved video to the existing two-model CV pipeline
 4. Produce a retained timeline and session export; create or link a destination
    session (no bulk hand import on job finish).
 5. Create a consistent SQLite backup.
-6. Review frames in Import: a full hand is auto-added when every navigable frame
-   is Correct (none flagged), the cards are complete, the terminal event was
-   observed, and the hand did not start mid-recording; incomplete or mid-start
-   hands stay out until you click **Add draft** (or **Add to session now** when
-   the auto gate already passes).
-7. Edit session hands in Study (Fix & confirm / finalize). On Approve, compare
-   the reconstructed table to key source frames side by side. Study readiness and
-   study inclusion stay separate — being in the session is not study-ready.
-8. Either flag the hand for later debugging or correct it immediately in Study.
-9. Retain before/after audit records, reconcile the ledger, and rerun coaching
-   before marking the hand reviewed.
+6. Review frames in Import: opening a hand drafts it into the session so you can
+   edit actions, cards, players, and gaps beside the frames. Mark a debugging
+   issue to hold a hand out of Study without fixing it now.
+7. Finish validation with no open issues to auto-approve the hand for Study
+   (partials are fine once you fill missing chunks yourself and readiness clears).
+8. Study is study-only (Replay + Analyze). Hands with open issues stay in the
+   Hands Issues inbox and deep-link back to Import validation.
+9. Retain before/after audit records; reconcile the ledger during validation;
+   rerun coaching in Study after approval when needed.
 
 Only one local processing job can run at a time. On restart, dead or stale workers are marked failed instead of remaining stuck. SQLite uses WAL mode so the UI can continue reading while the worker writes. Reconstruction uses Apple MPS or CUDA when available (same models/weights); set `POKER_CV_DEVICE=cpu` to force CPU.
 
@@ -345,17 +336,14 @@ remaining postflop ranges.
 
 ### Using the integration
 
-1. Open **Study** and choose a completed hand.
-2. In **Fix & confirm**, choose **Edit the hand — Fix** and open any wrong
-   action to change Who / Action / Amount. Use **Other fixes** for cards,
-   players, or chip accounting. A late-joined recording can still be finalized
-   if you reconstructed the whole hand — use **Finalize incomplete hand**.
-   What's blocking study lists each remaining check.
-3. When the reconstructed table matches the source frames, choose **Looks good
-   — Approve** → **Approve and next** (or **Approve all ready in this session**
-   for a batch).
-4. Open **Analyze → TexasSolver**. The app checks eligibility and explains every
-   item that still needs correction.
+1. On **Import**, validate frames and edit the hand beside them. Use **Other
+   fixes** for cards, players, or chip accounting. A late-joined recording can
+   still be finalized if you reconstructed the whole hand — use **Finalize
+   incomplete hand**. Mark a debugging issue to hold a hand out of Study.
+2. Press **Finish validation — send to Study** (or let auto-approve run when
+   every frame is Correct and readiness clears).
+3. Open **Study** → **Analyze → TexasSolver**. The app checks eligibility and
+   explains every item that still needs correction.
 5. Confirm the automatically selected heads-up street, pot, and effective stack.
 6. Start with **Default** ranges for both players, or choose a premade/custom
    range when you have a better assumption.
