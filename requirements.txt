@@ -4,6 +4,11 @@ Flask>=3.0
 pydantic>=2.7
 pytest>=8.2
 opencv-python-headless>=4.8,<5
+# Product path, not CV-only: ui/video_ingest validates every uploaded container
+# and codec through PyAV before a job may start, so Import's first step fails
+# without it. Pinned to the version requirements-cv.txt verifies, so a local
+# install and the container resolve the same PyAV.
+av==15.1.0
 Cython>=3.0  # build dependency for eval7 (no prebuilt wheel on some Python versions)
 eval7>=0.1.10  # hand evaluator + range parser powering the equity engine
 anthropic>=0.40  # official Anthropic SDK for the Claude coaching provider
