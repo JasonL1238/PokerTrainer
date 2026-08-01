@@ -40,6 +40,7 @@ from poker_tracker.persistence.completion import (
     strip_operator_attestation,
 )
 from poker_tracker.persistence.models import (
+    RELEASE_BLOCKING_ISSUE_TYPES,
     Action,
     CoachingResponse,
     CompletionStatus,
@@ -73,7 +74,7 @@ DEFAULT_DB_PATH = os.environ.get(
     "POKER_DB_PATH",
     str(Path(__file__).resolve().parent.parent.parent / "poker_tracker.db"),
 )
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 _PROCESSING_JOB_PID_UNSET = object()
 # A migration on a real database can outlast SQLite's 5s default, and a second
 # opener must wait for it rather than failing startup with "database is locked".
@@ -774,6 +775,26 @@ class PokerDatabase:
                 resolved_at TEXT,
                 FOREIGN KEY (hand_id) REFERENCES hands(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS regression_cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_id INTEGER NOT NULL,
+                correction_id INTEGER,
+                kind TEXT NOT NULL,
+                fixture_path TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'proposed',
+                failing_before INTEGER NOT NULL DEFAULT 0,
+                passing_after INTEGER NOT NULL DEFAULT 0,
+                fixing_commit TEXT NOT NULL DEFAULT '',
+                report_path TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (issue_id) REFERENCES hand_issues(id) ON DELETE CASCADE,
+                FOREIGN KEY (correction_id) REFERENCES hand_corrections(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_regression_cases_issue
+                ON regression_cases(issue_id, status, id);
 
             CREATE TABLE IF NOT EXISTS solver_range_profiles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1786,6 +1807,42 @@ class PokerDatabase:
             return issues
         return [issue for issue in issues if issue.status == status]
 
+    def fetch_hand_issue(self, issue_id: int) -> HandIssue | None:
+        """One issue, read through the same model-space rule as the queue."""
+        row = self._execute(
+            "SELECT * FROM hand_issues WHERE id = ?", (issue_id,)
+        ).fetchone()
+        return None if row is None else _hand_issue_from_row(row)
+
+    def _regression_blocker(self, issue_row: sqlite3.Row) -> str | None:
+        """Why this issue may not be closed yet, or None when it may.
+
+        A regression must have been observed BOTH failing for the original
+        defect and passing after the fix. One without the other proves nothing:
+        a test that only ever passed may not exercise the defect at all.
+        """
+        issue = _hand_issue_from_row(issue_row)
+        if not RELEASE_BLOCKING_ISSUE_TYPES.intersection(issue.issue_types):
+            return None
+        rows = self._execute(
+            """
+            SELECT failing_before, passing_after FROM regression_cases
+            WHERE issue_id = ?
+            """,
+            (issue_row["id"],),
+        ).fetchall()
+        if not rows:
+            return (
+                "This issue is release-blocking, so closing it needs a permanent "
+                "regression. Promote it to a regression case first."
+            )
+        if any(row["failing_before"] and row["passing_after"] for row in rows):
+            return None
+        return (
+            "The linked regression is not proven yet: it must be observed failing "
+            "for the original defect and passing after the fix."
+        )
+
     def resolve_hand_issue(
         self, issue_id: int, *, resolution_notes: str
     ) -> HandIssue:
@@ -1808,6 +1865,12 @@ class PokerDatabase:
             ).fetchone()
             if row is None or _hand_issue_from_row(row).status != "open":
                 raise ValueError("Open hand issue not found.")
+            # The regression gate is enforced by the writer, not by whichever UI
+            # happens to call it. Putting it in a service would leave this
+            # method as an ungated side door onto the same table.
+            blocker = self._regression_blocker(row)
+            if blocker is not None:
+                raise ValueError(blocker)
             cursor = self._execute(
                 """
                 UPDATE hand_issues
@@ -4522,6 +4585,58 @@ def _migrate_to_v16(db: PokerDatabase) -> None:
     db._ensure_column("actions", "source_image", "TEXT")
 
 
+def _migrate_to_v17(db: PokerDatabase) -> None:
+    """Link a closed issue to the regression that proves it stays closed.
+
+    MIGRATION IMPACT (schema 16 -> 17)
+
+    Added:
+      - regression_cases table (issue_id, correction_id, kind, fixture_path,
+        status, failing_before, passing_after, fixing_commit, report_path,
+        notes, created_at, updated_at)
+
+    Purely additive. No existing table or column changes, and no existing row is
+    read differently. A database migrated from 16 has zero regression cases, so
+    every previously resolved issue stays resolved exactly as it was.
+
+    Why it is needed: PLAN.md requires that every release-blocking closed issue
+    have a passing permanent regression, and that an issue not be resolved until
+    the regression failed before the fix and passed after it. Nothing recorded
+    that relationship, so "resolved" meant only that somebody typed a note. The
+    fail-before/pass-after evidence lives here alongside the fixing commit and
+    the report that demonstrated it.
+    """
+
+    db._execute(
+        """
+        CREATE TABLE IF NOT EXISTS regression_cases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_id INTEGER NOT NULL,
+            correction_id INTEGER,
+            kind TEXT NOT NULL,
+            fixture_path TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'proposed',
+            failing_before INTEGER NOT NULL DEFAULT 0,
+            passing_after INTEGER NOT NULL DEFAULT 0,
+            fixing_commit TEXT NOT NULL DEFAULT '',
+            report_path TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (issue_id) REFERENCES hand_issues(id) ON DELETE CASCADE,
+            FOREIGN KEY (correction_id) REFERENCES hand_corrections(id) ON DELETE SET NULL
+        )
+        """
+    )
+    db._execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_regression_cases_issue
+            ON regression_cases(issue_id, status, id)
+        """
+    )
+    db._commit()
+
+
 # Versioned migrations run in order and refuse databases written by newer apps.
 _MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {
     6: _migrate_to_v6,
@@ -4535,6 +4650,7 @@ _MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {
     14: _migrate_to_v14,
     15: _migrate_to_v15,
     16: _migrate_to_v16,
+    17: _migrate_to_v17,
 }
 
 

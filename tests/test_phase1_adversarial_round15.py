@@ -91,6 +91,10 @@ from poker_tracker.services.hand_accounting import (
     persist_reconciliation,
     reconcile_persisted_hand,
 )
+from poker_tracker.services.regression_promotion import (
+    promote_issue_to_regression,
+    record_regression_observation,
+)
 from poker_tracker.services.settlement_sync import (
     SettlementSyncRefused,
     sync_recorded_figures_from_ledger,
@@ -118,6 +122,22 @@ UNREADABLE_ISSUE_STATUSES: tuple[str, ...] = (
     "1",
     "",
 )
+
+
+
+def _prove_regression(db, issue_id: int) -> None:
+    """Satisfy the release-blocking closure gate for a test that is not about it.
+
+    Closing a release-blocking issue requires a regression observed failing for
+    the defect and passing after the fix. These tests predate that rule and are
+    about something else, so they record the evidence rather than route around it.
+    """
+    case = promote_issue_to_regression(
+        db, issue_id, kind="cached_state", fixture_path="tests/fixture.py::test_case"
+    )
+    record_regression_observation(
+        db, case.id, failing_before=True, passing_after=True, fixing_commit="deadbee"
+    )
 
 
 def _open_db(tmp_path: Path, name: str = "round15.db") -> PokerDatabase:
@@ -364,6 +384,7 @@ def test_the_resolve_control_resolves_the_issue_the_blocker_counted(
     assert db.fetch_hand_issues(hand_id=hand.id)[0].status == "open"
     assert "OPEN_DEBUGGING_ISSUE" in _codes(_readiness(db, hand.id))
 
+    _prove_regression(db, issue.id)
     resolved = db.resolve_hand_issue(issue.id, resolution_notes="Fixed the award row.")
 
     assert resolved.status == "resolved"
@@ -825,6 +846,7 @@ def test_a_reopened_issue_keeps_the_exporting_databases_resolution_notes(
         HandIssue(hand_id=hand.id, issue_types=["actions"], description="missing call")
     )
     assert issue.id is not None
+    _prove_regression(source, issue.id)
     source.resolve_hand_issue(issue.id, resolution_notes="Re-read the river pill.")
     payload = export_session(source, hand.session_id)
     source.close()

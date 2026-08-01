@@ -51,12 +51,32 @@ from poker_tracker.services.hand_accounting import (
     persist_reconciliation,
     reconcile_persisted_hand,
 )
+from poker_tracker.services.regression_promotion import (
+    promote_issue_to_regression,
+    record_regression_observation,
+)
 from poker_tracker.services.study_readiness import (
     evaluate_study_readiness,
     is_reconstructed_hand,
 )
 
 CV_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "cv"
+
+
+
+def _prove_regression(db, issue_id: int) -> None:
+    """Satisfy the release-blocking closure gate for a test that is not about it.
+
+    Closing a release-blocking issue requires a regression observed failing for
+    the defect and passing after the fix. These tests predate that rule and are
+    about something else, so they record the evidence rather than route around it.
+    """
+    case = promote_issue_to_regression(
+        db, issue_id, kind="cached_state", fixture_path="tests/fixture.py::test_case"
+    )
+    record_regression_observation(
+        db, case.id, failing_before=True, passing_after=True, fixing_commit="deadbee"
+    )
 
 
 def _clean_evidence(**overrides: object) -> CompletionEvidence:
@@ -519,6 +539,7 @@ def test_flagging_a_hand_for_debugging_records_the_demotion_in_its_evidence(
         issue = db.create_hand_issue(
             HandIssue(hand_id=hand.id, issue_types=["cards"], description="misread")
         )
+        _prove_regression(db, issue.id)
         db.resolve_hand_issue(issue.id, resolution_notes="fixed in pipeline")
 
         flagged = db.fetch_hand(hand.id)

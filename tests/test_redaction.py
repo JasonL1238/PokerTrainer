@@ -114,3 +114,42 @@ def test_ordinary_message_survives_unchanged():
     assert safe_error_message(exc) == (
         "Reconstructed timeline failed import validation."
     )
+
+
+def test_redacting_a_json_document_leaves_valid_json():
+    """Reports and bundles are redacted whole, then read back by machines."""
+    import json
+
+    document = json.dumps(
+        {
+            "api_key": "sk-ant-secret-value",
+            "config": {"password": "hunter2secret", "host": "db.internal"},
+            "note": "everything else survives",
+        },
+        indent=2,
+    )
+    scrubbed = redact_text(document, include_environment=False)
+    parsed = json.loads(scrubbed)
+
+    assert parsed["api_key"] == REDACTED
+    assert parsed["config"]["password"] == REDACTED
+    assert parsed["config"]["host"] == "db.internal"
+    assert parsed["note"] == "everything else survives"
+
+
+def test_a_numeric_json_secret_is_replaced_with_valid_json():
+    """A quoted key means JSON even when the value is not quoted."""
+    import json
+
+    scrubbed = redact_text('{"api_key": 1234567, "n": 5}', include_environment=False)
+    parsed = json.loads(scrubbed)
+    assert parsed["api_key"] == REDACTED
+    assert parsed["n"] == 5
+
+
+def test_session_id_is_not_treated_as_a_credential():
+    """It is a foreign key on almost every row here, not a web session token."""
+    import json
+
+    scrubbed = redact_text('{"session_id": 42}', include_environment=False)
+    assert json.loads(scrubbed)["session_id"] == 42

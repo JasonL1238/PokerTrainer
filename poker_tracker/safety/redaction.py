@@ -40,9 +40,13 @@ _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
 _ASSIGNMENT_PATTERN = re.compile(
     r"""(?ix)
     \b
+    # ``session_id`` is deliberately absent: in this codebase it is a plain
+    # foreign key on almost every row, and matching it redacted ordinary data
+    # while turning numeric JSON values into unquoted junk. A web session token
+    # is already covered by ``token``.
     (?P<key>[A-Za-z0-9_.\-]*
         (?:password|passwd|secret|token|api[_\-]?key|apikey|credential|
-           auth|access[_\-]?key|private[_\-]?key|session[_\-]?id)
+           auth|access[_\-]?key|private[_\-]?key)
         [A-Za-z0-9_.\-]*)
     (?P<keyquote>["']?)
     (?P<sep>\s*(?:=>|[:=])\s*)
@@ -89,13 +93,28 @@ def redact_text(text: str, *, include_environment: bool = True) -> str:
     # leave the actual token standing in the message.
     for pattern in _TOKEN_PATTERNS:
         scrubbed = pattern.sub(_replace_token, scrubbed)
-    scrubbed = _ASSIGNMENT_PATTERN.sub(
-        lambda m: (
-            f"{m.group('key')}{m.group('keyquote')}{m.group('sep')}{REDACTED}"
-        ),
-        scrubbed,
-    )
+    scrubbed = _ASSIGNMENT_PATTERN.sub(_replace_assignment, scrubbed)
     return scrubbed
+
+
+def _replace_assignment(match: re.Match[str]) -> str:
+    """Swap the value, preserving the quoting around it.
+
+    Dropping the value's quotes turns a redacted JSON document into invalid
+    JSON, which matters because release reports and issue bundles are redacted
+    as whole serialized documents and then read back by machines.
+
+    A quoted KEY means JSON even when the value is unquoted (``"api_key": 1234``),
+    so the replacement is quoted there too. In prose the value stays bare, which
+    is what ``api_key=<redacted>`` should look like.
+    """
+    quote = match.group("quote")
+    if not quote and match.group("keyquote"):
+        quote = match.group("keyquote")
+    return (
+        f"{match.group('key')}{match.group('keyquote')}{match.group('sep')}"
+        f"{quote}{REDACTED}{quote}"
+    )
 
 
 def _replace_token(match: re.Match[str]) -> str:

@@ -14,6 +14,10 @@ from poker_tracker.persistence.models import (
     HandPlayer,
     Session,
 )
+from poker_tracker.services.regression_promotion import (
+    promote_issue_to_regression,
+    record_regression_observation,
+)
 
 
 def _db() -> PokerDatabase:
@@ -135,6 +139,18 @@ def test_issue_can_be_resolved_without_deleting_debug_evidence() -> None:
             issue_types=["hand_boundary"],
             description="This may belong to the previous hand.",
         )
+    )
+
+    # hand_boundary is release-blocking, so closing it needs a regression that
+    # was seen failing for the defect and passing after the fix.
+    case = promote_issue_to_regression(
+        db,
+        issue.id,
+        kind="full_video",
+        fixture_path="tests/test_cv_recording_regressions.py::test_boundary",
+    )
+    record_regression_observation(
+        db, case.id, failing_before=True, passing_after=True, fixing_commit="abc123"
     )
 
     resolved = db.resolve_hand_issue(

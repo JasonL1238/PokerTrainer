@@ -67,6 +67,29 @@ HandIssueType = Literal[
     "coaching",
     "other",
 ]
+
+# Issue categories whose closure PLAN.md treats as release-blocking: each names
+# a fact a hand becomes study-ready on, so closing one without a permanent
+# regression means the same wrong hand can be admitted again silently.
+#
+# ``coaching`` and ``other`` are deliberately outside the set. Neither by itself
+# admits a wrong hand into study, and gating them too would push operators to
+# file everything as "other" -- which would cost the gate its meaning on the
+# categories that do matter.
+#
+# Lives here rather than in the regression service so the writer that enforces
+# the gate and the service that explains it read one definition.
+RELEASE_BLOCKING_ISSUE_TYPES: frozenset[str] = frozenset(
+    {
+        "hand_boundary",
+        "cards",
+        "players",
+        "stacks",
+        "actions",
+        "pot_or_result",
+        "accounting",
+    }
+)
 JobStatus = Literal["queued", "running", "cancelling", "completed", "failed", "cancelled"]
 JobType = Literal["frame_extraction", "cv_reconstruction"]
 SolverRunStatus = Literal[

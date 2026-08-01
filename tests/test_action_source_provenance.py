@@ -36,8 +36,9 @@ def _seed(db: PokerDatabase) -> Action:
     )
 
 
-def test_schema_is_sixteen() -> None:
-    assert SCHEMA_VERSION == 16
+def test_schema_is_at_least_sixteen() -> None:
+    """v16 added actions.source_image; later versions must keep it."""
+    assert SCHEMA_VERSION >= 16
 
 
 def test_source_image_round_trips_through_the_database() -> None:
