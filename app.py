@@ -189,8 +189,11 @@ from poker_tracker.ui.poker_visuals import (
 )
 from poker_tracker.ui.reconstruction_review import (
     ISSUE_GUIDANCE,
+    MONEY_ACTION_TYPES,
+    ActionCvIssue,
     FrameIssueTarget,
     ValidationFrameContext,
+    cv_issues_for_timeline_action,
     empty_hands_review_message,
     first_unreviewed_frame_index,
     frame_issue_targets,
@@ -200,6 +203,7 @@ from poker_tracker.ui.reconstruction_review import (
     job_id_from_hand_notes,
     load_timeline_for_job,
     match_db_action_to_frame_target,
+    match_db_action_to_timeline_action,
     observed_facts,
     states_for_hand,
     timeline_actions_for_image,
@@ -1759,7 +1763,8 @@ def study_action_label(
     badge = f" · ⚑ {issue_badge}" if issue_badge else ""
     return (
         f"{index + 1:02d} · {action.street.title()} · {actor} · "
-        f"{action.action_type.replace('-', ' ').title()}{amount}{badge}"
+        f"{action.action_type.replace('-', ' ').replace('_', ' ').title()}"
+        f"{amount}{badge}"
     )
 
 
@@ -5495,11 +5500,41 @@ def show_action_editor_contents(
                 amount=action.amount,
                 targets=targets,
             )
-            badge = ""
+            if linked is None:
+                # Frame flags belong to the frame, not the action's identity:
+                # a type or amount correction must not detach the row from
+                # its flagged source frame. Only adopt actual flags this way.
+                relaxed = match_db_action_to_frame_target(
+                    street=action.street,
+                    action_type=action.action_type,
+                    player_name=action.player_name,
+                    position=action.position,
+                    amount=action.amount,
+                    targets=targets,
+                    identity_only=True,
+                )
+                if relaxed is not None and relaxed.status == "incorrect":
+                    linked = relaxed
+            # Operator frame flags and machine CV reads carry distinct
+            # provenance prefixes; "unreviewed" alone is progress, not an
+            # issue, and stays out of the badge so real defects stand out.
+            badge_parts: list[str] = []
             if linked is not None and linked.status == "incorrect":
-                badge = ", ".join(linked.issue_types) or "flagged frame"
-            elif linked is not None and linked.status == "unreviewed":
-                badge = "unreviewed frame"
+                badge_parts.append(
+                    "flagged: " + (", ".join(linked.issue_types) or "frame")
+                )
+            cv_issues = _cv_issues_for_db_action(action, frame_context)
+            if cv_issues:
+                cv_kinds = list(
+                    dict.fromkeys(issue.kind.lower() for issue in cv_issues)
+                )
+                shown = cv_kinds[:2]
+                extra = len(cv_kinds) - len(shown)
+                cv_text = "CV: " + " · ".join(shown)
+                if extra > 0:
+                    cv_text += f" · +{extra} more"
+                badge_parts.append(cv_text)
+            badge = " · ".join(badge_parts)
             label = study_action_label(action, index, issue_badge=badge)
             is_focused = action.id == focus_id
             show_association = linked is not None and (
@@ -5528,10 +5563,88 @@ def show_action_editor_contents(
                     )
                 elif linked is not None:
                     st.caption(linked.summary())
+                if cv_issues:
+                    _render_action_cv_issues(
+                        hand_id=hand_id,
+                        action_id=action.id,
+                        issues=cv_issues,
+                        frame_context=frame_context,
+                    )
                 _render_edit_one_action(db, action, players)
 
     with st.expander("Add a missing action", expanded=not editable):
         _show_add_corrected_action(db, players)
+
+
+def _cv_issues_for_db_action(
+    action: Action,
+    frame_context: ValidationFrameContext | None,
+) -> list[ActionCvIssue]:
+    """CV read failures behind one saved action line, or [] without a timeline."""
+
+    if frame_context is None:
+        return []
+    timeline_action = match_db_action_to_timeline_action(
+        frame_context.timeline_hand,
+        street=action.street,
+        action_index=action.action_index,
+        action_type=action.action_type,
+        position=action.position,
+        player_name=action.player_name,
+    )
+    if timeline_action is None:
+        # An edited or hand-added line no longer maps to the reconstruction.
+        # An empty amount on a money action must stay visibly flagged anyway.
+        if (
+            action.amount is None
+            and action.action_type.replace("-", "_") in MONEY_ACTION_TYPES
+        ):
+            return [
+                ActionCvIssue(
+                    kind="Amount unknown",
+                    detail=(
+                        "This line was edited or added, so no CV amount read "
+                        "is linked to it — and its amount is still empty. "
+                        "Read the amount off the frames and enter it below."
+                    ),
+                )
+            ]
+        return []
+    return cv_issues_for_timeline_action(
+        timeline_action,
+        frame_context.timeline_hand,
+        frame_context.states,
+        db_amount=action.amount,
+        db_stack_before=action.stack_before,
+        recording_start_s=frame_context.recording_start_s,
+    )
+
+
+def _render_action_cv_issues(
+    *,
+    hand_id: int | None,
+    action_id: int,
+    issues: list[ActionCvIssue],
+    frame_context: ValidationFrameContext | None,
+) -> None:
+    """List the CV read failures behind this action, with a jump to their frame."""
+
+    st.warning("\n".join(f"- **{issue.kind}** — {issue.detail}" for issue in issues))
+    if frame_context is None or hand_id is None:
+        return
+    jump_indexes = list(
+        dict.fromkeys(
+            issue.frame_index for issue in issues if issue.frame_index is not None
+        )
+    )
+    for frame_index in jump_indexes:
+        if st.button(
+            f"Jump to frame {frame_index + 1}",
+            key=f"cv_issue_jump_{hand_id}_{action_id}_{frame_index}",
+            width="stretch",
+        ):
+            _jump_to_frame(frame_context, frame_index)
+            st.rerun()
 
 
 def _render_action_frame_association(
@@ -7709,6 +7822,13 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
                 reviews_by_image=hand_reviews,
                 cursor_key=cursor_key,
                 pending_hand_key=pending_key,
+                recording_start_s=min(
+                    (
+                        float(state.get("time_s", 0.0))
+                        for state in timeline.get("states", [])
+                    ),
+                    default=None,
+                ),
             ),
         )
 
