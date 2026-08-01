@@ -209,6 +209,7 @@ from poker_tracker.ui.reconstruction_review import (
     match_db_action_to_timeline_action,
     observed_facts,
     seat_holds_cards,
+    seat_value,
     states_for_hand,
     timeline_action_by_frame_and_seat,
     timeline_actions_for_image,
@@ -5611,7 +5612,7 @@ def show_action_editor_contents(
                 cv_kinds = list(
                     dict.fromkeys(
                         issue.kind.lower()
-                        for issue in cv_issues
+                        for issue in sorted(cv_issues, key=_issue_badge_rank)
                         if issue.kind != "Edited line"
                     )
                 )
@@ -5986,6 +5987,60 @@ def _row_still_matches_origin(action: Action, origin: dict[str, object]) -> bool
     )
 
 
+# Badge order: a row can only show two kinds, so a claim that a saved value
+# is wrong must outrank a hedge about where the row now sits.
+_BADGE_RANK = {
+    ACTION_MAY_NOT_BELONG: 0,
+    "Seat not in the hand on this frame": 1,
+    "Stack before looks post-action": 2,
+    "Amount unknown": 3,
+    "Stack before unknown": 4,
+    "Unmeasured transition": 5,
+    "Coverage gap": 6,
+    "Moved off its source street": 7,
+    "Frame checks no longer apply": 8,
+}
+
+
+def _issue_badge_rank(issue: ActionCvIssue) -> int:
+    return _BADGE_RANK.get(issue.kind, 5)
+
+
+def _frame_phrase(frame_index: int | None, action: Action) -> str:
+    """Name a frame with only the confidence its provenance supports."""
+
+    if frame_index is None:
+        return "its source frame"
+    if action.source_image:
+        return f"frame {frame_index + 1}, the frame this line came from,"
+    return (
+        f"frame {frame_index + 1}, the closest frame the reconstruction can "
+        "attribute to this line,"
+    )
+
+
+def _frame_bet_read(
+    frame_context: ValidationFrameContext,
+    own_image: str | None,
+    action: Action,
+) -> float | None:
+    """What the reader recorded in this seat's bet box on that frame."""
+
+    if not own_image:
+        return None
+    state = next(
+        (
+            candidate
+            for candidate in frame_context.states
+            if str(candidate.get("image") or "") == own_image
+        ),
+        None,
+    )
+    if state is None:
+        return None
+    return seat_value(state.get("bets"), _seat_index_for_action(action, frame_context))
+
+
 def _issues_for_unattributable_row(
     action: Action,
     frame_context: ValidationFrameContext,
@@ -6014,23 +6069,27 @@ def _issues_for_unattributable_row(
         and action.action_type.replace("-", "_") in MONEY_ACTION_TYPES
     ):
         if _row_frame_shows_no_cards(action, frame_context, own_image):
+            # Name the frame with the confidence it was actually earned, and
+            # never deny a bet box the reader recorded a value for.
+            box = _frame_bet_read(frame_context, own_image, action)
+            box_note = (
+                f", though the reader did read {box:g} BB in its bet box "
+                "there — that total belongs to an earlier action on this "
+                "street"
+                if box is not None
+                else ", so there was no bet box to read"
+            )
             where = (
-                "Its source frame shows no cards for this seat, so there was "
-                "no bet box to read — confirm this action happened before "
-                "entering an amount for it."
+                f"{_frame_phrase(own_index, action).capitalize()} shows no "
+                f"cards for this seat{box_note}. Confirm this action happened "
+                "before entering an amount for it."
             )
         elif own_index is None:
             where = "Read the amount off the frames and enter it below."
-        elif action.source_image:
-            where = (
-                f"It came from frame {own_index + 1} — open that frame, read "
-                "the chips this seat added, and enter that below."
-            )
         else:
             where = (
-                f"Frame {own_index + 1} is the closest the reconstruction can "
-                "attribute to this line — open it, read the chips this seat "
-                "added, and enter that below."
+                f"{_frame_phrase(own_index, action).capitalize()} — open it, "
+                "read the chips this seat added, and enter that below."
             )
         issues.append(
             ActionCvIssue(
@@ -6044,6 +6103,21 @@ def _issues_for_unattributable_row(
             )
         )
     issues.extend(_frame_evidence_for_row(action, frame_context, own_image))
+    if not action.source_image and (
+        action.stack_before is None or action.amount is None
+    ):
+        issues.append(
+            ActionCvIssue(
+                kind="Frame checks no longer apply",
+                detail=(
+                    "No source frame was recorded for this line and it no "
+                    "longer matches any reconstructed line, so the import's "
+                    "frame-based checks — including any earlier stack warning "
+                    "— can no longer be applied. Re-check its Amount and "
+                    "Stack before against the frames yourself."
+                ),
+            )
+        )
     return issues
 
 
@@ -6124,6 +6198,34 @@ def _frame_evidence_for_row(
         )
         if issue.kind != "Amount unknown"
     ]
+    if _row_frame_shows_no_cards(action, frame_context, own_image):
+        # Whatever else this frame says, it does not show this seat in the
+        # hand — so nothing derived from it may be offered as a value to type,
+        # and the editor must not open the field to invite one.
+        issues = [
+            issue.__class__(
+                kind=issue.kind,
+                detail=issue.detail,
+                frame_index=issue.frame_index,
+                offers_a_value=False,
+            )
+            for issue in issues
+        ]
+        if not any(issue.kind == ACTION_MAY_NOT_BELONG for issue in issues):
+            index = _frame_index_for_image(own_image, frame_context)
+            issues.insert(
+                0,
+                ActionCvIssue(
+                    kind="Seat not in the hand on this frame",
+                    detail=(
+                        f"{_frame_phrase(index, action).capitalize()} shows no "
+                        "cards for this seat, so it was not in the hand there. "
+                        "Check that frame before entering anything for this "
+                        "line."
+                    ),
+                    frame_index=index,
+                ),
+            )
     if not any(issue.kind == ACTION_MAY_NOT_BELONG for issue in issues):
         # The evidence is (frame, seat), both of which survive every edit, so
         # it must not depend on a derivation the edit knocked out. Four

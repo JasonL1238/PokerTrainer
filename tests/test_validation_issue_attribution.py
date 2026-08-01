@@ -10,7 +10,7 @@ import pytest
 
 from app import _cv_issues_for_db_action
 from poker_tracker.persistence.models import Action
-from poker_tracker.ui.reconstruction_review import ValidationFrameContext
+from poker_tracker.ui.reconstruction_review import ActionCvIssue, ValidationFrameContext
 
 FRAME_A = "/frames/f0.jpg"
 FRAME_B = "/frames/f1.jpg"
@@ -526,3 +526,89 @@ def test_the_bet_box_ownership_guard_reaches_the_detached_path() -> None:
         for issue in _cv_issues_for_db_action(detached, context)
         if issue.kind == "Stack before looks post-action"
     ], "a blind-poster was told its stack was post-action"
+
+
+def _no_cards_context() -> ValidationFrameContext:
+    states = _states()
+    states[0]["dealt_in"] = [2]          # seat 1 holds nothing on frame A
+    states[0]["stacks"] = {"1": 181.0}   # ... its post-fold stack
+    return ValidationFrameContext(
+        job_id=1, hand_number=1, timeline_hand=_hand(), states=states,
+        reviews_by_image={}, cursor_key="c", pending_hand_key="p",
+        recording_start_s=0.0,
+    )
+
+
+def test_an_added_row_on_a_frame_without_its_seat_is_never_handed_a_value() -> None:
+    """B12 round 12 F2: a row the operator adds has no provenance, so the
+    delete-instruction path cannot fire — and nothing else questioned it. The
+    panel offered a post-fold stack as the stack BEFORE a later action, with
+    the field opened to invite it."""
+    added = _row(action_type="check", amount=None, source_image=None)
+    issues = _cv_issues_for_db_action(added, _no_cards_context())
+    assert any(
+        issue.kind == "Seat not in the hand on this frame" for issue in issues
+    ), "nothing questioned a row on a frame that shows no such seat"
+    assert all(
+        not issue.offers_a_value for issue in issues
+    ), "a value was offered for a seat the frame does not show"
+
+
+def test_no_bet_box_is_never_denied_when_the_reader_read_one() -> None:
+    """B12 round 12 F1: round 11's repair landed in one of two sibling paths."""
+    context = _no_cards_context()
+    context.states[0]["bets"] = {"1": 13.0}
+    issue = next(
+        issue
+        for issue in _cv_issues_for_db_action(
+            _row(action_type="bet", source_image=None), context
+        )
+        if issue.kind == "Amount unknown"
+    )
+    assert "read 13 BB in its bet box" in issue.detail
+    assert "there was no bet box to read" not in issue.detail
+
+
+def test_the_unattributable_path_never_overclaims_provenance() -> None:
+    """The recorded/guessed split must apply to every branch, not just two."""
+    context = _no_cards_context()
+    guessed = _cv_issues_for_db_action(
+        _row(action_type="bet", source_image=None), context
+    )
+    assert any(
+        "closest frame the reconstruction can attribute" in issue.detail
+        for issue in guessed
+    )
+    assert not any(
+        "the frame this line came from" in issue.detail.lower()
+        for issue in guessed
+    )
+
+
+def test_a_stranded_row_says_its_frame_checks_no_longer_apply() -> None:
+    """B12 round 12 F3: an edit on a row with no recorded provenance dropped
+    severe warnings and the caption turned reassuring, with nothing saying the
+    checks could no longer be made."""
+    context = _context()
+    stranded = _row(street="turn", action_index=7, source_image=None)
+    issues = _cv_issues_for_db_action(stranded, context)
+    assert any(
+        issue.kind == "Frame checks no longer apply" for issue in issues
+    )
+
+
+def test_the_badge_shows_the_most_severe_kinds_first() -> None:
+    """B12 round 12 F5: badge order followed emission, so a claim that a saved
+    number is wrong could be truncated behind a positional hedge."""
+    from app import _issue_badge_rank
+
+    ranks = [
+        _issue_badge_rank(ActionCvIssue(kind=kind, detail=""))
+        for kind in (
+            "Action may not belong to this hand",
+            "Stack before looks post-action",
+            "Coverage gap",
+            "Moved off its source street",
+        )
+    ]
+    assert ranks == sorted(ranks), "severity order is not monotonic"

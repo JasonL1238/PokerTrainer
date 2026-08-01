@@ -798,7 +798,7 @@ def cv_issues_for_timeline_action(
         timeline_amount = timeline_action.get("amount")
         code = _seat_code(state.get("bets_unknown") if state else None, seat)
         code_text = _unknown_code_text(code)
-        readable_bet = _seat_value(state.get("bets") if state else None, seat)
+        readable_bet = seat_value(state.get("bets") if state else None, seat)
         parsed_amount = _optional_float(timeline_amount)
         if parsed_amount is not None:
             if readable_bet is not None:
@@ -825,7 +825,7 @@ def cv_issues_for_timeline_action(
             # The accusation itself belongs to ACTION_MAY_NOT_BELONG below;
             # this branch only explains why the amount is missing, and must
             # never instruct a delete under an "Amount unknown" heading.
-            box_read = _seat_value(state.get("bets") if state else None, seat)
+            box_read = seat_value(state.get("bets") if state else None, seat)
             if box_read is not None:
                 detail = (
                     f"{frame_ref.capitalize()} shows no cards for this seat, "
@@ -904,13 +904,13 @@ def cv_issues_for_timeline_action(
         and state is not None
         and seat is not None
     ):
-        own_read = _seat_value(state.get("stacks"), seat)
+        own_read = seat_value(state.get("stacks"), seat)
         # The premise is that the client's stack figure excludes chips already
         # in the bet box, so it only holds when the frame actually shows this
         # seat committing something. Without that, nothing moved and the
         # saved figure is simply the seat's stack.
         committed_here = (
-            _seat_value(state.get("bets"), seat) is not None
+            seat_value(state.get("bets"), seat) is not None
             or _seat_code(state.get("bets_unknown"), seat) is not None
         ) and not _earlier_action_owns_the_box(
             hand, timeline_action, seat, timeline_action.get("street")
@@ -1049,12 +1049,12 @@ def _stack_before_issue(
             state is not None
             and row_type in MONEY_ACTION_TYPES
             and (
-                _seat_value(state.get("bets"), seat) is not None
+                seat_value(state.get("bets"), seat) is not None
                 or _seat_code(state.get("bets_unknown"), seat) is not None
             )
-            and _seat_value(state.get("stacks"), seat) is not None
+            and seat_value(state.get("stacks"), seat) is not None
             and abs(
-                (_seat_value(state.get("stacks"), seat) or 0.0) - timeline_stack
+                (seat_value(state.get("stacks"), seat) or 0.0) - timeline_stack
             )
             < 1e-6
         ):
@@ -1208,7 +1208,7 @@ def _latest_stack_refusal(
         )
         if code_text is not None:
             return code_text, index
-        if _seat_value(state.get("stacks"), seat) is not None:
+        if seat_value(state.get("stacks"), seat) is not None:
             return None
     return None
 
@@ -1235,7 +1235,7 @@ def _recording_starts_mid_hand(
     return t_start == start and "starting_stack_unknown" in warnings
 
 
-def _seat_value(mapping: Any, seat: int | None) -> float | None:
+def seat_value(mapping: Any, seat: int | None) -> float | None:
     """Fetch a per-seat numeric read from a JSON dict keyed by str or int seat."""
 
     if seat is None or not isinstance(mapping, dict):
@@ -1326,7 +1326,7 @@ def _frame_carrying_stack(
     # moved, so it is never evidence for a stack-before.
     last = len(states) if frame_index is None else min(frame_index, len(states))
     for index in range(last - 1, -1, -1):
-        read = _seat_value(states[index].get("stacks"), seat)
+        read = seat_value(states[index].get("stacks"), seat)
         if read is not None and abs(read - value) < 1e-6:
             return index
     return None
@@ -1395,7 +1395,7 @@ def _nearest_readable(
         indexes = range(min(origin, len(states)))
     order = sorted(indexes, key=lambda index: (abs(index - origin), index))
     for index in order:
-        value = _seat_value(states[index].get(field), seat)
+        value = seat_value(states[index].get(field), seat)
         if value is not None:
             return value, index
     return None
