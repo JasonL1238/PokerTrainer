@@ -1877,3 +1877,105 @@ def test_post_action_claim_requires_this_action_to_own_the_box() -> None:
         )
         if issue.kind == "Stack before looks post-action"
     ]
+
+
+def test_every_hinted_stack_message_flags_whether_it_offers_a_value() -> None:
+    """B11 round 11 F1: the flag was set on 2 of 4 hint-carrying paths, so a
+    caption told the operator a verified-correct figure had been 'ruled out'."""
+    hand, states = _cv_issue_fixture()
+    states[0]["stacks"] = {"1": 182.2}
+    variants = [
+        dict(hand["actions"][0], derivation="inferred_round_complete",
+             source_image="/tmp/f1.jpg", stack_before=None),
+        dict(hand["actions"][0], derivation="amount_unknown",
+             source_image="/tmp/f1.jpg", stack_before=None),
+    ]
+    for timeline_action in variants:
+        issue = next(
+            (
+                issue
+                for issue in cv_issues_for_timeline_action(
+                    timeline_action, hand, states,
+                    db_amount=None, db_stack_before=None,
+                )
+                if issue.kind == "Stack before unknown"
+            ),
+            None,
+        )
+        if issue is None:
+            continue
+        names_a_value = "The reconstruction read" in issue.detail
+        assert issue.offers_a_value == names_a_value, issue.detail
+
+
+def test_no_bet_box_claim_respects_the_readers_own_record() -> None:
+    """B11 round 11 F2: the reader had read 13 BB in that very box."""
+    hand, states = _cv_issue_fixture()
+    states[1]["dealt_in"] = [0, 2, 4]
+    states[1]["bets"] = {"7": 13.0}
+    action = dict(hand["actions"][1], amount=None, derivation="inferred_round_complete")
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, hand, states, db_amount=None, db_stack_before=224.2
+        )
+        if issue.kind == "Amount unknown"
+    )
+    assert "read 13 BB in its bet box" in issue.detail
+    assert "there was no bet box to read" not in issue.detail
+
+
+def test_stack_refusal_scan_is_strictly_before_the_action() -> None:
+    """A11 round 11 F8/M40: the strictly-before bound changes 396 real rows
+    and nothing pinned it."""
+    hand, states = _cv_issue_fixture()
+    # A refusal on the action's OWN frame must not be cited: that frame reads
+    # the stack after the chips moved.
+    states[1]["stacks_unknown"] = {"1": "no_digit_run"}
+    states[0]["stacks"] = {"1": 200.0}
+    action = dict(hand["actions"][0], source_image="/tmp/f1.jpg")
+    issue = next(
+        (
+            issue
+            for issue in cv_issues_for_timeline_action(
+                action, hand, states, db_amount=6.0, db_stack_before=None
+            )
+            if issue.kind == "Stack before unknown"
+        ),
+        None,
+    )
+    assert issue is not None
+    assert "On frame 2" not in issue.detail, "cited a refusal on the action's own frame"
+
+
+def test_a_stale_hint_never_claims_to_offer_a_value() -> None:
+    """A11 round 11 F8/M34: 264 rows hang on this, untested."""
+    hand, states = _cv_issue_fixture()
+    states[0]["stacks"] = {"1": 1450.8}
+    hand = dict(
+        hand,
+        actions=[
+            *hand["actions"],
+            {
+                "street": "preflop", "action_index": 8, "seat": 1,
+                "player_name": "Seat1", "position": "UTG+1",
+                "action_type": "raise", "amount": 10.0,
+                "source_image": "/tmp/f1.jpg", "derivation": "stack_delta",
+            },
+        ],
+    )
+    later = {
+        "street": "flop", "action_index": 1, "seat": 1,
+        "player_name": "Seat1", "position": "UTG+1", "action_type": "bet",
+        "amount": 12.8, "source_image": states[2]["image"],
+        "derivation": "bet_text",
+    }
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            later, hand, states, db_amount=12.8, db_stack_before=None
+        )
+        if issue.kind == "Stack before unknown"
+    )
+    assert "put chips in since then" in issue.detail
+    assert issue.offers_a_value is False, "a stale figure was offered as usable"

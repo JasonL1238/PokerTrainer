@@ -1987,6 +1987,28 @@ def frame_context_belongs_to_hand(
     return owning is None or owning == frame_context.job_id
 
 
+def usable_frame_context(
+    hand: Hand,
+    frame_context: ValidationFrameContext | None,
+) -> tuple[ValidationFrameContext | None, str]:
+    """Drop a frame context that belongs to a different reconstruction job.
+
+    Several jobs can run on one video and all resolve to this same hand.
+    Explaining its rows with another job's frames produces claims that are
+    true of neither, so the panel says which job owns the hand and derives
+    nothing. Returned rather than applied inline so the decision is testable.
+    """
+
+    if frame_context is None or frame_context_belongs_to_hand(hand, frame_context):
+        return frame_context, ""
+    owning = owning_job_for_hand(hand)
+    return None, (
+        f"This hand was imported from job {owning}, but you are viewing job "
+        f"{frame_context.job_id}'s frames. Frame-based notes are hidden — "
+        f"open job {owning} to validate it."
+    )
+
+
 def render_validation_edit_and_approve(
     db: PokerDatabase,
     hand: Hand,
@@ -2000,19 +2022,9 @@ def render_validation_edit_and_approve(
         return
     # Always re-fetch so edits from this same render cycle are visible next rerun.
     hand = db.fetch_hand(hand.id) or hand
-    owning_job = owning_job_for_hand(hand)
-    if frame_context is not None and not frame_context_belongs_to_hand(
-        hand, frame_context
-    ):
-        # Several jobs can run on one video and all resolve to this same hand.
-        # Explaining its rows with another job's frames produces claims that
-        # are true of neither, so say which job owns it and derive nothing.
-        st.warning(
-            f"This hand was imported from job {owning_job}, but you are "
-            f"viewing job {frame_context.job_id}'s frames. Frame-based notes "
-            f"are hidden — open job {owning_job} to validate it."
-        )
-        frame_context = None
+    frame_context, foreign_job_notice = usable_frame_context(hand, frame_context)
+    if foreign_job_notice:
+        st.warning(foreign_job_notice)
     if frame_context is not None:
         # Rows imported before schema 16 have no recorded source frame; fill it
         # now that the timeline is open. Only from the job this hand was
@@ -5945,6 +5957,23 @@ def _origin_is_unambiguous(
     return len(same_frame) == 1
 
 
+def _row_is_the_same_line(action: Action, origin: dict[str, object]) -> bool:
+    """Whether this row is still the line it came from, ignoring its order.
+
+    Reordering does not change which line a row IS, so its own derivation
+    still applies — losing it silently dropped the stack warning. Actor and
+    type must still agree: those are what a borrowed derivation would
+    misdescribe.
+    """
+
+    return (
+        action.street.lower() == str(origin.get("street", "")).lower()
+        and action.action_type.replace("-", "_")
+        == str(origin.get("action_type") or "").replace("-", "_")
+        and action.player_name == str(origin.get("player_name") or "")
+    )
+
+
 def _row_still_matches_origin(action: Action, origin: dict[str, object]) -> bool:
     """Whether a saved row still claims the same street, order, type and actor."""
 
@@ -6060,6 +6089,9 @@ def _frame_evidence_for_row(
     stub = {
         "source_image": own_image,
         "seat": seat,
+        # Needed by the bet-box ownership guard, which compares this line's
+        # position on the street against the seat's earlier ones.
+        "action_index": (neighbour or {}).get("action_index", action.action_index),
         # The street the LINE was reconstructed on, so a moved row still gets
         # hedged here; falls back to the row's own street when unknown.
         "street": str((neighbour or {}).get("street") or action.street),
@@ -6074,7 +6106,7 @@ def _frame_evidence_for_row(
         # observed row of having been inferred.
         "derivation": (
             str((neighbour or {}).get("derivation") or "")
-            if neighbour is not None and _row_still_matches_origin(action, neighbour)
+            if neighbour is not None and _row_is_the_same_line(action, neighbour)
             else ""
         ),
     }
@@ -6115,19 +6147,63 @@ def _stranded_seat_issue(
 
     if action.action_type.replace("-", "_") == "fold":
         return None
+    if not action.source_image:
+        # Without recorded provenance the frame was inferred from the row's
+        # current street and order, so it moves with the edit. Recommending a
+        # delete on evidence the edit produced would destroy real rows.
+        return None
     if not _row_frame_shows_no_cards(action, frame_context, own_image):
         return None
     index = _frame_index_for_image(own_image, frame_context)
     where = f"frame {index + 1}" if index is not None else "its source frame"
+    # Only claim origin when provenance actually recorded it; otherwise this
+    # frame is merely the closest the reconstruction can attribute — and this
+    # is the message that instructs a delete.
+    opening = (
+        f"The frame this line came from ({where})"
+        if action.source_image
+        else f"{where.capitalize()}, the closest frame the reconstruction can "
+        "attribute to this line,"
+    )
+    seat = _seat_index_for_action(action, frame_context)
+    origin = timeline_action_by_frame_and_seat(
+        frame_context.timeline_hand, own_image, seat
+    )
+    if str((origin or {}).get("action_type") or "").replace("-", "_") == "fold":
+        # The frame records a fold; retyping the row does not change that, and
+        # a folding seat loses its cards on its own frame.
+        return None
+    held_earlier = _seat_held_cards_earlier(frame_context, own_image, seat)
+    consequence = (
+        "so it had already left the hand and cannot have acted here"
+        if held_earlier
+        else "and no earlier frame shows it holding any, so it may never have "
+        "been in this hand"
+    )
     return ActionCvIssue(
         kind=ACTION_MAY_NOT_BELONG,
         detail=(
-            f"The frame this line came from ({where}) shows no cards for this "
-            "seat, so it had already left the hand and cannot have acted "
-            "here — whatever this row now says. Check that frame and delete "
-            "this line if the action did not happen."
+            f"{opening} shows no cards for this seat, {consequence} — "
+            "whatever this row now says. Check that frame and delete this "
+            "line if the action did not happen."
         ),
         frame_index=index,
+    )
+
+
+def _seat_held_cards_earlier(
+    frame_context: ValidationFrameContext,
+    own_image: str,
+    seat: int | None,
+) -> bool:
+    """Whether any frame before this one shows the seat holding cards."""
+
+    index = _frame_index_for_image(own_image, frame_context)
+    if index is None or seat is None:
+        return False
+    return any(
+        seat_holds_cards(state, seat)
+        for state in frame_context.states[:index]
     )
 
 

@@ -825,11 +825,21 @@ def cv_issues_for_timeline_action(
             # The accusation itself belongs to ACTION_MAY_NOT_BELONG below;
             # this branch only explains why the amount is missing, and must
             # never instruct a delete under an "Amount unknown" heading.
-            detail = (
-                f"{frame_ref.capitalize()} shows no cards for this seat, so "
-                "there was no bet box to read. Confirm this action happened "
-                "before entering an amount for it."
-            )
+            box_read = _seat_value(state.get("bets") if state else None, seat)
+            if box_read is not None:
+                detail = (
+                    f"{frame_ref.capitalize()} shows no cards for this seat, "
+                    f"though the reader did read {box_read:g} BB in its bet "
+                    "box there — that total belongs to an earlier action on "
+                    "this street. Confirm this action happened before "
+                    "entering an amount for it."
+                )
+            else:
+                detail = (
+                    f"{frame_ref.capitalize()} shows no cards for this seat, "
+                    "so there was no bet box to read. Confirm this action "
+                    "happened before entering an amount for it."
+                )
         elif derivation.startswith("inferred"):
             detail = (
                 f"{_inferred_reason(derivation)}, so no amount reading is "
@@ -903,7 +913,7 @@ def cv_issues_for_timeline_action(
             _seat_value(state.get("bets"), seat) is not None
             or _seat_code(state.get("bets_unknown"), seat) is not None
         ) and not _earlier_action_owns_the_box(
-            hand, timeline_action, seat, db_street or timeline_action.get("street")
+            hand, timeline_action, seat, timeline_action.get("street")
         )
         if (
             own_read is not None
@@ -1000,6 +1010,20 @@ def _stack_before_issue(
     """
 
     kind = "Stack before unknown"
+
+    def _hinted(detail: str, index: int | None = None) -> ActionCvIssue:
+        """A stack issue whose value-offer flag always matches its hint."""
+        return ActionCvIssue(
+            kind=kind,
+            detail=detail,
+            frame_index=(
+                hint_index
+                if hint_index is not None
+                else (index if index is not None else frame_index)
+            ),
+            offers_a_value=hint_offers_value,
+        )
+
     row_type = str(
         db_action_type
         if db_action_type is not None
@@ -1104,13 +1128,9 @@ def _stack_before_issue(
                 ),
                 frame_index=frame_index,
             )
-        return ActionCvIssue(
-            kind=kind,
-            detail=(
-                f"{_inferred_reason(derivation)}, so the import did not attach "
-                f"a stack to it. {hint}"
-            ),
-            frame_index=hint_index if hint_index is not None else frame_index,
+        return _hinted(
+            f"{_inferred_reason(derivation)}, so the import did not attach "
+            f"a stack to it. {hint}"
         )
     # A missing stack-before is usually caused by reads on EARLIER frames
     # (that is where the value would have come from), so scan backward for
@@ -1118,12 +1138,7 @@ def _stack_before_issue(
     refusal = _latest_stack_refusal(states, frame_index, seat)
     if refusal is not None:
         code_text, at_index = refusal
-        return ActionCvIssue(
-            kind=kind,
-            detail=f"On frame {at_index + 1}, {code_text}. {hint}",
-            frame_index=hint_index if hint_index is not None else at_index,
-            offers_a_value=hint_offers_value,
-        )
+        return _hinted(f"On frame {at_index + 1}, {code_text}. {hint}", at_index)
     starting_code = _starting_stack_unknown_code(hand, seat)
     if starting_code is not None:
         committed = starting_code.startswith("committed_at_start")
@@ -1157,25 +1172,16 @@ def _stack_before_issue(
                 f"so the stack before this action could not be back-computed. "
                 f"{hint}"
             )
-        return ActionCvIssue(
-            kind=kind,
-            detail=detail,
-            frame_index=hint_index if hint_index is not None else frame_index,
-        )
+        return _hinted(detail)
     action_type = str(
         db_action_type
         if db_action_type is not None
         else timeline_action.get("action_type") or ""
     ).replace("-", "_")
     if db_amount is None and action_type in MONEY_ACTION_TYPES:
-        return ActionCvIssue(
-            kind=kind,
-            detail=(
-                "The import could not derive this seat's stack before the "
-                f"action, because this line's own amount is unknown. {hint}"
-            ),
-            frame_index=hint_index if hint_index is not None else frame_index,
-            offers_a_value=hint_offers_value,
+        return _hinted(
+            "The import could not derive this seat's stack before the "
+            f"action, because this line's own amount is unknown. {hint}"
         )
     return None
 

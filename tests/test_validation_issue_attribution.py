@@ -403,3 +403,126 @@ def test_an_attributed_row_on_the_wrong_street_is_hedged() -> None:
     assert hedge is not None, "an attributed row on the wrong street was not hedged"
     assert "reconstructed on the flop" in hedge.detail
     assert "now saved on the preflop" in hedge.detail
+
+
+def test_an_order_edit_keeps_the_stack_warning_too() -> None:
+    """B11 round 11 F5: round 10 hardened the phantom accusation against an
+    Order keystroke but left its sibling on the same derivation branch, so the
+    stack warning still vanished and the row went silent."""
+    hand = _hand()
+    hand["actions"][0]["derivation"] = "inferred_round_complete"
+    hand["actions"][0]["stack_before"] = None
+    context = ValidationFrameContext(
+        job_id=1, hand_number=1, timeline_hand=hand, states=_states(),
+        reviews_by_image={}, cursor_key="c", pending_hand_key="p",
+        recording_start_s=0.0,
+    )
+    before = _cv_issues_for_db_action(_row(amount=10.0), context)
+    assert any(issue.kind == "Stack before unknown" for issue in before)
+    after = _cv_issues_for_db_action(_row(amount=10.0, action_index=9), context)
+    assert any(
+        issue.kind == "Stack before unknown" for issue in after
+    ), "an order edit silenced the stack warning"
+
+
+def test_a_delete_instruction_never_asserts_refused_provenance() -> None:
+    """B11 round 11 F3: the message that instructs a DELETE claimed "the frame
+    this line came from" even for rows whose provenance the backfill had
+    explicitly refused to record."""
+    from app import _stranded_seat_issue
+
+    states = _states()
+    states[0]["dealt_in"] = [2]        # seat 1 holds no cards here
+    states[1]["dealt_in"] = [1, 2]     # ... but did earlier? no: index 1 is later
+    context = ValidationFrameContext(
+        job_id=1, hand_number=1, timeline_hand=_hand(), states=states,
+        reviews_by_image={}, cursor_key="c", pending_hand_key="p",
+        recording_start_s=0.0,
+    )
+    # Without recorded provenance the frame follows the row's CURRENT street
+    # and order, so it moves with the edit. Recommending a delete on evidence
+    # the edit itself produced would destroy real rows: say nothing.
+    assert (
+        _stranded_seat_issue(
+            _row(action_type="bet", source_image=None), context, FRAME_A
+        )
+        is None
+    )
+
+    recorded = _stranded_seat_issue(
+        _row(action_type="bet"), context, FRAME_A
+    )
+    assert recorded is not None
+    assert "The frame this line came from" in recorded.detail
+
+    # A fold legitimately loses its cards on its own frame.
+    assert _stranded_seat_issue(
+        _row(action_type="fold"), context, FRAME_A
+    ) is None
+
+
+def test_a_seat_never_seen_holding_cards_is_described_as_such() -> None:
+    """B11 round 11 F6: 'it had already left the hand' was asserted for a seat
+    that never entered it — disprovable by looking at any earlier frame."""
+    from app import _stranded_seat_issue
+
+    # A third frame, so frame B is not the terminal one (absence on a hand's
+    # last retained frame proves nothing and is guarded separately).
+    states = [*_states(), {**_states()[1], "image": "/frames/f2.jpg"}]
+    states[0]["dealt_in"] = [2]
+    states[1]["dealt_in"] = [2]
+    context = ValidationFrameContext(
+        job_id=1, hand_number=1, timeline_hand=_hand(), states=states,
+        reviews_by_image={}, cursor_key="c", pending_hand_key="p",
+        recording_start_s=0.0,
+    )
+    # Frame B is later, and seat 1 never held cards on any earlier frame.
+    issue = _stranded_seat_issue(_row(action_type="bet"), context, FRAME_B)
+    assert issue is not None
+    assert "may never have been in this hand" in issue.detail
+    assert "already left the hand" not in issue.detail
+
+    # With an earlier frame showing cards, the stronger claim is correct.
+    states[0]["dealt_in"] = [1, 2]
+    issue = _stranded_seat_issue(_row(action_type="bet"), context, FRAME_B)
+    assert issue is not None
+    assert "already left the hand" in issue.detail
+
+
+def test_the_bet_box_ownership_guard_reaches_the_detached_path() -> None:
+    """A11 round 11 F2: the stub carried no action_index, so the guard that
+    stops a blind-poster being told its stack is post-action returned False
+    unconditionally — 62 of 62 calls from this path."""
+    hand = _hand()
+    # Seat 1 posts a blind first, then acts again on the same street.
+    hand["actions"] = [
+        {
+            "street": "preflop", "action_index": 1, "seat": 1,
+            "player_name": "Seat1", "position": "UTG",
+            "action_type": "post_blind", "amount": 1.0,
+            "source_image": FRAME_A, "derivation": "action_pill",
+        },
+        {
+            "street": "preflop", "action_index": 3, "seat": 1,
+            "player_name": "Seat1", "position": "UTG", "action_type": "call",
+            "amount": 10.0, "stack_before": 200.0,
+            "source_image": FRAME_A, "derivation": "stack_delta",
+        },
+    ]
+    states = _states()
+    states[0]["bets"] = {"1": 1.0}          # the blind, not this action
+    states[0]["stacks"] = {"1": 200.0}
+    context = ValidationFrameContext(
+        job_id=1, hand_number=1, timeline_hand=hand, states=states,
+        reviews_by_image={}, cursor_key="c", pending_hand_key="p",
+        recording_start_s=0.0,
+    )
+    # A type edit detaches the row, so the stub path runs.
+    detached = _row(
+        action_index=3, action_type="bet", amount=10.0, stack_before=200.0
+    )
+    assert not [
+        issue
+        for issue in _cv_issues_for_db_action(detached, context)
+        if issue.kind == "Stack before looks post-action"
+    ], "a blind-poster was told its stack was post-action"

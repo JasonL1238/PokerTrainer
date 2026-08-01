@@ -125,6 +125,31 @@ def test_the_guard_ignores_notes_an_operator_rewrote() -> None:
     db.close()
 
 
+def test_a_foreign_jobs_context_is_dropped_before_anything_is_derived() -> None:
+    """A10/A11: the guard block could be deleted outright with a green suite,
+    because every test pinned the helper and none pinned the decision the
+    panel actually makes."""
+    db = _db()
+    hand = _hand_with_identity(db, job_id=1, notes=NOTES)
+
+    kept, notice = app.usable_frame_context(hand, _context(1))
+    assert kept is not None
+    assert notice == ""
+
+    dropped, notice = app.usable_frame_context(hand, _context(3))
+    assert dropped is None, "a foreign job's frames were kept"
+    assert "imported from job 1" in notice
+    assert "viewing job 3" in notice
+    db.close()
+
+
+def test_no_context_is_passed_through_untouched() -> None:
+    db = _db()
+    hand = _hand_with_identity(db, job_id=1, notes=NOTES)
+    assert app.usable_frame_context(hand, None) == (None, "")
+    db.close()
+
+
 def test_an_unstamped_hand_is_not_stranded() -> None:
     db = _db()
     hand = _hand_with_identity(db, job_id=None, notes=NOTES)
