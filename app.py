@@ -5700,6 +5700,14 @@ def show_action_editor_contents(
                     stack_value_ruled_out=any(
                         _issue_rules_out_its_figure(issue) for issue in cv_issues
                     ),
+                    action_may_not_have_happened=any(
+                        issue.kind
+                        in (
+                            ACTION_MAY_NOT_BELONG,
+                            "Seat not in the hand on this frame",
+                        )
+                        for issue in cv_issues
+                    ),
                 )
 
     with st.expander("Add a missing action", expanded=not editable):
@@ -5811,61 +5819,6 @@ def _frame_index_for_image(
         ),
         None,
     )
-
-
-def _frame_level_issues_for_action(
-    action: Action,
-    frame_context: ValidationFrameContext | None,
-) -> list[ActionCvIssue]:
-    """Coverage gaps and unmeasured transitions for an edited row's own frame.
-
-    These are properties of the frame, not of the action's identity, so they
-    must survive a type or actor correction that detaches the row from its
-    reconstructed line. A coverage gap is seat-independent, so it survives
-    even when the actor was reassigned and the slot no longer resolves.
-    """
-
-    if frame_context is None:
-        return []
-    own_image = _timeline_source_image_for_action(
-        action, frame_context
-    )
-    identity_resolved = bool(own_image)
-    if not own_image:
-        own_image = _slot_source_image_ignoring_identity(action, frame_context)
-    if not own_image:
-        return []
-    stub = {
-        "source_image": own_image,
-        # Without a confirmed identity the seat is a guess, so only
-        # seat-independent facts may be reported below.
-        "seat": (
-            _seat_index_for_action(action, frame_context)
-            if identity_resolved
-            else None
-        ),
-        "action_type": action.action_type,
-        "amount": action.amount,
-        "stack_before": action.stack_before,
-        "derivation": "",
-    }
-    allowed = (
-        {"Coverage gap", "Unmeasured transition"}
-        if identity_resolved
-        else {"Coverage gap"}
-    )
-    return [
-        issue
-        for issue in cv_issues_for_timeline_action(
-            stub,
-            frame_context.timeline_hand,
-            frame_context.states,
-            db_amount=action.amount,
-            db_stack_before=action.stack_before,
-            recording_start_s=frame_context.recording_start_s,
-        )
-        if issue.kind in allowed
-    ]
 
 
 def _seat_index_for_action(
@@ -6073,7 +6026,9 @@ def _claims_retired_by_the_edit(
     ]
     if not lost:
         return None
-    names = " and ".join(sorted({issue.kind.lower() for issue in lost}))
+    kinds = sorted({issue.kind.lower() for issue in lost})
+    names = " and ".join(f'"{kind}"' for kind in kinds)
+    verb = "check no longer runs" if len(kinds) == 1 else "checks no longer run"
     saved = (
         f" Its saved Stack before ({action.stack_before:g} BB) was what that "
         "check objected to."
@@ -6084,8 +6039,8 @@ def _claims_retired_by_the_edit(
     return ActionCvIssue(
         kind="Check no longer applies",
         detail=(
-            f"This line's type changed, so the import's {names} check no "
-            f"longer runs on it — but nothing it flagged was corrected.{saved} "
+            f"This line's type changed, so the import's {names} {verb} on "
+            f"it — but nothing it flagged was corrected.{saved} "
             "Re-check this row against its frames yourself."
         ),
     )
@@ -6186,10 +6141,10 @@ def _frame_phrase(frame_index: int | None, action: Action) -> str:
     if frame_index is None:
         return "its source frame"
     if action.source_image:
-        return f"frame {frame_index + 1}, the frame this line came from,"
+        return f"frame {frame_index + 1}, the frame this line came from"
     return (
         f"frame {frame_index + 1}, the closest frame the reconstruction can "
-        "attribute to this line,"
+        "attribute to this line"
     )
 
 
@@ -6277,9 +6232,8 @@ def _issues_for_unattributable_row(
             where = "Read the amount off the frames and enter it below."
         else:
             where = (
-                f"{_frame_phrase(own_index, action).capitalize().rstrip(',')} "
-                "— open it, read the chips this seat added, and enter that "
-                "below."
+                f"{_frame_phrase(own_index, action).capitalize()} — open it, "
+                "read the chips this seat added, and enter that below."
             )
         issues.append(
             ActionCvIssue(
@@ -6584,6 +6538,7 @@ def _render_edit_one_action(
     needs_stack_before: bool = False,
     stack_value_not_supplied: bool = False,
     stack_value_ruled_out: bool = False,
+    action_may_not_have_happened: bool = False,
 ) -> None:
     """Simple per-action editor: Who / What / Amount first; advanced fields optional.
 
@@ -6591,6 +6546,9 @@ def _render_edit_one_action(
     issue on this row hands the operator a value to enter there.
     ``stack_value_not_supplied`` means a stack issue fired but gave no usable
     figure, so the block still opens but must not claim one was named.
+    ``action_may_not_have_happened`` keeps the block shut outright: a row
+    whose frame shows its seat was not in the hand must not be handed a field
+    to legitimize it with, whatever else fired alongside.
     """
 
     if action.id is None:
@@ -6622,9 +6580,9 @@ def _render_edit_one_action(
     )
     advanced_key = f"action_advanced_{action.id}"
     if (
-        needs_stack_before or stack_value_not_supplied or stack_value_ruled_out
-    ) and (
-        advanced_key not in st.session_state
+        (needs_stack_before or stack_value_not_supplied or stack_value_ruled_out)
+        and not action_may_not_have_happened
+        and advanced_key not in st.session_state
     ):
         # A warning on this row asks for Stack before, which lives here.
         st.session_state[advanced_key] = True
