@@ -27,10 +27,10 @@ from poker_tracker.persistence.models import (
     SettlementEntry,
 )
 
-EXPORT_VERSION = 5
+EXPORT_VERSION = 6
 # The literal 4 must stay listed: bumping EXPORT_VERSION alone would silently
 # drop support for payloads written by the previous release.
-SUPPORTED_IMPORT_VERSIONS = {1, 2, 3, 4, EXPORT_VERSION}
+SUPPORTED_IMPORT_VERSIONS = {1, 2, 3, 4, 5, EXPORT_VERSION}
 
 
 def export_hand(db: PokerDatabase, hand_id: int) -> dict[str, Any]:

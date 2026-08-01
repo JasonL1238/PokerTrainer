@@ -1505,7 +1505,20 @@ def test_bet_box_clause_only_claims_a_box_that_was_read() -> None:
         )
         if issue.kind == "Amount unknown"
     )
-    assert "Nothing on frame 3 shows this seat's bet box" in issue.detail
+    assert "recorded no bet box for this seat on frame 3" in issue.detail
+
+    # When the reader DID see a box and refuse it, say that instead of
+    # claiming nothing was there — its own record contradicts the claim.
+    states[2]["bets_unknown"] = {"7": "below_calibrated_render_size"}
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            swept, hand, states, db_amount=None, db_stack_before=224.2
+        )
+        if issue.kind == "Amount unknown"
+    )
+    assert "On frame 3, the on-screen text rendered below" in issue.detail
+    assert "recorded no bet box" not in issue.detail
 
     with_box = dict(hand["actions"][1])
     issue = next(

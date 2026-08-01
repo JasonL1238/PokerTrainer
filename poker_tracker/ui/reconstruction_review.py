@@ -740,15 +740,22 @@ def cv_issues_for_timeline_action(
         code_text = _unknown_code_text(code)
         readable_bet = _seat_value(state.get("bets") if state else None, seat)
         if timeline_amount is not None:
-            box_note = (
-                f" ({frame_ref.capitalize()}'s bet box shows the seat's total "
-                "for the street, not this increment.)"
-                if readable_bet is not None
-                else f" (Nothing on {frame_ref} shows this seat's bet box, so "
-                "check the frame before it.)"
-            )
+            if readable_bet is not None:
+                box_note = (
+                    f" ({frame_ref.capitalize()}'s bet box shows the seat's "
+                    "total for the street, not this increment.)"
+                )
+            elif code_text is not None:
+                # The reader saw a box and declined it; saying nothing was
+                # there contradicts its own record for this frame.
+                box_note = f" (On {frame_ref}, {code_text}.)"
+            else:
+                box_note = (
+                    f" (The reader recorded no bet box for this seat on "
+                    f"{frame_ref}.)"
+                )
             detail = (
-                f"The reconstruction read {float(timeline_amount):g} BB as the "
+                f"The reconstruction read {_optional_float(timeline_amount):g} BB as the "
                 "chips this seat added here, but the saved amount is empty — "
                 "confirm it and re-enter it in the Amount field below."
                 f"{box_note}"
@@ -837,8 +844,7 @@ def cv_issues_for_timeline_action(
 
     if state is not None:
         if bool(state.get("coverage_gap")):
-            gap = state.get("prior_gap_s")
-            gap_text = f"{float(gap):g}s" if gap is not None else "several seconds"
+            gap_text = _format_seconds(state.get("prior_gap_s"))
             issues.append(
                 ActionCvIssue(
                     kind="Coverage gap",
@@ -922,7 +928,7 @@ def _stack_before_issue(
         return ActionCvIssue(
             kind=kind,
             detail=(
-                f"The reconstruction computed {float(timeline_stack):g} BB "
+                f"The reconstruction computed {_optional_float(timeline_stack):g} BB "
                 "for this seat's stack before the action, but the saved field "
                 "is empty — re-enter it under **More fields → Stack before "
                 f"(BB)**.{where}"
@@ -1125,11 +1131,31 @@ def _seat_holds_cards(state: dict[str, Any] | None, seat: int | None) -> bool:
     return False
 
 
+def _format_seconds(value: Any) -> str:
+    """Render a gap length, degrading rather than raising on bad JSON."""
+
+    try:
+        return f"{float(value):g}s"
+    except (TypeError, ValueError):
+        return "several seconds"
+
+
+def _optional_float(value: Any) -> float | None:
+    """Coerce a JSON number, returning None rather than raising."""
+
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _int_set(values: Any) -> set[int]:
     """Coerce a JSON list of seat numbers, skipping anything non-numeric."""
 
     result: set[int] = set()
-    for item in values or []:
+    if not isinstance(values, (list, tuple, set)):
+        return result
+    for item in values:
         try:
             result.add(int(item))
         except (TypeError, ValueError):

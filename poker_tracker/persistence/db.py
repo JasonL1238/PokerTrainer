@@ -73,7 +73,7 @@ DEFAULT_DB_PATH = os.environ.get(
     "POKER_DB_PATH",
     str(Path(__file__).resolve().parent.parent.parent / "poker_tracker.db"),
 )
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 _PROCESSING_JOB_PID_UNSET = object()
 # A migration on a real database can outlast SQLite's 5s default, and a second
 # opener must wait for it rather than failing startup with "database is locked".
@@ -712,6 +712,7 @@ class PokerDatabase:
                 pot_before REAL,
                 stack_before REAL,
                 notes TEXT NOT NULL DEFAULT '',
+                source_image TEXT,
                 FOREIGN KEY (hand_id) REFERENCES hands(id) ON DELETE CASCADE
             );
 
@@ -2247,9 +2248,9 @@ class PokerDatabase:
             INSERT INTO actions (
                 hand_id, player_key, street, action_index, player_name, position,
                 action_type, amount, amount_semantics, forced_bet_type,
-                is_live_post, pot_before, stack_before, notes
+                is_live_post, pot_before, stack_before, notes, source_image
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload["hand_id"],
@@ -2266,6 +2267,7 @@ class PokerDatabase:
                 payload["pot_before"],
                 payload["stack_before"],
                 payload["notes"],
+                payload["source_image"],
             ),
         )
         self._invalidate_hand_derivatives(payload["hand_id"])
@@ -2342,6 +2344,9 @@ class PokerDatabase:
     def _update_action_row(self, payload: dict, stored_hand_id: int) -> None:
         cursor = self._execute(
             """
+            -- source_image is deliberately not updated: it records which
+            -- frame produced this line, and must survive the operator
+            -- correcting the street, order, actor, type, or amount.
             UPDATE actions
             SET player_key = ?, street = ?, action_index = ?, player_name = ?, position = ?,
                 action_type = ?, amount = ?, amount_semantics = ?,
@@ -4434,6 +4439,30 @@ def _migrate_to_v15(db: PokerDatabase) -> None:
     db._ensure_column("hands", "study_inclusion", "TEXT NOT NULL DEFAULT 'auto'")
 
 
+def _migrate_to_v16(db: PokerDatabase) -> None:
+    """Remember which source frame produced each reconstructed action.
+
+    MIGRATION IMPACT (schema 15 -> 16)
+
+    Added:
+      - actions.source_image TEXT NULL
+
+    Purely additive and unbackfilled. Existing rows read NULL and fall back to
+    the slot lookup used today, so nothing about an existing hand changes.
+
+    Why it is needed: action indexes are per-street, so correcting a row's
+    street or order moves it onto a different slot, and the validation UI —
+    which had no other way to know where a row came from — either lost every
+    frame-derived warning for it or, after a delete, attached another line's
+    frame and stack figure. Storing the frame at import makes provenance
+    survive any later edit.
+
+    Written only by the CV import path. Manual hands leave it NULL.
+    """
+
+    db._ensure_column("actions", "source_image", "TEXT")
+
+
 # Versioned migrations run in order and refuse databases written by newer apps.
 _MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {
     6: _migrate_to_v6,
@@ -4446,6 +4475,7 @@ _MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {
     13: _migrate_to_v13,
     14: _migrate_to_v14,
     15: _migrate_to_v15,
+    16: _migrate_to_v16,
 }
 
 

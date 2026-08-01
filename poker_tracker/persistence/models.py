@@ -291,6 +291,10 @@ class Action(PersistedModel):
     pot_before: float | None = Field(default=None, ge=0)
     stack_before: float | None = Field(default=None, ge=0)
     notes: str = ""
+    # Frame this line was reconstructed from, when it came from CV import.
+    # Provenance must survive street/order corrections, which move the row
+    # onto a different slot; NULL for manually entered hands.
+    source_image: str | None = None
 
     @field_validator("action_type", mode="before")
     @classmethod

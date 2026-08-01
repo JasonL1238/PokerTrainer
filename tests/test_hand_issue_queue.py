@@ -171,7 +171,7 @@ def test_issue_queue_survives_export_import() -> None:
     imported_hand = target.fetch_hands_by_session(imported_session.id)[0]
     imported_issue = target.fetch_hand_issues(hand_id=imported_hand.id)[0]
 
-    assert EXPORT_VERSION == 5
+    assert EXPORT_VERSION == 6
     assert payload["export_version"] == EXPORT_VERSION
     assert imported_issue.description == "Final result does not match the recording."
     assert imported_issue.issue_types == ["pot_or_result"]

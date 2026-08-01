@@ -262,9 +262,11 @@ def _legacy_hand_payload(source_type: str, review_status: str = "reviewed") -> d
     return data
 
 
-def test_export_version_is_five() -> None:
-    assert EXPORT_VERSION == 5
-    assert SUPPORTED_IMPORT_VERSIONS == {1, 2, 3, 4, 5}
+def test_export_version_is_six_and_every_older_version_still_imports() -> None:
+    assert EXPORT_VERSION == 6
+    # Every previously released version must stay importable: bumping the
+    # export version alone would silently orphan payloads already on disk.
+    assert SUPPORTED_IMPORT_VERSIONS == {1, 2, 3, 4, 5, 6}
 
 
 def test_export_includes_completion_status_and_evidence() -> None:
@@ -284,7 +286,7 @@ def test_export_includes_completion_status_and_evidence() -> None:
     hand_payload = export_hand(db, hand.id)
     session_payload = export_session(db, session.id)
 
-    assert hand_payload["export_version"] == 5
+    assert hand_payload["export_version"] == EXPORT_VERSION
     assert hand_payload["hand"]["completion_status"] == "complete"
     assert hand_payload["hand"]["completion_evidence"] == evidence
     assert session_payload["hands"][0]["hand"]["completion_evidence"] == evidence
@@ -539,11 +541,11 @@ def test_import_v5_with_corrupt_evidence_stores_empty_evidence(evidence: object)
     db.close()
 
 
-def test_import_rejects_export_version_six() -> None:
+def test_import_rejects_an_unreleased_future_export_version() -> None:
     db = make_db()
-    payload = _payload_with_hand(_legacy_hand_payload("manual"), 6)
+    payload = _payload_with_hand(_legacy_hand_payload("manual"), 7)
 
-    with pytest.raises(ValueError, match="Unsupported export_version 6"):
+    with pytest.raises(ValueError, match="Unsupported export_version 7"):
         import_session(db, payload)
 
     assert db.fetch_sessions() == []
@@ -696,7 +698,7 @@ def test_a_v5_round_trip_survives_a_second_export() -> None:
     third_db = make_db()
     third = export_session(third_db, import_session(third_db, second).id)
 
-    assert second["export_version"] == first["export_version"] == 5
+    assert second["export_version"] == first["export_version"] == EXPORT_VERSION
     assert first["hands"][0]["hand"]["completion_evidence"] == evidence
     # The stamp is applied once and is idempotent: a payload that already
     # carries it re-exports byte-identically, so nothing accumulates across an

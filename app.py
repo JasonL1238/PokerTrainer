@@ -5480,7 +5480,6 @@ def show_action_editor_contents(
     hand_id: int | None = None,
 ) -> None:
     targets = issue_targets or []
-    contested = contested_timeline_slots(actions)
     focus_key = (
         _validation_focus_action_key(hand_id) if hand_id is not None else None
     )
@@ -5498,12 +5497,9 @@ def show_action_editor_contents(
             # Scope BOTH lookups to the row's own source frame: an unscoped
             # match can hand a row a neighbouring frame's flag, thumbnail and
             # jump button after a type correction.
-            own_image = (
-                None
-                if action.action_index is not None
-                and (action.street.lower(), action.action_index) in contested
-                else _timeline_source_image_for_action(action, frame_context)
-            )
+            own_image = _timeline_source_image_for_action(
+                action, frame_context
+            ) or _slot_source_image_ignoring_identity_safe(action, frame_context)
             scoped_targets = (
                 [target for target in targets if target.source_image == own_image]
                 if own_image
@@ -5552,7 +5548,6 @@ def show_action_editor_contents(
             cv_issues = _cv_issues_for_db_action(
                 action,
                 frame_context,
-                contested,
                 fallback_frame_index=(
                     linked.frame_index if linked is not None else None
                 ),
@@ -5629,10 +5624,18 @@ def _timeline_source_image_for_action(
     action: Action,
     frame_context: ValidationFrameContext | None,
 ) -> str | None:
-    """Which frame this row came from, regardless of later type corrections."""
+    """Which frame this row came from, regardless of any later correction.
+
+    Prefers the frame stored on the row at import. The slot lookup below is
+    the fallback for rows saved before schema 16 (and for manual hands), and
+    it follows the row's CURRENT street and order — so it goes wrong exactly
+    when the operator moves a row, which is what the stored value fixes.
+    """
 
     if frame_context is None:
         return None
+    if action.source_image:
+        return action.source_image
     return timeline_source_image_for_slot(
         frame_context.timeline_hand,
         street=action.street,
@@ -5676,6 +5679,19 @@ def _issue_requests_a_stack_value(issue: ActionCvIssue) -> bool:
     if issue.kind not in STACK_VALUE_KINDS:
         return False
     return not any(marker in issue.detail for marker in _NO_STACK_VALUE_MARKERS)
+
+
+def _slot_source_image_ignoring_identity_safe(
+    action: Action,
+    frame_context: ValidationFrameContext | None,
+) -> str | None:
+    """Identity-free slot lookup that tolerates a missing frame context."""
+
+    if frame_context is None:
+        return None
+    if action.source_image:
+        return action.source_image
+    return _slot_source_image_ignoring_identity(action, frame_context)
 
 
 def _frame_index_for_image(
@@ -5776,28 +5792,9 @@ def _seat_index_for_action(
     return None
 
 
-def contested_timeline_slots(actions: list[Action]) -> set[tuple[str, int]]:
-    """Street/index slots claimed by more than one saved action.
-
-    DB action indexes are per-street, so moving a row to another street lands
-    it on a real slot there — and it would then inherit that slot's frame,
-    stack figure and read issues. Two rows claiming one slot is the signal
-    that at least one of them was moved, so neither may inherit.
-    """
-
-    seen: dict[tuple[str, int], int] = {}
-    for action in actions:
-        if action.action_index is None:
-            continue
-        key = (action.street.lower(), action.action_index)
-        seen[key] = seen.get(key, 0) + 1
-    return {key for key, count in seen.items() if count > 1}
-
-
 def _cv_issues_for_db_action(
     action: Action,
     frame_context: ValidationFrameContext | None,
-    contested: set[tuple[str, int]] | None = None,
     *,
     fallback_frame_index: int | None = None,
 ) -> list[ActionCvIssue]:
@@ -5805,22 +5802,6 @@ def _cv_issues_for_db_action(
 
     if frame_context is None:
         return []
-    if (
-        contested
-        and action.action_index is not None
-        and (action.street.lower(), action.action_index) in contested
-    ):
-        return [
-            ActionCvIssue(
-                kind="Source frame unknown",
-                detail=(
-                    "Another saved action already occupies this street and "
-                    "order, so the import cannot tell which frame this line "
-                    "came from. Fix the ordering before trusting any "
-                    "frame-based warning here."
-                ),
-            )
-        ]
     timeline_action = match_db_action_to_timeline_action(
         frame_context.timeline_hand,
         street=action.street,

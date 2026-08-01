@@ -550,6 +550,10 @@ def _build_actions(hand: dict[str, Any]) -> list[Action]:
             is_live_post=live_post if live_post is None else bool(live_post),
             pot_before=row.get("pot_before"),
             stack_before=row.get("stack_before"),
+            # Provenance: which frame produced this line. Kept so the
+            # validation UI can still explain the row after the operator
+            # corrects its street or order, which moves it off its slot.
+            source_image=row.get("source_image") or None,
         ))
     return actions
 
