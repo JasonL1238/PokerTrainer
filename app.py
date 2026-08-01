@@ -209,12 +209,14 @@ from poker_tracker.ui.reconstruction_review import (
     match_db_action_to_timeline_action,
     observed_facts,
     seat_holds_cards,
+    seat_refusal_code,
     seat_value,
     states_for_hand,
     timeline_action_by_frame_and_seat,
     timeline_actions_for_image,
     timeline_path_for_job,
     timeline_source_image_for_slot,
+    unknown_read_text,
 )
 from poker_tracker.ui.roi import ROI_TYPES, validate_roi_bounds
 from poker_tracker.ui.roi_profiles import (
@@ -1988,6 +1990,29 @@ def frame_context_belongs_to_hand(
     return owning is None or owning == frame_context.job_id
 
 
+def prepare_hand_frames(
+    db: PokerDatabase,
+    hand: Hand,
+    frame_context: ValidationFrameContext | None,
+) -> tuple[ValidationFrameContext | None, str]:
+    """Settle which frames may explain this hand, and repair its provenance.
+
+    Both steps together, and in this order, because the second writes to the
+    database: backfilling from a foreign job's timeline records frames the
+    hand never came from, and the write is one-shot, so it cannot be undone
+    through the app. Kept out of the Streamlit function so the wiring itself
+    is testable — deleting either step here must fail a test, not just
+    deleting the helpers it calls.
+    """
+
+    usable, notice = usable_frame_context(hand, frame_context)
+    if usable is not None and hand.id is not None:
+        # Rows imported before schema 16 have no recorded source frame; fill
+        # it now that the timeline is open.
+        backfill_action_provenance(db, hand.id, usable.timeline_hand)
+    return usable, notice
+
+
 def usable_frame_context(
     hand: Hand,
     frame_context: ValidationFrameContext | None,
@@ -2023,14 +2048,9 @@ def render_validation_edit_and_approve(
         return
     # Always re-fetch so edits from this same render cycle are visible next rerun.
     hand = db.fetch_hand(hand.id) or hand
-    frame_context, foreign_job_notice = usable_frame_context(hand, frame_context)
+    frame_context, foreign_job_notice = prepare_hand_frames(db, hand, frame_context)
     if foreign_job_notice:
         st.warning(foreign_job_notice)
-    if frame_context is not None:
-        # Rows imported before schema 16 have no recorded source frame; fill it
-        # now that the timeline is open. Only from the job this hand was
-        # actually imported from, and the write is one-shot.
-        backfill_action_provenance(db, hand.id, frame_context.timeline_hand)
     actions = db.fetch_actions_by_hand(hand.id)
     players = db.fetch_players_by_hand(hand.id)
     accounting, accounting_error = _reconcile_cached(db, hand.id, None)
@@ -5914,6 +5934,8 @@ def _cv_issues_for_db_action(
         db_street=action.street,
         db_action_type=action.action_type,
     )
+    if detached and _row_still_matches_origin(action, origin):
+        detached = False
     if detached and issues:
         # Never let a correction silently clear a live warning: say the
         # warnings are re-derived from the frame this row came from.
@@ -6019,15 +6041,19 @@ def _frame_phrase(frame_index: int | None, action: Action) -> str:
     )
 
 
-def _frame_bet_read(
+def _frame_bet_record(
     frame_context: ValidationFrameContext,
     own_image: str | None,
     action: Action,
-) -> float | None:
-    """What the reader recorded in this seat's bet box on that frame."""
+) -> tuple[float | None, str]:
+    """What the reader recorded for this seat's bet box: a value, or a refusal.
+
+    A refusal is still the reader saying it saw a box, so denying one is as
+    wrong as denying a read value.
+    """
 
     if not own_image:
-        return None
+        return None, ""
     state = next(
         (
             candidate
@@ -6037,8 +6063,13 @@ def _frame_bet_read(
         None,
     )
     if state is None:
-        return None
-    return seat_value(state.get("bets"), _seat_index_for_action(action, frame_context))
+        return None, ""
+    seat = _seat_index_for_action(action, frame_context)
+    value = seat_value(state.get("bets"), seat)
+    if value is not None:
+        return value, ""
+    code = seat_refusal_code(state.get("bets_unknown"), seat)
+    return None, (unknown_read_text(code) if code else "")
 
 
 def _issues_for_unattributable_row(
@@ -6071,14 +6102,20 @@ def _issues_for_unattributable_row(
         if _row_frame_shows_no_cards(action, frame_context, own_image):
             # Name the frame with the confidence it was actually earned, and
             # never deny a bet box the reader recorded a value for.
-            box = _frame_bet_read(frame_context, own_image, action)
-            box_note = (
-                f", though the reader did read {box:g} BB in its bet box "
-                "there — that total belongs to an earlier action on this "
-                "street"
-                if box is not None
-                else ", so there was no bet box to read"
-            )
+            box, box_refused = _frame_bet_record(frame_context, own_image, action)
+            if box is not None:
+                box_note = (
+                    f", though the reader did read {box:g} BB in its bet box "
+                    "there — that total belongs to an earlier action on this "
+                    "street"
+                )
+            elif box_refused:
+                box_note = (
+                    ", though the reader did see a bet box there and declined "
+                    f"to read it ({box_refused})"
+                )
+            else:
+                box_note = ", so there was no bet box to read"
             where = (
                 f"{_frame_phrase(own_index, action).capitalize()} shows no "
                 f"cards for this seat{box_note}. Confirm this action happened "
@@ -6211,7 +6248,10 @@ def _frame_evidence_for_row(
             )
             for issue in issues
         ]
-        if not any(issue.kind == ACTION_MAY_NOT_BELONG for issue in issues):
+        if not any(
+            issue.kind in (ACTION_MAY_NOT_BELONG, "Seat not in the hand on this frame")
+            for issue in issues
+        ):
             index = _frame_index_for_image(own_image, frame_context)
             issues.insert(
                 0,

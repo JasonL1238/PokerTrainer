@@ -612,3 +612,49 @@ def test_the_badge_shows_the_most_severe_kinds_first() -> None:
         )
     ]
     assert ranks == sorted(ranks), "severity order is not monotonic"
+
+
+def test_the_caption_gate_reads_the_flag_not_the_prose() -> None:
+    """A12 round 12 F3: the flag was pinned at the producer and unpinned at
+    its only consumer — ignoring it flips 1111 of 1378 captions."""
+    from app import _issue_requests_a_stack_value
+
+    offered = ActionCvIssue(
+        kind="Stack before unknown",
+        detail="The reconstruction read 182.2 BB for this seat on frame 12.",
+        offers_a_value=True,
+    )
+    withheld = ActionCvIssue(
+        kind="Stack before unknown",
+        detail="The reconstruction read 182.2 BB for this seat on frame 12.",
+        offers_a_value=False,
+    )
+    assert _issue_requests_a_stack_value(offered) is True
+    assert _issue_requests_a_stack_value(withheld) is False, (
+        "the caption gate ignored the flag and read the wording instead"
+    )
+    # A non-stack kind never opens the field, however it is worded.
+    assert (
+        _issue_requests_a_stack_value(
+            ActionCvIssue(kind="Coverage gap", detail="x", offers_a_value=True)
+        )
+        is False
+    )
+
+
+def test_an_unedited_row_is_never_announced_as_edited() -> None:
+    """A12 round 12 F7: 'detached' was pinned in one direction only, so always
+    announcing it passed — putting 'you edited this' on 707 untouched rows."""
+    issues = _cv_issues_for_db_action(_row(), _context())
+    assert issues
+    assert not any(issue.kind == "Edited line" for issue in issues)
+
+
+def test_the_seat_absence_notice_is_never_duplicated() -> None:
+    """A12 round 12 F13."""
+    issues = _cv_issues_for_db_action(
+        _row(action_type="check", amount=None, source_image=None),
+        _no_cards_context(),
+    )
+    kinds = [issue.kind for issue in issues]
+    assert kinds.count("Seat not in the hand on this frame") <= 1

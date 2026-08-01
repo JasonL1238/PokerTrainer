@@ -710,7 +710,7 @@ def timeline_source_image_for_slot(
     return None
 
 
-def _seat_code(mapping: Any, seat: int | None) -> str | None:
+def seat_refusal_code(mapping: Any, seat: int | None) -> str | None:
     """Fetch a per-seat refusal code from a JSON dict keyed by str or int seat."""
 
     if seat is None or not isinstance(mapping, dict):
@@ -719,7 +719,7 @@ def _seat_code(mapping: Any, seat: int | None) -> str | None:
     return str(value) if value else None
 
 
-def _unknown_code_text(code: str | None) -> str | None:
+def unknown_read_text(code: str | None) -> str | None:
     if code is None:
         return None
     return UNKNOWN_AMOUNT_CODE_TEXT.get(code, f"read refused ({code.replace('_', ' ')})")
@@ -796,8 +796,8 @@ def cv_issues_for_timeline_action(
     derivation = str(timeline_action.get("derivation") or "")
     if db_amount is None and action_type in MONEY_ACTION_TYPES:
         timeline_amount = timeline_action.get("amount")
-        code = _seat_code(state.get("bets_unknown") if state else None, seat)
-        code_text = _unknown_code_text(code)
+        code = seat_refusal_code(state.get("bets_unknown") if state else None, seat)
+        code_text = unknown_read_text(code)
         readable_bet = seat_value(state.get("bets") if state else None, seat)
         parsed_amount = _optional_float(timeline_amount)
         if parsed_amount is not None:
@@ -826,7 +826,15 @@ def cv_issues_for_timeline_action(
             # this branch only explains why the amount is missing, and must
             # never instruct a delete under an "Amount unknown" heading.
             box_read = seat_value(state.get("bets") if state else None, seat)
-            if box_read is not None:
+            box_refused = seat_refusal_code(state.get("bets_unknown") if state else None, seat)
+            if box_read is None and box_refused is not None:
+                detail = (
+                    f"{frame_ref.capitalize()} shows no cards for this seat, "
+                    "though the reader did see a bet box there and declined "
+                    f"to read it ({unknown_read_text(box_refused)}). Confirm "
+                    "this action happened before entering an amount for it."
+                )
+            elif box_read is not None:
                 detail = (
                     f"{frame_ref.capitalize()} shows no cards for this seat, "
                     f"though the reader did read {box_read:g} BB in its bet "
@@ -911,7 +919,7 @@ def cv_issues_for_timeline_action(
         # saved figure is simply the seat's stack.
         committed_here = (
             seat_value(state.get("bets"), seat) is not None
-            or _seat_code(state.get("bets_unknown"), seat) is not None
+            or seat_refusal_code(state.get("bets_unknown"), seat) is not None
         ) and not _earlier_action_owns_the_box(
             hand, timeline_action, seat, timeline_action.get("street")
         )
@@ -1050,7 +1058,7 @@ def _stack_before_issue(
             and row_type in MONEY_ACTION_TYPES
             and (
                 seat_value(state.get("bets"), seat) is not None
-                or _seat_code(state.get("bets_unknown"), seat) is not None
+                or seat_refusal_code(state.get("bets_unknown"), seat) is not None
             )
             and seat_value(state.get("stacks"), seat) is not None
             and abs(
@@ -1166,7 +1174,7 @@ def _stack_before_issue(
                 f"during the hand. {hint}"
             )
         else:
-            code_text = _unknown_code_text(starting_code) or "the read was refused"
+            code_text = unknown_read_text(starting_code) or "the read was refused"
             detail = (
                 f"This seat's starting stack could not be read ({code_text}), "
                 f"so the stack before this action could not be back-computed. "
@@ -1203,8 +1211,8 @@ def _latest_stack_refusal(
     # the chips moved, so it is never where stack-before would have come from.
     for index in range(min(frame_index, len(states)) - 1, -1, -1):
         state = states[index]
-        code_text = _unknown_code_text(
-            _seat_code(state.get("stacks_unknown"), seat)
+        code_text = unknown_read_text(
+            seat_refusal_code(state.get("stacks_unknown"), seat)
         )
         if code_text is not None:
             return code_text, index

@@ -155,3 +155,61 @@ def test_an_unstamped_hand_is_not_stranded() -> None:
     hand = _hand_with_identity(db, job_id=None, notes=NOTES)
     assert app.frame_context_belongs_to_hand(hand, _context(1)) is True
     db.close()
+
+
+def _timeline_hand(job: int) -> dict:
+    return {
+        "hand_number": 1,
+        "actions": [
+            {
+                "street": "preflop", "action_index": 1, "seat": 1,
+                "player_name": "Seat1", "position": "UTG",
+                "action_type": "call", "amount": 3.0,
+                "source_image": f"/frames/cv_job_{job}/t000000.00.jpg",
+            }
+        ],
+    }
+
+
+def _job_context(job: int) -> ValidationFrameContext:
+    return ValidationFrameContext(
+        job_id=job,
+        hand_number=1,
+        timeline_hand=_timeline_hand(job),
+        states=[],
+        reviews_by_image={},
+        cursor_key="c",
+        pending_hand_key="p",
+    )
+
+
+def test_the_panel_never_writes_a_foreign_jobs_frames() -> None:
+    """A12 round 12 F1: the guard function was well tested, but deleting its
+    CALL SITE left the suite green — and the next line writes to the database.
+    A cross-job backfill is one-shot, so it cannot be undone through the app."""
+    db = _db()
+    hand = _hand_with_identity(db, job_id=1, notes=NOTES)
+
+    context, notice = app.prepare_hand_frames(db, hand, _job_context(3))
+    assert context is None
+    assert "imported from job 1" in notice
+    stored = db.fetch_actions_by_hand(hand.id)[0].source_image
+    assert stored is None, f"a foreign job's frame was written: {stored}"
+    db.close()
+
+
+def test_the_panel_repairs_provenance_from_the_owning_job() -> None:
+    """A12 round 12 F2: deleting the backfill call also survived, and 31 of
+    the live database's 33 rows get provenance only from it."""
+    db = _db()
+    hand = _hand_with_identity(db, job_id=1, notes=NOTES)
+    assert db.fetch_actions_by_hand(hand.id)[0].source_image is None
+
+    context, notice = app.prepare_hand_frames(db, hand, _job_context(1))
+    assert context is not None
+    assert notice == ""
+    assert (
+        db.fetch_actions_by_hand(hand.id)[0].source_image
+        == "/frames/cv_job_1/t000000.00.jpg"
+    ), "the panel did not repair this hand's provenance"
+    db.close()
