@@ -938,14 +938,29 @@ def _stack_before_issue(
             # push the operator to legitimize it with a number. Deliberately
             # phrased as a check to run, not an instruction to delete — a
             # wrong accusation here destroys real data.
+            last_held = _last_frame_holding_cards(states, seat, frame_index)
+            if last_held is not None:
+                # Say what the frames actually establish: the seat was dealt
+                # in and later had no cards, which is a fold. Claiming it "may
+                # never have been in the hand" is disproved by frame 1 and
+                # invites the operator to dismiss a correct warning.
+                evidence = (
+                    f"This seat held cards through frame {last_held + 1} and "
+                    f"none by {frame_ref}, so it had already folded and "
+                    "cannot have acted here."
+                )
+            else:
+                evidence = (
+                    f"No frame up to {frame_ref} shows this seat holding "
+                    "cards, so it may not have been in the hand at all."
+                )
             return ActionCvIssue(
                 kind=ACTION_MAY_NOT_BELONG,
                 detail=(
-                    f"This line was not observed — it was inferred because the "
-                    f"betting round completed. {frame_ref.capitalize()} shows "
-                    "no cards for this seat, so it may not have been in the "
-                    "hand at all. Open that frame and confirm this action "
-                    "happened before accepting it; delete it if it did not."
+                    "This line was not observed — it was inferred because the "
+                    f"betting round completed. {evidence} Check {frame_ref}, "
+                    "then delete this line; if the seat's fold is not "
+                    "recorded either, add it under 'Add a missing action'."
                 ),
                 frame_index=frame_index,
             )
@@ -1138,10 +1153,28 @@ def _frame_carrying_stack(
 
     if seat is None:
         return None
-    last = len(states) - 1 if frame_index is None else min(frame_index, len(states) - 1)
-    for index in range(last, -1, -1):
+    # Strictly before: the action's own frame reads the stack AFTER the chips
+    # moved, so it is never evidence for a stack-before.
+    last = len(states) if frame_index is None else min(frame_index, len(states))
+    for index in range(last - 1, -1, -1):
         read = _seat_value(states[index].get("stacks"), seat)
         if read is not None and abs(read - value) < 1e-6:
+            return index
+    return None
+
+
+def _last_frame_holding_cards(
+    states: list[dict[str, Any]],
+    seat: int | None,
+    frame_index: int | None,
+) -> int | None:
+    """Latest frame before ``frame_index`` where this seat still held cards."""
+
+    if seat is None:
+        return None
+    last = len(states) if frame_index is None else min(frame_index, len(states))
+    for index in range(last - 1, -1, -1):
+        if _seat_holds_cards(states[index], seat):
             return index
     return None
 

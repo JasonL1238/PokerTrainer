@@ -5480,6 +5480,7 @@ def show_action_editor_contents(
     hand_id: int | None = None,
 ) -> None:
     targets = issue_targets or []
+    contested = contested_timeline_slots(actions)
     focus_key = (
         _validation_focus_action_key(hand_id) if hand_id is not None else None
     )
@@ -5497,7 +5498,12 @@ def show_action_editor_contents(
             # Scope BOTH lookups to the row's own source frame: an unscoped
             # match can hand a row a neighbouring frame's flag, thumbnail and
             # jump button after a type correction.
-            own_image = _timeline_source_image_for_action(action, frame_context)
+            own_image = (
+                None
+                if action.action_index is not None
+                and (action.street.lower(), action.action_index) in contested
+                else _timeline_source_image_for_action(action, frame_context)
+            )
             scoped_targets = (
                 [target for target in targets if target.source_image == own_image]
                 if own_image
@@ -5543,7 +5549,14 @@ def show_action_editor_contents(
                     "source frame flagged: "
                     + (", ".join(linked.issue_types) or "frame")
                 )
-            cv_issues = _cv_issues_for_db_action(action, frame_context)
+            cv_issues = _cv_issues_for_db_action(
+                action,
+                frame_context,
+                contested,
+                fallback_frame_index=(
+                    linked.frame_index if linked is not None else None
+                ),
+            )
             if cv_issues:
                 cv_kinds = list(
                     dict.fromkeys(issue.kind.lower() for issue in cv_issues)
@@ -5598,8 +5611,12 @@ def show_action_editor_contents(
                     # for a value. A row questioning whether the action
                     # happened must not invite the operator to legitimize it.
                     needs_stack_before=any(
+                        _issue_requests_a_stack_value(issue)
+                        for issue in cv_issues
+                    ),
+                    stack_value_not_supplied=any(
                         issue.kind in STACK_VALUE_KINDS
-                        and "leave the field empty" not in issue.detail
+                        and not _issue_requests_a_stack_value(issue)
                         for issue in cv_issues
                     ),
                 )
@@ -5643,6 +5660,22 @@ def _slot_source_image_ignoring_identity(
         position="",
         player_name="",
     )
+
+
+# Phrases marking a stack issue that gives the operator no value to enter.
+_NO_STACK_VALUE_MARKERS = (
+    "leave the field empty",
+    "not the stack before this action",
+    "cannot confirm itself",
+)
+
+
+def _issue_requests_a_stack_value(issue: ActionCvIssue) -> bool:
+    """Whether this issue hands the operator a value to type into the field."""
+
+    if issue.kind not in STACK_VALUE_KINDS:
+        return False
+    return not any(marker in issue.detail for marker in _NO_STACK_VALUE_MARKERS)
 
 
 def _frame_index_for_image(
@@ -5743,14 +5776,51 @@ def _seat_index_for_action(
     return None
 
 
+def contested_timeline_slots(actions: list[Action]) -> set[tuple[str, int]]:
+    """Street/index slots claimed by more than one saved action.
+
+    DB action indexes are per-street, so moving a row to another street lands
+    it on a real slot there — and it would then inherit that slot's frame,
+    stack figure and read issues. Two rows claiming one slot is the signal
+    that at least one of them was moved, so neither may inherit.
+    """
+
+    seen: dict[tuple[str, int], int] = {}
+    for action in actions:
+        if action.action_index is None:
+            continue
+        key = (action.street.lower(), action.action_index)
+        seen[key] = seen.get(key, 0) + 1
+    return {key for key, count in seen.items() if count > 1}
+
+
 def _cv_issues_for_db_action(
     action: Action,
     frame_context: ValidationFrameContext | None,
+    contested: set[tuple[str, int]] | None = None,
+    *,
+    fallback_frame_index: int | None = None,
 ) -> list[ActionCvIssue]:
     """CV read failures behind one saved action line, or [] without a timeline."""
 
     if frame_context is None:
         return []
+    if (
+        contested
+        and action.action_index is not None
+        and (action.street.lower(), action.action_index) in contested
+    ):
+        return [
+            ActionCvIssue(
+                kind="Source frame unknown",
+                detail=(
+                    "Another saved action already occupies this street and "
+                    "order, so the import cannot tell which frame this line "
+                    "came from. Fix the ordering before trusting any "
+                    "frame-based warning here."
+                ),
+            )
+        ]
     timeline_action = match_db_action_to_timeline_action(
         frame_context.timeline_hand,
         street=action.street,
@@ -5776,7 +5846,14 @@ def _cv_issues_for_db_action(
             own_image = _timeline_source_image_for_action(
                 action, frame_context
             ) or _slot_source_image_ignoring_identity(action, frame_context)
-            own_index = _frame_index_for_image(own_image, frame_context)
+            # A re-added row has no timeline slot at all, but the badge match
+            # may still have found its frame; never say "read the frames"
+            # while the panel above names one.
+            own_index = (
+                _frame_index_for_image(own_image, frame_context)
+                if own_image
+                else fallback_frame_index
+            )
             where = (
                 f"It came from frame {own_index + 1} — open that frame, read "
                 "the chips this seat added, and enter that below."
@@ -5868,11 +5945,14 @@ def _render_edit_one_action(
     players: list[HandPlayer],
     *,
     needs_stack_before: bool = False,
+    stack_value_not_supplied: bool = False,
 ) -> None:
     """Simple per-action editor: Who / What / Amount first; advanced fields optional.
 
     ``needs_stack_before`` opens the advanced block by default, because a CV
-    issue on this row asks the operator to fill in a field that lives there.
+    issue on this row hands the operator a value to enter there.
+    ``stack_value_not_supplied`` means a stack issue fired but gave no usable
+    figure, so the block still opens but must not claim one was named.
     """
 
     if action.id is None:
@@ -5903,7 +5983,9 @@ def _render_edit_one_action(
         ),
     )
     advanced_key = f"action_advanced_{action.id}"
-    if needs_stack_before and advanced_key not in st.session_state:
+    if (needs_stack_before or stack_value_not_supplied) and (
+        advanced_key not in st.session_state
+    ):
         # A warning on this row asks for Stack before, which lives here.
         st.session_state[advanced_key] = True
     show_advanced = st.checkbox(
@@ -5957,12 +6039,22 @@ def _render_edit_one_action(
             else "dead"
         )
         if show_advanced:
-            st.caption(
-                "Stack before is requested by a warning on this action — "
-                "fill it in from the frame that warning names."
-                if needs_stack_before
-                else "Usually leave these alone unless the ledger still fails."
-            )
+            if needs_stack_before:
+                caption = (
+                    "Stack before is requested by a warning on this action — "
+                    "fill it in from the frame that warning names."
+                )
+            elif stack_value_not_supplied:
+                caption = (
+                    "A warning on this action needs Stack before, but no "
+                    "frame gives a usable value — work it out from the "
+                    "frames rather than copying the figure above."
+                )
+            else:
+                caption = (
+                    "Usually leave these alone unless the ledger still fails."
+                )
+            st.caption(caption)
             order_col, notes_col = st.columns([1, 2])
             action_index = order_col.number_input(
                 "Order",

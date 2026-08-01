@@ -928,8 +928,12 @@ def test_inferred_line_on_a_frame_without_cards_offers_deletion() -> None:
     issue = next(
         issue for issue in issues if issue.kind == ACTION_MAY_NOT_BELONG
     )
-    assert "shows no cards for this seat" in issue.detail
-    assert "confirm this action happened before accepting it" in issue.detail
+    # The evidence must be what the frames establish — the seat was dealt in
+    # and later had no cards, i.e. it folded — not the falsifiable claim that
+    # it was never in the hand.
+    assert "held cards through frame 1" in issue.detail
+    assert "had already folded" in issue.detail
+    assert "add it under 'Add a missing action'" in issue.detail
     assert "269.1" not in issue.detail
     # It must NOT ask for a stack: that field is what legitimizes a fake row.
     assert all(issue.kind != "Stack before unknown" for issue in issues)
@@ -1549,3 +1553,61 @@ def test_malformed_timeline_values_do_not_crash_the_panel() -> None:
         action, hand, states, db_amount=None, db_stack_before=None
     )
     assert isinstance(issues, list)
+
+
+def test_carrier_frame_is_strictly_before_the_action() -> None:
+    """B6 round 6 F5: the bound was inclusive, so 274 of 468 rows named the
+    action's own post-action frame."""
+    hand, states = _cv_issue_fixture()
+    states[0]["stacks"] = {"7": 224.2}
+    states[1]["stacks"] = {"7": 224.2}   # also on the action's own frame
+    action = dict(hand["actions"][1], stack_before=224.2)
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, hand, states, db_amount=12.0, db_stack_before=None
+        )
+        if issue.kind == "Stack before unknown"
+    )
+    assert issue.frame_index == 0
+    assert "frame 1" in issue.detail
+
+
+def test_phantom_evidence_is_what_the_frames_establish() -> None:
+    """B6 round 6 F1: 'may not have been in the hand at all' is disproved by
+    frame 1, where the seat is dealt in. The true claim is that it folded."""
+    hand, states = _cv_issue_fixture()
+    states[0]["dealt_in"] = [0, 2, 4, 7]
+    states[1]["dealt_in"] = [0, 2, 4]
+    inferred = {
+        "street": "turn",
+        "action_index": 2,
+        "seat": 7,
+        "player_name": "Seat7",
+        "position": "BB",
+        "action_type": "check",
+        "amount": None,
+        "source_image": "/tmp/f1.jpg",
+        "derivation": "inferred_round_complete",
+    }
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            inferred, hand, states, db_amount=None, db_stack_before=None
+        )
+        if issue.kind == ACTION_MAY_NOT_BELONG
+    )
+    assert "held cards through frame 1" in issue.detail
+    assert "had already folded" in issue.detail
+    assert "may not have been in the hand at all" not in issue.detail
+
+    # With no card evidence anywhere, the weaker claim is the honest one.
+    states[0]["dealt_in"] = [0, 2, 4]
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            inferred, hand, states, db_amount=None, db_stack_before=None
+        )
+        if issue.kind == ACTION_MAY_NOT_BELONG
+    )
+    assert "may not have been in the hand at all" in issue.detail
