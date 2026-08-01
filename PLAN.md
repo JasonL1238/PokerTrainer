@@ -2337,6 +2337,15 @@ Strengthen the existing hand evaluator so:
 
 ## Phase 4 — Harden video ingestion and job execution
 
+**Status: implemented and tested; exit gate met for everything testable
+locally.** Upload validation, atomic storage, and replacement/truncation
+detection were already present. This phase added explicit retention behavior
+(`poker_tracker/services/retention.py`, `python -m
+poker_tracker.maintenance.retention_cli`), a user-visible storage audit that is
+a dry run by default, and the nine failure-injection scenarios that had no
+coverage. Job error messages are now redacted before being bounded.
+
+
 ### Upload and storage
 
 - Validate extension, actual container/codec, file size, duration, frame count,
@@ -2640,6 +2649,15 @@ can return anything at all.
 
 ## Phase 6 — Complete the correction and regression feedback loop
 
+**Status: the regression link and issue bundle are implemented; "re-run the
+affected corpus slice and the entire locked acceptance set" cannot be satisfied
+until Phase 2 exists.** A release-blocking issue can no longer be closed without
+a regression observed both failing for the defect and passing after the fix
+(schema 17, `regression_cases`). Issue bundles carry the identity of the source
+recording, frames, models and environment so an issue stays reproducible after
+the models move on.
+
+
 ### Save-now/debug-later behavior
 
 - Keep flagging available directly from Study.
@@ -2694,6 +2712,17 @@ can return anything at all.
 - Every closed release-blocking issue has a passing regression.
 
 ## Phase 7 — Complete authoritative accounting
+
+**Status: ledger correctness and the test bullets are met; the exit gate depends
+on Phase 2.** A real defect was found and fixed here: uncalled-bet refunds were
+measured against total contributions, so an unmatched ante or dead blind was
+refunded and left the pot entirely. Property/fuzz suites now cover chip
+conservation across generated stacks, all-in layering, splits and rake policies,
+and golden ledgers pin straddles, dead blinds and three-way side pots.
+
+The exit gate ("every study-ready CV hand is authoritative and balanced") is a
+statement about a corpus, so it cannot be evaluated until answer keys exist.
+
 
 ### Ledger correctness
 
@@ -2794,6 +2823,13 @@ publishing any image. This is not legal advice; obtain qualified review.
   the chosen local distribution path pass.
 
 ## Phase 9 — Finish and certify coaching
+
+**Status: grounding implemented; live-provider evaluation not run.** Responses
+are now checked against the prompt that produced them, so an invented card or a
+solver-shaped frequency with no retained solver evidence is caught. Provider
+retention, fail-closed behavior and staleness were already present. The opt-in
+live-provider smoke test is not part of any automated run.
+
 
 ### Provider behavior
 
@@ -2967,6 +3003,17 @@ publishing any image. This is not legal advice; obtain qualified review.
 
 ## Phase 12 — Security, privacy, and safety hardening
 
+**Status: implemented; no known critical or high finding remains open.** Added a
+process-wide bound on repeated sign-in attempts (a per-session counter is reset
+by opening a new tab, so it would have been decoration), credential scrubbing by
+shape and by configured value, and a dependency inventory/SBOM.
+
+The SBOM surfaced a release blocker that was previously unrecorded anywhere:
+**`ultralytics` is AGPL-3.0 and the reconstruction pipeline depends on it**, so
+publishing the base image raises the same question TexasSolver raises for a
+solver-enabled one. See the licensing note under Phase 8.
+
+
 ### Authentication and sessions
 
 - Fail closed when authentication is required but no password is configured.
@@ -3130,6 +3177,14 @@ publishing any image. This is not legal advice; obtain qualified review.
 - All mandatory suites pass without unexplained skips or flaky reruns.
 
 ## Phase 15 — Documentation and operator readiness
+
+**Status: runbooks written; release evidence archive not yet produced.**
+`docs/RUNBOOKS.md` covers install, diagnostics, the release gate, corpus vault,
+migration, backup and isolated restore, failed-job recovery, storage audit,
+containers, upgrade and rollback, licensing before distribution, and the
+issue-to-regression loop. The release evidence archive requires a release that
+can pass, which requires Phase 2.
+
 
 ### README
 
