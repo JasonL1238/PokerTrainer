@@ -5960,8 +5960,6 @@ def _cv_issues_for_db_action(
         db_street=action.street,
         db_action_type=action.action_type,
     )
-    if detached and _row_still_matches_origin(action, origin):
-        detached = False
     if detached:
         retired = _claims_retired_by_the_edit(
             action, origin, frame_context, issues
