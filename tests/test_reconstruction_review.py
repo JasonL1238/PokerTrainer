@@ -1655,21 +1655,72 @@ def test_saved_stack_taken_from_the_action_frame_is_flagged() -> None:
     ]
 
 
-def test_source_frame_from_another_street_is_hedged() -> None:
-    """B7 round 7 M2: stored provenance keeps naming the old frame after a row
-    is repurposed onto a different street."""
+def test_row_moved_off_its_source_street_is_hedged() -> None:
+    """A8/B8 round 8: the hedge compared the frame's board size to the
+    TIMELINE's street, so it never fired for an operator street correction
+    (1940 of 2004 missed) and every one of its 16 firings was false — a
+    closing action is routinely only observable on the next street's first
+    frame, which is exactly why the reconstruction read it there."""
     hand, states = _cv_issue_fixture()
-    states[1]["board_cards"] = ["2c", "3d", "4h", "5s"]  # a turn frame
-    repurposed = dict(hand["actions"][1], street="river")
+    # Unedited: the row sits where it was reconstructed, so no hedge.
+    assert not [
+        issue
+        for issue in cv_issues_for_timeline_action(
+            hand["actions"][1], hand, states, db_amount=None, db_stack_before=224.2
+        )
+        if issue.kind == "Moved off its source street"
+    ]
+    # Operator moved it to the river: hedge, without claiming the frame
+    # cannot show the original action.
     issue = next(
         issue
         for issue in cv_issues_for_timeline_action(
-            repurposed, hand, states, db_amount=None, db_stack_before=224.2
+            hand["actions"][1],
+            hand,
+            states,
+            db_amount=None,
+            db_stack_before=224.2,
+            db_street="river",
         )
-        if issue.kind == "Source frame is from another street"
+        if issue.kind == "Moved off its source street"
     )
-    assert "is a turn frame" in issue.detail
-    assert "this line is on the river" in issue.detail
+    assert "reconstructed on the preflop" in issue.detail
+    assert "now saved on the river" in issue.detail
+    assert "cannot show this action" not in issue.detail
+
+
+def test_money_gates_read_the_saved_type_not_the_reconstructed_one() -> None:
+    """A8 round 8: 144 rows retyped to a fold were still asked for an amount,
+    and 1455 folds retyped to a money type went completely silent."""
+    hand, states = _cv_issue_fixture()
+    money_row = hand["actions"][0]        # a raise with no amount
+    # Retyped to a check: stop demanding an amount.
+    assert not [
+        issue
+        for issue in cv_issues_for_timeline_action(
+            money_row,
+            hand,
+            states,
+            db_amount=None,
+            db_stack_before=212.2,
+            db_action_type="check",
+        )
+        if issue.kind == "Amount unknown"
+    ]
+    # A reconstructed check retyped to a bet with an empty amount must flag.
+    check_row = dict(money_row, action_type="check", amount=None)
+    assert [
+        issue
+        for issue in cv_issues_for_timeline_action(
+            check_row,
+            hand,
+            states,
+            db_amount=None,
+            db_stack_before=212.2,
+            db_action_type="bet",
+        )
+        if issue.kind == "Amount unknown"
+    ]
 
 
 def test_timeline_action_by_frame_and_seat_is_edit_proof_but_refuses_ties() -> None:
@@ -1705,3 +1756,24 @@ def test_malformed_amount_and_stack_degrade_instead_of_raising() -> None:
             action, hand, states, db_amount=None, db_stack_before=None
         )
         assert isinstance(issues, list)
+
+
+def test_clearing_a_post_action_stack_does_not_re_offer_it() -> None:
+    """B8 round 8: clearing the field produced 'the reconstruction computed
+    212.2 ... re-enter it', and re-entering produced 'that is the stack AFTER
+    this action'. The two messages looped, and the correct value was never
+    named."""
+    hand, states = _cv_issue_fixture()
+    states[0]["stacks"] = {"1": 212.2}
+    action = dict(hand["actions"][0], stack_before=212.2, amount=3.0)
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, hand, states, db_amount=3.0, db_stack_before=None
+        )
+        if issue.kind == "Stack before unknown"
+    )
+    assert "AFTER this seat's chips moved" in issue.detail
+    assert "not the stack before this action" in issue.detail
+    assert "add this action's 3 BB back to it" in issue.detail
+    assert "No earlier frame reads that value" not in issue.detail

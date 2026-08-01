@@ -10,6 +10,7 @@ from poker_tracker.persistence.import_export import (
     import_session,
 )
 from poker_tracker.persistence.models import Action, Hand, Session
+from poker_tracker.services.action_provenance import backfill_action_provenance
 
 
 def make_db() -> PokerDatabase:
@@ -164,4 +165,86 @@ def test_update_action_does_not_carry_provenance_from_the_caller() -> None:
     edited = db.fetch_actions_by_hand(saved.hand_id)[0]
     assert edited.action_type == "raise"
     assert edited.source_image == "/frames/t000069.00.jpg"
+    db.close()
+
+
+def _timeline_hand() -> dict:
+    return {
+        "hand_number": 1,
+        "actions": [
+            {
+                "street": "flop",
+                "action_index": 1,
+                "seat": 2,
+                "player_name": "Seat2",
+                "position": "UTG+1",
+                "action_type": "bet",
+                "amount": 6.5,
+                "source_image": "/frames/t000069.00.jpg",
+            }
+        ],
+    }
+
+
+def test_backfill_fills_legacy_rows() -> None:
+    """B8/A8 round 8: migration 16 cannot backfill (the value lives in the
+    timeline on disk), so every existing row stayed NULL and none of the
+    provenance repairs reached the operator's actual data."""
+    db = make_db()
+    session = db.create_session(Session(name="Legacy"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+    saved = db.create_action(
+        Action(
+            hand_id=hand.id,
+            street="flop",
+            action_index=1,
+            player_name="Seat2",
+            position="UTG+1",
+            action_type="bet",
+            amount=6.5,
+        )
+    )
+    assert saved.source_image is None
+    assert backfill_action_provenance(db, hand.id, _timeline_hand()) == 1
+    assert (
+        db.fetch_actions_by_hand(hand.id)[0].source_image
+        == "/frames/t000069.00.jpg"
+    )
+    # Idempotent.
+    assert backfill_action_provenance(db, hand.id, _timeline_hand()) == 0
+    db.close()
+
+
+def test_backfill_leaves_already_edited_rows_alone() -> None:
+    """A row the operator moved no longer matches its line, so filling it
+    would be a guess at where it came from."""
+    db = make_db()
+    session = db.create_session(Session(name="Edited"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+    db.create_action(
+        Action(
+            hand_id=hand.id,
+            street="turn",          # operator already moved it
+            action_index=1,
+            player_name="Seat2",
+            position="UTG+1",
+            action_type="bet",
+            amount=6.5,
+        )
+    )
+    assert backfill_action_provenance(db, hand.id, _timeline_hand()) == 0
+    assert db.fetch_actions_by_hand(hand.id)[0].source_image is None
+    db.close()
+
+
+def test_backfill_never_overwrites_a_recorded_frame() -> None:
+    db = make_db()
+    saved = _seed(db)
+    other = dict(_timeline_hand())
+    other["actions"][0]["source_image"] = "/frames/t999999.00.jpg"
+    assert backfill_action_provenance(db, saved.hand_id, other) == 0
+    assert (
+        db.fetch_actions_by_hand(saved.hand_id)[0].source_image
+        == "/frames/t000069.00.jpg"
+    )
     db.close()

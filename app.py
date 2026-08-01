@@ -86,6 +86,7 @@ from poker_tracker.persistence.models import (
     utc_now,
 )
 from poker_tracker.player_labels import actor_label
+from poker_tracker.services.action_provenance import backfill_action_provenance
 from poker_tracker.services.hand_accounting import (
     AccountingReconciliation,
     attest_assumption,
@@ -1976,6 +1977,10 @@ def render_validation_edit_and_approve(
         return
     # Always re-fetch so edits from this same render cycle are visible next rerun.
     hand = db.fetch_hand(hand.id) or hand
+    if frame_context is not None:
+        # Rows imported before schema 16 have no recorded source frame; fill
+        # it now that the timeline is open, so their warnings survive edits.
+        backfill_action_provenance(db, hand.id, frame_context.timeline_hand)
     actions = db.fetch_actions_by_hand(hand.id)
     players = db.fetch_players_by_hand(hand.id)
     accounting, accounting_error = _reconcile_cached(db, hand.id, None)
@@ -5555,7 +5560,11 @@ def show_action_editor_contents(
             )
             if cv_issues:
                 cv_kinds = list(
-                    dict.fromkeys(issue.kind.lower() for issue in cv_issues)
+                    dict.fromkeys(
+                        issue.kind.lower()
+                        for issue in cv_issues
+                        if issue.kind != "Edited line"
+                    )
                 )
                 shown = cv_kinds[:2]
                 extra = len(cv_kinds) - len(shown)
@@ -5810,11 +5819,19 @@ def _cv_issues_for_db_action(
 
     if frame_context is None:
         return []
+    # The seat is resolved from the row's CURRENT actor, so an actor
+    # correction moves this key. Accept a frame+seat hit only when it is
+    # unambiguous: the frame carries a single reconstructed line, or the row
+    # still occupies that line's slot (which an actor-only edit preserves).
     seat = _seat_index_for_action(action, frame_context)
     origin = timeline_action_by_frame_and_seat(
         frame_context.timeline_hand, action.source_image, seat
     )
-    detached = origin is not None
+    if origin is not None and not _origin_is_unambiguous(
+        action, origin, frame_context
+    ):
+        origin = None
+    detached = False
     if origin is None:
         origin = match_db_action_to_timeline_action(
             frame_context.timeline_hand,
@@ -5849,6 +5866,8 @@ def _cv_issues_for_db_action(
         db_amount=action.amount,
         db_stack_before=action.stack_before,
         recording_start_s=frame_context.recording_start_s,
+        db_street=action.street,
+        db_action_type=action.action_type,
     )
     if detached and issues:
         # Never let a correction silently clear a live warning: say the
@@ -5864,14 +5883,45 @@ def _cv_issues_for_db_action(
     return issues
 
 
+def _origin_is_unambiguous(
+    action: Action,
+    origin: dict[str, object],
+    frame_context: ValidationFrameContext,
+) -> bool:
+    """Whether a frame+seat hit really identifies THIS row's origin.
+
+    A frame usually carries several reconstructed lines, so after an actor
+    correction the seat key can land on a different seat's line and lend it
+    its amounts. Require either a frame with a single line, or agreement on
+    the slot the row still occupies.
+
+    This is deliberately conservative and fails safe: a row that was moved AND
+    whose frame carries other lines falls back to the unattributable path,
+    which still warns but explains less. Storing the seat alongside the frame
+    would let attribution survive both edits at once.
+    """
+
+    if origin.get("action_index") == action.action_index and str(
+        origin.get("street") or ""
+    ).lower() == action.street.lower():
+        return True
+    same_frame = [
+        line
+        for line in frame_context.timeline_hand.get("actions") or []
+        if str(line.get("source_image") or "") == action.source_image
+    ]
+    return len(same_frame) == 1
+
+
 def _row_still_matches_origin(action: Action, origin: dict[str, object]) -> bool:
-    """Whether a saved row still claims the same street, order and type."""
+    """Whether a saved row still claims the same street, order, type and actor."""
 
     return (
         action.street.lower() == str(origin.get("street", "")).lower()
         and action.action_index == origin.get("action_index")
         and action.action_type.replace("-", "_")
         == str(origin.get("action_type") or "").replace("-", "_")
+        and action.player_name == str(origin.get("player_name") or "")
     )
 
 
@@ -5882,23 +5932,26 @@ def _issues_for_unattributable_row(
 ) -> list[ActionCvIssue]:
     """Rows the reconstruction can no longer be tied to: added, or re-pointed.
 
-    An empty money amount must stay visibly flagged, and the frame-level facts
-    still apply when a frame can be named at all.
+    The row's reads no longer apply, but its source frame usually still
+    resolves — so the frame's own evidence (missing stacks, coverage gaps,
+    unmeasured transitions, a seat holding no cards) is re-derived from a stub
+    carrying only THIS row's values. Nothing is copied from another line,
+    which is what makes re-deriving safe rather than a fresh borrow.
     """
 
+    own_image = _timeline_source_image_for_action(
+        action, frame_context
+    ) or _slot_source_image_ignoring_identity(action, frame_context)
+    own_index = (
+        _frame_index_for_image(own_image, frame_context)
+        if own_image
+        else fallback_frame_index
+    )
     issues: list[ActionCvIssue] = []
     if (
         action.amount is None
         and action.action_type.replace("-", "_") in MONEY_ACTION_TYPES
     ):
-        own_image = _timeline_source_image_for_action(
-            action, frame_context
-        ) or _slot_source_image_ignoring_identity(action, frame_context)
-        own_index = (
-            _frame_index_for_image(own_image, frame_context)
-            if own_image
-            else fallback_frame_index
-        )
         if own_index is None:
             where = "Read the amount off the frames and enter it below."
         elif action.source_image:
@@ -5907,8 +5960,6 @@ def _issues_for_unattributable_row(
                 "the chips this seat added, and enter that below."
             )
         else:
-            # No stored provenance: the frame was inferred from the row's
-            # current slot or its badge match, so do not assert origin.
             where = (
                 f"Frame {own_index + 1} is the closest the reconstruction can "
                 "attribute to this line — open it, read the chips this seat "
@@ -5925,8 +5976,51 @@ def _issues_for_unattributable_row(
                 frame_index=own_index,
             )
         )
-    issues.extend(_frame_level_issues_for_action(action, frame_context))
+    issues.extend(_frame_evidence_for_row(action, frame_context, own_image))
     return issues
+
+
+def _frame_evidence_for_row(
+    action: Action,
+    frame_context: ValidationFrameContext,
+    own_image: str | None,
+) -> list[ActionCvIssue]:
+    """Everything the row's own frame still says about it, minus its reads."""
+
+    if not own_image:
+        return []
+    seat = _seat_index_for_action(action, frame_context)
+    neighbour = timeline_action_by_frame_and_seat(
+        frame_context.timeline_hand, own_image, seat
+    )
+    stub = {
+        "source_image": own_image,
+        "seat": seat,
+        "street": action.street,
+        "action_type": action.action_type,
+        # Deliberately no amount or stack_before: this row has no
+        # reconstructed reads any more, and copying a neighbour's would be
+        # the borrowing this whole path exists to prevent.
+        "amount": None,
+        "stack_before": None,
+        # Whether the line was observed or inferred is a property of the
+        # frame, not of the row's current fields, so it is safe to reuse.
+        "derivation": str((neighbour or {}).get("derivation") or ""),
+    }
+    return [
+        issue
+        for issue in cv_issues_for_timeline_action(
+            stub,
+            frame_context.timeline_hand,
+            frame_context.states,
+            db_amount=action.amount,
+            db_stack_before=action.stack_before,
+            recording_start_s=frame_context.recording_start_s,
+            db_street=action.street,
+            db_action_type=action.action_type,
+        )
+        if issue.kind != "Amount unknown"
+    ]
 
 
 def _render_action_cv_issues(
@@ -6092,9 +6186,9 @@ def _render_edit_one_action(
                 )
             elif stack_value_not_supplied:
                 caption = (
-                    "A warning on this action needs Stack before, and the "
-                    "figure it mentions is not one you can copy — read the "
-                    "value off the frame yourself."
+                    "A warning on this action concerns Stack before. Read it "
+                    "from the frames if you can establish it — do not copy a "
+                    "figure the warning has ruled out."
                 )
             else:
                 caption = (

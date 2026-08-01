@@ -2292,6 +2292,20 @@ class PokerDatabase:
         ).fetchone()
         return int(row["next_index"])
 
+    def set_action_source_image(self, action_id: int, source_image: str) -> None:
+        """Record which frame produced an action, without touching anything else.
+
+        Provenance repair for rows imported before schema 16, so it writes no
+        correction record and does not demote a reviewed hand — nothing about
+        the hand's facts changes.
+        """
+
+        self._execute(
+            "UPDATE actions SET source_image = ? WHERE id = ? AND source_image IS NULL",
+            (source_image, action_id),
+        )
+        self._commit()
+
     def update_action(
         self, action: Action, *, correction_notes: str = ""
     ) -> Action:

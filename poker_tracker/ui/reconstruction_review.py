@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,8 +107,8 @@ MONEY_ACTION_TYPES = {"bet", "raise", "call", "all_in", "all-in", "post_blind", 
 # happened at all, so it must never drive a "fill this field in" affordance.
 ACTION_MAY_NOT_BELONG = "Action may not belong to this hand"
 
-# Kinds that ask the operator to supply a stack-before value.
-STACK_VALUE_KINDS = {"Stack before unknown"}
+# Kinds whose remedy is the Stack-before field, so the editor must reveal it.
+STACK_VALUE_KINDS = {"Stack before unknown", "Stack before looks post-action"}
 
 _INFERRED_REASONS: dict[str, str] = {
     "inferred_round_complete": (
@@ -728,6 +729,8 @@ def cv_issues_for_timeline_action(
     db_amount: float | None,
     db_stack_before: float | None,
     recording_start_s: float | None = None,
+    db_street: str | None = None,
+    db_action_type: str | None = None,
 ) -> list[ActionCvIssue]:
     """Explain which CV read failures affect one action line, tied to its frame.
 
@@ -735,6 +738,12 @@ def cv_issues_for_timeline_action(
     operator fills a field in, the matching issue stops being reported.
     ``recording_start_s`` is the whole recording's first sampled second (not
     this hand's) so mid-hand claims survive recordings that open on a lobby.
+
+    ``db_street`` / ``db_action_type`` are the SAVED row's values. Every gate
+    that asks "does this row need an amount" or "is this row on the frame's
+    street" must read these, not the reconstructed line's frozen fields —
+    otherwise a retyped fold is still asked for an amount, and a fold retyped
+    to a bet goes silent.
     """
 
     source_image = str(timeline_action.get("source_image") or "")
@@ -750,29 +759,31 @@ def cv_issues_for_timeline_action(
     seat_raw = timeline_action.get("seat")
     try:
         seat = None if seat_raw is None else int(seat_raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         seat = None
-    action_type = str(timeline_action.get("action_type") or "").replace("-", "_")
+    action_type = str(
+        db_action_type
+        if db_action_type is not None
+        else timeline_action.get("action_type") or ""
+    ).replace("-", "_")
     frame_ref = (
         f"frame {frame_index + 1}" if frame_index is not None else "an unretained frame"
     )
     issues: list[ActionCvIssue] = []
-    row_street = str(timeline_action.get("street") or "").lower()
-    state_street = _street_for_state(state)
-    if (
-        state is not None
-        and row_street
-        and state_street
-        and row_street != state_street
-    ):
+    origin_street = str(timeline_action.get("street") or "").lower()
+    row_street = str(db_street or origin_street).lower()
+    if row_street and origin_street and row_street != origin_street:
+        # The row was moved off the street it was reconstructed on, so the
+        # frame below belongs to the line's ORIGINAL street.
         issues.append(
             ActionCvIssue(
-                kind="Source frame is from another street",
+                kind="Moved off its source street",
                 detail=(
-                    f"{frame_ref.capitalize()} is a {state_street} frame, but "
-                    f"this line is on the {row_street}. Its recorded source "
-                    "frame cannot show this action — treat the frame-based "
-                    "notes below with suspicion."
+                    f"This line was reconstructed on the {origin_street} from "
+                    f"{frame_ref}, but it is now saved on the {row_street}. "
+                    "The frame-based notes below still describe the "
+                    f"{origin_street} line — re-check them against the frames "
+                    "for its new street."
                 ),
                 frame_index=frame_index,
             )
@@ -909,6 +920,7 @@ def cv_issues_for_timeline_action(
             frame_ref=frame_ref,
             frame_index=frame_index,
             db_amount=db_amount,
+            db_action_type=action_type,
             recording_start_s=recording_start_s,
         )
         if stack_issue is not None:
@@ -958,6 +970,7 @@ def _stack_before_issue(
     frame_ref: str,
     frame_index: int | None,
     db_amount: float | None,
+    db_action_type: str | None,
     recording_start_s: float | None,
 ) -> ActionCvIssue | None:
     """Explain a missing stack-before without asserting a mechanism we can't prove.
@@ -984,6 +997,26 @@ def _stack_before_issue(
                 f" That figure is the reader's own value for frame "
                 f"{carrier + 1}, so it cannot confirm itself — read the stack "
                 "off that frame yourself before entering it."
+            )
+        elif (
+            state is not None
+            and _seat_value(state.get("stacks"), seat) is not None
+            and abs(
+                (_seat_value(state.get("stacks"), seat) or 0.0) - timeline_stack
+            )
+            < 1e-6
+        ):
+            # Re-offering this figure is what made clearing the field and
+            # re-entering it loop forever.
+            amount_note = (
+                f" add this action's {_optional_float(timeline_action.get('amount')):g} BB back to it"
+                if _optional_float(timeline_action.get("amount")) is not None
+                else " add back whatever this action put in"
+            )
+            where = (
+                f" That figure is what {frame_ref} reads AFTER this seat's "
+                "chips moved, so it is not the stack before this action —"
+                f"{amount_note}."
             )
         else:
             where = (
@@ -1097,7 +1130,11 @@ def _stack_before_issue(
             detail=detail,
             frame_index=hint_index if hint_index is not None else frame_index,
         )
-    action_type = str(timeline_action.get("action_type") or "").replace("-", "_")
+    action_type = str(
+        db_action_type
+        if db_action_type is not None
+        else timeline_action.get("action_type") or ""
+    ).replace("-", "_")
     if db_amount is None and action_type in MONEY_ACTION_TYPES:
         return ActionCvIssue(
             kind=kind,
@@ -1164,24 +1201,7 @@ def _seat_value(mapping: Any, seat: int | None) -> float | None:
 
     if seat is None or not isinstance(mapping, dict):
         return None
-    value = mapping.get(str(seat), mapping.get(seat))
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _street_for_state(state: dict[str, Any] | None) -> str:
-    """Street a frame depicts, from its board size (empty when unreadable)."""
-
-    if state is None:
-        return ""
-    board = state.get("board_cards")
-    if not isinstance(board, list):
-        return ""
-    return _STREET_BY_BOARD_COUNT.get(len(board), "").lower()
+    return _optional_float(mapping.get(str(seat), mapping.get(seat)))
 
 
 def _seat_holds_cards(state: dict[str, Any] | None, seat: int | None) -> bool:
@@ -1225,9 +1245,12 @@ def _optional_float(value: Any) -> float | None:
     """Coerce a JSON number, returning None rather than raising."""
 
     try:
-        return None if value is None else float(value)
-    except (TypeError, ValueError):
+        parsed = None if value is None else float(value)
+    except (TypeError, ValueError, OverflowError):
         return None
+    if parsed is not None and not math.isfinite(parsed):
+        return None
+    return parsed
 
 
 def _int_set(values: Any) -> set[int]:
@@ -1239,7 +1262,7 @@ def _int_set(values: Any) -> set[int]:
     for item in values:
         try:
             result.add(int(item))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
     return result
 
