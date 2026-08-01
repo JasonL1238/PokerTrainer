@@ -427,6 +427,16 @@ offered for deletion at any age, and the audit always prints its plan before
 `--apply` acts. Source recordings need an explicit `--include-orphan-videos`,
 because a recording is the one artifact nothing can rebuild.
 
+A window must be positive. A zero or negative `POKER_RETAIN_*_DAYS` is refused
+with an error naming the variable, because an unset variable expanding to empty
+would otherwise mean "expire everything immediately". When you genuinely want
+that, `--purge-now` says so explicitly; it still keeps referenced files and
+still requires `--include-orphan-videos` for recordings.
+
+Exit codes are the same whatever `--json` does to the output: `0` nothing to do,
+would delete, or deleted; `1` a deletion failed; `2` the configuration is
+invalid; `3` the sweep refused to act.
+
 The age shown is the file's modification time, not how long it has been
 unreferenced — nothing records when a row stopped pointing at a file. Backups are
 outside retention's scope; they rotate on their own fixed count.

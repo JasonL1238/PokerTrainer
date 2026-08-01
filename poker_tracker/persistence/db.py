@@ -66,6 +66,7 @@ from poker_tracker.persistence.models import (
     VideoRecord,
 )
 from poker_tracker.persistence.validation import CardValidationError, normalize_cards
+from poker_tracker.safety.redaction import redact_text
 from poker_tracker.ui.roi import validate_roi_bounds
 
 # Anchored to the project root so launching from another directory does not
@@ -3500,7 +3501,7 @@ class PokerDatabase:
                 payload["log_path"],
                 payload["exploitability_pct"],
                 payload["runtime_seconds"],
-                payload["error_message"],
+                _scrubbed_job_text(payload["error_message"]),
                 payload["pid"],
                 _serialize_optional_datetime(payload["heartbeat_at"]),
                 _serialize_datetime(payload["created_at"]),
@@ -3549,6 +3550,8 @@ class PokerDatabase:
                 values.append(_serialize_json(value))
             elif key in {"heartbeat_at", "started_at", "completed_at"}:
                 values.append(_serialize_optional_datetime(value))  # type: ignore[arg-type]
+            elif key == "error_message":
+                values.append(_scrubbed_job_text(value))  # type: ignore[arg-type]
             else:
                 values.append(value)
         values.append(run_id)
@@ -3785,8 +3788,8 @@ class PokerDatabase:
                 payload["status"],
                 payload["video_id"],
                 payload["progress_percent"],
-                payload["message"],
-                payload["error_message"],
+                _scrubbed_job_text(payload["message"]),
+                _scrubbed_job_text(payload["error_message"]),
                 payload["pid"],
                 _serialize_optional_datetime(payload["heartbeat_at"]),
                 _serialize_datetime(payload["created_at"]),
@@ -3825,8 +3828,10 @@ class PokerDatabase:
         params: list[object] = [
             status or current.status,
             current.progress_percent if progress_percent is None else progress_percent,
-            current.message if message is None else message,
-            current.error_message if error_message is None else error_message,
+            _scrubbed_job_text(current.message if message is None else message),
+            _scrubbed_job_text(
+                current.error_message if error_message is None else error_message
+            ),
             next_pid,
             _serialize_optional_datetime(
                 heartbeat_at if heartbeat_at is not None else current.heartbeat_at
@@ -4692,6 +4697,21 @@ def _json_representable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_representable(item) for item in value]
     return value
+
+
+def _scrubbed_job_text(value: str | None) -> str | None:
+    """Scrub credentials out of a job's free-text column on the way in.
+
+    Job status and failure text is written by whichever worker happened to fail,
+    and an exception raised inside a client library carries the request it was
+    making -- key included. Scrubbing where the column is written rather than in
+    each worker is what makes the guarantee survive the next writer: there is no
+    path to these columns that can skip it. Redaction is idempotent, so a caller
+    that already scrubbed and bounded its own message loses nothing here.
+    """
+    if not value:
+        return value
+    return redact_text(value)
 
 
 def _parse_date(value: str) -> date:

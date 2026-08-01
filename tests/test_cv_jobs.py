@@ -7,10 +7,13 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 import pytest
+from streamlit.testing.v1 import AppTest
 
+from poker_tracker.persistence import db as db_module
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import ProcessingJob, VideoRecord
-from poker_tracker.ui import cv_jobs, run_cv_job
+from poker_tracker.ui import cv_jobs, run_cv_job, video_storage
+from poker_tracker.ui import jobs as jobs_module
 from poker_tracker.ui.run_cv_job import BACKUP_KEEP_COUNT, backup_database
 from poker_tracker.ui.video_ingest import sha256_file
 
@@ -83,7 +86,7 @@ def test_start_cv_job_launches_detached_worker_and_enforces_single_job(
         return SimpleNamespace(pid=43210)
 
     monkeypatch.setattr(cv_jobs.subprocess, "Popen", fake_popen)
-    monkeypatch.setattr(cv_jobs, "JOB_LOGS_DIR", videos_dir.parent / "logs")
+    monkeypatch.setattr(video_storage, "JOB_LOGS_DIR", videos_dir.parent / "logs")
     monkeypatch.setattr(cv_jobs, "ensure_data_directories", lambda: {})
 
     job = cv_jobs.start_cv_job(db, video.id, video.stored_path, "Imported study")
@@ -766,7 +769,7 @@ def test_start_cv_job_blocked_by_active_solver(
     )
     monkeypatch.setattr(cv_jobs.subprocess, "Popen", lambda *a, **k: SimpleNamespace(pid=1))
     monkeypatch.setattr(cv_jobs, "ensure_data_directories", lambda: {})
-    monkeypatch.setattr(cv_jobs, "JOB_LOGS_DIR", videos_dir.parent / "logs")
+    monkeypatch.setattr(video_storage, "JOB_LOGS_DIR", videos_dir.parent / "logs")
 
     with pytest.raises(cv_jobs.CVJobAlreadyRunningError, match="Solver run"):
         cv_jobs.start_cv_job(db, video.id, video.stored_path, "Imported study")
@@ -953,3 +956,315 @@ def test_reconcile_fails_stale_queued_job_without_worker(tmp_path: Path) -> None
     assert reconciled == [job.id]
     assert db.fetch_processing_job(job.id).status == "failed"
     db.close()
+
+
+SECRET_LOG_LINE = "  File client.py: POST https://api.anthropic.com key=sk-ant-abcdef0123456789"
+
+
+def _seed_failed_import(
+    db_path: Path,
+    logs_dir: Path,
+    *,
+    status: str = "failed",
+    progress_percent: float = 82.0,
+    imported_hands: int = 0,
+    write_log: bool = True,
+) -> tuple[int, int]:
+    """A reconstruction that stopped part-way, plus whatever it really committed."""
+    from poker_tracker.persistence.models import Hand, Session
+    from poker_tracker.services.validated_hand_import import CV_TIMELINE_IDENTITY_KEY
+
+    db = PokerDatabase(str(db_path))
+    db.init_db()
+    session = db.create_session(Session(name="Tuesday grind"))
+    video = db.create_video(
+        VideoRecord(
+            original_filename="session.mp4",
+            stored_path=str(db_path.parent / "session.mp4"),
+            file_size_bytes=1,
+            session_id=session.id,
+        )
+    )
+    job = db.create_processing_job(
+        ProcessingJob(
+            video_id=video.id,
+            job_type="cv_reconstruction",
+            status=status,
+            progress_percent=progress_percent,
+            message="Failed" if status == "failed" else status.title(),
+            error_message="Pipeline exited with code 1.",
+        )
+    )
+    for index in range(imported_hands):
+        db.create_hand(
+            Hand(
+                session_id=session.id,
+                hand_number=index + 1,
+                source_type="cv_import",
+                completion_evidence={
+                    CV_TIMELINE_IDENTITY_KEY: {
+                        "job_id": job.id,
+                        "timeline_hand_number": index + 1,
+                    }
+                },
+            )
+        )
+    if write_log:
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        (logs_dir / f"cv_job_{job.id}.log").write_text(
+            "\n".join(["Starting reconstruction", SECRET_LOG_LINE, "Traceback: pipeline died"]),
+            encoding="utf-8",
+        )
+    job_id, video_id = job.id, video.id
+    db.close()
+    return job_id, video_id
+
+
+def _render_reconstruction_panel(
+    db_path: Path, video_id: int, monkeypatch: pytest.MonkeyPatch
+) -> AppTest:
+    import streamlit as st
+
+    monkeypatch.delenv("APP_PASSWORD", raising=False)
+    monkeypatch.delenv("POKERTRAINER_REQUIRE_AUTH", raising=False)
+    monkeypatch.setenv("POKER_DB_PATH", str(db_path))
+    monkeypatch.setattr(db_module, "DEFAULT_DB_PATH", str(db_path))
+    st.cache_resource.clear()
+
+    script = db_path.parent / f"_cv_panel_{video_id}.py"
+    script.write_text(
+        "\n".join(
+            [
+                "from poker_tracker.persistence.db import PokerDatabase",
+                "import app as app_module",
+                f"db = PokerDatabase(r'{db_path}')",
+                "db.init_db()",
+                f"video = db.fetch_video({video_id})",
+                "app_module.show_cv_reconstruction(db, video)",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    app = AppTest.from_file(str(script), default_timeout=60).run()
+    assert not list(app.exception), list(app.exception)
+    return app
+
+
+def _rendered_text(app: AppTest) -> str:
+    parts: list[str] = []
+    for item in app.metric:
+        parts.append(f"{item.label} {item.value}")
+    for collection in (app.markdown, app.caption, app.code, app.error, app.info, app.warning):
+        parts.extend(str(item.value) for item in collection)
+    parts.extend(str(item.label) for item in app.expander)
+    return "\n".join(parts)
+
+
+def test_failed_import_panel_states_its_outcome_instead_of_its_last_percentage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """82% beside "Failed" reads as "most of my hands got in". It must not render.
+
+    The panel has to answer the only question the operator actually has -- what
+    is in my database now -- from the database, not from how far the worker got.
+    """
+    logs_dir = tmp_path / "job_logs"
+    monkeypatch.setattr(video_storage, "JOB_LOGS_DIR", logs_dir)
+    _, video_id = _seed_failed_import(tmp_path / "tracker.sqlite3", logs_dir)
+
+    app = _render_reconstruction_panel(tmp_path / "tracker.sqlite3", video_id, monkeypatch)
+    text = _rendered_text(app)
+
+    assert "82%" not in text, f"a stopped job still displayed its last progress reading: {text}"
+    assert "82" not in next(item.value for item in app.metric if item.label == "Progress")
+    assert not app.get("progress"), "a stopped job still drew a progress bar"
+    assert "No hands were imported" in text
+    assert "Nothing from this job reached the study database" in text
+
+    # The outcome block sits between keyed widgets, so a rerun must reproduce
+    # it without disturbing the launch and cancel controls above it.
+    app.run()
+    assert not list(app.exception), list(app.exception)
+    assert _rendered_text(app) == text
+    assert {button.label for button in app.button} == {"Run CV reconstruction", "Cancel"}
+
+
+def test_failed_import_panel_surfaces_the_worker_log_with_credentials_redacted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The log is the only record of why the job stopped, and it holds secrets."""
+    logs_dir = tmp_path / "job_logs"
+    monkeypatch.setattr(video_storage, "JOB_LOGS_DIR", logs_dir)
+    job_id, video_id = _seed_failed_import(tmp_path / "tracker.sqlite3", logs_dir)
+
+    app = _render_reconstruction_panel(tmp_path / "tracker.sqlite3", video_id, monkeypatch)
+    text = _rendered_text(app)
+
+    assert str(logs_dir / f"cv_job_{job_id}.log") in text, "the job log was never offered"
+    assert "Traceback: pipeline died" in text, "the log tail never reached the screen"
+    assert "sk-ant-abcdef0123456789" not in text, "an API key was printed verbatim"
+    assert "<redacted>" in text
+
+
+def test_running_import_keeps_the_progress_reading_it_earned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The correction is scoped to terminal states; live work still reports progress."""
+    logs_dir = tmp_path / "job_logs"
+    monkeypatch.setattr(video_storage, "JOB_LOGS_DIR", logs_dir)
+    _, video_id = _seed_failed_import(
+        tmp_path / "tracker.sqlite3",
+        logs_dir,
+        status="running",
+        progress_percent=41.0,
+        write_log=False,
+    )
+
+    app = _render_reconstruction_panel(tmp_path / "tracker.sqlite3", video_id, monkeypatch)
+    text = _rendered_text(app)
+
+    assert "41%" in text
+    assert "No hands were imported" not in text
+
+
+@pytest.mark.parametrize("status", ["failed", "cancelled"])
+def test_every_terminal_non_success_reports_an_outcome_not_a_percentage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    """Cancelled is the same defect as failed: the work stopped and nothing says so."""
+    logs_dir = tmp_path / "job_logs"
+    monkeypatch.setattr(video_storage, "JOB_LOGS_DIR", logs_dir)
+    db_path = tmp_path / f"tracker_{status}.sqlite3"
+    job_id, _ = _seed_failed_import(db_path, logs_dir, status=status, write_log=False)
+
+    db = PokerDatabase(str(db_path))
+    outcome = jobs_module.describe_job_outcome(db, db.fetch_processing_job(job_id))
+    db.close()
+
+    assert outcome.progress_percent is None
+    assert outcome.progress_label == "—"
+    assert outcome.committed_count == 0
+    assert "82" not in outcome.headline + outcome.statement + outcome.progress_label
+    assert "nothing imported" in outcome.headline
+    assert "No hands were imported" in outcome.statement
+
+
+def test_heartbeat_expiry_outcome_is_measured_not_inferred(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker that died mid-run is reconciled to failed and must state the same thing."""
+    logs_dir = tmp_path / "job_logs"
+    monkeypatch.setattr(video_storage, "JOB_LOGS_DIR", logs_dir)
+    db = make_db()
+    video = add_video(db, tmp_path / "session.mp4")
+    heartbeat = datetime.now(UTC) - timedelta(minutes=40)
+    job = db.create_processing_job(
+        ProcessingJob(
+            job_type="cv_reconstruction",
+            status="running",
+            video_id=video.id,
+            progress_percent=82,
+            pid=99999,
+            heartbeat_at=heartbeat,
+            started_at=heartbeat,
+        )
+    )
+    monkeypatch.setattr(cv_jobs, "_pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(cv_jobs, "_terminate_job_group", lambda pid: True)
+
+    assert cv_jobs.reconcile_stuck_jobs(db, now=datetime.now(UTC)) == [job.id]
+    outcome = jobs_module.describe_job_outcome(db, db.fetch_processing_job(job.id))
+
+    assert outcome.progress_label == "—"
+    assert outcome.progress_percent is None
+    assert "No hands were imported" in outcome.statement
+    assert "heartbeat expired" in outcome.error_message
+    db.close()
+
+
+def test_failed_import_that_did_land_hands_says_how_many_and_where(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Partial work is stated as partial: the count is queried, never assumed to be zero."""
+    logs_dir = tmp_path / "job_logs"
+    monkeypatch.setattr(video_storage, "JOB_LOGS_DIR", logs_dir)
+    db_path = tmp_path / "tracker.sqlite3"
+    job_id, _ = _seed_failed_import(db_path, logs_dir, imported_hands=2, write_log=False)
+
+    db = PokerDatabase(str(db_path))
+    outcome = jobs_module.describe_job_outcome(db, db.fetch_processing_job(job_id))
+    db.close()
+
+    assert outcome.committed_count == 2
+    assert "2 hands were imported before the job stopped" in outcome.statement
+    assert "Tuesday grind" in outcome.statement
+    assert "Nothing else from this job reached the study database" in outcome.statement
+    assert "82" not in outcome.statement
+
+
+def test_job_rows_without_a_queried_outcome_never_claim_nothing_was_imported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller that did not look says so, rather than reporting a zero it never measured."""
+    from poker_tracker.ui.view_models import build_job_rows
+
+    logs_dir = tmp_path / "job_logs"
+    monkeypatch.setattr(video_storage, "JOB_LOGS_DIR", logs_dir)
+    db_path = tmp_path / "tracker.sqlite3"
+    job_id, video_id = _seed_failed_import(db_path, logs_dir, write_log=False)
+
+    db = PokerDatabase(str(db_path))
+    job = db.fetch_processing_job(job_id)
+    video = db.fetch_video(video_id)
+    unmeasured = build_job_rows([job], [video])[0]
+    measured = build_job_rows([job], [video], outcomes=jobs_module.describe_job_outcomes(db, [job]))[0]
+    db.close()
+
+    assert unmeasured.progress_percent is None
+    assert unmeasured.progress_label == "—"
+    assert unmeasured.outcome.committed_count is None
+    assert "did not check" in unmeasured.outcome_statement
+    assert "No hands were imported" not in unmeasured.outcome_statement
+    assert "No hands were imported" in measured.outcome_statement
+
+
+def test_launcher_and_failure_panel_agree_on_where_the_log_lives(
+    videos_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One definition of the log path, or the panel offers a file nothing wrote."""
+    db = make_db()
+    video = add_video(db, videos_dir / "session.avi", playable=True, with_hash=True)
+    logs_dir = videos_dir.parent / "job_logs"
+    monkeypatch.setattr(video_storage, "JOB_LOGS_DIR", logs_dir)
+    monkeypatch.setattr(cv_jobs, "ensure_data_directories", lambda: {})
+    opened: dict = {}
+
+    def fake_popen(command, **kwargs):
+        opened["stdout"] = kwargs["stdout"].name
+        return SimpleNamespace(pid=43211)
+
+    monkeypatch.setattr(cv_jobs.subprocess, "Popen", fake_popen)
+
+    job = cv_jobs.start_cv_job(db, video.id, video.stored_path, "Imported study")
+
+    assert Path(opened["stdout"]) == jobs_module.job_log_path(job.id)
+    assert jobs_module.job_log_path(job.id).parent == logs_dir
+    db.close()
+
+
+def test_log_tail_is_bounded_and_scrubbed_before_it_leaves_the_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Redaction happens at the read, not only at the render that happens to be current."""
+    logs_dir = tmp_path / "job_logs"
+    logs_dir.mkdir()
+    monkeypatch.setattr(video_storage, "JOB_LOGS_DIR", logs_dir)
+    lines = [f"line {index}" for index in range(200)] + [SECRET_LOG_LINE]
+    jobs_module.job_log_path(7).write_text("\n".join(lines), encoding="utf-8")
+
+    tail = jobs_module.read_job_log_tail(7)
+
+    assert len(tail) == jobs_module.LOG_TAIL_LINES
+    assert tail[-1].endswith("<redacted>")
+    assert not any("sk-ant-" in line for line in tail)
+    assert jobs_module.read_job_log_tail(999) == ()

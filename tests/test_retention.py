@@ -7,19 +7,25 @@ saved issue because the file happens to be old. Age is never the first question;
 
 from __future__ import annotations
 
+import json
+import os
 import time
 from pathlib import Path
 
 import pytest
 
+from poker_tracker.maintenance import retention_cli
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.services.retention import (
     DEFAULT_RETENTION_DAYS,
     NEVER_MANAGED,
     RETENTION_ENV_VARS,
+    AuditedFile,
     RetentionPolicy,
+    StorageAudit,
     apply_retention,
     audit_storage,
+    path_identity_keys,
 )
 from poker_tracker.ui.video_storage import ensure_data_directories
 
@@ -41,10 +47,28 @@ def _write(path: Path, *, age_days: float, content: bytes = b"x" * 128) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     stamp = time.time() - age_days * DAY
-    import os
-
     os.utime(path, (stamp, stamp))
     return path
+
+
+def _record_video(db, path: Path, *, filename: str | None = None) -> None:
+    """Point a videos row at ``path`` exactly as an upload would."""
+    db._execute(
+        "INSERT INTO videos (session_id, original_filename, stored_path,"
+        " file_size_bytes, content_sha256, uploaded_at, notes)"
+        " VALUES (NULL, ?, ?, ?, '', '2026-01-01T00:00:00Z', '')",
+        (filename or Path(path).name, str(path), 128),
+    )
+    db._commit()
+
+
+def _filesystem_ignores_case(directory: Path) -> bool:
+    probe = directory / "CaseProbe"
+    probe.write_bytes(b"probe")
+    try:
+        return (directory / "caseprobe").exists()
+    finally:
+        probe.unlink()
 
 
 def _reference_frame(db, image_path) -> None:
@@ -305,6 +329,11 @@ def test_a_regression_fixture_is_never_deleted(workspace):
     assert entry.referenced is True
     assert entry.deletable is False
 
+    # And it survives the sweep itself, not just the plan.
+    outcome = apply_retention(audit, confirm=True)
+    assert fixture.exists()
+    assert outcome.removed == []
+
 
 def test_an_orphan_video_does_not_claim_to_have_been_unused(workspace):
     """Age is the file's mtime, not how long nothing pointed at it.
@@ -319,3 +348,276 @@ def test_an_orphan_video_does_not_claim_to_have_been_unused(workspace):
     entry = next(f for f in audit.files if f.path == video)
     assert entry.deletable is True
     assert "does NOT mean it has been unused" in entry.reason
+
+
+# --- B-2: a path is a file, not a string -----------------------------------
+
+
+def test_a_reference_is_honored_through_a_different_case_spelling(workspace):
+    """``Session.MOV`` on disk and ``session.mov`` in SQLite are one file.
+
+    macOS ships a case-insensitive filesystem and ``realpath`` does not fold
+    case, so a string comparison calls the recording an orphan and deletes the
+    one artifact nothing can rebuild while a row still points at it.
+    """
+    db, paths = workspace
+    if not _filesystem_ignores_case(paths["videos"]):
+        pytest.skip("case-sensitive filesystem: the two spellings are two files")
+    video = _write(paths["videos"] / "Session.MOV", age_days=5000)
+    _record_video(db, paths["videos"] / "session.mov", filename="Session.MOV")
+
+    audit = _audit(db, paths, include_orphan_videos=True)
+    entry = next(f for f in audit.files if f.path == video)
+    assert entry.referenced is True
+    assert entry.deletable is False
+
+    outcome = apply_retention(audit, confirm=True)
+    assert video.exists()
+    assert outcome.removed == []
+
+
+def test_a_reference_is_honored_through_a_hard_link(workspace):
+    """Identity is the inode. Two names for one file are not two files."""
+    db, paths = workspace
+    frame = _write(paths["frames"] / "real.jpg", age_days=900)
+    alias = paths["frames"] / "alias.jpg"
+    os.link(frame, alias)
+    _reference_frame(db, alias)
+
+    audit = _audit(db, paths)
+    entry = next(f for f in audit.files if f.path == frame)
+    assert entry.referenced is True
+    assert entry.deletable is False
+
+
+def test_non_normalized_spellings_share_one_identity(tmp_path: Path):
+    """The helper every comparison goes through, exercised directly."""
+    real = tmp_path / "sub" / "file.jpg"
+    real.parent.mkdir(parents=True)
+    real.write_bytes(b"x")
+    detour = tmp_path / "sub" / "." / ".." / "sub" / "FILE.jpg"
+    assert path_identity_keys(real) & path_identity_keys(detour)
+    assert not path_identity_keys(real) & path_identity_keys(tmp_path / "other.jpg")
+
+
+def test_a_relative_reference_is_honored_from_any_working_directory(
+    workspace, monkeypatch, tmp_path: Path
+):
+    """A relative stored path means the data root, not wherever the sweep ran.
+
+    Resolving it against the process working directory is how a frame behind a
+    saved review looks like an orphan simply because the operator ran the sweep
+    from somewhere else.
+    """
+    db, paths = workspace
+    frame = _write(paths["frames"] / "relative.jpg", age_days=900)
+    _reference_frame(db, Path("frames") / "relative.jpg")
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    audit = _audit(db, paths)
+    entry = next(f for f in audit.files if f.path == frame)
+    assert entry.referenced is True
+    assert entry.deletable is False
+
+
+def test_a_category_directory_that_resolves_inside_backups_is_not_walked(workspace):
+    """The never-managed guarantee holds even when a data root is laid out oddly."""
+    db, paths = workspace
+    trap = paths["backups"] / "frames"
+    trap.mkdir(parents=True, exist_ok=True)
+    snapshot = _write(trap / "poker_tracker_old.sqlite3", age_days=9000)
+
+    audit = audit_storage(
+        db,
+        {**paths, "frames": trap},
+        RetentionPolicy(days=dict(DEFAULT_RETENTION_DAYS)),
+    )
+    assert all(f.path != snapshot for f in audit.files)
+    assert snapshot.exists()
+
+
+# --- B-3: an audit is a proposal, never an authorization --------------------
+
+
+def test_a_reference_created_after_the_audit_stops_the_deletion(workspace):
+    """A CV job finishing while the operator reads the plan must win.
+
+    The audit classified this frame as an orphan and it stopped being one before
+    the sweep ran. Deleting on the strength of a stale plan destroys a live file.
+    """
+    db, paths = workspace
+    orphan = _write(paths["frames"] / "orphan.jpg", age_days=900)
+    audit = _audit(db, paths)
+    assert [f.path for f in audit.deletable] == [orphan]
+
+    _reference_frame(db, orphan.resolve())
+
+    outcome = apply_retention(audit, confirm=True)
+    assert orphan.exists()
+    assert outcome.removed == []
+    assert any("now references it" in entry for entry in outcome.skipped)
+
+
+def test_a_reference_source_that_fails_after_the_audit_stops_the_deletion(
+    workspace, monkeypatch
+):
+    """Losing the ability to check must stop the sweep, not wave it through."""
+    db, paths = workspace
+    orphan = _write(paths["frames"] / "orphan.jpg", age_days=900)
+    audit = _audit(db, paths)
+    assert audit.deletable
+
+    monkeypatch.setattr(
+        db,
+        "referenced_artifact_paths",
+        lambda: (set(), ["extracted_frames.image_path"]),
+    )
+    # Something else writes, so the check re-reads and discovers the bad source.
+    _record_video(db, paths["videos"] / "unrelated.mov")
+
+    outcome = apply_retention(audit, confirm=True)
+    assert orphan.exists()
+    assert outcome.removed == []
+    assert any("could not read" in entry for entry in outcome.skipped)
+
+
+def test_an_audit_without_a_live_reference_check_cannot_delete(tmp_path: Path):
+    """A hand-built audit is a claim about the past with nothing to re-prove it."""
+    victim = _write(tmp_path / "orphan.jpg", age_days=900)
+    audit = StorageAudit(
+        files=[
+            AuditedFile(
+                path=victim,
+                category="frames",
+                size_bytes=128,
+                age_days=900.0,
+                referenced=False,
+                deletable=True,
+                reason="unreferenced",
+            )
+        ]
+    )
+    outcome = apply_retention(audit, confirm=True)
+    assert victim.exists()
+    assert outcome.removed == []
+    assert outcome.failures
+
+
+# --- B-4: zero days is a typo, not a policy ---------------------------------
+
+
+@pytest.mark.parametrize("variable", sorted(set(RETENTION_ENV_VARS.values())))
+def test_a_zero_window_is_refused_for_every_category(monkeypatch, variable):
+    """"Retain for zero days" purges everything, and it is one keystroke away."""
+    monkeypatch.setenv(variable, "0")
+    with pytest.raises(ValueError) as excinfo:
+        RetentionPolicy.from_env()
+    message = str(excinfo.value)
+    assert variable in message
+    assert "--purge-now" in message
+
+
+def test_a_zero_window_is_refused_however_the_policy_is_built():
+    days = dict(DEFAULT_RETENTION_DAYS)
+    days["frames"] = 0
+    with pytest.raises(ValueError):
+        RetentionPolicy(days=days)
+
+
+def test_a_zero_window_written_after_construction_is_still_refused():
+    """``days`` is a plain dict, so the check has to live at the point of use too."""
+    policy = RetentionPolicy(days=dict(DEFAULT_RETENTION_DAYS))
+    policy.days["frames"] = 0
+    with pytest.raises(ValueError):
+        policy.window_days("frames")
+
+
+def test_purging_now_is_available_but_has_to_be_asked_for(workspace):
+    """The real operator need is met by a flag that says what it does."""
+    db, paths = workspace
+    fresh = _write(paths["frames"] / "recent.jpg", age_days=0.5)
+    referenced = _write(paths["frames"] / "kept.jpg", age_days=0.5)
+    _reference_frame(db, referenced.resolve())
+    video = _write(paths["videos"] / "orphan.mov", age_days=0.5)
+
+    policy = RetentionPolicy(
+        days=dict(DEFAULT_RETENTION_DAYS), purge_immediately=True
+    )
+    assert policy.window_days("frames") == 0
+    audit = audit_storage(db, paths, policy)
+
+    assert next(f for f in audit.files if f.path == fresh).deletable is True
+    # Purging ignores age. It does not ignore references, and it does not
+    # promote a source recording past its own opt-in.
+    assert next(f for f in audit.files if f.path == referenced).deletable is False
+    assert next(f for f in audit.files if f.path == video).deletable is False
+
+
+# --- B2-6: the output format cannot decide the exit code --------------------
+
+
+def _run_cli_scenario(scenario: str, *, json_mode: bool, root: Path, monkeypatch) -> int:
+    """Run the CLI once for ``scenario`` in a workspace of its own."""
+    data_dir = root / "data"
+    paths = ensure_data_directories(data_dir)
+    db_path = root / "retention.db"
+    db = PokerDatabase(db_path)
+    db.init_db()
+    db.close()
+
+    argv = ["--db", str(db_path), "--data-dir", str(data_dir)]
+    if json_mode:
+        argv.append("--json")
+
+    if scenario == "error":
+        monkeypatch.setenv("POKER_RETAIN_FRAMES_DAYS", "0")
+    if scenario in {"would-delete", "deleted", "refused", "deletion-failed"}:
+        _write(paths["frames"] / "orphan.jpg", age_days=900)
+    if scenario in {"deleted", "refused", "deletion-failed"}:
+        argv.append("--apply")
+    if scenario == "refused":
+        monkeypatch.setattr(
+            PokerDatabase,
+            "referenced_artifact_paths",
+            lambda self: (set(), ["reconstruction_frame_reviews.source_image"]),
+        )
+    if scenario == "deletion-failed":
+
+        def _cannot_unlink(self, missing_ok: bool = False) -> None:
+            raise OSError(13, "Permission denied")
+
+        monkeypatch.setattr(Path, "unlink", _cannot_unlink)
+
+    return retention_cli.main(argv)
+
+
+@pytest.mark.parametrize(
+    "scenario, expected",
+    [
+        ("nothing-to-do", 0),
+        ("would-delete", 0),
+        ("deleted", 0),
+        ("deletion-failed", 1),
+        ("error", 2),
+        ("refused", 3),
+    ],
+)
+def test_json_and_text_report_the_same_exit_code(
+    scenario, expected, tmp_path: Path, monkeypatch, capsys
+):
+    """A script branching on the exit code must see what the operator sees."""
+    text_code = _run_cli_scenario(
+        scenario, json_mode=False, root=tmp_path / f"{scenario}-text", monkeypatch=monkeypatch
+    )
+    capsys.readouterr()
+    json_code = _run_cli_scenario(
+        scenario, json_mode=True, root=tmp_path / f"{scenario}-json", monkeypatch=monkeypatch
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert text_code == json_code == expected
+    assert payload["outcome"] == scenario
+    assert payload["exit_code"] == expected

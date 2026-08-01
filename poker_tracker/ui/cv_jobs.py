@@ -12,7 +12,7 @@ from pathlib import Path
 
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import ProcessingJob
-from poker_tracker.ui.jobs import mark_cancelled, mark_failed
+from poker_tracker.ui.jobs import job_log_path, mark_cancelled, mark_failed
 from poker_tracker.ui.video_ingest import (
     assert_stored_video_matches_record,
     require_playable_video,
@@ -20,7 +20,6 @@ from poker_tracker.ui.video_ingest import (
 )
 from poker_tracker.ui.video_storage import (
     CV_TIMELINES_DIR,
-    JOB_LOGS_DIR,
     VIDEOS_DIR,
     ensure_data_directories,
 )
@@ -88,8 +87,8 @@ def start_cv_job(
 
     try:
         ensure_data_directories()
-        JOB_LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = JOB_LOGS_DIR / f"cv_job_{job.id}.log"
+        log_path = job_log_path(job.id)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         command = [
             sys.executable,
             "-m",

@@ -519,7 +519,8 @@ def save_manual_spot(
         winner = next(
             player for player in saved_players if player.player_key == built.winner_key
         )
-        # Folded blind fillers can create side pots; award every layer to the winner.
+        # Folded blind fillers split the pot into layers -- dead-money layers,
+        # not side pots -- so award every layer to the winner.
         draft_ledger = build_ledger_from_records(saved_players, built.actions)
         pot_indexes = [pot.index for pot in draft_ledger.pots] or [0]
         db.upsert_hand_settlement(

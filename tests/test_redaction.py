@@ -228,3 +228,44 @@ def test_a_non_positive_limit_bounds_rather_than_slicing_from_the_end(limit):
     """collapsed[:limit-1] counts backwards for limit <= 0."""
     message = safe_error_message(ValueError("x" * 200), limit=limit)
     assert len(message) <= max(0, limit)
+
+
+# --- Scrubbing twice ---------------------------------------------------------
+#
+# Callers scrub what they are about to hand over and the store scrubs again on
+# the way into the column, so most messages are passed through this module more
+# than once. A second pass has to be a no-op: if it rewrote its own output the
+# guarantee would depend on counting how many times a message had been handled.
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "auth failed for sk-ant-api03-AAAABBBBCCCCDDDD",
+        "Authorization: Token 4f9a2b7c1d8e6f3a0b5c9d2e",
+        "api_key=hunter2secret",
+        'config {"password": "hunter2secret"}',
+        'password="correct horse battery staple"',
+        "could not connect to postgres://admin:s3cr3tpw@db.internal:5432/study",
+        '{"api_key": 1234567, "n": 5}',
+        "Reconstructed timeline failed import validation.",
+    ],
+)
+def test_scrubbing_an_already_scrubbed_message_changes_nothing(text):
+    once = redact_text(text, include_environment=False)
+    assert redact_text(once, include_environment=False) == once
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        REDACTED,
+        f"api_key={REDACTED}",
+        f'{{"password": "{REDACTED}"}}',
+        f"Authorization: {REDACTED}",
+        f"postgres://{REDACTED}@db.internal:5432/study",
+    ],
+)
+def test_the_marker_itself_survives_another_pass_intact(text):
+    """A pass that ate its own marker would report a leak as clean text."""
+    assert redact_text(text, include_environment=False) == text

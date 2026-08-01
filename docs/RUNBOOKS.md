@@ -216,7 +216,7 @@ python -m poker_tracker.maintenance.retention_cli --apply
 ```
 
 The retention audit is a dry run by default and always prints its plan before
-`--apply` acts. Two things to understand before using it:
+`--apply` acts. Four things to understand before using it:
 
 - **A file the database references is never offered**, at any age. Windows only
   apply to files nothing points at.
@@ -224,16 +224,51 @@ The retention audit is a dry run by default and always prints its plan before
   Nothing records when a row stopped pointing at a file, so a recording orphaned
   moments ago still reports its original age. This matters most for
   `--include-orphan-videos`, which is the one deletion nothing can undo.
+- **The plan is a proposal, not an authorization.** `--apply` re-checks every
+  path against the database immediately before unlinking it, so a CV job that
+  finishes while you are reading the plan protects its frames retroactively.
+  Files rescued that way are printed as `KEPT` and the run exits `3`.
+- **A reference is matched by file identity, not by spelling.** On the
+  case-insensitive filesystem macOS ships, `Session.MOV` on disk and
+  `session.mov` in SQLite are one file; retention compares `st_dev`/`st_ino`
+  rather than strings so it cannot mistake one for an orphan.
 
-Windows are set per category:
+Windows are set per category, in whole days:
 
 ```bash
 export POKER_RETAIN_FRAMES_DAYS=30
 export POKER_RETAIN_TIMELINES_DAYS=90
 export POKER_RETAIN_JOB_LOGS_DAYS=30
 export POKER_RETAIN_EXPORTS_DAYS=90
+export POKER_RETAIN_ROI_PREVIEWS_DAYS=30
 export POKER_RETAIN_ORPHAN_VIDEOS_DAYS=365
 ```
+
+**Zero and negative windows are refused.** `POKER_RETAIN_FRAMES_DAYS=0` reads as
+"retain for zero days", which purges every unreferenced frame on the next
+`--apply` — too destructive to sit one typo away from a correct setting, and
+reachable by accident whenever a shell expands an unset variable to something
+`int()` accepts. The CLI exits `2` and names the variable instead. Purging on
+purpose is a real need, so it has a flag that says so:
+
+```bash
+python -m poker_tracker.maintenance.retention_cli --purge-now          # dry run
+python -m poker_tracker.maintenance.retention_cli --purge-now --apply
+```
+
+`--purge-now` ignores every window and offers all unreferenced managed artifacts
+regardless of age. It does not weaken anything else: referenced files are still
+kept, and source recordings still need `--include-orphan-videos` on top.
+
+Exit codes are the same in text and `--json` mode — the format decides how the
+outcome is written down, never what it was:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Audit only, or an apply that removed everything it offered |
+| `1` | An apply attempted a deletion and it failed |
+| `2` | Invalid configuration; nothing was examined |
+| `3` | Refused to act — a reference source was unreadable, or the plan went stale |
 
 Backups are deliberately outside retention's scope — `poker_tracker.persistence.backup`
 owns that directory, and two components expiring one directory is how a verified

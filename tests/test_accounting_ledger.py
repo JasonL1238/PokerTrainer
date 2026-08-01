@@ -666,6 +666,95 @@ def test_a_folded_ante_poster_is_not_eligible() -> None:
     assert "C" not in ledger.pots[0].eligible_players
 
 
+def test_a_layer_split_off_by_a_folded_blind_is_not_called_a_side_pot() -> None:
+    """The label states what created the layer, not where it sits in the list.
+
+    Blinds 1/2 with a straddle to 4: the small and big blinds fold for less, so
+    the pot layers at 1, 2 and 4. Nobody was all-in, nobody's eligibility is
+    capped -- every layer is contested by exactly the same two players. Calling
+    the second and third layers "side pots" because their index is not zero is a
+    false statement about the hand and teaches the wrong definition of the term.
+    """
+    players = [
+        LedgerPlayer(name="sb", starting_stack=100, seat=0),
+        LedgerPlayer(name="bb", starting_stack=100, seat=1),
+        LedgerPlayer(name="straddler", starting_stack=100, seat=2),
+        LedgerPlayer(name="utg1", starting_stack=100, seat=3),
+    ]
+    actions = [
+        LedgerAction(player="sb", street="preflop", kind="post_blind", amount=1),
+        LedgerAction(player="bb", street="preflop", kind="post_blind", amount=2),
+        LedgerAction(player="straddler", street="preflop", kind="post_blind", amount=4),
+        LedgerAction(player="utg1", street="preflop", kind="call", amount=4),
+        LedgerAction(player="sb", street="preflop", kind="fold"),
+        LedgerAction(player="bb", street="preflop", kind="fold"),
+        LedgerAction(player="straddler", street="preflop", kind="check"),
+    ]
+    layers = build_hand_ledger(players, actions).pots
+
+    assert [pot.amount for pot in layers] == pytest.approx([4, 3, 4])
+    assert [pot.cause for pot in layers] == ["main", "dead_money", "dead_money"]
+    assert [pot.label for pot in layers] == [
+        "Main pot",
+        "Dead-money layer",
+        "Dead-money layer",
+    ]
+    # Same contest at every layer, which is why none of them is a side pot.
+    assert {pot.eligible_players for pot in layers} == {("straddler", "utg1")}
+
+
+def test_only_a_layer_that_caps_eligibility_is_called_a_side_pot() -> None:
+    """A short stack all-in for less is the one thing that makes a side pot."""
+    players = [
+        _player("short", stack=10, seat=0),
+        _player("mid", stack=40, seat=1),
+        _player("deep", stack=100, seat=2),
+    ]
+    actions = [
+        _action("short", "all-in", 10),
+        _action("mid", "all-in", 40),
+        _action("deep", "call", 40),
+    ]
+    layers = build_hand_ledger(players, actions).pots
+
+    assert [pot.cause for pot in layers] == ["main", "side"]
+    assert [pot.label for pot in layers] == ["Main pot", "Side pot"]
+    # The side pot is exactly the layer the short stack cannot win.
+    assert layers[0].eligible_players == ("short", "mid", "deep")
+    assert layers[1].eligible_players == ("mid", "deep")
+
+
+def test_a_seat_all_in_for_only_an_ante_caps_the_layer_above_it() -> None:
+    """A forced post can be the whole stack, and that still makes a side pot.
+
+    The short stack's chips are dead money pooled into the main pot, so the cause
+    cannot be read off the live contribution layers alone -- it has to follow the
+    eligibility the layer actually grants.
+    """
+    players = [_player("short", stack=5), _player("B"), _player("C")]
+    actions = [
+        _action("short", "ante", 5),
+        _action("B", "bet", 15),
+        _action("C", "call", 15),
+    ]
+    layers = build_hand_ledger(players, actions).pots
+
+    assert len(layers) == 1
+    assert layers[0].cause == "main"
+    assert "short" in layers[0].eligible_players
+
+
+def test_a_pot_made_only_of_dead_money_is_the_main_pot() -> None:
+    """No live chip was wagered, so there is one pot and everyone contests it."""
+    players = [_player("A"), _player("B")]
+    actions = [_action("A", "ante", 1), _action("B", "ante", 1)]
+    layers = build_hand_ledger(players, actions, dead_money=2).pots
+
+    assert [pot.cause for pot in layers] == ["main"]
+    assert layers[0].label == "Main pot"
+    assert layers[0].amount == pytest.approx(4)
+
+
 def test_antes_do_not_coarsen_an_evenly_chopped_pot() -> None:
     """The split quantum is the finest denomination the hand demonstrates.
 

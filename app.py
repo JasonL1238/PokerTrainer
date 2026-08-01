@@ -158,6 +158,7 @@ from poker_tracker.ui.components import (
     frequency_bars,
     kpi_card,
     page_header,
+    panel,
     product_hero,
     section_header,
     section_header_with_meta,
@@ -177,6 +178,7 @@ from poker_tracker.ui.frame_extraction import (
     select_representative_frames,
 )
 from poker_tracker.ui.image_utils import image_dimensions, save_roi_crop_preview
+from poker_tracker.ui.jobs import LOG_TAIL_LINES, describe_job_outcome, describe_job_outcomes
 from poker_tracker.ui.navigation import Page, navigate_to, render_navigation
 from poker_tracker.ui.poker_visuals import (
     action_replay_state,
@@ -1100,7 +1102,12 @@ def show_product_overview(db: PokerDatabase) -> None:
         )
 
     section_header("Processing", "Recent offline reconstruction activity")
-    job_rows = build_job_rows(db.fetch_recent_jobs(6), db.fetch_videos())
+    recent_jobs = db.fetch_recent_jobs(6)
+    job_rows = build_job_rows(
+        recent_jobs,
+        db.fetch_videos(),
+        outcomes=describe_job_outcomes(db, recent_jobs),
+    )
     if not job_rows:
         empty_state("No processing jobs", "Uploaded video reconstruction jobs will appear here.")
     else:
@@ -1110,8 +1117,12 @@ def show_product_overview(db: PokerDatabase) -> None:
                     "Video": row.filename,
                     "Type": row.job_type,
                     "Status": row.status.replace("_", " ").title(),
-                    "Progress": f"{row.progress_percent:.0f}%",
-                    "Update": row.message,
+                    "Progress": row.progress_label,
+                    "Outcome": row.outcome_statement,
+                    # The worker log is the only account of why a job stopped,
+                    # so it travels with the outcome instead of living one page
+                    # deeper where nobody knows to look for it.
+                    "Log": row.outcome.log_path or "—",
                     "Created": row.age_label,
                 }
                 for row in job_rows
@@ -3760,7 +3771,19 @@ def show_accounting_editor(
                     "This makes the reconciled ledger the saved summary."
                 ),
             )
-            st.caption("Awards declare winners by pot layer: 0 is the main pot; 1+ are side pots.")
+            # Name each layer from the ledger's own record of what created it.
+            # Reading "1+ are side pots" off the index told the operator that a
+            # layer split off by a blind that folded for less was a side pot,
+            # which it is not.
+            if accounting is not None and accounting.ledger.pots:
+                layer_names = ", ".join(
+                    f"{pot.index} {pot.label.lower()}" for pot in accounting.ledger.pots
+                )
+                st.caption(f"Awards declare winners by pot layer: {layer_names}.")
+            else:
+                st.caption(
+                    "Awards declare winners by pot layer, numbered from 0 for the main pot."
+                )
             award_rows = st.data_editor(
                 [
                     {
@@ -8065,7 +8088,7 @@ def show_cv_reconstruction(db: PokerDatabase, video: VideoRecord) -> None:
         if latest.status in {"queued", "running", "cancelling"}:
             _show_live_cv_job_status(db, video.id)
         else:
-            _render_cv_job_status(latest)
+            _render_cv_job_status(db, latest)
         completed_jobs = [job for job in latest_jobs if job.status == "completed"]
         if completed_jobs:
             review_job = _choose_frame_review_job(db, video.id, completed_jobs)
@@ -8128,7 +8151,7 @@ def _show_live_cv_job_status(db: PokerDatabase, video_id: int) -> None:
     latest = latest_jobs[0]
     if latest.status not in {"queued", "running", "cancelling"}:
         st.rerun()
-    _render_cv_job_status(latest)
+    _render_cv_job_status(db, latest)
     st.caption("Updating automatically — you can leave this page open.")
 
 
@@ -8236,22 +8259,49 @@ def _choose_frame_review_job(db: PokerDatabase, video_id: int, completed_jobs: l
     return by_id[selected_id]
 
 
-def _render_cv_job_status(job) -> None:
-    """Render the latest persisted state of one reconstruction job."""
-    st.progress(
-        job.progress_percent / 100,
-        text=f"{job.status.title()} · {job.message}",
-    )
+def _render_cv_job_status(db: PokerDatabase, job) -> None:
+    """Render what one reconstruction job is doing, or what it left behind.
+
+    A stopped job gets no progress bar and no percentage. The figure it stopped
+    at describes work in flight, and beside "Failed" it is read as a share of
+    hands that made it in; the outcome resolver answers that question from the
+    database instead. The wording is carried in text, not colour, so the state
+    survives a screenshot, a colour-blind reader and a printed page.
+    """
+    outcome = describe_job_outcome(db, job)
+    if outcome.is_live and outcome.progress_percent is not None:
+        st.progress(
+            max(0.0, min(1.0, outcome.progress_percent / 100)),
+            text=f"{outcome.headline} · {outcome.statement}",
+        )
     status_cols = st.columns(4)
-    status_cols[0].metric("Status", job.status.replace("_", " ").title())
-    status_cols[1].metric("Progress", f"{job.progress_percent:.0f}%")
+    status_cols[0].metric("Status", outcome.headline)
+    status_cols[1].metric("Progress", outcome.progress_label)
     status_cols[2].metric("Job", f"#{job.id}")
     heartbeat = job.heartbeat_at or job.started_at
     status_cols[3].metric(
         "Heartbeat", heartbeat.strftime("%H:%M:%S UTC") if heartbeat else "Waiting"
     )
-    if job.error_message:
-        st.error(job.error_message)
+    if not outcome.is_live:
+        panel("Outcome", outcome.statement)
+    if outcome.error_message:
+        st.error(f"Failure detail: {outcome.error_message}")
+    _render_job_log(outcome)
+
+
+def _render_job_log(outcome) -> None:
+    """Offer the worker log a failure wrote, which nothing else surfaces.
+
+    The tail is redacted upstream, in the outcome resolver, because a worker log
+    is where a provider key or a connection string ends up printed verbatim.
+    """
+    if not outcome.log_path:
+        return
+    data_callout("Worker log", outcome.log_path)
+    if not outcome.log_tail:
+        return
+    with st.expander(f"Worker log · last {LOG_TAIL_LINES} lines (credentials redacted)"):
+        st.code("\n".join(outcome.log_tail), language="text")
 
 
 def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
@@ -8988,18 +9038,24 @@ def show_legacy_frame_extraction(db: PokerDatabase, video: VideoRecord) -> None:
     jobs = db.fetch_jobs_by_video(video.id)
     if jobs:
         st.markdown("##### Jobs")
+        # Same outcome resolver as the reconstruction panel: a diagnostics table
+        # is still a place an operator reads "82%" as hands that got in, and the
+        # error column is still a place a credential surfaces.
+        diagnostic_rows = build_job_rows(jobs, [video], outcomes=describe_job_outcomes(db, jobs))
+        created_at = {job.id: job.created_at for job in jobs if job.id is not None}
         st.dataframe(
             [
                 {
-                    "ID": job.id,
-                    "Type": job.job_type,
-                    "Status": job.status,
-                    "Progress": job.progress_percent,
-                    "Message": job.message,
-                    "Error": job.error_message,
-                    "Created": job.created_at.isoformat(),
+                    "ID": row.job_id,
+                    "Type": row.job_type,
+                    "Status": row.status,
+                    "Progress": row.progress_label,
+                    "Outcome": row.outcome_statement,
+                    "Error": row.outcome.error_message,
+                    "Log": row.outcome.log_path or "—",
+                    "Created": created_at[row.job_id].isoformat(),
                 }
-                for job in jobs
+                for row in diagnostic_rows
             ],
             hide_index=True,
             width="stretch",

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.safety.redaction import safe_error_message
 from poker_tracker.solver.models import ResolvedRange, SolverSpot
 from poker_tracker.solver.texassolver import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -172,7 +173,10 @@ def run_solver_job(
                 run_id,
                 expected_statuses=("queued", "running"),
                 status="failed",
-                error_message=str(exc),
+                # The store scrubs this column whatever a writer hands it; this
+                # call also bounds and flattens the message, so a solver
+                # traceback does not arrive as a multi-line wall of text.
+                error_message=safe_error_message(exc),
                 runtime_seconds=max(0.0, time.monotonic() - started),
                 pid=None,
                 heartbeat_at=datetime.now(UTC),

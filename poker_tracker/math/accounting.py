@@ -31,6 +31,8 @@ LedgerActionKind = Literal[
     "win",
 ]
 
+PotLayerCause = Literal["main", "side", "dead_money"]
+
 _COMMITMENT_KINDS = {"ante", "post_blind", "bet", "call", "raise", "all-in"}
 _BETTING_COMMITMENT_KINDS = _COMMITMENT_KINDS - {"ante"}
 _NON_COMMITMENT_KINDS = {"fold", "check", "show", "win"}
@@ -42,6 +44,14 @@ _ZERO = Decimal("0")
 # that claim -- taken verbatim from a declared field -- that let "Chip unit"
 # redirect a chop. See _split_granularity.
 _MAX_SPLIT_QUANTUM = Decimal("1")
+# The one place a layer's operator-facing name is written. Every consumer reads
+# it through ``PotLayer.label`` so a layer cannot be renamed in one surface and
+# not another, and so no surface can invent a name from the layer's index.
+_POT_LAYER_LABELS: dict[PotLayerCause, str] = {
+    "main": "Main pot",
+    "side": "Side pot",
+    "dead_money": "Dead-money layer",
+}
 
 
 class LedgerError(ValueError):
@@ -129,6 +139,22 @@ class PotLayer:
     contributors: tuple[str, ...]
     eligible_players: tuple[str, ...]
     winners: tuple[str, ...] = ()
+    cause: PotLayerCause = "main"
+
+    @property
+    def label(self) -> str:
+        """What this layer is, derived from what created it and not from its index.
+
+        A side pot is one specific thing: a layer that exists because a player
+        still in the hand was all-in for less than the wager, so that player
+        cannot win it.  Every layer above the first used to be called a side pot,
+        which is a false statement about the ordinary hands that produce layers
+        for other reasons -- a blind that folds for less, an unmatched ante --
+        and reading it teaches an operator studying their own hand the wrong
+        definition of the term.
+        """
+
+        return _POT_LAYER_LABELS[self.cause]
 
 
 @dataclass(frozen=True)
@@ -163,8 +189,10 @@ def build_hand_ledger(
     """Reduce normalized completed-hand actions into pots and player results.
 
     ``winners`` maps each generated pot index to one or more ordered winners.
-    Pot 0 is the main pot; later indexes are side pots.  Omitting winners
-    returns a useful but explicitly unsettled ledger. ``flop_seen`` is an
+    Pot 0 is the main pot; every later layer records what created it in
+    ``PotLayer.cause``, and only a layer that caps a remaining player's
+    eligibility is a side pot.  Omitting winners returns a useful but explicitly
+    unsettled ledger. ``flop_seen`` is an
     optional completed-hand fact for histories where a board ran out without
     any postflop action (for example, a preflop all-in). When omitted, the
     ledger preserves the historic behavior of inferring it from action streets.
@@ -438,6 +466,7 @@ def build_hand_ledger(
                 contributors=pot["contributors"],
                 eligible_players=pot["eligible_players"],
                 winners=pot_winners,
+                cause=pot["cause"],
             )
         )
 
@@ -676,7 +705,20 @@ def _build_pots(
         contributors = tuple(name for name in order if contributions[name] >= level)
         amount = (level - previous) * len(contributors)
         eligible = tuple(name for name in contributors if name not in folded)
-        if not pots:
+        if pots:
+            # What draws this boundary is the set of players who stopped
+            # contributing below it. If any of them is still in the hand they
+            # were all-in for less than the wager and cannot win here, and that
+            # -- capped eligibility -- is the whole definition of a side pot. If
+            # they all folded, their chips are dead money: everyone who can win
+            # the layer beneath can win this one too, so the split is
+            # bookkeeping and calling it a side pot states something untrue.
+            capped_out = [
+                name for name in pots[-1]["eligible_players"] if name not in eligible
+            ]
+            cause: PotLayerCause = "side" if capped_out else "dead_money"
+        else:
+            cause = "main"
             amount += dead_money
             # Dead money joins this layer, so everyone still in the hand can win
             # it -- including a player whose ENTIRE commitment was a forced post.
@@ -699,6 +741,7 @@ def _build_pots(
                     "amount": amount,
                     "contributors": contributors,
                     "eligible_players": eligible,
+                    "cause": cause,
                 }
             )
         previous = level
@@ -706,11 +749,14 @@ def _build_pots(
         eligible = tuple(name for name in order if name not in folded)
         if not eligible:
             raise LedgerError("Dead money has no eligible player.")
+        # Nobody put a live chip in, so the whole pot is the forced posts. It is
+        # still the one pot every remaining player contests.
         pots.append(
             {
                 "amount": dead_money,
                 "contributors": (),
                 "eligible_players": eligible,
+                "cause": "main",
             }
         )
     return pots

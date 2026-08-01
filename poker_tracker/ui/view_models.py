@@ -11,6 +11,23 @@ from poker_tracker.persistence.completion import (
     has_operator_manual_completion,
 )
 from poker_tracker.persistence.models import Hand, ProcessingJob, Session, VideoRecord
+from poker_tracker.safety.redaction import redact_text
+
+# A progress reading only describes a job that is still doing work. Every other
+# status is terminal, and the two sets below are the only place that distinction
+# is made, so a status added later cannot quietly acquire a progress bar: it
+# falls through to "stopped without succeeding", which is the safe side.
+LIVE_JOB_STATUSES = frozenset({"queued", "running", "cancelling"})
+SUCCEEDED_JOB_STATUSES = frozenset({"completed"})
+
+# What one job of each type actually commits, and the verb the product uses for
+# it. "imported" is deliberate for reconstruction: the promise the operator is
+# owed is that no failed or partial job ever claims a hand was imported.
+_COMMITTED_UNITS: dict[str, tuple[str, str, str]] = {
+    "cv_reconstruction": ("hand", "hands", "imported"),
+    "frame_extraction": ("frame", "frames", "extracted"),
+}
+_UNKNOWN_UNIT = ("record", "records", "written")
 
 
 @dataclass(frozen=True)
@@ -51,15 +68,59 @@ class HandRow:
 
 
 @dataclass(frozen=True)
+class JobOutcome:
+    """What a job is doing, or what it left behind once it stopped.
+
+    A percentage is a reading of work in flight. The moment a job stops without
+    succeeding it stops being a reading of anything, and "82%" beside a failed
+    import is read as "most of my hands got in" -- the precise claim this
+    product is not allowed to make. So ``progress_percent`` is ``None`` for
+    every terminal status and ``progress_label`` degrades to a dash, and their
+    place is taken by ``statement``: a count that was queried from the database
+    rather than inferred from how far the worker happened to get.
+
+    ``committed_count is None`` means the caller did not look. That is said
+    plainly instead of being rendered as zero, because "nothing was imported"
+    is itself a claim about the database and has to be earned by a query.
+    """
+
+    job_id: int
+    job_type: str
+    status: str
+    is_live: bool
+    succeeded: bool
+    headline: str
+    statement: str
+    progress_percent: float | None
+    progress_label: str
+    committed_count: int | None
+    destination: str
+    error_message: str
+    log_path: str
+    log_tail: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class JobRow:
     job_id: int
     video_id: int
     filename: str
     job_type: str
     status: str
-    progress_percent: float
+    # ``None`` once the job has stopped: a stale reading is not an outcome, and
+    # a row that cannot carry one cannot be formatted into a misleading percent.
+    progress_percent: float | None
     message: str
     age_label: str
+    outcome: JobOutcome
+
+    @property
+    def progress_label(self) -> str:
+        return self.outcome.progress_label
+
+    @property
+    def outcome_statement(self) -> str:
+        return self.outcome.statement
 
 
 def build_portfolio_summary(hands: Iterable[Hand], session_count: int) -> PortfolioSummary:
@@ -127,28 +188,152 @@ def build_hand_rows(
     return rows
 
 
+def job_is_live(status: str) -> bool:
+    """Whether the job is still working, and its progress reading still means something."""
+    return (status or "").strip().lower() in LIVE_JOB_STATUSES
+
+
+def job_succeeded(status: str) -> bool:
+    return (status or "").strip().lower() in SUCCEEDED_JOB_STATUSES
+
+
+def job_stopped_without_success(status: str) -> bool:
+    """Failed, cancelled, timed out, worker died -- and anything added later.
+
+    Deliberately defined by exclusion. A status this build does not recognize is
+    treated as a terminal failure rather than as live work, so a new terminal
+    state cannot inherit a progress bar by being forgotten here.
+    """
+    return not job_is_live(status) and not job_succeeded(status)
+
+
+def build_job_outcome(
+    job: ProcessingJob,
+    *,
+    committed_count: int | None = None,
+    destination: str = "",
+    log_path: str = "",
+    log_tail: Iterable[str] = (),
+) -> JobOutcome:
+    """Phrase one job's state as an outcome the operator can act on.
+
+    Every caller that has queried what the job actually committed passes
+    ``committed_count``; the wording below never guesses it from the progress
+    figure, which is the whole point. Free text reaching the screen -- the
+    worker's message, the failure detail, the log tail -- is scrubbed here so
+    that no surface can display an unredacted credential by choosing to render
+    a field directly.
+    """
+    status = (job.status or "").strip().lower()
+    live = job_is_live(status)
+    succeeded = job_succeeded(status)
+    singular, plural, verb = _COMMITTED_UNITS.get(job.job_type, _UNKNOWN_UNIT)
+    title = status.replace("_", " ").title() or "Unknown"
+    message = redact_text(job.message or "").strip()
+    error_message = redact_text(job.error_message or "").strip()
+    where = f" in {destination}" if destination else ""
+
+    if live:
+        progress_percent: float | None = job.progress_percent
+        progress_label = f"{job.progress_percent:.0f}%"
+        headline = title
+        statement = message or "Working."
+    else:
+        progress_percent = None
+        progress_label = "—"
+        count_phrase = (
+            ""
+            if committed_count is None
+            else (f"1 {singular}" if committed_count == 1 else f"{committed_count} {plural}")
+        )
+        if succeeded:
+            headline = title
+            if committed_count is None:
+                statement = message or "Finished."
+            elif committed_count == 0:
+                statement = (
+                    f"{message + '. ' if message else ''}"
+                    f"No {plural} from this job are in the study database yet."
+                )
+            else:
+                statement = (
+                    f"{message + '. ' if message else ''}"
+                    f"{count_phrase} from this job {'is' if committed_count == 1 else 'are'} "
+                    f"in the study database{where}."
+                )
+        elif committed_count is None:
+            headline = title
+            statement = (
+                f"{title}. This view did not check what the job committed; open the "
+                "video's reconstruction panel for the outcome."
+            )
+        elif committed_count == 0:
+            headline = f"{title} · nothing {verb}"
+            statement = (
+                f"No {plural} were {verb}. Nothing from this job reached the study database."
+            )
+        else:
+            headline = f"{title} · {count_phrase} {verb}"
+            statement = (
+                f"{count_phrase} {'was' if committed_count == 1 else 'were'} {verb} "
+                f"before the job stopped, and {'it is' if committed_count == 1 else 'they are'} "
+                f"{('in ' + destination) if destination else 'in the study database'}. "
+                f"Nothing else from this job reached the study database."
+            )
+
+    return JobOutcome(
+        job_id=job.id or 0,
+        job_type=job.job_type,
+        status=status,
+        is_live=live,
+        succeeded=succeeded,
+        headline=headline,
+        statement=statement,
+        progress_percent=progress_percent,
+        progress_label=progress_label,
+        committed_count=committed_count,
+        destination=destination,
+        error_message=error_message,
+        log_path=log_path,
+        log_tail=tuple(redact_text(line) for line in log_tail),
+    )
+
+
 def build_job_rows(
     jobs: Iterable[ProcessingJob],
     videos: Iterable[VideoRecord],
     *,
+    outcomes: Mapping[int, JobOutcome] | None = None,
     now: datetime | None = None,
 ) -> list[JobRow]:
+    """Rows for a job list, each carrying the outcome it is allowed to display.
+
+    ``outcomes`` comes from the resolver that queried the database. A caller
+    that supplies none still gets rows, but the outcome they carry says the
+    committed work was not checked rather than inventing a zero.
+    """
     video_names = {video.id: video.original_filename for video in videos if video.id is not None}
+    resolved = outcomes or {}
     current = now or datetime.now(UTC)
-    return [
-        JobRow(
-            job_id=job.id or 0,
-            video_id=job.video_id,
-            filename=video_names.get(job.video_id, "Unknown video"),
-            job_type=job.job_type.replace("_", " ").title(),
-            status=job.status,
-            progress_percent=job.progress_percent,
-            message=job.message or job.error_message,
-            age_label=format_age(job.created_at, current),
+    rows: list[JobRow] = []
+    for job in jobs:
+        if job.id is None:
+            continue
+        outcome = resolved.get(job.id) or build_job_outcome(job)
+        rows.append(
+            JobRow(
+                job_id=job.id,
+                video_id=job.video_id,
+                filename=video_names.get(job.video_id, "Unknown video"),
+                job_type=job.job_type.replace("_", " ").title(),
+                status=job.status,
+                progress_percent=outcome.progress_percent,
+                message=redact_text(job.message or job.error_message),
+                age_label=format_age(job.created_at, current),
+                outcome=outcome,
+            )
         )
-        for job in jobs
-        if job.id is not None
-    ]
+    return rows
 
 
 def completion_evidence_rows(

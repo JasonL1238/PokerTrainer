@@ -20,7 +20,8 @@ from pathlib import Path
 import pytest
 
 from poker_tracker.persistence.db import PokerDatabase
-from poker_tracker.persistence.models import ProcessingJob, Session
+from poker_tracker.persistence.models import Hand, ProcessingJob, Session, SolverRun
+from poker_tracker.solver.run_job import run_solver_job
 from poker_tracker.ui import run_cv_job
 from poker_tracker.ui.video_ingest import (
     VideoIngestLimits,
@@ -284,6 +285,200 @@ def test_failure_messages_are_bounded_and_single_line(job_workspace, monkeypatch
     assert "\n" not in message, "newlines break the job list rendering"
     assert secret not in message
     assert "<redacted>" in message, "the key must be scrubbed, not merely cut off"
+
+
+# --- The store, not the worker, is what keeps a credential out of SQLite -----
+
+CREDENTIAL = "sk-ant-boundary-secret-key"
+
+
+def _stored_text(db_path: Path, sql: str, params: tuple[object, ...]) -> str:
+    """What SQLite actually holds, read outside the store that wrote it."""
+    connection = sqlite3.connect(db_path)
+    try:
+        row = connection.execute(sql, params).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    return row[0] or ""
+
+
+def test_a_failure_message_is_scrubbed_whatever_writer_hands_it_over(job_workspace):
+    """No worker is involved here, and the stored row still has to be clean.
+
+    Every scrubbing worker is one forgetful writer away from a leak -- the solver
+    worker stored ``str(exc)`` for exactly that reason. This writes through the
+    lowest-level public write path, which is what a writer added tomorrow will
+    reach for.
+    """
+    db, db_path, _video_path, job_id = job_workspace
+    db.update_processing_job(
+        job_id,
+        status="failed",
+        message=f"Authorization: Token {CREDENTIAL}",
+        error_message=f"calling provider with api_key={CREDENTIAL}",
+    )
+
+    stored = _stored_text(
+        db_path, "SELECT error_message FROM processing_jobs WHERE id = ?", (job_id,)
+    )
+    assert CREDENTIAL not in stored
+    assert "<redacted>" in stored, "scrubbed, not merely truncated"
+    # The progress column is displayed and exported beside the failure column,
+    # and the view model falls back to it, so it carries the same guarantee.
+    assert CREDENTIAL not in _stored_text(
+        db_path, "SELECT message FROM processing_jobs WHERE id = ?", (job_id,)
+    )
+
+
+def test_a_job_inserted_with_a_credential_is_stored_scrubbed(job_workspace):
+    """The insert is a write path too; a row can arrive already failed."""
+    db, db_path, _video_path, job_id = job_workspace
+    existing = db.fetch_processing_job(job_id)
+    assert existing is not None
+    created = db.create_processing_job(
+        ProcessingJob(
+            video_id=existing.video_id,
+            job_type="cv_reconstruction",
+            status="failed",
+            error_message=f"api_key={CREDENTIAL}",
+        )
+    )
+
+    stored = _stored_text(
+        db_path, "SELECT error_message FROM processing_jobs WHERE id = ?", (created.id,)
+    )
+    assert CREDENTIAL not in stored
+    assert "<redacted>" in stored
+
+
+def _solver_workspace(tmp_path: Path) -> tuple[PokerDatabase, Path, int]:
+    db_path = tmp_path / "solver.db"
+    db = make_db(str(db_path))
+    session = db.create_session(Session(name="Solver failure"))
+    hand = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=1,
+            game_type="NLHE cash",
+            table_size=6,
+        )
+    )
+    assert hand.id is not None
+    return db, db_path, hand.id
+
+
+def _solver_spot(hand_id: int) -> dict[str, object]:
+    return {
+        "hand_id": hand_id,
+        "table_size": 6,
+        "street": "flop",
+        "board": "Ah7d2c",
+        "pot": 10.0,
+        "effective_stack": 90.0,
+        "pot_type": "single_raised",
+        "preflop_aggressor_key": "hero",
+        "oop": {
+            "player_key": "hero",
+            "player_name": "Hero",
+            "position": "BB",
+            "role": "oop",
+            "is_hero": True,
+        },
+        "ip": {
+            "player_key": "villain",
+            "player_name": "Villain",
+            "position": "BTN",
+            "role": "ip",
+        },
+        "hero_cards": "AhQs",
+    }
+
+
+def _resolved_range(player_key: str, role: str) -> dict[str, object]:
+    return {
+        "player_key": player_key,
+        "player_name": player_key.title(),
+        "position": "BB" if role == "oop" else "BTN",
+        "role": role,
+        "source": "custom",
+        "profile_name": "Test range",
+        "notation": "AA",
+        "solver_notation": "AA",
+        "combo_count": 6,
+        "range_percent": 0.05,
+    }
+
+
+def test_a_solver_runs_failure_message_is_scrubbed_at_the_store(tmp_path: Path):
+    """The other job table has the same column and the same exposure."""
+    db, db_path, hand_id = _solver_workspace(tmp_path)
+    try:
+        run = db.create_solver_run(
+            SolverRun(
+                hand_id=hand_id,
+                input_hash="c" * 64,
+                error_message=f"api_key={CREDENTIAL}",
+            )
+        )
+        assert CREDENTIAL not in _stored_text(
+            db_path, "SELECT error_message FROM solver_runs WHERE id = ?", (run.id,)
+        )
+
+        db.update_solver_run(
+            run.id,
+            status="failed",
+            error_message=f"provider rejected api_key={CREDENTIAL}",
+        )
+        stored = _stored_text(
+            db_path, "SELECT error_message FROM solver_runs WHERE id = ?", (run.id,)
+        )
+        assert CREDENTIAL not in stored
+        assert "<redacted>" in stored
+    finally:
+        db.close()
+
+
+def test_the_solver_worker_cannot_store_a_raw_exception(tmp_path: Path, monkeypatch):
+    """The writer this was found in, driven end to end."""
+    binary = tmp_path / "console_solver"
+    binary.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    binary.chmod(0o755)
+    resources = tmp_path / "resources"
+    (resources / "compairer").mkdir(parents=True)
+    (resources / "compairer" / "card5_dic_sorted.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setenv("TEXAS_SOLVER_PATH", str(binary))
+    monkeypatch.setenv("TEXAS_SOLVER_RESOURCE_DIR", str(resources))
+
+    db, db_path, hand_id = _solver_workspace(tmp_path)
+    command_path = tmp_path / "input.txt"
+    command_path.write_text("set_pot 10\n", encoding="utf-8")
+    run = db.create_solver_run(
+        SolverRun(
+            hand_id=hand_id,
+            input_hash="d" * 64,
+            spot=_solver_spot(hand_id),
+            range_ip=_resolved_range("villain", "ip"),
+            range_oop=_resolved_range("hero", "oop"),
+            command_path=str(command_path),
+            result_path=str(tmp_path / "result.json"),
+            log_path=str(tmp_path / "solver.log"),
+        )
+    )
+
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError(f"solver launch failed with api_key={CREDENTIAL}")
+
+    monkeypatch.setattr(subprocess, "Popen", _explode)
+    with pytest.raises(RuntimeError):
+        run_solver_job(db, run.id, timeout_seconds=5)
+
+    stored = _stored_text(
+        db_path, "SELECT error_message FROM solver_runs WHERE id = ?", (run.id,)
+    )
+    assert stored.strip(), "a failed run must still say why"
+    assert CREDENTIAL not in stored
+    assert "<redacted>" in stored
 
 
 @pytest.mark.parametrize(
