@@ -180,7 +180,7 @@ ISSUE_GUIDANCE: dict[str, tuple[str, str]] = {
     ),
 }
 
-_STREET_BY_BOARD_COUNT = {0: "Preflop", 3: "Flop", 4: "Turn", 5: "River"}
+STREET_BY_BOARD_COUNT = {0: "Preflop", 3: "Flop", 4: "Turn", 5: "River"}
 
 
 def timeline_path_for_job(
@@ -263,7 +263,7 @@ def states_for_hand(
 def observed_facts(state: dict[str, Any]) -> list[tuple[str, str]]:
     """Compact, human-readable model observations for one retained frame."""
     board = state.get("board_cards") or []
-    street = _STREET_BY_BOARD_COUNT.get(len(board), str(state.get("stage") or "Unknown").title())
+    street = STREET_BY_BOARD_COUNT.get(len(board), str(state.get("stage") or "Unknown").title())
     stacks = state.get("stacks") or {}
     bets = state.get("bets") or {}
     pills = state.get("pills") or {}
@@ -324,7 +324,7 @@ def history_impacts(
     if board != prior_board and board:
         impacts.append(
             {
-                "kind": _STREET_BY_BOARD_COUNT.get(len(board), "Board"),
+                "kind": STREET_BY_BOARD_COUNT.get(len(board), "Board"),
                 "text": f"Board became {_cards(board)}.",
                 "source": "face-card detections",
             }
@@ -1608,7 +1608,7 @@ def select_key_frames_for_review(
         # Skip preflop (0); keep Flop/Turn/River from the shared street map.
         if board_len < 3 or board_len in seen_board_lens:
             continue
-        label = _STREET_BY_BOARD_COUNT.get(board_len)
+        label = STREET_BY_BOARD_COUNT.get(board_len)
         if label is None:
             continue
         add(label, state)

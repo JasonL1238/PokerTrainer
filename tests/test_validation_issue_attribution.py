@@ -479,7 +479,9 @@ def test_a_seat_never_seen_holding_cards_is_described_as_such() -> None:
     # Frame B is later, and seat 1 never held cards on any earlier frame.
     issue = _stranded_seat_issue(_row(action_type="bet"), context, FRAME_B)
     assert issue is not None
-    assert "may never have been in this hand" in issue.detail
+    # The panel renders the seat's own fold row cleanly elsewhere, so
+    # "never in this hand" would contradict it. State both possibilities.
+    assert "never dealt in, or had already folded" in issue.detail
     assert "already left the hand" not in issue.detail
 
     # With an earlier frame showing cards, the stronger claim is correct.
@@ -658,3 +660,117 @@ def test_the_seat_absence_notice_is_never_duplicated() -> None:
     )
     kinds = [issue.kind for issue in issues]
     assert kinds.count("Seat not in the hand on this frame") <= 1
+
+
+def test_a_type_change_that_retires_a_check_says_so() -> None:
+    """B13 round 13 F2: retyping a money row to a fold stopped the stack check
+    from running, and the row rendered completely clean while the value that
+    check had objected to was still saved."""
+    hand = _hand()
+    hand["actions"][0]["amount"] = 10.0
+    states = _states()
+    states[0]["bets"] = {"1": 10.0}
+    states[0]["stacks"] = {"1": 190.0}
+    context = ValidationFrameContext(
+        job_id=1, hand_number=1, timeline_hand=hand, states=states,
+        reviews_by_image={}, cursor_key="c", pending_hand_key="p",
+        recording_start_s=0.0,
+    )
+    flagged = _row(amount=10.0, stack_before=190.0)
+    assert any(
+        issue.kind == "Stack before looks post-action"
+        for issue in _cv_issues_for_db_action(flagged, context)
+    )
+    retyped = _row(action_type="fold", amount=10.0, stack_before=190.0)
+    issues = _cv_issues_for_db_action(retyped, context)
+    assert issues, "the row went completely silent"
+    notice = next(
+        (issue for issue in issues if issue.kind == "Check no longer applies"),
+        None,
+    )
+    assert notice is not None
+    assert "190 BB" in notice.detail
+    assert "nothing it flagged was corrected" in notice.detail
+
+
+def test_the_badge_and_the_body_share_one_order() -> None:
+    """B13 round 13 F3: only the badge was sorted, so the kind it promoted
+    could appear last when the row was expanded."""
+    from app import _ordered_by_severity
+
+    issues = [
+        ActionCvIssue(kind="Coverage gap", detail="c"),
+        ActionCvIssue(kind="Edited line", detail="e"),
+        ActionCvIssue(kind="Action may not belong to this hand", detail="a"),
+        ActionCvIssue(kind="Amount unknown", detail="m"),
+    ]
+    ordered = [issue.kind for issue in _ordered_by_severity(issues)]
+    assert ordered[0] == "Edited line", "the edit note must stay first"
+    assert ordered[1] == "Action may not belong to this hand"
+    assert ordered.index("Amount unknown") < ordered.index("Coverage gap")
+
+
+def test_the_seat_absence_fact_is_stated_once() -> None:
+    """B13 round 13 F4: the same frame fact appeared three times and consumed
+    both badge slots."""
+    context = _no_cards_context()
+    issues = _cv_issues_for_db_action(
+        _row(action_type="bet", action_index=9), context
+    )
+    seat_facts = [
+        issue
+        for issue in issues
+        if issue.kind
+        in ("Action may not belong to this hand", "Seat not in the hand on this frame")
+    ]
+    assert len(seat_facts) <= 1
+
+
+def test_a_re_added_fold_can_reach_a_clean_state() -> None:
+    """B13 round 13 F6: the notice demanded an Amount on a fold, so the only
+    way to clear it was to type 0 into a field labelled 'Not applicable'."""
+    added_fold = _row(
+        action_type="fold", amount=None, stack_before=200.0, source_image=None
+    )
+    assert not [
+        issue
+        for issue in _cv_issues_for_db_action(added_fold, _context())
+        if issue.kind == "Frame checks no longer apply"
+    ]
+
+
+def test_the_caption_distinguishes_no_figure_from_a_condemned_one() -> None:
+    """B13 round 13 F1: 'don't auto-offer' and 'the figure is wrong' were
+    conflated, so a caption told the operator not to copy a figure on 17 of 33
+    rows where the warning above had just handed them one."""
+    from app import _issue_requests_a_stack_value, _issue_rules_out_its_figure
+
+    offers = ActionCvIssue(
+        kind="Stack before unknown",
+        detail="The reconstruction read 182.2 BB for this seat on frame 12 — "
+        "check that frame and enter the value.",
+        offers_a_value=True,
+    )
+    assert _issue_requests_a_stack_value(offers) is True
+    assert _issue_rules_out_its_figure(offers) is False
+
+    condemned = ActionCvIssue(
+        kind="Stack before looks post-action",
+        detail="The saved stack (212.2 BB) is what frame 1 reads after this "
+        "seat's chips moved.",
+    )
+    assert _issue_rules_out_its_figure(condemned) is True
+
+    self_confirming = ActionCvIssue(
+        kind="Stack before unknown",
+        detail="The reconstruction computed 1447.9 BB. That figure is the "
+        "reader's own value for frame 16, so it cannot confirm itself.",
+    )
+    assert _issue_rules_out_its_figure(self_confirming) is True
+
+    # Merely withholding a value is not a condemnation.
+    withheld = ActionCvIssue(
+        kind="Stack before unknown",
+        detail="No frame before this action shows this seat's stack.",
+    )
+    assert _issue_rules_out_its_figure(withheld) is False

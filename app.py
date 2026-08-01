@@ -193,6 +193,7 @@ from poker_tracker.ui.reconstruction_review import (
     ISSUE_GUIDANCE,
     MONEY_ACTION_TYPES,
     STACK_VALUE_KINDS,
+    STREET_BY_BOARD_COUNT,
     ActionCvIssue,
     FrameIssueTarget,
     ValidationFrameContext,
@@ -5621,18 +5622,20 @@ def show_action_editor_contents(
                     "source frame flagged: "
                     + (", ".join(linked.issue_types) or "frame")
                 )
-            cv_issues = _cv_issues_for_db_action(
-                action,
-                frame_context,
-                fallback_frame_index=(
-                    linked.frame_index if linked is not None else None
-                ),
+            cv_issues = _ordered_by_severity(
+                _cv_issues_for_db_action(
+                    action,
+                    frame_context,
+                    fallback_frame_index=(
+                        linked.frame_index if linked is not None else None
+                    ),
+                )
             )
             if cv_issues:
                 cv_kinds = list(
                     dict.fromkeys(
                         issue.kind.lower()
-                        for issue in sorted(cv_issues, key=_issue_badge_rank)
+                        for issue in cv_issues
                         if issue.kind != "Edited line"
                     )
                 )
@@ -5694,6 +5697,9 @@ def show_action_editor_contents(
                         and not _issue_requests_a_stack_value(issue)
                         for issue in cv_issues
                     ),
+                    stack_value_ruled_out=any(
+                        _issue_rules_out_its_figure(issue) for issue in cv_issues
+                    ),
                 )
 
     with st.expander("Add a missing action", expanded=not editable):
@@ -5742,6 +5748,26 @@ def _slot_source_image_ignoring_identity(
         action_index=action.action_index,
         position="",
         player_name="",
+    )
+
+
+# Phrases that mark a message as CONDEMNING the figure it names, rather than
+# simply not offering one. Only these may produce the "do not copy" caption.
+_RULED_OUT_MARKERS = (
+    "cannot confirm itself",
+    "not the stack before this action",
+    "is the stack AFTER this action",
+    "put chips in since then",
+)
+
+
+def _issue_rules_out_its_figure(issue: ActionCvIssue) -> bool:
+    """Whether this message tells the operator its own figure is wrong."""
+
+    if issue.kind == "Stack before looks post-action":
+        return True
+    return issue.kind in STACK_VALUE_KINDS and any(
+        marker in issue.detail for marker in _RULED_OUT_MARKERS
     )
 
 
@@ -5936,6 +5962,12 @@ def _cv_issues_for_db_action(
     )
     if detached and _row_still_matches_origin(action, origin):
         detached = False
+    if detached:
+        retired = _claims_retired_by_the_edit(
+            action, origin, frame_context, issues
+        )
+        if retired:
+            issues.append(retired)
     if detached and issues:
         # Never let a correction silently clear a live warning: say the
         # warnings are re-derived from the frame this row came from.
@@ -5978,6 +6010,57 @@ def _origin_is_unambiguous(
         if str(line.get("source_image") or "") == action.source_image
     ]
     return len(same_frame) == 1
+
+
+def _claims_retired_by_the_edit(
+    action: Action,
+    origin: dict[str, object],
+    frame_context: ValidationFrameContext,
+    issues: list[ActionCvIssue],
+) -> ActionCvIssue | None:
+    """Warn when an edit stopped a check that had been flagging a saved value.
+
+    Retyping a money action to a fold stops the amount and stack checks from
+    running, but the value they were objecting to is still stored. Going quiet
+    reads as resolved, so say which check no longer applies and what it had
+    flagged.
+    """
+
+    kinds_now = {issue.kind for issue in issues}
+    before = cv_issues_for_timeline_action(
+        origin,
+        frame_context.timeline_hand,
+        frame_context.states,
+        db_amount=action.amount,
+        db_stack_before=action.stack_before,
+        recording_start_s=frame_context.recording_start_s,
+        db_street=str(origin.get("street") or action.street),
+        db_action_type=str(origin.get("action_type") or action.action_type),
+    )
+    lost = [
+        issue
+        for issue in before
+        if issue.kind not in kinds_now
+        and issue.kind in {"Stack before looks post-action", "Amount unknown"}
+    ]
+    if not lost:
+        return None
+    names = " and ".join(sorted({issue.kind.lower() for issue in lost}))
+    saved = (
+        f" Its saved Stack before ({action.stack_before:g} BB) was what that "
+        "check objected to."
+        if action.stack_before is not None
+        and any(i.kind == "Stack before looks post-action" for i in lost)
+        else ""
+    )
+    return ActionCvIssue(
+        kind="Check no longer applies",
+        detail=(
+            f"This line's type changed, so the import's {names} check no "
+            f"longer runs on it — but nothing it flagged was corrected.{saved} "
+            "Re-check this row against its frames yourself."
+        ),
+    )
 
 
 def _row_is_the_same_line(action: Action, origin: dict[str, object]) -> bool:
@@ -6026,6 +6109,45 @@ _BADGE_RANK = {
 
 def _issue_badge_rank(issue: ActionCvIssue) -> int:
     return _BADGE_RANK.get(issue.kind, 5)
+
+
+def _ordered_by_severity(issues: list[ActionCvIssue]) -> list[ActionCvIssue]:
+    """One order for the badge and the expanded body, so they never disagree.
+
+    The badge shows two kinds; the body shows all of them. Sorting only the
+    badge meant the item it promoted could appear last when expanded.
+    """
+
+    edited = [issue for issue in issues if issue.kind == "Edited line"]
+    rest = sorted(
+        (issue for issue in issues if issue.kind != "Edited line"),
+        key=_issue_badge_rank,
+    )
+    return [*edited, *rest]
+
+
+def _street_depicted_by_frame(
+    frame_context: ValidationFrameContext,
+    own_image: str | None,
+) -> str:
+    """The street a frame shows, from its board size."""
+
+    if not own_image:
+        return ""
+    state = next(
+        (
+            candidate
+            for candidate in frame_context.states
+            if str(candidate.get("image") or "") == own_image
+        ),
+        None,
+    )
+    if state is None:
+        return ""
+    board = state.get("board_cards")
+    if not isinstance(board, list):
+        return ""
+    return STREET_BY_BOARD_COUNT.get(len(board), "").lower()
 
 
 def _frame_phrase(frame_index: int | None, action: Action) -> str:
@@ -6140,8 +6262,9 @@ def _issues_for_unattributable_row(
             )
         )
     issues.extend(_frame_evidence_for_row(action, frame_context, own_image))
+    needs_amount = action.action_type.replace("-", "_") in MONEY_ACTION_TYPES
     if not action.source_image and (
-        action.stack_before is None or action.amount is None
+        action.stack_before is None or (needs_amount and action.amount is None)
     ):
         issues.append(
             ActionCvIssue(
@@ -6205,7 +6328,11 @@ def _frame_evidence_for_row(
         "action_index": (neighbour or {}).get("action_index", action.action_index),
         # The street the LINE was reconstructed on, so a moved row still gets
         # hedged here; falls back to the row's own street when unknown.
-        "street": str((neighbour or {}).get("street") or action.street),
+        "street": str(
+            (neighbour or {}).get("street")
+            or _street_depicted_by_frame(frame_context, own_image)
+            or action.street
+        ),
         "action_type": action.action_type,
         # Deliberately no amount or stack_before: this row has no
         # reconstructed reads any more, and copying a neighbour's would be
@@ -6272,6 +6399,13 @@ def _frame_evidence_for_row(
         # consecutive rounds found an edit silently clearing this accusation.
         stranded = _stranded_seat_issue(action, frame_context, own_image)
         if stranded is not None:
+            # It supersedes the weaker seat-absence notice rather than joining
+            # it: one frame fact stated twice consumes both badge slots.
+            issues = [
+                issue
+                for issue in issues
+                if issue.kind != "Seat not in the hand on this frame"
+            ]
             issues.insert(0, stranded)
     return issues
 
@@ -6319,8 +6453,9 @@ def _stranded_seat_issue(
     consequence = (
         "so it had already left the hand and cannot have acted here"
         if held_earlier
-        else "and no earlier frame shows it holding any, so it may never have "
-        "been in this hand"
+        else "and no frame in this hand shows it holding any — it was either "
+        "never dealt in, or had already folded before the first retained "
+        "frame"
     )
     return ActionCvIssue(
         kind=ACTION_MAY_NOT_BELONG,
@@ -6412,6 +6547,7 @@ def _render_edit_one_action(
     *,
     needs_stack_before: bool = False,
     stack_value_not_supplied: bool = False,
+    stack_value_ruled_out: bool = False,
 ) -> None:
     """Simple per-action editor: Who / What / Amount first; advanced fields optional.
 
@@ -6449,7 +6585,9 @@ def _render_edit_one_action(
         ),
     )
     advanced_key = f"action_advanced_{action.id}"
-    if (needs_stack_before or stack_value_not_supplied) and (
+    if (
+        needs_stack_before or stack_value_not_supplied or stack_value_ruled_out
+    ) and (
         advanced_key not in st.session_state
     ):
         # A warning on this row asks for Stack before, which lives here.
@@ -6510,11 +6648,16 @@ def _render_edit_one_action(
                     "Stack before is requested by a warning on this action — "
                     "fill it in from the frame that warning names."
                 )
+            elif stack_value_ruled_out:
+                caption = (
+                    "The warning above rules out the figure it names — work "
+                    "the value out from the frames before entering it here."
+                )
             elif stack_value_not_supplied:
                 caption = (
-                    "A warning on this action concerns Stack before. Read it "
-                    "from the frames if you can establish it — do not copy a "
-                    "figure the warning has ruled out."
+                    "A warning on this action concerns Stack before. Follow "
+                    "its instruction: read the frame it names and enter what "
+                    "you see."
                 )
             else:
                 caption = (
