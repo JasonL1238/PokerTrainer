@@ -43,6 +43,11 @@ def directory_bytes(path: Path) -> int:
     """
     if not path.exists():
         return 0
+    if path.is_symlink():
+        # ``os.walk`` follows a symlinked TOP regardless of followlinks, so a
+        # report dir pointing at the video vault would bill the whole corpus as
+        # this run's output.
+        return 0
     total = 0
     for root, _dirs, files in os.walk(path, followlinks=False):
         for name in files:

@@ -38,31 +38,6 @@ STREET_RANK: dict[str, int] = {
     "showdown": 4,
 }
 
-CRITICAL_CATEGORIES = frozenset(
-    {
-        "missed_hand",
-        "spurious_hand",
-        "split_hand",
-        "merged_hand",
-        "duplicate_hand",
-        "completion_class",
-        "hero_cards",
-        "board_cards",
-        "winner",
-        "result",
-        "illegal_action",
-        # Material action-line failures on a complete GT hand.
-        "missing_action",
-        "spurious_action",
-        "action_amount",
-        "action_order",
-        # A fact that is neither annotated nor declared unobservable cannot be
-        # scored at all, so the gate treats the corpus itself as failing.
-        "answer_key_incomplete",
-    }
-)
-
-
 def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
     return max(0.0, min(a1, b1) - max(a0, b0))
 
@@ -116,22 +91,35 @@ def _declared_unobservable(gt: dict[str, Any]) -> set[str]:
     return {fact for fact in raw if isinstance(fact, str)}
 
 
-def _gt_action_sequence(gt: dict[str, Any]) -> list[dict[str, Any]]:
+def _gt_action_sequence(
+    gt: dict[str, Any], excluded_facts: list[str] | None = None
+) -> list[dict[str, Any]]:
     """Certain, observable answer-key actions in play order.
 
     Ordering is scored, so the sequence must come from the annotated
     ``street``/``order`` pair rather than from however the JSON happens to be
     laid out on disk.
+
+    Actions marked uncertain or unobservable are dropped from scoring, and each
+    one is recorded as a skipped check. Dropping them silently is the same
+    failure the hand-fact ``unobservable`` rule exists to prevent: an answer key
+    could mark every action uncertain and the report would show a clean score
+    over a line nothing checked.
     """
-    actions = [
-        action
-        for action in (gt.get("actions") or [])
-        if isinstance(action, dict)
-        and action.get("certain") is True
-        and action.get("observable", True) is True
-    ]
+    scored: list[dict[str, Any]] = []
+    for action in gt.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        if action.get("certain") is True and action.get("observable", True) is True:
+            scored.append(action)
+        elif excluded_facts is not None:
+            reason = "uncertain" if action.get("certain") is not True else "unobservable"
+            excluded_facts.append(
+                f"action:{action.get('street')}:{action.get('seat')}:"
+                f"{action.get('action')}:{reason}"
+            )
     return sorted(
-        actions,
+        scored,
         key=lambda action: (
             STREET_RANK.get(str(action.get("street")), len(STREET_RANK)),
             action.get("order") if isinstance(action.get("order"), int) else 0,
@@ -335,8 +323,12 @@ def _score_hand(
     # Material action mistakes are critical on complete GT lines; pot/net/dealer stay
     # noncritical and are bounded by MAX_NONCRITICAL_PER_COMPLETED_HAND.
     action_severity = "critical" if actions_complete else "noncritical"
+    if not actions_complete:
+        # The action line is not scored at all on such a hand. Say so, rather
+        # than letting a fabricated action pass unremarked.
+        excluded_facts.append("action_line:answer key declares actions incomplete")
     if actions_complete:
-        gt_actions = _gt_action_sequence(gt)
+        gt_actions = _gt_action_sequence(gt, excluded_facts)
         pred_actions = [a for a in (pred.get("actions") or []) if isinstance(a, dict)]
         available = list(enumerate(pred_actions))
         matched_positions: list[tuple[tuple[str, int, str], int]] = []
@@ -471,18 +463,22 @@ def _score_action_ordering(
     answer key's ``street``/``order`` pair is the reference sequence.
     """
     previous_position = -1
-    previous_want: tuple[str, int, str] | None = None
+    # The action holding the running-max position, which is what a later action
+    # is actually compared against. Naming the immediately preceding action
+    # instead produced messages that pointed at the wrong reference.
+    high_water_want: tuple[str, int, str] | None = None
     for want, position in matched_positions:
-        if position < previous_position and previous_want is not None:
+        if position < previous_position and high_water_want is not None:
             errors.append(
                 _error(
                     "action_order",
-                    f"{want} appears before {previous_want} in the prediction",
+                    f"{want} appears before {high_water_want} in the prediction",
                     severity=severity,
                 )
             )
-        previous_position = max(previous_position, position)
-        previous_want = want
+        if position > previous_position:
+            previous_position = position
+            high_water_want = want
 
 
 def evaluate_answer_key_against_timeline(

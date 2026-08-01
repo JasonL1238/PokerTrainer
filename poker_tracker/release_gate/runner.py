@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -15,18 +16,20 @@ from poker_tracker.release_gate.environment import collect_environment, ffmpeg_v
 from poker_tracker.release_gate.evaluate import evaluate_answer_key_against_timeline
 from poker_tracker.release_gate.models import (
     allowlist_violations,
+    partially_pinned_cases,
     resolve_models,
     unpinned_cases,
 )
 from poker_tracker.release_gate.report import write_report
 from poker_tracker.release_gate.resources import collect_resources
+from poker_tracker.safety.redaction import redact_text, safe_error_message
 from poker_tracker.validation.corpus import (
     EXIT_GATE_FAILED,
     EXIT_OK,
     EXIT_SETUP_INVALID,
     check_corpus,
 )
-from poker_tracker.validation.hashing import sha256_file
+from poker_tracker.validation.hashing import sha256_bytes, sha256_file
 from poker_tracker.validation.schemas import load_json, require_mapping
 
 Mode = Literal["fixture", "full", "container"]
@@ -161,9 +164,19 @@ def run_release_gate(
     document = _load_manifest(manifest_path)
     model_detail: dict[str, Any] = {"models": resolved_models}
     models_ok = True
+    # Pinning completeness is a REPRODUCIBILITY requirement, and only a mode
+    # that actually runs the weights can be unreproducible for lack of them.
+    # Fixture mode loads no model, so incomplete pinning is reported there and
+    # gates nothing -- otherwise the stage reads "failed" inside a verdict that
+    # says the gate passed, which is worse than either answer alone.
+    pinning_is_required = mode in {"full", "container"}
+    model_skipped: str | None = (
+        None if pinning_is_required else "fixture mode loads no model weights"
+    )
     if isinstance(document, str):
         model_detail["error"] = document
         models_ok = False
+        model_skipped = None
     else:
         scored = _scored_cases(document)
         violations = {
@@ -172,32 +185,54 @@ def run_release_gate(
         }
         violations = {k: v for k, v in violations.items() if v}
         unpinned = unpinned_cases(scored)
+        # A case that pins one role and leaves another free is not pinned: the
+        # unpinned role runs whatever happens to be on disk.
+        partial = partially_pinned_cases(scored, resolved_models)
         model_detail["allowlist_violations"] = violations
         model_detail["unpinned_cases"] = unpinned
+        model_detail["partially_pinned_cases"] = partial
         model_detail["scored_cases"] = len(scored)
+        model_detail["pinning_required"] = pinning_is_required
+        # A hash the manifest claims that disagrees with the installed weights is
+        # a manifest/environment contradiction in ANY mode, not a reproducibility
+        # preference, so it always fails.
         if violations:
             models_ok = False
+            model_skipped = None
             for case_id, reasons in violations.items():
                 fail(EXIT_SETUP_INVALID, f"models.{case_id}", "; ".join(reasons))
-        # An unpinned case is unreproducible, so the check has not passed in any
-        # mode. Only a release-certifying mode escalates it to a failing exit
-        # code; fixture mode reports it and its verdict says it certifies nothing.
-        if unpinned:
-            models_ok = False
-            if mode in {"full", "container"}:
+        if pinning_is_required:
+            if unpinned:
+                models_ok = False
                 fail(
                     EXIT_SETUP_INVALID,
                     "models.unpinned",
                     f"cases pin no model weights: {', '.join(sorted(unpinned))}",
                 )
-        if not scored:
-            # Nothing was examined, so "no violations" is not a result.
-            models_ok = False
+            if partial:
+                models_ok = False
+                fail(
+                    EXIT_SETUP_INVALID,
+                    "models.partially_pinned",
+                    "; ".join(
+                        f"{case}: {', '.join(roles)}" for case, roles in partial.items()
+                    ),
+                )
+            if not scored:
+                # Nothing was examined, so "no violations" is not a result.
+                models_ok = False
+                fail(
+                    EXIT_SETUP_INVALID,
+                    "models.no_cases",
+                    "no release-scored cases; nothing was checked",
+                )
+        elif not scored:
             model_detail["note"] = "no release-scored cases; nothing was checked"
     stages.append(
         _stage(
             "models",
             ok=models_ok,
+            skipped=model_skipped,
             elapsed_s=time.perf_counter() - t_models,
             detail=model_detail,
         )
@@ -205,24 +240,37 @@ def run_release_gate(
 
     # --- Stage: mode-specific execution ---
     t1 = time.perf_counter()
-    if mode == "fixture":
-        detail = _run_fixture_predictions(manifest_path)
-        stage_name = "fixture_eval"
-    elif mode == "full":
-        detail = _run_full_reconstruction(
-            manifest_path, report_dir=report_dir, resolved_models=resolved_models
-        )
-        stage_name = "full_video"
-    else:
-        detail = _run_container_acceptance(
-            manifest_path,
-            repo_root=repo_root,
-            report_dir=report_dir,
-            image=container_image or os.environ.get(
-                "POKER_RELEASE_GATE_IMAGE", DEFAULT_CONTAINER_IMAGE
-            ),
-        )
-        stage_name = "container"
+    stage_name = {
+        "fixture": "fixture_eval",
+        "full": "full_video",
+        "container": "container",
+    }[mode]
+    try:
+        if mode == "fixture":
+            detail = _run_fixture_predictions(manifest_path)
+        elif mode == "full":
+            detail = _run_full_reconstruction(
+                manifest_path, report_dir=report_dir, resolved_models=resolved_models
+            )
+        else:
+            detail = _run_container_acceptance(
+                manifest_path,
+                repo_root=repo_root,
+                report_dir=report_dir,
+                image=container_image or os.environ.get(
+                    "POKER_RELEASE_GATE_IMAGE", DEFAULT_CONTAINER_IMAGE
+                ),
+            )
+    except Exception as exc:  # noqa: BLE001 - a crash must still produce evidence
+        # An unhandled error used to propagate out of the CLI, exiting 1 with no
+        # report written at all. That is indistinguishable from a genuine
+        # accuracy failure and leaves nothing to diagnose.
+        detail = {
+            "ok": False,
+            "fail_closed": f"gate crashed: {safe_error_message(exc)}",
+            "setup_invalid": True,
+            "cases": [],
+        }
 
     stage_ok = bool(detail.get("ok")) if corpus.ok else False
     if corpus.ok and not stage_ok:
@@ -242,10 +290,25 @@ def run_release_gate(
     )
 
     aggregate = _aggregate_metrics(detail)
+    # A report may not say the gate passed while carrying a stage that failed.
+    # The exit code and the stage list are computed separately, and any drift
+    # between them is a reporting bug that must not resolve in favour of "pass".
+    failed_stages = [
+        stage["name"] for stage in stages if not stage["ok"] and not stage["skipped"]
+    ]
+    if failed_stages and exit_code == EXIT_OK:
+        fail(
+            EXIT_SETUP_INVALID,
+            "stages",
+            f"stage(s) failed without setting an exit code: {', '.join(failed_stages)}",
+        )
     report = {
         "ok": exit_code == EXIT_OK,
         "exit_code": exit_code,
         "mode": mode,
+        # Present only when this run was launched by an outer container-mode run,
+        # which uses it to prove the report it reads is the one it just caused.
+        "run_token": os.environ.get("POKER_RELEASE_GATE_RUN_TOKEN") or None,
         "certification": _certification(mode, aggregate),
         "manifest_path": _portable_path(manifest_path, repo_root),
         "manifest_sha256": (
@@ -715,35 +778,47 @@ def _run_container_acceptance(
             "cases": [],
         }
 
+    # A fresh directory per run. Reusing one lets a leftover report from an
+    # earlier run be read as this run's verdict when the container exits 0
+    # without writing -- which publishes hand counts nothing measured.
     container_reports = report_dir / "container"
-    container_reports.mkdir(parents=True, exist_ok=True)
-    try:
-        relative_manifest = manifest_path.resolve().relative_to(repo_root)
-    except ValueError:
-        return {
-            "ok": False,
-            "fail_closed": "manifest must live inside the repository for container mode",
-            "setup_invalid": True,
-            "cases": [],
-        }
+    if container_reports.exists():
+        shutil.rmtree(container_reports)
+    container_reports.mkdir(parents=True)
+
+    corpus_dir = manifest_path.resolve().parent
+    manifest_name = manifest_path.name
+    # Proof of authorship. The token is generated here, handed to the container,
+    # and must come back inside the report; a stale or foreign file cannot carry
+    # it. Derived from the run's own inputs so scripts stay reproducible.
+    token = sha256_bytes(
+        f"{image}|{manifest_path.resolve()}|{time.time_ns()}".encode()
+    )
     command = [
         "docker",
         "run",
         "--rm",
         "--network",
         "none",
+        # The corpus is data, mounted read-only somewhere that is NOT on
+        # sys.path. Mounting the repository at the working directory would put
+        # the host's poker_tracker ahead of the image's on sys.path, so the gate
+        # under test would be the host's code and the image would contribute
+        # only an interpreter.
         "-v",
-        f"{repo_root}:/repo:ro",
+        f"{corpus_dir}:/corpus:ro",
         "-v",
         f"{container_reports}:/reports",
+        "-e",
+        f"POKER_RELEASE_GATE_RUN_TOKEN={token}",
         "-w",
-        "/repo",
+        "/app",
         image,
         "python",
         "-m",
         "poker_tracker.release_gate",
         "--manifest",
-        f"/repo/{relative_manifest.as_posix()}",
+        f"/corpus/{manifest_name}",
         "--mode",
         "fixture",
         "--report-dir",
@@ -761,6 +836,9 @@ def _run_container_acceptance(
         return {
             "ok": False,
             "fail_closed": "container acceptance timed out",
+            # A hung container is an environment problem, not a measurement of
+            # product quality.
+            "setup_invalid": True,
             "cases": [],
         }
     except OSError as exc:
@@ -781,7 +859,9 @@ def _run_container_acceptance(
     detail: dict[str, Any] = {
         "image": image,
         "exit_code": completed.returncode,
-        "report_path": str(inner_path) if inner_path.is_file() else None,
+        "report_path": _portable_path(inner_path, report_dir)
+        if inner_path.is_file()
+        else None,
         "artifacts": [str(inner_path)] if inner_path.is_file() else [],
         "cases": [],
     }
@@ -790,7 +870,23 @@ def _run_container_acceptance(
             {
                 "ok": False,
                 "fail_closed": "container run produced no readable report",
-                "stderr_tail": (completed.stderr or "").strip().splitlines()[-5:],
+                "setup_invalid": True,
+                "stderr_tail": [
+                    redact_text(line)
+                    for line in (completed.stderr or "").strip().splitlines()[-5:]
+                ],
+            }
+        )
+        return detail
+    if inner.get("run_token") != token:
+        detail.update(
+            {
+                "ok": False,
+                "fail_closed": (
+                    "container report does not carry this run's token; "
+                    "it was not produced by this run"
+                ),
+                "setup_invalid": True,
             }
         )
         return detail
@@ -800,6 +896,9 @@ def _run_container_acceptance(
     )
     detail["cases_failed"] = int((inner.get("aggregate") or {}).get("cases_failed") or 0)
     detail["ok"] = bool(inner.get("ok")) and completed.returncode == 0
+    # The inner gate's own exit code carries its meaning: 2 is a setup problem
+    # inside the image, not the product scoring badly.
+    detail["setup_invalid"] = completed.returncode == EXIT_SETUP_INVALID
     detail["fail_closed"] = (
         None if detail["ok"] else f"container gate exited {completed.returncode}"
     )

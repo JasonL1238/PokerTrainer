@@ -416,24 +416,50 @@ def test_fixture_mode_states_that_it_certifies_nothing(release_corpus, tmp_path:
     assert "model execution" in joined
 
 
-def test_models_stage_is_not_ok_when_it_checked_nothing(tmp_path: Path):
-    """"No violations" across zero cases is not a passing check."""
+def test_models_stage_reports_that_it_checked_nothing(tmp_path: Path):
+    """"No violations" across zero cases must be visible as zero cases."""
     result = run_release_gate(
         manifest_path=MANIFEST, mode="fixture", report_dir=tmp_path / "reports"
     )
     stage = next(s for s in result.report["stages"] if s["name"] == "models")
-    assert stage["ok"] is False
     assert stage["detail"]["scored_cases"] == 0
+    assert stage["detail"]["pinning_required"] is False
+    assert stage["skipped"]
 
 
-def test_models_stage_is_not_ok_when_cases_pin_nothing(release_corpus, tmp_path: Path):
+def test_certifying_mode_fails_when_the_models_stage_checked_nothing(tmp_path: Path):
     result = run_release_gate(
-        manifest_path=release_corpus(pin_models=False),
-        mode="fixture",
-        report_dir=tmp_path / "reports",
+        manifest_path=MANIFEST, mode="full", report_dir=tmp_path / "reports"
     )
-    stage = next(s for s in result.report["stages"] if s["name"] == "models")
-    assert stage["ok"] is False
+    assert result.exit_code == EXIT_SETUP_INVALID
+    assert any(issue["path"] == "models.no_cases" for issue in result.report["issues"])
+
+
+def test_unpinned_cases_gate_a_certifying_mode_but_only_report_in_fixture(
+    release_corpus, tmp_path: Path, monkeypatch
+):
+    """Pinning is a reproducibility requirement of modes that run the weights.
+
+    Fixture mode loads no model, so failing its models stage would put a failed
+    stage inside a passing verdict — worse than either answer alone.
+    """
+    manifest = release_corpus(pin_models=False)
+    fixture = run_release_gate(
+        manifest_path=manifest, mode="fixture", report_dir=tmp_path / "fixture"
+    )
+    stage = next(s for s in fixture.report["stages"] if s["name"] == "models")
+    assert stage["ok"] is True
+    assert stage["skipped"] == "fixture mode loads no model weights"
+    assert stage["detail"]["unpinned_cases"]
+
+    monkeypatch.delenv("POKER_VALIDATION_ROOT", raising=False)
+    certifying = run_release_gate(
+        manifest_path=manifest, mode="full", report_dir=tmp_path / "full"
+    )
+    assert certifying.exit_code == EXIT_SETUP_INVALID
+    assert any(
+        issue["path"] == "models.unpinned" for issue in certifying.report["issues"]
+    )
 
 
 def test_scored_case_records_answer_key_and_prediction_hashes(

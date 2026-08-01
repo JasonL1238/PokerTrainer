@@ -85,6 +85,17 @@ def _validate_action(
     amount = action.get("amount")
     if amount is not None and not isinstance(amount, (int, float)):
         result.add(f"{path}.amount", "amount must be a number or null")
+    if semantics == "unknown" and amount is not None:
+        # ``unknown`` excludes this action's amount from scoring. An annotated
+        # figure alongside it means the amount WAS read, so the exclusion would
+        # silently neutralize a check the key can actually answer -- the same
+        # contradiction the hand-fact rule rejects for a declared-unobservable
+        # fact that carries a value.
+        result.add(
+            f"{path}.amount_semantics",
+            "amount_semantics=unknown but an amount is annotated; "
+            "drop the amount or give it real semantics",
+        )
     if kind in {"bet", "raise", "call", "all-in", "post_blind", "ante"}:
         if action.get("certain") is True and action.get("observable", True) is True:
             if amount is None and semantics != "unknown":

@@ -239,8 +239,10 @@ def test_partial_unobserved_prediction_matches_partial_truth():
     report = evaluate_answer_key_against_timeline(truth, timeline)
     assert report["ok"] is True
     assert report["critical_errors"] == 0
-    # The skipped checks are reported, not silently dropped.
+    # The skipped checks are reported, not silently dropped — including the
+    # action line, which is unscored because the answer key says it is partial.
     assert report["excluded_facts"] == [
+        "action_line:answer key declares actions incomplete",
         "dealer_seat",
         "final_pot",
         "hero_net",

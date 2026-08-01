@@ -316,3 +316,95 @@ def test_metrics_are_none_rather_than_one_when_nothing_was_scored():
     metrics = completion_metrics([])
     assert metrics["precision"] is None
     assert metrics["recall"] is None
+
+
+# --- Adversarial round 1 findings (Adversary A) ------------------------------
+
+
+def test_uncertain_actions_are_reported_as_skipped_not_dropped_silently():
+    """An answer key could mark every action uncertain and score clean.
+
+    That is the same failure the hand-fact ``unobservable`` rule prevents: the
+    check did not happen, so the report has to say so.
+    """
+    truth = _truth_hand(
+        actions=[
+            {
+                "street": "flop",
+                "order": 1,
+                "seat": 0,
+                "action": "bet",
+                "amount": 5.0,
+                "amount_semantics": "incremental",
+                "certain": False,
+                "observable": True,
+            },
+            {
+                "street": "flop",
+                "order": 2,
+                "seat": 1,
+                "action": "call",
+                "amount": 5.0,
+                "amount_semantics": "incremental",
+                "certain": True,
+                "observable": False,
+            },
+        ]
+    )
+    report = _run([truth], [_pred_hand(actions=[])])
+    excluded = report["excluded_facts"]
+    assert any(f.startswith("action:") and f.endswith("uncertain") for f in excluded)
+    assert any(f.startswith("action:") and f.endswith("unobservable") for f in excluded)
+
+
+def test_a_partial_hand_says_its_action_line_went_unscored():
+    truth = _truth_hand(
+        completion_class="partial",
+        partial_end=True,
+        actions_complete=False,
+        winner_seat=None,
+        final_pot=None,
+        result=None,
+        unobservable=["winner_seat", "final_pot", "result"],
+    )
+    pred = _pred_hand(
+        complete=False,
+        actions=[{"street": "river", "seat": 0, "action_type": "bet", "amount": 400.0}],
+    )
+    report = _run([truth], [pred])
+    assert "action_line:answer key declares actions incomplete" in report[
+        "excluded_facts"
+    ]
+
+
+def test_unknown_semantics_carrying_an_amount_is_rejected_by_the_validator():
+    """Excluding a check the key can actually answer is a contradiction."""
+    from poker_tracker.validation.truth_validate import validate_answer_key
+
+    document = {
+        "schema_version": 2,
+        "case_id": "c",
+        "annotation": {"passes": 2, "adjudicated": True},
+        "hands": [
+            {
+                **_truth_hand(
+                    actions=[
+                        {
+                            "street": "river",
+                            "order": 1,
+                            "seat": 0,
+                            "action": "bet",
+                            "amount": 50.0,
+                            "amount_semantics": "unknown",
+                            "certain": True,
+                            "observable": True,
+                        }
+                    ]
+                ),
+                "terminal_event": "showdown",
+            }
+        ],
+    }
+    result = validate_answer_key(document)
+    assert result.ok is False
+    assert any("amount_semantics=unknown" in issue.message for issue in result.issues)

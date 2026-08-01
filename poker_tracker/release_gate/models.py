@@ -77,6 +77,33 @@ def allowlist_violations(
     return violations
 
 
+def partially_pinned_cases(
+    cases: list[Any],
+    resolved: dict[str, dict[str, Any]],
+) -> dict[str, list[str]]:
+    """Scored cases that pin some model roles but not all of them.
+
+    ``allowlist_violations`` enumerates what the case *claims*, so a case that
+    pins the detector and says nothing about the classifier passes it cleanly --
+    while the classifier runs whatever happens to be installed. Enforcement has
+    to enumerate the obligation, which is every role the run actually uses.
+    """
+    partial: dict[str, list[str]] = {}
+    for case in cases:
+        if not isinstance(case, dict):
+            continue
+        if case.get("counts_toward_release") is False:
+            continue
+        allowlist = case.get("model_allowlist")
+        if not isinstance(allowlist, dict) or not allowlist:
+            # Fully unpinned; ``unpinned_cases`` owns that report.
+            continue
+        missing = sorted(role for role in resolved if role not in allowlist)
+        if missing:
+            partial[str(case.get("case_id"))] = missing
+    return partial
+
+
 def unpinned_cases(cases: list[Any]) -> list[str]:
     """Scored cases that pin no model at all.
 
