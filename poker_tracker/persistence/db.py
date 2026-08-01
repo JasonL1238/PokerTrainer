@@ -2301,7 +2301,8 @@ class PokerDatabase:
         """
 
         self._execute(
-            "UPDATE actions SET source_image = ? WHERE id = ? AND source_image IS NULL",
+            "UPDATE actions SET source_image = ? "
+            "WHERE id = ? AND (source_image IS NULL OR TRIM(source_image) = '')",
             (source_image, action_id),
         )
         self._commit()
@@ -2338,6 +2339,11 @@ class PokerDatabase:
                 update={
                     "action_index": action_index,
                     "player_key": payload["player_key"],
+                    # The UPDATE never writes source_image, and callers rebuild
+                    # the row without it, so comparing it would make every CV
+                    # row look changed — un-approving the hand and recording a
+                    # correction that claims provenance was cleared.
+                    "source_image": stored.source_image,
                 }
             )
             if stored != updated:

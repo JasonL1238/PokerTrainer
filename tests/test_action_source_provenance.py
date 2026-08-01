@@ -333,3 +333,71 @@ def test_recorded_provenance_is_write_once_at_the_sql_layer() -> None:
         == "/frames/t000069.00.jpg"
     )
     db.close()
+
+
+def test_saving_an_unchanged_cv_row_is_a_no_op() -> None:
+    """A10 round 10 F7: the UPDATE never writes source_image and the edit form
+    rebuilds the row without it, so every CV row compared unequal. Pressing
+    Save with no changes un-approved the hand and recorded a correction whose
+    after_state claimed provenance had been cleared."""
+    db = make_db()
+    saved = _seed(db)
+    before = db.fetch_hand_corrections(hand_id=saved.hand_id)
+    db.update_action(
+        Action(
+            id=saved.id,
+            hand_id=saved.hand_id,
+            street=saved.street,
+            action_index=saved.action_index,
+            player_name=saved.player_name,
+            position=saved.position,
+            action_type=saved.action_type,
+            amount=saved.amount,
+        ),
+        correction_notes="",
+    )
+    after = db.fetch_hand_corrections(hand_id=saved.hand_id)
+    assert len(after) == len(before), "a no-op save recorded a correction"
+    assert (
+        db.fetch_actions_by_hand(saved.hand_id)[0].source_image
+        == "/frames/t000069.00.jpg"
+    )
+    db.close()
+
+
+def test_a_blank_recorded_frame_can_still_be_repaired() -> None:
+    """A10 round 10 F9: the write was NULL-only, so an empty string was
+    permanently unrecoverable while still counting as filled every render."""
+    db = make_db()
+    saved = _seed(db)
+    assert saved.id is not None
+    db._execute("UPDATE actions SET source_image = '' WHERE id = ?", (saved.id,))
+    db._commit()
+    assert backfill_action_provenance(db, saved.hand_id, _timeline_hand()) == 1
+    assert (
+        db.fetch_actions_by_hand(saved.hand_id)[0].source_image
+        == "/frames/t000069.00.jpg"
+    )
+    db.close()
+
+
+def test_a_single_candidate_is_still_refused_when_figures_contradict() -> None:
+    """A10 round 10 F2: 'no rivals' returned True with no figure check at all,
+    and 318 of 416 real fills took that branch."""
+    db = make_db()
+    session = db.create_session(Session(name="Contradict"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+    db.create_action(
+        Action(
+            hand_id=hand.id,
+            street="flop",
+            action_index=1,
+            player_name="Seat2",
+            position="UTG+1",
+            action_type="bet",
+            amount=99.0,          # the only candidate records 6.5
+        )
+    )
+    assert backfill_action_provenance(db, hand.id, _timeline_hand()) == 0
+    assert db.fetch_actions_by_hand(hand.id)[0].source_image is None
+    db.close()

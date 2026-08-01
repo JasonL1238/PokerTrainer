@@ -1848,3 +1848,32 @@ def test_a_fold_is_never_told_its_stack_is_post_action() -> None:
         )
         if "AFTER this seat's chips moved" in issue.detail
     ]
+
+
+def test_post_action_claim_requires_this_action_to_own_the_box() -> None:
+    """B10 round 10 F3: chips in the box prove a commitment, not WHICH one. A
+    seat that posted a blind has money out before it acts again, so the
+    frame's stack read is not 'after this action'."""
+    hand, states = _cv_issue_fixture()
+    states[1]["stacks"] = {"7": 212.2}
+    states[1]["bets"] = {"7": 1.0}          # the blind post, not this action
+    hand = dict(
+        hand,
+        actions=[
+            {
+                "street": "preflop", "action_index": 1, "seat": 7,
+                "player_name": "Seat7", "position": "BB",
+                "action_type": "post_blind", "amount": 1.0,
+                "source_image": "/tmp/f1.jpg", "derivation": "action_pill",
+            },
+            *hand["actions"],
+        ],
+    )
+    later = dict(hand["actions"][2], action_index=5, seat=7, stack_before=212.2)
+    assert not [
+        issue
+        for issue in cv_issues_for_timeline_action(
+            later, hand, states, db_amount=12.0, db_stack_before=212.2
+        )
+        if issue.kind == "Stack before looks post-action"
+    ]

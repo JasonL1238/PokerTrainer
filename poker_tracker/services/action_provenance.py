@@ -78,10 +78,29 @@ def _fill_is_safe(
         )
     ]
     if not rivals:
-        return True
+        # Nothing else could have produced the row — but if its own figures
+        # contradict this line, the row is not what the slot says it is.
+        return not _figures_contradict(action, origin)
     return _figures_agree(action, origin) and not any(
         _figures_agree(action, rival) for rival in rivals
     )
+
+
+def _figures_contradict(action: Action, line: dict[str, Any]) -> bool:
+    """Whether the row's own amount or stack rules this line out."""
+
+    for saved, recorded in (
+        (action.amount, line.get("amount")),
+        (action.stack_before, line.get("stack_before")),
+    ):
+        if saved is None or recorded is None:
+            continue
+        try:
+            if abs(float(saved) - float(recorded)) >= 1e-6:
+                return True
+        except (TypeError, ValueError):
+            return True
+    return False
 
 
 def _figures_agree(action: Action, line: dict[str, Any]) -> bool:

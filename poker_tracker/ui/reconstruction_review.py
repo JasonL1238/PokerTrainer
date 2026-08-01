@@ -76,6 +76,10 @@ class ActionCvIssue:
     kind: str
     detail: str
     frame_index: int | None = None
+    # True only when the message hands the operator a figure to type in.
+    # Matching this out of the prose is how a caption came to tell the
+    # operator to re-enter the very number the warning had condemned.
+    offers_a_value: bool = False
 
     def label(self) -> str:
         return f"{self.kind} — {self.detail}"
@@ -898,6 +902,8 @@ def cv_issues_for_timeline_action(
         committed_here = (
             _seat_value(state.get("bets"), seat) is not None
             or _seat_code(state.get("bets_unknown"), seat) is not None
+        ) and not _earlier_action_owns_the_box(
+            hand, timeline_action, seat, db_street or timeline_action.get("street")
         )
         if (
             own_read is not None
@@ -1063,6 +1069,7 @@ def _stack_before_issue(
             frame_index=carrier if carrier is not None else frame_index,
         )
     hint = _stack_field_hint(hint_index, hint_value, stale=hint_stale)
+    hint_offers_value = hint_value is not None and hint_index is not None and not hint_stale
     derivation = str(timeline_action.get("derivation") or "")
     if derivation.startswith("inferred"):
         if _line_may_not_belong(states, state, seat, frame_index):
@@ -1115,6 +1122,7 @@ def _stack_before_issue(
             kind=kind,
             detail=f"On frame {at_index + 1}, {code_text}. {hint}",
             frame_index=hint_index if hint_index is not None else at_index,
+            offers_a_value=hint_offers_value,
         )
     starting_code = _starting_stack_unknown_code(hand, seat)
     if starting_code is not None:
@@ -1167,6 +1175,7 @@ def _stack_before_issue(
                 f"action, because this line's own amount is unknown. {hint}"
             ),
             frame_index=hint_index if hint_index is not None else frame_index,
+            offers_a_value=hint_offers_value,
         )
     return None
 
@@ -1384,6 +1393,35 @@ def _nearest_readable(
         if value is not None:
             return value, index
     return None
+
+
+def _earlier_action_owns_the_box(
+    hand: dict[str, Any],
+    timeline_action: dict[str, Any],
+    seat: int | None,
+    street: Any,
+) -> bool:
+    """Whether chips already in this seat's box came from an earlier action.
+
+    The post-action claim rests on the client's stack figure excluding chips
+    in the bet box. That only identifies THIS action when nothing earlier on
+    the street put them there — otherwise the box holds a blind post or a
+    previous bet, and the frame's stack read is simply the seat's stack.
+    """
+
+    if seat is None:
+        return False
+    index = timeline_action.get("action_index")
+    street_key = str(street or "").lower()
+    for line in hand.get("actions") or []:
+        if line.get("seat") != seat or line is timeline_action:
+            continue
+        if str(line.get("street") or "").lower() != street_key:
+            continue
+        other = line.get("action_index")
+        if isinstance(index, int) and isinstance(other, int) and other < index:
+            return True
+    return False
 
 
 def _seat_committed_between(

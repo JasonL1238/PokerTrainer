@@ -189,6 +189,7 @@ from poker_tracker.ui.poker_visuals import (
     render_poker_table,
 )
 from poker_tracker.ui.reconstruction_review import (
+    ACTION_MAY_NOT_BELONG,
     ISSUE_GUIDANCE,
     MONEY_ACTION_TYPES,
     STACK_VALUE_KINDS,
@@ -1965,6 +1966,27 @@ def _render_study_fix_tool(
         st.caption("Unknown fix tool.")
 
 
+def owning_job_for_hand(hand: Hand) -> int | None:
+    """Which reconstruction job this hand was imported from.
+
+    Reads the stamped identity in preference to the notes: the stamp is what
+    chose this hand for that job, while the notes are free text the operator
+    can rewrite from this very panel.
+    """
+
+    return _cv_timeline_identity(hand)[0]
+
+
+def frame_context_belongs_to_hand(
+    hand: Hand,
+    frame_context: ValidationFrameContext,
+) -> bool:
+    """Whether this job's frames may be used to explain this hand's rows."""
+
+    owning = owning_job_for_hand(hand)
+    return owning is None or owning == frame_context.job_id
+
+
 def render_validation_edit_and_approve(
     db: PokerDatabase,
     hand: Hand,
@@ -1978,13 +2000,23 @@ def render_validation_edit_and_approve(
         return
     # Always re-fetch so edits from this same render cycle are visible next rerun.
     hand = db.fetch_hand(hand.id) or hand
-    if frame_context is not None and frame_context.job_id == job_id_from_hand_notes(
-        hand.notes
+    owning_job = owning_job_for_hand(hand)
+    if frame_context is not None and not frame_context_belongs_to_hand(
+        hand, frame_context
     ):
+        # Several jobs can run on one video and all resolve to this same hand.
+        # Explaining its rows with another job's frames produces claims that
+        # are true of neither, so say which job owns it and derive nothing.
+        st.warning(
+            f"This hand was imported from job {owning_job}, but you are "
+            f"viewing job {frame_context.job_id}'s frames. Frame-based notes "
+            f"are hidden — open job {owning_job} to validate it."
+        )
+        frame_context = None
+    if frame_context is not None:
         # Rows imported before schema 16 have no recorded source frame; fill it
         # now that the timeline is open. Only from the job this hand was
-        # actually imported from: several jobs can share a video and resolve to
-        # the same DB hand, and the write is one-shot.
+        # actually imported from, and the write is one-shot.
         backfill_action_provenance(db, hand.id, frame_context.timeline_hand)
     actions = db.fetch_actions_by_hand(hand.id)
     players = db.fetch_players_by_hand(hand.id)
@@ -5680,20 +5712,15 @@ def _slot_source_image_ignoring_identity(
     )
 
 
-# Phrases marking a stack issue that gives the operator no value to enter.
-_NO_STACK_VALUE_MARKERS = (
-    "leave the field empty",
-    "not the stack before this action",
-    "cannot confirm itself",
-)
-
-
 def _issue_requests_a_stack_value(issue: ActionCvIssue) -> bool:
-    """Whether this issue hands the operator a value to type into the field."""
+    """Whether this issue hands the operator a value to type into the field.
 
-    if issue.kind not in STACK_VALUE_KINDS:
-        return False
-    return not any(marker in issue.detail for marker in _NO_STACK_VALUE_MARKERS)
+    Reads the flag the issue sets, never its prose: inferring this from
+    wording is how the caption came to tell the operator to re-enter the
+    figure the warning directly above it had just condemned.
+    """
+
+    return issue.kind in STACK_VALUE_KINDS and issue.offers_a_value
 
 
 def _slot_source_image_ignoring_identity_safe(
@@ -6051,7 +6078,7 @@ def _frame_evidence_for_row(
             else ""
         ),
     }
-    return [
+    issues = [
         issue
         for issue in cv_issues_for_timeline_action(
             stub,
@@ -6065,6 +6092,43 @@ def _frame_evidence_for_row(
         )
         if issue.kind != "Amount unknown"
     ]
+    if not any(issue.kind == ACTION_MAY_NOT_BELONG for issue in issues):
+        # The evidence is (frame, seat), both of which survive every edit, so
+        # it must not depend on a derivation the edit knocked out. Four
+        # consecutive rounds found an edit silently clearing this accusation.
+        stranded = _stranded_seat_issue(action, frame_context, own_image)
+        if stranded is not None:
+            issues.insert(0, stranded)
+    return issues
+
+
+def _stranded_seat_issue(
+    action: Action,
+    frame_context: ValidationFrameContext,
+    own_image: str,
+) -> ActionCvIssue | None:
+    """Flag an edited row whose source frame shows its seat holding nothing.
+
+    Folds are excluded: a folding seat loses its cards on its own frame, so
+    absence there is the expected observation rather than evidence against it.
+    """
+
+    if action.action_type.replace("-", "_") == "fold":
+        return None
+    if not _row_frame_shows_no_cards(action, frame_context, own_image):
+        return None
+    index = _frame_index_for_image(own_image, frame_context)
+    where = f"frame {index + 1}" if index is not None else "its source frame"
+    return ActionCvIssue(
+        kind=ACTION_MAY_NOT_BELONG,
+        detail=(
+            f"The frame this line came from ({where}) shows no cards for this "
+            "seat, so it had already left the hand and cannot have acted "
+            "here — whatever this row now says. Check that frame and delete "
+            "this line if the action did not happen."
+        ),
+        frame_index=index,
+    )
 
 
 def _render_action_cv_issues(
