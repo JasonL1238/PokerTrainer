@@ -891,7 +891,19 @@ def cv_issues_for_timeline_action(
         and seat is not None
     ):
         own_read = _seat_value(state.get("stacks"), seat)
-        if own_read is not None and abs(own_read - db_stack_before) < 1e-6:
+        # The premise is that the client's stack figure excludes chips already
+        # in the bet box, so it only holds when the frame actually shows this
+        # seat committing something. Without that, nothing moved and the
+        # saved figure is simply the seat's stack.
+        committed_here = (
+            _seat_value(state.get("bets"), seat) is not None
+            or _seat_code(state.get("bets_unknown"), seat) is not None
+        )
+        if (
+            own_read is not None
+            and committed_here
+            and abs(own_read - db_stack_before) < 1e-6
+        ):
             # The client's stack figure excludes chips already in the bet box,
             # so the action's own frame reads the stack AFTER this action.
             # Every branch that CITES a frame already refuses to use this one;
@@ -1028,13 +1040,15 @@ def _stack_before_issue(
                 " This hand's chip ledger does not balance, so treat the "
                 "figure with extra suspicion."
             )
+        lead = (
+            f"This seat's stack before the action was not saved. The "
+            f"reconstruction computed {timeline_stack:g} BB."
+        )
         return ActionCvIssue(
             kind=kind,
             detail=(
-                f"The reconstruction computed {timeline_stack:g} BB "
-                "for this seat's stack before the action, but the saved field "
-                "is empty — re-enter it under **More fields → Stack before "
-                f"(BB)**.{where}"
+                f"{lead}{where} Enter the result under **More fields → Stack "
+                "before (BB)**."
             ),
             frame_index=carrier if carrier is not None else frame_index,
         )
@@ -1204,7 +1218,7 @@ def _seat_value(mapping: Any, seat: int | None) -> float | None:
     return _optional_float(mapping.get(str(seat), mapping.get(seat)))
 
 
-def _seat_holds_cards(state: dict[str, Any] | None, seat: int | None) -> bool:
+def seat_holds_cards(state: dict[str, Any] | None, seat: int | None) -> bool:
     """Whether this seat still holds cards on the frame.
 
     ``dealt_in`` counts face-DOWN card backs only. At showdown the client
@@ -1304,7 +1318,7 @@ def _last_frame_holding_cards(
         return None
     last = len(states) if frame_index is None else min(frame_index, len(states))
     for index in range(last - 1, -1, -1):
-        if _seat_holds_cards(states[index], seat):
+        if seat_holds_cards(states[index], seat):
             return index
     return None
 
@@ -1323,7 +1337,7 @@ def _line_may_not_belong(
     cleared the table, so absence there proves nothing.
     """
 
-    if _seat_holds_cards(state, seat):
+    if seat_holds_cards(state, seat):
         return False
     if frame_index is not None and frame_index >= len(states) - 1:
         return False

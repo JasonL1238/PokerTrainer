@@ -248,3 +248,73 @@ def test_backfill_never_overwrites_a_recorded_frame() -> None:
         == "/frames/t000069.00.jpg"
     )
     db.close()
+
+
+def _two_line_timeline() -> dict:
+    """A hand where one seat makes the same kind of action twice — the shape
+    that lets a pre-upgrade move land on the wrong line."""
+    return {
+        "hand_number": 1,
+        "actions": [
+            {
+                "street": "preflop", "action_index": 4, "seat": 6,
+                "player_name": "Seat6", "position": "SB", "action_type": "call",
+                "amount": 3.0, "stack_before": 191.0,
+                "source_image": "/frames/A.jpg",
+            },
+            {
+                "street": "preflop", "action_index": 7, "seat": 6,
+                "player_name": "Seat6", "position": "SB", "action_type": "call",
+                "amount": 10.0, "stack_before": 191.0,
+                "source_image": "/frames/B.jpg",
+            },
+        ],
+    }
+
+
+def _legacy_row(db: PokerDatabase, **overrides) -> Action:
+    session = db.create_session(Session(name="Legacy"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+    payload = dict(
+        hand_id=hand.id,
+        street="preflop",
+        action_index=4,
+        player_name="Seat6",
+        position="SB",
+        action_type="call",
+        amount=10.0,          # truly the frame-B line, renumbered into slot 4
+        stack_before=191.0,
+    )
+    payload.update(overrides)
+    return db.create_action(Action(**payload))
+
+
+def test_backfill_refuses_a_row_that_could_have_come_from_two_lines() -> None:
+    """B9 round 9: a row moved BEFORE the upgrade — exactly the population this
+    repairs — can occupy a slot held by a different line with the same actor
+    and type. The fill is permanent and disarms the render-time guard, so it
+    must not be a guess."""
+    db = make_db()
+    row = _legacy_row(db)
+    assert backfill_action_provenance(db, row.hand_id, _two_line_timeline()) == 0
+    assert db.fetch_actions_by_hand(row.hand_id)[0].source_image is None
+    db.close()
+
+
+def test_backfill_accepts_when_the_rows_own_figures_single_a_line_out() -> None:
+    db = make_db()
+    # Amount 3.0 matches only the frame-A line.
+    row = _legacy_row(db, amount=3.0)
+    assert backfill_action_provenance(db, row.hand_id, _two_line_timeline()) == 1
+    assert (
+        db.fetch_actions_by_hand(row.hand_id)[0].source_image == "/frames/A.jpg"
+    )
+    db.close()
+
+
+def test_backfill_refuses_when_the_row_has_no_figures_to_disambiguate() -> None:
+    db = make_db()
+    row = _legacy_row(db, amount=None, stack_before=None)
+    assert backfill_action_provenance(db, row.hand_id, _two_line_timeline()) == 0
+    assert db.fetch_actions_by_hand(row.hand_id)[0].source_image is None
+    db.close()

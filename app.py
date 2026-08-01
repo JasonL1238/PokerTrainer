@@ -207,6 +207,7 @@ from poker_tracker.ui.reconstruction_review import (
     match_db_action_to_frame_target,
     match_db_action_to_timeline_action,
     observed_facts,
+    seat_holds_cards,
     states_for_hand,
     timeline_action_by_frame_and_seat,
     timeline_actions_for_image,
@@ -5952,7 +5953,13 @@ def _issues_for_unattributable_row(
         action.amount is None
         and action.action_type.replace("-", "_") in MONEY_ACTION_TYPES
     ):
-        if own_index is None:
+        if _row_frame_shows_no_cards(action, frame_context, own_image):
+            where = (
+                "Its source frame shows no cards for this seat, so there was "
+                "no bet box to read — confirm this action happened before "
+                "entering an amount for it."
+            )
+        elif own_index is None:
             where = "Read the amount off the frames and enter it below."
         elif action.source_image:
             where = (
@@ -5980,6 +5987,27 @@ def _issues_for_unattributable_row(
     return issues
 
 
+def _row_frame_shows_no_cards(
+    action: Action,
+    frame_context: ValidationFrameContext,
+    own_image: str | None,
+) -> bool:
+    """Whether the row's own frame shows this seat holding nothing."""
+
+    if not own_image:
+        return False
+    state = next(
+        (
+            candidate
+            for candidate in frame_context.states
+            if str(candidate.get("image") or "") == own_image
+        ),
+        None,
+    )
+    seat = _seat_index_for_action(action, frame_context)
+    return state is not None and not seat_holds_cards(state, seat)
+
+
 def _frame_evidence_for_row(
     action: Action,
     frame_context: ValidationFrameContext,
@@ -5996,7 +6024,9 @@ def _frame_evidence_for_row(
     stub = {
         "source_image": own_image,
         "seat": seat,
-        "street": action.street,
+        # The street the LINE was reconstructed on, so a moved row still gets
+        # hedged here; falls back to the row's own street when unknown.
+        "street": str((neighbour or {}).get("street") or action.street),
         "action_type": action.action_type,
         # Deliberately no amount or stack_before: this row has no
         # reconstructed reads any more, and copying a neighbour's would be
