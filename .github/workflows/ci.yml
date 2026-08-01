@@ -42,3 +42,32 @@ jobs:
 
       - name: Test
         run: python -m pytest
+
+      # Schema and hash validation for every corpus artifact that is safe to
+      # commit. Private recordings are never available here, so this checks the
+      # manifest and answer keys only.
+      - name: Validate corpus schemas and hashes
+        run: python -m poker_tracker.validation --manifest validation/clubwpt_v1.json --skip-release-minimums
+
+      # The fixture release gate must fail closed while the corpus is
+      # incomplete. Exit 2 (setup invalid) is the expected, asserted result --
+      # a green CI must never be mistaken for a passing release gate.
+      - name: Release gate (fixture, expected to fail closed)
+        run: |
+          set +e
+          python -m poker_tracker.release_gate --mode fixture --report-dir "$RUNNER_TEMP/release_reports" > "$RUNNER_TEMP/gate.json"
+          code=$?
+          set -e
+          echo "release gate exit code: $code"
+          if [ "$code" -eq 0 ]; then
+            echo "::error::Release gate passed, but the committed corpus cannot satisfy the Phase 2 minimums. Something is failing open."
+            exit 1
+          fi
+
+      - name: Retain release report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-report
+          path: ${{ runner.temp }}/release_reports/
+          if-no-files-found: warn

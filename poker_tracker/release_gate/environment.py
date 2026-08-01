@@ -65,6 +65,57 @@ def _redact_value(value: Any) -> Any:
     return value
 
 
+# Dependencies whose version materially changes a reconstruction verdict.
+RELEASE_CRITICAL_PACKAGES: tuple[str, ...] = (
+    "streamlit",
+    "numpy",
+    "opencv-python-headless",
+    "opencv-python",
+    "torch",
+    "ultralytics",
+    "av",
+    "pydantic",
+    "pillow",
+)
+
+
+def _dependency_versions() -> dict[str, str | None]:
+    from importlib.metadata import PackageNotFoundError, version
+
+    versions: dict[str, str | None] = {}
+    for name in RELEASE_CRITICAL_PACKAGES:
+        try:
+            versions[name] = version(name)
+        except PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
+def _ffmpeg_version() -> str | None:
+    """First line of ``ffmpeg -version``, or None when it is not installed."""
+    try:
+        completed = subprocess.run(
+            ["ffmpeg", "-version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    first = completed.stdout.strip().splitlines()
+    return first[0] if first else None
+
+
+def _memory_bytes() -> int | None:
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def collect_environment(repo_root: Path) -> dict[str, Any]:
     env_subset = {
         key: value
@@ -79,6 +130,10 @@ def collect_environment(repo_root: Path) -> dict[str, Any]:
         "machine": platform.machine(),
         "processor": platform.processor(),
         "system": platform.system(),
+        "cpu_count": os.cpu_count(),
+        "memory_bytes": _memory_bytes(),
+        "ffmpeg": _ffmpeg_version(),
+        "dependencies": _dependency_versions(),
         "git": _git_identity(repo_root),
         "env": redact_mapping(env_subset),
     }

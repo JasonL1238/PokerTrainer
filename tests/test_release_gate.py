@@ -208,6 +208,15 @@ def test_partial_unobserved_prediction_matches_partial_truth():
                 "final_board": [],
                 "dealt_in_seats": [0, 1],
                 "actions": [],
+                # The recording starts mid-hand and never shows the end, so
+                # these facts are unobservable by name rather than by silence.
+                "unobservable": [
+                    "dealer_seat",
+                    "winner_seat",
+                    "result",
+                    "final_pot",
+                    "hero_net",
+                ],
             }
         ]
     }
@@ -230,6 +239,14 @@ def test_partial_unobserved_prediction_matches_partial_truth():
     report = evaluate_answer_key_against_timeline(truth, timeline)
     assert report["ok"] is True
     assert report["critical_errors"] == 0
+    # The skipped checks are reported, not silently dropped.
+    assert report["excluded_facts"] == [
+        "dealer_seat",
+        "final_pot",
+        "hero_net",
+        "result",
+        "winner_seat",
+    ]
 
 
 def test_evaluate_merged_prediction_fails():

@@ -2230,6 +2230,20 @@ The corpus must include:
 
 ## Phase 3 — Create the executable release-gate framework
 
+**Status: framework implemented; exit gate NOT met because it cannot yet be
+exercised.** All three modes, the evaluator corrections, the report contract, and
+CI integration are built and tested. `fixture` mode scores retained prediction
+timelines; `full` mode decodes real recordings with the pinned models; `container`
+mode re-runs the gate inside the pinned image and compares verdicts. Every mode
+fails closed, and setup failures (absent vault, absent weights, absent Docker)
+exit 2 while genuine accuracy misses exit 1.
+
+What the framework cannot do yet is produce a *passing* verdict, because Phase 2
+has produced no answer keys. The committed corpus therefore exits 2, and CI
+asserts that it does — a green CI explicitly does not mean a passing release
+gate. The exit gate below is met when a real corpus makes the command capable of
+returning 0.
+
 ### Operator interface
 
 Add:

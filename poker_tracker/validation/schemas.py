@@ -7,7 +7,22 @@ from pathlib import Path
 from typing import Any
 
 MANIFEST_SCHEMA_VERSION = 1
-ANSWER_KEY_SCHEMA_VERSION = 1
+# v2 replaced implicit ``None`` skipping with an explicit ``unobservable`` list:
+# a critical fact that carries no value must say so by name, so the evaluator can
+# never award a silent pass for a fact nobody annotated.
+ANSWER_KEY_SCHEMA_VERSION = 2
+
+# Critical hand facts the release gate scores. Each must either carry a value in
+# the answer key or be named in that hand's ``unobservable`` list.
+SCORABLE_HAND_FACTS: tuple[str, ...] = (
+    "hero_cards",
+    "final_board",
+    "dealer_seat",
+    "winner_seat",
+    "result",
+    "final_pot",
+    "hero_net",
+)
 
 VALID_SPLITS: frozenset[str] = frozenset({"development", "validation", "locked_test"})
 VALID_COMPLETION_CLASSES: frozenset[str] = frozenset(

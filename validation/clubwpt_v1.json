@@ -44,7 +44,7 @@
         "height": null
       },
       "truth_relpath": "truth/fixture_synthetic_hu_01.json",
-      "truth_sha256": "80bba72d03fd418491eb9930572753c89b0cfab7949e136a6434453c71319534",
+      "truth_sha256": "93a5cf9d83130210f086999adfa5c92ef9cf731fec74d2160492008ee885cef5",
       "model_allowlist": {}
     }
   ]

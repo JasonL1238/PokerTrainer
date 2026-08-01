@@ -13,6 +13,7 @@ from poker_tracker.math.cards import RANKS, SUITS, parse_card
 from poker_tracker.validation.schemas import (
     AMOUNT_SEMANTICS,
     ANSWER_KEY_SCHEMA_VERSION,
+    SCORABLE_HAND_FACTS,
     VALID_ACTIONS,
     VALID_COMPLETION_CLASSES,
     VALID_STREETS,
@@ -237,6 +238,63 @@ def _street_order_check(
         last_rank = max(last_rank, rank)
 
 
+def _fact_is_supplied(hand: dict[str, Any], fact: str) -> bool:
+    """Whether the answer key actually annotated this fact.
+
+    ``final_board: []`` is a real annotation (the board never came), so
+    emptiness is not absence — only ``None``/missing is.
+    """
+    return hand.get(fact) is not None
+
+
+def _observability_check(
+    hand: dict[str, Any],
+    *,
+    path: str,
+    result: TruthValidationResult,
+) -> None:
+    """Every scored fact is annotated or explicitly named unobservable.
+
+    Schema v1 let a ``null`` critical fact mean "skip this check", so a hand
+    nobody finished annotating scored exactly like a hand where the fact was
+    genuinely off-camera. v2 makes the annotator say which one it is: silence is
+    a corpus defect, not a free pass.
+    """
+    declared = hand.get("unobservable", [])
+    if not isinstance(declared, list):
+        result.add(f"{path}.unobservable", "unobservable must be a list of fact names")
+        return
+    seen: set[str] = set()
+    for index, fact in enumerate(declared):
+        if not isinstance(fact, str):
+            result.add(f"{path}.unobservable[{index}]", "fact name must be a string")
+            continue
+        if fact not in SCORABLE_HAND_FACTS:
+            result.add(
+                f"{path}.unobservable[{index}]",
+                f"unknown scored fact {fact!r}; expected one of {sorted(SCORABLE_HAND_FACTS)}",
+            )
+            continue
+        if fact in seen:
+            result.add(f"{path}.unobservable[{index}]", f"duplicate fact {fact!r}")
+        seen.add(fact)
+        if _fact_is_supplied(hand, fact):
+            result.add(
+                f"{path}.unobservable[{index}]",
+                f"{fact} is declared unobservable but carries a value",
+            )
+    for fact in SCORABLE_HAND_FACTS:
+        if fact in seen or _fact_is_supplied(hand, fact):
+            continue
+        result.add(
+            f"{path}.{fact}",
+            f"{fact} has no value and is not listed in unobservable; "
+            "annotate it or declare it explicitly",
+        )
+    if isinstance(hand.get("result"), str) and not hand["result"].strip():
+        result.add(f"{path}.result", "result must be a non-empty string when observable")
+
+
 def _validate_hand(
     hand: dict[str, Any],
     *,
@@ -324,8 +382,18 @@ def _validate_hand(
                     visible.append(str(card))
 
     board = hand.get("final_board")
+    declared_unobservable = hand.get("unobservable")
+    board_declared = (
+        isinstance(declared_unobservable, list) and "final_board" in declared_unobservable
+    )
     if board is None:
-        result.add(f"{path}.final_board", "final_board is required (use [] when none)")
+        if not board_declared:
+            # ``_observability_check`` owns the undeclared case; keep the older,
+            # more specific hint for the common "board never came" mistake.
+            result.add(
+                f"{path}.final_board",
+                "final_board is required (use [] when no board came, or declare it unobservable)",
+            )
     elif not isinstance(board, list):
         result.add(f"{path}.final_board", "final_board must be a list")
     elif len(board) not in {0, 3, 4, 5}:
@@ -392,6 +460,7 @@ def _validate_hand(
             if key not in evidence:
                 result.add(f"{path}.evidence.{key}", f"complete hands require evidence.{key}")
 
+    _observability_check(hand, path=path, result=result)
     _arithmetic_cross_check(hand, path=path, result=result)
 
 

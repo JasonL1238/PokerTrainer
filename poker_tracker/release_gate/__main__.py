@@ -37,6 +37,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Verify raw videos under POKER_VALIDATION_ROOT (implied for full/container)",
     )
+    parser.add_argument(
+        "--container-image",
+        default=None,
+        help="Image for --mode container (default: $POKER_RELEASE_GATE_IMAGE)",
+    )
     return parser
 
 
@@ -47,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
         mode=args.mode,
         report_dir=args.report_dir,
         require_recordings=args.require_recordings,
+        container_image=args.container_image,
     )
     print(json.dumps(result.report, indent=2, sort_keys=True))
     return result.exit_code
