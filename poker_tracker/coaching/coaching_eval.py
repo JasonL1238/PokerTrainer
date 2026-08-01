@@ -30,6 +30,7 @@ from poker_tracker.coaching.coaching_prompts import (
     REQUIRED_REVIEW_SECTIONS,
     build_hand_review_prompt,
 )
+from poker_tracker.coaching.grounding import check_grounding
 from poker_tracker.coaching.llm_providers import LLMProvider, parse_sections
 from poker_tracker.persistence.models import Action, Hand, HandPlayer, Session
 
@@ -291,6 +292,11 @@ def run_coaching_eval(provider: LLMProvider) -> CoachingEvalReport:
         failures.extend(_score_sections(response))
         failures.extend(_score_safety(response))
         failures.extend(_score_fabricated_equity(response, golden.equity_supplied))
+        # Compare the response against the prompt that produced it. No golden
+        # hand runs a solver, so any solver-shaped figure here is invented.
+        failures.extend(
+            check_grounding(prompt, response, solver_evidence=None).failures
+        )
         cases.append(
             CoachingEvalCase(name=golden.name, passed=not failures, failures=failures)
         )
