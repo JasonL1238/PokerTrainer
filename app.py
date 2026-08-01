@@ -5770,7 +5770,12 @@ def _cv_issues_for_db_action(
             action.amount is None
             and action.action_type.replace("-", "_") in MONEY_ACTION_TYPES
         ):
-            own_image = _timeline_source_image_for_action(action, frame_context)
+            # Fall back to the identity-free slot lookup the badge and
+            # frame-fact paths already use, so this message never says
+            # "read the frames" while the panel above names one.
+            own_image = _timeline_source_image_for_action(
+                action, frame_context
+            ) or _slot_source_image_ignoring_identity(action, frame_context)
             own_index = _frame_index_for_image(own_image, frame_context)
             where = (
                 f"It came from frame {own_index + 1} — open that frame, read "
