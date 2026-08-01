@@ -6,19 +6,27 @@ import json
 from pathlib import Path
 from typing import Any
 
+# Keys whose values legitimately differ between two runs of an identical
+# verdict. They are quarantined out of the stable body so ``diff`` of two
+# reports shows verdict changes only -- the workflow PLAN.md asks for when it
+# says to retain reports for comparison. Measured resource use belongs here:
+# peak RSS and free disk move every run, and leaving them inline makes every
+# diff non-empty, which trains a reader to ignore diffs entirely.
+NON_DETERMINISTIC_KEYS = frozenset({"elapsed_s", "timing", "report_path", "resources"})
+
 
 def write_report(report: dict[str, Any], report_dir: Path) -> Path:
     """Write a deterministic JSON report.
 
-    Wall-clock timings are stored under ``timing`` and are excluded from the
-    stable fingerprint body so identical gate outcomes compare equal.
+    Measurements that vary run to run are kept under ``measurements``, separate
+    from the verdict body, so two identical outcomes compare byte-equal.
     """
     report_dir.mkdir(parents=True, exist_ok=True)
     path = report_dir / "release_gate_report.json"
     stable = {
         key: value
         for key, value in report.items()
-        if key not in {"elapsed_s", "timing", "report_path"}
+        if key not in NON_DETERMINISTIC_KEYS
     }
     # Drop per-stage wall clocks from the durable artifact.
     stages = []
@@ -28,11 +36,12 @@ def write_report(report: dict[str, Any], report_dir: Path) -> Path:
         else:
             stages.append(stage)
     stable["stages"] = stages
-    # Keep non-deterministic timing alongside, clearly separated.
+    # Keep the varying measurements alongside, clearly separated.
     durable = {
         **stable,
-        "timing": {
+        "measurements": {
             "elapsed_s": report.get("elapsed_s"),
+            "resources": report.get("resources"),
             "stages": [
                 {"name": s.get("name"), "elapsed_s": s.get("elapsed_s")}
                 for s in (report.get("stages") or [])

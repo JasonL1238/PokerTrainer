@@ -10,8 +10,11 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from poker_tracker.safety.redaction import redact_text
+
 _SECRET_KEY = re.compile(
-    r"(password|secret|token|api[_-]?key|authorization|credential)",
+    r"(password|passwd|secret|token|api[_-]?key|apikey|authorization|credential"
+    r"|_pw$|_key$|access[_-]?key|private[_-]?key|session[_-]?id)",
     re.IGNORECASE,
 )
 
@@ -56,12 +59,12 @@ def _redact_value(value: Any) -> Any:
         return redact_mapping(value)
     if isinstance(value, list):
         return [_redact_value(item) for item in value]
-    if isinstance(value, str) and _SECRET_KEY.search(value):
-        # Value itself looks credential-bearing (e.g. embedded password=).
-        return "<redacted>"
-    if isinstance(value, str) and ("://" in value and "@" in value.split("://", 1)[-1]):
-        # user:pass@host DSNs
-        return "<redacted>"
+    if isinstance(value, str):
+        # Key-name matching alone misses a credential stored under a name nobody
+        # anticipated, so the value is also scrubbed by shape. Environment
+        # literals are excluded here: this IS the environment, and substituting
+        # every configured value against itself would blank the whole snapshot.
+        return redact_text(value, include_environment=False)
     return value
 
 
@@ -91,7 +94,7 @@ def _dependency_versions() -> dict[str, str | None]:
     return versions
 
 
-def _ffmpeg_version() -> str | None:
+def ffmpeg_version() -> str | None:
     """First line of ``ffmpeg -version``, or None when it is not installed."""
     try:
         completed = subprocess.run(
@@ -132,7 +135,7 @@ def collect_environment(repo_root: Path) -> dict[str, Any]:
         "system": platform.system(),
         "cpu_count": os.cpu_count(),
         "memory_bytes": _memory_bytes(),
-        "ffmpeg": _ffmpeg_version(),
+        "ffmpeg": ffmpeg_version(),
         "dependencies": _dependency_versions(),
         "git": _git_identity(repo_root),
         "env": redact_mapping(env_subset),

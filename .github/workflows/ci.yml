@@ -50,19 +50,35 @@ jobs:
         run: python -m poker_tracker.validation --manifest validation/clubwpt_v1.json --skip-release-minimums
 
       # The fixture release gate must fail closed while the corpus is
-      # incomplete. Exit 2 (setup invalid) is the expected, asserted result --
-      # a green CI must never be mistaken for a passing release gate.
-      - name: Release gate (fixture, expected to fail closed)
+      # incomplete. This asserts the EXACT expected exit code and that a
+      # well-formed report was written -- "not zero" alone would pass green if
+      # the gate crashed on import or were deleted from the repository, which
+      # is the opposite of verifying that it fails closed.
+      - name: Release gate (fixture, must fail closed with exit 2)
         run: |
           set +e
-          python -m poker_tracker.release_gate --mode fixture --report-dir "$RUNNER_TEMP/release_reports" > "$RUNNER_TEMP/gate.json"
+          python -m poker_tracker.release_gate --mode fixture --report-dir "$RUNNER_TEMP/release_reports"
           code=$?
           set -e
           echo "release gate exit code: $code"
-          if [ "$code" -eq 0 ]; then
-            echo "::error::Release gate passed, but the committed corpus cannot satisfy the Phase 2 minimums. Something is failing open."
+          if [ "$code" -ne 2 ]; then
+            echo "::error::Expected exit 2 (setup invalid) from the committed corpus, got $code."
             exit 1
           fi
+          python - "$RUNNER_TEMP/release_reports/release_gate_report.json" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1]))
+          # A crashing or absent gate cannot produce this structure, so these
+          # assertions distinguish "ran and refused" from "never ran".
+          assert report["exit_code"] == 2, report["exit_code"]
+          assert report["ok"] is False
+          assert report["certification"]["release_certifying"] is False
+          assert report["aggregate"]["measured"] is False
+          names = [stage["name"] for stage in report["stages"]]
+          assert "corpus" in names and "models" in names, names
+          assert any(issue["path"].startswith("corpus.") for issue in report["issues"])
+          print("release gate failed closed as expected")
+          PY
 
       - name: Retain release report
         if: always()

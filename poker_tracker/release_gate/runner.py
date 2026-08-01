@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from poker_tracker.release_gate.environment import collect_environment
+from poker_tracker.release_gate.environment import collect_environment, ffmpeg_version
 from poker_tracker.release_gate.evaluate import evaluate_answer_key_against_timeline
 from poker_tracker.release_gate.models import (
     allowlist_violations,
@@ -174,19 +174,26 @@ def run_release_gate(
         unpinned = unpinned_cases(scored)
         model_detail["allowlist_violations"] = violations
         model_detail["unpinned_cases"] = unpinned
+        model_detail["scored_cases"] = len(scored)
         if violations:
             models_ok = False
             for case_id, reasons in violations.items():
                 fail(EXIT_SETUP_INVALID, f"models.{case_id}", "; ".join(reasons))
-        # An unpinned case is unreproducible. Fixture mode reports it; a real
-        # video run refuses to certify it.
-        if unpinned and mode in {"full", "container"}:
+        # An unpinned case is unreproducible, so the check has not passed in any
+        # mode. Only a release-certifying mode escalates it to a failing exit
+        # code; fixture mode reports it and its verdict says it certifies nothing.
+        if unpinned:
             models_ok = False
-            fail(
-                EXIT_SETUP_INVALID,
-                "models.unpinned",
-                f"cases pin no model weights: {', '.join(sorted(unpinned))}",
-            )
+            if mode in {"full", "container"}:
+                fail(
+                    EXIT_SETUP_INVALID,
+                    "models.unpinned",
+                    f"cases pin no model weights: {', '.join(sorted(unpinned))}",
+                )
+        if not scored:
+            # Nothing was examined, so "no violations" is not a result.
+            models_ok = False
+            model_detail["note"] = "no release-scored cases; nothing was checked"
     stages.append(
         _stage(
             "models",
@@ -239,7 +246,8 @@ def run_release_gate(
         "ok": exit_code == EXIT_OK,
         "exit_code": exit_code,
         "mode": mode,
-        "manifest_path": str(manifest_path.resolve()),
+        "certification": _certification(mode, aggregate),
+        "manifest_path": _portable_path(manifest_path, repo_root),
         "manifest_sha256": (
             sha256_file(manifest_path) if manifest_path.is_file() else None
         ),
@@ -268,6 +276,53 @@ def run_release_gate(
     )
 
 
+def _certification(mode: str, aggregate: dict[str, Any]) -> dict[str, Any]:
+    """State in the report itself what this verdict does and does not cover.
+
+    ``fixture`` mode scores retained prediction timelines. It decodes no video,
+    loads no model, and cannot tell a timeline the pipeline produced from one a
+    person wrote by hand next to the answer key. That makes it a fast regression
+    check, not a release certification — and an ``ok: true`` fixture report is
+    otherwise indistinguishable from a real one at a glance.
+    """
+    certifying = mode in {"full", "container"}
+    covered = [
+        "answer-key and manifest schema integrity",
+        "hand-level scoring of whatever timelines were supplied",
+    ]
+    not_covered: list[str] = []
+    if not certifying:
+        not_covered.extend(
+            [
+                "video decoding, sampling, anchoring, and hand-boundary detection",
+                "model execution (no weights are loaded in fixture mode)",
+                "provenance of the scored timelines: retained inputs are trusted "
+                "as given and are not attributed to a pipeline run",
+            ]
+        )
+    else:
+        covered.extend(
+            [
+                "video decoding with the pinned weights",
+                "end-to-end reconstruction of each corpus recording",
+            ]
+        )
+    if not aggregate.get("measured"):
+        not_covered.append("accuracy: no hand was scored in this run")
+    return {
+        "release_certifying": certifying,
+        "mode": mode,
+        "summary": (
+            "Release-certifying run."
+            if certifying
+            else "NOT a release certification: fixture mode scores retained "
+            "timelines without decoding video or loading models."
+        ),
+        "covers": covered,
+        "does_not_cover": not_covered,
+    }
+
+
 def _aggregate_metrics(detail: dict[str, Any]) -> dict[str, Any]:
     """Roll per-case evaluations into the report's headline numbers.
 
@@ -277,6 +332,11 @@ def _aggregate_metrics(detail: dict[str, Any]) -> dict[str, Any]:
     """
     cases = [c for c in (detail.get("cases") or []) if isinstance(c, dict)]
     hands = sum(int(c.get("hands_scored") or 0) for c in cases)
+    # "Zero errors" and "zero measurements" produce identical counts. Every
+    # count below is meaningless unless something was actually scored, so the
+    # report says which of the two it is instead of leaving a reader to infer
+    # quality from a row of zeros.
+    measured = hands > 0
     critical = sum(int(c.get("critical_errors") or 0) for c in cases)
     total_errors = sum(int(c.get("total_errors") or 0) for c in cases)
     budget = sum(int(c.get("noncritical_budget_violations") or 0) for c in cases)
@@ -292,21 +352,26 @@ def _aggregate_metrics(detail: dict[str, Any]) -> dict[str, Any]:
         fn += int(completion.get("false_negative") or 0)
         tn += int(completion.get("true_negative") or 0)
     return {
+        "measured": measured,
+        "unmeasured_reason": (
+            None if measured else "no hand was scored; every count below is vacuous"
+        ),
         "cases_scored": int(detail.get("cases_scored") or 0),
         "cases_failed": int(detail.get("cases_failed") or 0),
         "hands_scored": hands,
-        "total_errors": total_errors,
-        "critical_errors": critical,
-        "noncritical_budget_violations": budget,
-        "spurious_predicted_hands": spurious,
+        "total_errors": total_errors if measured else None,
+        "critical_errors": critical if measured else None,
+        "noncritical_budget_violations": budget if measured else None,
+        "spurious_predicted_hands": spurious if measured else None,
         "excluded_checks": excluded,
         "completion": {
-            "true_positive": tp,
-            "false_positive": fp,
-            "false_negative": fn,
-            "true_negative": tn,
-            "precision": (tp / (tp + fp)) if (tp + fp) else None,
-            "recall": (tp / (tp + fn)) if (tp + fn) else None,
+            "measured": measured,
+            "true_positive": tp if measured else None,
+            "false_positive": fp if measured else None,
+            "false_negative": fn if measured else None,
+            "true_negative": tn if measured else None,
+            "precision": (tp / (tp + fp)) if (measured and (tp + fp)) else None,
+            "recall": (tp / (tp + fn)) if (measured and (tp + fn)) else None,
         },
     }
 
@@ -342,9 +407,29 @@ def _score_case(
     evaluation = evaluate_answer_key_against_timeline(truth, timeline)
     return {
         "case_id": case.get("case_id"),
-        "prediction_path": str(prediction_path),
+        # Paths are recorded relative to the manifest so an archived report does
+        # not carry the operator's home directory and account name.
+        "prediction_path": _portable_path(prediction_path, manifest_path.parent),
+        # Identify exactly which answer key and which timeline produced this
+        # score. Without these an edited key yields an indistinguishable report.
+        "truth_sha256": sha256_file(truth_path) if truth_path.is_file() else None,
+        "prediction_sha256": (
+            sha256_file(prediction_path) if prediction_path.is_file() else None
+        ),
         **evaluation,
     }
+
+
+def _portable_path(path: Path, base: Path) -> str:
+    """``path`` relative to ``base`` when possible, else its basename.
+
+    Release reports are archived as evidence, so an absolute path leaks the
+    operator's username and home directory into a document that outlives the run.
+    """
+    try:
+        return path.resolve().relative_to(base.resolve()).as_posix()
+    except ValueError:
+        return path.name
 
 
 def _run_fixture_predictions(manifest_path: Path) -> dict[str, Any]:
@@ -430,6 +515,15 @@ def _run_full_reconstruction(
         return {
             "ok": False,
             "fail_closed": "POKER_VALIDATION_ROOT is unset or not a directory",
+            "setup_invalid": True,
+            "cases": [],
+        }
+    if ffmpeg_version() is None:
+        # Decoding needs it. Discovering that per-case at decode time turns one
+        # setup problem into N accuracy-shaped failures.
+        return {
+            "ok": False,
+            "fail_closed": "FFmpeg is not installed; full mode cannot decode video",
             "setup_invalid": True,
             "cases": [],
         }

@@ -3664,6 +3664,44 @@ class PokerDatabase:
             ).fetchall()
         return [_video_from_row(row) for row in rows]
 
+    # Every column that stores a path to a file on disk. Retention consults this
+    # before deleting anything, so a column added here without being listed
+    # leaves its files looking unreferenced. Keep it exhaustive.
+    ARTIFACT_PATH_COLUMNS: tuple[tuple[str, str], ...] = (
+        ("videos.stored_path", "SELECT stored_path FROM videos"),
+        ("extracted_frames.image_path", "SELECT image_path FROM extracted_frames"),
+        (
+            "reconstruction_frame_reviews.source_image",
+            "SELECT source_image FROM reconstruction_frame_reviews",
+        ),
+        ("actions.source_image", "SELECT source_image FROM actions"),
+        ("solver_runs.result_path", "SELECT result_path FROM solver_runs"),
+        ("solver_runs.log_path", "SELECT log_path FROM solver_runs"),
+        ("solver_runs.command_path", "SELECT command_path FROM solver_runs"),
+    )
+
+    def referenced_artifact_paths(self) -> tuple[set[str], list[str]]:
+        """Paths the database still points at, plus sources it could not read.
+
+        The unreadable list matters as much as the paths: "this table holds no
+        references" and "this table could not be queried" must never produce the
+        same answer, because a caller acting on the first would delete files the
+        second was about to protect.
+        """
+        found: set[str] = set()
+        unreadable: list[str] = []
+        for label, sql in self.ARTIFACT_PATH_COLUMNS:
+            try:
+                rows = self._execute(sql).fetchall()
+            except sqlite3.Error:
+                unreadable.append(label)
+                continue
+            for row in rows:
+                raw = row[0]
+                if isinstance(raw, str) and raw.strip():
+                    found.add(raw.strip())
+        return found, unreadable
+
     def create_processing_job(self, job: ProcessingJob) -> ProcessingJob:
         payload = job.model_dump()
         cursor = self._execute(

@@ -322,9 +322,11 @@ def test_report_records_resources_environment_and_models(
     assert set(report["models"]) == {"region_detector", "card_classifier"}
     assert report["manifest_sha256"]
 
-    # The durable artifact is deterministic apart from the timing block.
+    # The durable artifact keeps varying measurements out of the verdict body.
     written = json.loads((tmp_path / "reports" / "release_gate_report.json").read_text())
-    assert "timing" in written
+    assert "measurements" in written
+    assert "resources" in written["measurements"]
+    assert "resources" not in written
     assert all("elapsed_s" not in stage for stage in written["stages"])
 
 
@@ -343,3 +345,133 @@ def test_directory_bytes_does_not_follow_symlinks(tmp_path: Path):
     (linked / "link").symlink_to(real / "payload.bin")
     # Counting the link's own size, not its 4 KiB target.
     assert directory_bytes(linked) < 4096
+
+
+# --- Adversarial round 1 findings -------------------------------------------
+
+
+def test_two_identical_runs_produce_byte_identical_verdict_bodies(
+    release_corpus, tmp_path: Path
+):
+    """PLAN retains reports for comparison; a diff must mean the verdict moved.
+
+    Peak RSS and free disk change every run. Left inline they make every diff
+    non-empty, which trains a reader to ignore diffs — including a real one.
+    """
+    manifest = release_corpus()
+    bodies = []
+    for name in ("runA", "runB"):
+        run_release_gate(
+            manifest_path=manifest, mode="fixture", report_dir=tmp_path / name
+        )
+        written = json.loads(
+            (tmp_path / name / "release_gate_report.json").read_text()
+        )
+        written.pop("measurements")
+        bodies.append(json.dumps(written, sort_keys=True))
+    assert bodies[0] == bodies[1]
+
+
+def test_unmeasured_run_does_not_report_zero_errors(tmp_path: Path):
+    """Zero errors because nothing was scored must not look like a clean score."""
+    result = run_release_gate(
+        manifest_path=MANIFEST, mode="fixture", report_dir=tmp_path / "reports"
+    )
+    aggregate = result.report["aggregate"]
+    assert aggregate["measured"] is False
+    assert aggregate["unmeasured_reason"]
+    # The counts a reader would quote as evidence are withheld, not zeroed.
+    for field in (
+        "critical_errors",
+        "total_errors",
+        "noncritical_budget_violations",
+        "spurious_predicted_hands",
+    ):
+        assert aggregate[field] is None, f"{field} must not read as 0 when unmeasured"
+    completion = aggregate["completion"]
+    assert completion["measured"] is False
+    assert completion["true_negative"] is None
+
+
+def test_measured_run_reports_real_counts(release_corpus, tmp_path: Path):
+    result = run_release_gate(
+        manifest_path=release_corpus(), mode="fixture", report_dir=tmp_path / "reports"
+    )
+    aggregate = result.report["aggregate"]
+    assert aggregate["measured"] is True
+    assert aggregate["critical_errors"] == 0
+    assert aggregate["completion"]["true_positive"] == 100
+
+
+def test_fixture_mode_states_that_it_certifies_nothing(release_corpus, tmp_path: Path):
+    """A passing fixture report must not be quotable as a release pass."""
+    result = run_release_gate(
+        manifest_path=release_corpus(), mode="fixture", report_dir=tmp_path / "reports"
+    )
+    certification = result.report["certification"]
+    assert certification["release_certifying"] is False
+    assert "NOT a release certification" in certification["summary"]
+    joined = " ".join(certification["does_not_cover"])
+    assert "decoding" in joined
+    assert "model execution" in joined
+
+
+def test_models_stage_is_not_ok_when_it_checked_nothing(tmp_path: Path):
+    """"No violations" across zero cases is not a passing check."""
+    result = run_release_gate(
+        manifest_path=MANIFEST, mode="fixture", report_dir=tmp_path / "reports"
+    )
+    stage = next(s for s in result.report["stages"] if s["name"] == "models")
+    assert stage["ok"] is False
+    assert stage["detail"]["scored_cases"] == 0
+
+
+def test_models_stage_is_not_ok_when_cases_pin_nothing(release_corpus, tmp_path: Path):
+    result = run_release_gate(
+        manifest_path=release_corpus(pin_models=False),
+        mode="fixture",
+        report_dir=tmp_path / "reports",
+    )
+    stage = next(s for s in result.report["stages"] if s["name"] == "models")
+    assert stage["ok"] is False
+
+
+def test_scored_case_records_answer_key_and_prediction_hashes(
+    release_corpus, tmp_path: Path
+):
+    """An edited answer key must not yield an indistinguishable report."""
+    result = run_release_gate(
+        manifest_path=release_corpus(), mode="fixture", report_dir=tmp_path / "reports"
+    )
+    stage = next(s for s in result.report["stages"] if s["name"] == "fixture_eval")
+    case = stage["detail"]["cases"][0]
+    assert len(case["truth_sha256"]) == 64
+    assert len(case["prediction_sha256"]) == 64
+
+
+def test_report_carries_no_absolute_host_paths(release_corpus, tmp_path: Path):
+    """Archived evidence must not leak the operator's home directory."""
+    manifest = release_corpus()
+    run_release_gate(
+        manifest_path=manifest, mode="fixture", report_dir=tmp_path / "reports"
+    )
+    written = (tmp_path / "reports" / "release_gate_report.json").read_text()
+    body = json.loads(written)
+    assert not str(body["manifest_path"]).startswith("/")
+    stage = next(s for s in body["stages"] if s["name"] == "fixture_eval")
+    for case in stage["detail"]["cases"]:
+        assert not case["prediction_path"].startswith("/")
+
+
+def test_environment_redacts_credentials_under_unanticipated_names(
+    tmp_path: Path, monkeypatch
+):
+    """Key-name matching alone misses a secret nobody thought to name."""
+    monkeypatch.setenv("POKER_ADMIN_PW", "hunter2secret")
+    monkeypatch.setenv("POKER_TRACKER_LLM_KEY", "sk-ant-live-abc12345")
+    run_release_gate(
+        manifest_path=MANIFEST, mode="fixture", report_dir=tmp_path / "reports"
+    )
+    written = (tmp_path / "reports" / "release_gate_report.json").read_text()
+    assert "hunter2secret" not in written
+    assert "sk-ant-live-abc12345" not in written

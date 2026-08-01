@@ -16,6 +16,7 @@ from cv_lab.scripts.pipeline.export_yolo_card_hands_for_app import export_timeli
 from poker_tracker.persistence.backup import BACKUP_KEEP_COUNT, backup_database
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import Session
+from poker_tracker.safety.redaction import safe_error_message
 from poker_tracker.ui.jobs import mark_cancelled, mark_failed, update_progress
 from poker_tracker.ui.video_ingest import (
     assert_stored_video_matches_record,
@@ -177,7 +178,7 @@ def run_job(
             pass
         return 1
     except BaseException as exc:
-        safe_message = str(exc).replace("\n", " ")[:500] or type(exc).__name__
+        safe_message = safe_error_message(exc)
         try:
             current = db.fetch_processing_job(job_id)
             if current is not None and current.status in {"cancelling", "cancelled"}:
