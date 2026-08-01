@@ -388,6 +388,62 @@ Hosted execution and binary distribution remain a release gate until written
 maintainer permission for that scope or documented AGPL compliance is retained
 with the release.
 
+## Release gate
+
+One command produces a reproducible verdict on whether this build is releasable:
+
+```bash
+python -m poker_tracker.release_gate --mode fixture --report-dir data/release_reports
+```
+
+Modes: `fixture` scores retained prediction timelines without decoding video
+(fast, and what CI runs); `full` decodes every corpus recording with the pinned
+weights; `container` re-runs the acceptance path inside the pinned image and
+compares verdicts. Exit `0` means every mandatory gate passed, `1` means a
+product or accuracy gate failed, and `2` means the run could not be performed at
+all — a setup problem, not a measurement.
+
+Two report fields are load-bearing and easy to misread. `aggregate.measured`
+is `false` when nothing was scored, and the counts beside it read `null` rather
+than `0`, because zero errors over zero measurements is not a result.
+`certification.release_certifying` is `false` in `fixture` mode, which decodes
+no video and loads no model — a passing fixture report is a regression check,
+not a release.
+
+The committed corpus currently exits `2`: Phase 2 has produced no answer keys,
+so no accuracy claim can be evaluated. CI asserts that it still fails closed, so
+a green CI explicitly does not mean a passing release gate.
+
+## Storage retention
+
+```bash
+python -m poker_tracker.maintenance.retention_cli              # dry run
+python -m poker_tracker.maintenance.retention_cli --apply
+```
+
+Frames, timelines, job logs, exports and ROI previews expire on per-category
+windows (`POKER_RETAIN_*_DAYS`). A file the database still references is never
+offered for deletion at any age, and the audit always prints its plan before
+`--apply` acts. Source recordings need an explicit `--include-orphan-videos`,
+because a recording is the one artifact nothing can rebuild.
+
+The age shown is the file's modification time, not how long it has been
+unreferenced — nothing records when a row stopped pointing at a file. Backups are
+outside retention's scope; they rotate on their own fixed count.
+
+## Dependency inventory and licensing
+
+```bash
+python -m poker_tracker.maintenance.sbom --format notices > NOTICES.txt
+python -m poker_tracker.maintenance.sbom --format cyclonedx > sbom.json
+```
+
+**`ultralytics` is AGPL-3.0 and the reconstruction pipeline depends on it.**
+Local use is unaffected; publishing an image is what triggers the obligation, and
+it applies to the base image, not only a solver-enabled one. TexasSolver carries
+a separate blocker of the same kind. `--fail-on-review` exits nonzero while any
+such component is present. This is not legal advice.
+
 ## Data health
 
 Run the operator audit against the configured SQLite database and data directory:
@@ -463,6 +519,10 @@ Project guidance has one source per purpose:
   Code. It must remain byte-for-byte identical to `AGENTS.md`.
 - [PLAN.md](PLAN.md) contains current status, priorities, release gates, and the
   definition of done.
+- [docs/RUNBOOKS.md](docs/RUNBOOKS.md) contains the operator procedures: install,
+  diagnostics, release gate, corpus vault, migration, backup and isolated
+  restore, failed-job recovery, storage audit, containers, upgrade and rollback,
+  licensing before distribution, and the issue-to-regression debugging loop.
 - [cv_lab/notes/README.md](cv_lab/notes/README.md) indexes the chronological CV
   research record. Those findings explain decisions but are not the roadmap.
 - [deploy/oci/README.md](deploy/oci/README.md) is the Oracle deployment
