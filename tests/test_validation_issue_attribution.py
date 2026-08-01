@@ -189,3 +189,92 @@ def test_provenance_beats_the_slot_when_they_disagree() -> None:
     texts = _texts(_cv_issues_for_db_action(row, _context()))
     assert "20 BB" in texts, "did not follow the recorded source frame"
     assert "10 BB" not in texts, "followed the slot instead of provenance"
+
+
+def test_the_saved_type_reaches_the_money_gates_through_the_app() -> None:
+    """A9 round 9 F4: the type/street threading was pinned only by calling
+    cv_issues_for_timeline_action directly with the kwargs — dropping them at
+    the single call site left 537/537 retyped folds silent with a green suite."""
+    # A reconstructed call retyped to a fold must stop demanding an amount.
+    as_fold = _row(action_type="fold")
+    assert not [
+        issue
+        for issue in _cv_issues_for_db_action(as_fold, _context())
+        if issue.kind == "Amount unknown"
+    ]
+    # A reconstructed fold retyped to a bet, amount empty, must be flagged.
+    fold_hand = _hand()
+    fold_hand["actions"][0]["action_type"] = "fold"
+    fold_hand["actions"][0]["amount"] = None
+    context = ValidationFrameContext(
+        job_id=1, hand_number=1, timeline_hand=fold_hand, states=_states(),
+        reviews_by_image={}, cursor_key="c", pending_hand_key="p",
+        recording_start_s=0.0,
+    )
+    assert [
+        issue
+        for issue in _cv_issues_for_db_action(_row(action_type="bet"), context)
+        if issue.kind == "Amount unknown"
+    ]
+
+
+def test_the_saved_street_reaches_the_hedge_through_the_app() -> None:
+    """Same for db_street: dropping it at the call site must fail here. The
+    hedge is the only thing telling the operator the frame below describes a
+    different street's line."""
+    moved = _row(street="turn", action_index=1)
+    issues = _cv_issues_for_db_action(moved, _context())
+    hedge = next(
+        (issue for issue in issues if issue.kind == "Moved off its source street"),
+        None,
+    )
+    assert hedge is not None, "a moved row was not hedged"
+    assert "reconstructed on the preflop" in hedge.detail
+    assert "now saved on the turn" in hedge.detail
+
+
+def test_a_detached_row_never_borrows_a_neighbours_derivation() -> None:
+    """A9 round 9 F3: 49 frames carry lines with mixed derivations. After an
+    actor correction the frame+seat key finds the NEW seat's line, so
+    borrowing its derivation accused an observed row of having been inferred
+    and told the operator to delete it."""
+    hand = _hand()
+    # Seat 1's line on frame A was inferred; seat 2's was observed.
+    hand["actions"][0]["derivation"] = "inferred_round_complete"
+    hand["actions"][1]["derivation"] = "action_pill"
+    states = _states()
+    states[0]["dealt_in"] = [2]        # seat 1 holds no cards on this frame
+    context = ValidationFrameContext(
+        job_id=1, hand_number=1, timeline_hand=hand, states=states,
+        reviews_by_image={}, cursor_key="c", pending_hand_key="p",
+        recording_start_s=0.0,
+    )
+    # Seat 2's OBSERVED row, actor corrected to Seat1 — whose line on the same
+    # frame is inferred. It must not inherit that and be accused.
+    detached = Action(
+        hand_id=1,
+        street="preflop",
+        action_index=2,
+        player_name="Seat1",
+        position="UTG",
+        action_type="raise",
+        amount=None,
+        source_image=FRAME_A,
+    )
+    issues = _cv_issues_for_db_action(detached, context)
+    assert not [
+        issue
+        for issue in issues
+        if issue.kind == "Action may not belong to this hand"
+    ], "an observed row was accused using a neighbour's derivation"
+    assert not any("delete this line" in issue.detail for issue in issues)
+
+
+def test_the_backfill_only_runs_for_the_job_the_hand_came_from() -> None:
+    """A9 round 9 F1: several jobs can share a video and resolve to the same
+    DB hand, so opening another job's validation stamped ITS frames."""
+    from poker_tracker.ui.reconstruction_review import job_id_from_hand_notes
+
+    notes = "CV draft from YOLO card timeline. timeline=/x/job_1_timeline.json"
+    assert job_id_from_hand_notes(notes) == 1
+    assert job_id_from_hand_notes("manual hand") is None

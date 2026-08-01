@@ -318,3 +318,18 @@ def test_backfill_refuses_when_the_row_has_no_figures_to_disambiguate() -> None:
     assert backfill_action_provenance(db, row.hand_id, _two_line_timeline()) == 0
     assert db.fetch_actions_by_hand(row.hand_id)[0].source_image is None
     db.close()
+
+
+def test_recorded_provenance_is_write_once_at_the_sql_layer() -> None:
+    """A9 round 9: the caller already skips filled rows, so only a direct
+    write exercises the IS NULL guard — and that guard is what makes a wrong
+    fill impossible to compound."""
+    db = make_db()
+    saved = _seed(db)
+    assert saved.id is not None
+    db.set_action_source_image(saved.id, "/frames/OTHER.jpg")
+    assert (
+        db.fetch_actions_by_hand(saved.hand_id)[0].source_image
+        == "/frames/t000069.00.jpg"
+    )
+    db.close()

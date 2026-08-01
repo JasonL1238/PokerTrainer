@@ -817,7 +817,7 @@ def cv_issues_for_timeline_action(
                 "confirm it and re-enter it in the Amount field below."
                 f"{box_note}"
             )
-        elif _line_may_not_belong(timeline_action, states, state, seat, frame_index):
+        elif _line_may_not_belong(states, state, seat, frame_index):
             # The accusation itself belongs to ACTION_MAY_NOT_BELONG below;
             # this branch only explains why the amount is missing, and must
             # never instruct a delete under an "Amount unknown" heading.
@@ -994,6 +994,11 @@ def _stack_before_issue(
     """
 
     kind = "Stack before unknown"
+    row_type = str(
+        db_action_type
+        if db_action_type is not None
+        else timeline_action.get("action_type") or ""
+    ).replace("-", "_")
     nearest = _nearest_readable(states, frame_index, seat, "stacks", before_only=True)
     hint_value, hint_index = nearest if nearest is not None else (None, None)
     hint_stale = _seat_committed_between(hand, states, seat, hint_index, frame_index)
@@ -1012,6 +1017,11 @@ def _stack_before_issue(
             )
         elif (
             state is not None
+            and row_type in MONEY_ACTION_TYPES
+            and (
+                _seat_value(state.get("bets"), seat) is not None
+                or _seat_code(state.get("bets_unknown"), seat) is not None
+            )
             and _seat_value(state.get("stacks"), seat) is not None
             and abs(
                 (_seat_value(state.get("stacks"), seat) or 0.0) - timeline_stack
@@ -1055,7 +1065,7 @@ def _stack_before_issue(
     hint = _stack_field_hint(hint_index, hint_value, stale=hint_stale)
     derivation = str(timeline_action.get("derivation") or "")
     if derivation.startswith("inferred"):
-        if _line_may_not_belong(timeline_action, states, state, seat, frame_index):
+        if _line_may_not_belong(states, state, seat, frame_index):
             # The frame that produced this line shows no sign of the seat: the
             # honest reading is that the line may not belong here, so do not
             # push the operator to legitimize it with a number. Deliberately
@@ -1324,7 +1334,6 @@ def _last_frame_holding_cards(
 
 
 def _line_may_not_belong(
-    timeline_action: dict[str, Any],
     states: list[dict[str, Any]],
     state: dict[str, Any] | None,
     seat: int | None,

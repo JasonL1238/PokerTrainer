@@ -1978,9 +1978,13 @@ def render_validation_edit_and_approve(
         return
     # Always re-fetch so edits from this same render cycle are visible next rerun.
     hand = db.fetch_hand(hand.id) or hand
-    if frame_context is not None:
-        # Rows imported before schema 16 have no recorded source frame; fill
-        # it now that the timeline is open, so their warnings survive edits.
+    if frame_context is not None and frame_context.job_id == job_id_from_hand_notes(
+        hand.notes
+    ):
+        # Rows imported before schema 16 have no recorded source frame; fill it
+        # now that the timeline is open. Only from the job this hand was
+        # actually imported from: several jobs can share a video and resolve to
+        # the same DB hand, and the write is one-shot.
         backfill_action_provenance(db, hand.id, frame_context.timeline_hand)
     actions = db.fetch_actions_by_hand(hand.id)
     players = db.fetch_players_by_hand(hand.id)
@@ -6004,8 +6008,13 @@ def _row_frame_shows_no_cards(
         ),
         None,
     )
-    seat = _seat_index_for_action(action, frame_context)
-    return state is not None and not seat_holds_cards(state, seat)
+    if state is None:
+        return False
+    # A hand's last retained frame has already cleared the table, so absence
+    # there is not evidence — the same guard the phantom check applies.
+    if frame_context.states and state is frame_context.states[-1]:
+        return False
+    return not seat_holds_cards(state, _seat_index_for_action(action, frame_context))
 
 
 def _frame_evidence_for_row(
@@ -6033,9 +6042,14 @@ def _frame_evidence_for_row(
         # the borrowing this whole path exists to prevent.
         "amount": None,
         "stack_before": None,
-        # Whether the line was observed or inferred is a property of the
-        # frame, not of the row's current fields, so it is safe to reuse.
-        "derivation": str((neighbour or {}).get("derivation") or ""),
+        # Only the row's OWN line may lend its derivation: frames carry lines
+        # with different derivations, so a neighbour's would accuse an
+        # observed row of having been inferred.
+        "derivation": (
+            str((neighbour or {}).get("derivation") or "")
+            if neighbour is not None and _row_still_matches_origin(action, neighbour)
+            else ""
+        ),
     }
     return [
         issue

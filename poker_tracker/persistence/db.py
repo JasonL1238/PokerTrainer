@@ -4471,7 +4471,8 @@ def _migrate_to_v16(db: PokerDatabase) -> None:
     frame and stack figure. Storing the frame at import makes provenance
     survive any later edit.
 
-    Written only by the CV import path. Manual hands leave it NULL.
+    Written by the CV import path, and backfilled for pre-16 rows when Import
+    validation opens the hand they belong to. Manual hands leave it NULL.
     """
 
     db._ensure_column("actions", "source_image", "TEXT")

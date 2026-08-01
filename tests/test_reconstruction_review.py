@@ -1777,3 +1777,74 @@ def test_clearing_a_post_action_stack_does_not_re_offer_it() -> None:
     assert "not the stack before this action" in issue.detail
     assert "add this action's 3 BB back to it" in issue.detail
     assert "No earlier frame reads that value" not in issue.detail
+
+
+def test_post_action_claims_require_the_frame_to_show_chips() -> None:
+    """A9 round 9 F2: both places that make this claim must check the frame
+    shows the seat committing something — that IS the premise. A fold moves no
+    chips, so condemning its stack is condemning a correct value."""
+    hand, states = _cv_issue_fixture()
+    states[1]["stacks"] = {"7": 212.2}
+    states[1]["bets"] = {}
+    states[1]["bets_unknown"] = {}
+    action = dict(hand["actions"][1], stack_before=212.2)
+    # Saved-value check.
+    assert not [
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, hand, states, db_amount=12.0, db_stack_before=212.2
+        )
+        if issue.kind == "Stack before looks post-action"
+    ]
+    # Cleared-field twin inside the stack ladder.
+    assert not [
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, hand, states, db_amount=12.0, db_stack_before=None
+        )
+        if "AFTER this seat's chips moved" in issue.detail
+    ]
+    # With a bet box present, both fire again.
+    states[1]["bets"] = {"7": 12.0}
+    assert [
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, hand, states, db_amount=12.0, db_stack_before=212.2
+        )
+        if issue.kind == "Stack before looks post-action"
+    ]
+
+
+def test_a_fold_is_never_told_its_stack_is_post_action() -> None:
+    """A fold moves no chips even on a frame where the seat has money out from
+    an earlier action, so BOTH the saved-value check and the cleared-field
+    twin must refuse it."""
+    hand, states = _cv_issue_fixture()
+    states[1]["stacks"] = {"7": 212.2}
+    states[1]["bets"] = {"7": 12.0}
+    action = dict(hand["actions"][1], stack_before=212.2)
+    assert not [
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action,
+            hand,
+            states,
+            db_amount=None,
+            db_stack_before=212.2,
+            db_action_type="fold",
+        )
+        if issue.kind == "Stack before looks post-action"
+    ]
+    # The cleared-field twin inside the stack ladder.
+    assert not [
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action,
+            hand,
+            states,
+            db_amount=None,
+            db_stack_before=None,
+            db_action_type="fold",
+        )
+        if "AFTER this seat's chips moved" in issue.detail
+    ]
