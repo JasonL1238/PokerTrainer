@@ -645,6 +645,31 @@ def match_db_action_to_timeline_action(
     return None
 
 
+def timeline_action_by_frame_and_seat(
+    hand: dict[str, Any],
+    source_image: str | None,
+    seat: int | None,
+) -> dict[str, Any] | None:
+    """The reconstructed line a row came from, keyed by frame and seat.
+
+    This key survives every correction the operator can make — street, order,
+    type, actor, amount — because it names where the line was observed rather
+    than what it currently claims. Used to keep explaining a row after an edit
+    detaches it from its slot. Returns None when the pair is ambiguous, since
+    guessing here would attribute another line's reads.
+    """
+
+    if not source_image or seat is None:
+        return None
+    matches = [
+        action
+        for action in hand.get("actions") or []
+        if str(action.get("source_image") or "") == source_image
+        and action.get("seat") == seat
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def timeline_source_image_for_slot(
     hand: dict[str, Any],
     *,
@@ -732,6 +757,26 @@ def cv_issues_for_timeline_action(
         f"frame {frame_index + 1}" if frame_index is not None else "an unretained frame"
     )
     issues: list[ActionCvIssue] = []
+    row_street = str(timeline_action.get("street") or "").lower()
+    state_street = _street_for_state(state)
+    if (
+        state is not None
+        and row_street
+        and state_street
+        and row_street != state_street
+    ):
+        issues.append(
+            ActionCvIssue(
+                kind="Source frame is from another street",
+                detail=(
+                    f"{frame_ref.capitalize()} is a {state_street} frame, but "
+                    f"this line is on the {row_street}. Its recorded source "
+                    "frame cannot show this action — treat the frame-based "
+                    "notes below with suspicion."
+                ),
+                frame_index=frame_index,
+            )
+        )
 
     derivation = str(timeline_action.get("derivation") or "")
     if db_amount is None and action_type in MONEY_ACTION_TYPES:
@@ -739,7 +784,8 @@ def cv_issues_for_timeline_action(
         code = _seat_code(state.get("bets_unknown") if state else None, seat)
         code_text = _unknown_code_text(code)
         readable_bet = _seat_value(state.get("bets") if state else None, seat)
-        if timeline_amount is not None:
+        parsed_amount = _optional_float(timeline_amount)
+        if parsed_amount is not None:
             if readable_bet is not None:
                 box_note = (
                     f" ({frame_ref.capitalize()}'s bet box shows the seat's "
@@ -755,8 +801,8 @@ def cv_issues_for_timeline_action(
                     f"{frame_ref}.)"
                 )
             detail = (
-                f"The reconstruction read {_optional_float(timeline_amount):g} BB as the "
-                "chips this seat added here, but the saved amount is empty — "
+                f"The reconstruction read {parsed_amount:g} BB as the chips "
+                "this seat added here, but the saved amount is empty — "
                 "confirm it and re-enter it in the Amount field below."
                 f"{box_note}"
             )
@@ -826,6 +872,32 @@ def cv_issues_for_timeline_action(
                 kind="Amount unknown", detail=detail, frame_index=frame_index
             )
         )
+
+    if (
+        db_stack_before is not None
+        and action_type in MONEY_ACTION_TYPES
+        and state is not None
+        and seat is not None
+    ):
+        own_read = _seat_value(state.get("stacks"), seat)
+        if own_read is not None and abs(own_read - db_stack_before) < 1e-6:
+            # The client's stack figure excludes chips already in the bet box,
+            # so the action's own frame reads the stack AFTER this action.
+            # Every branch that CITES a frame already refuses to use this one;
+            # a saved value taken from it was never checked.
+            issues.append(
+                ActionCvIssue(
+                    kind="Stack before looks post-action",
+                    detail=(
+                        f"The saved stack ({db_stack_before:g} BB) is what "
+                        f"{frame_ref} reads after this seat's chips moved, so "
+                        "it is the stack AFTER this action, not before it. "
+                        "Re-read that frame and add back what this action "
+                        "put in."
+                    ),
+                    frame_index=frame_index,
+                )
+            )
 
     if db_stack_before is None:
         stack_issue = _stack_before_issue(
@@ -900,15 +972,13 @@ def _stack_before_issue(
     nearest = _nearest_readable(states, frame_index, seat, "stacks", before_only=True)
     hint_value, hint_index = nearest if nearest is not None else (None, None)
     hint_stale = _seat_committed_between(hand, states, seat, hint_index, frame_index)
-    timeline_stack = timeline_action.get("stack_before")
+    timeline_stack = _optional_float(timeline_action.get("stack_before"))
     if timeline_stack is not None:
         # Point at the frame this figure was read from, and say plainly that
         # it cannot confirm itself: matching the number against the same OCR
         # read it came from has no diagnostic power, and would launder a
         # misread (this corpus contains a 10x decimal error) as verified.
-        carrier = _frame_carrying_stack(
-            states, seat, float(timeline_stack), frame_index
-        )
+        carrier = _frame_carrying_stack(states, seat, timeline_stack, frame_index)
         if carrier is not None:
             where = (
                 f" That figure is the reader's own value for frame "
@@ -917,8 +987,8 @@ def _stack_before_issue(
             )
         else:
             where = (
-                " No frame at or before this action reads that value, so "
-                "check it against the frames before entering it."
+                " No earlier frame reads that value, so check it against the "
+                "frames before entering it."
             )
         if "stack_ledger_incoherent" in (hand.get("warnings") or []):
             where += (
@@ -928,7 +998,7 @@ def _stack_before_issue(
         return ActionCvIssue(
             kind=kind,
             detail=(
-                f"The reconstruction computed {_optional_float(timeline_stack):g} BB "
+                f"The reconstruction computed {timeline_stack:g} BB "
                 "for this seat's stack before the action, but the saved field "
                 "is empty — re-enter it under **More fields → Stack before "
                 f"(BB)**.{where}"
@@ -1103,6 +1173,17 @@ def _seat_value(mapping: Any, seat: int | None) -> float | None:
         return None
 
 
+def _street_for_state(state: dict[str, Any] | None) -> str:
+    """Street a frame depicts, from its board size (empty when unreadable)."""
+
+    if state is None:
+        return ""
+    board = state.get("board_cards")
+    if not isinstance(board, list):
+        return ""
+    return _STREET_BY_BOARD_COUNT.get(len(board), "").lower()
+
+
 def _seat_holds_cards(state: dict[str, Any] | None, seat: int | None) -> bool:
     """Whether this seat still holds cards on the frame.
 
@@ -1169,7 +1250,7 @@ def _frame_carrying_stack(
     value: float,
     frame_index: int | None,
 ) -> int | None:
-    """Latest frame AT OR BEFORE the action whose stack read equals ``value``.
+    """Latest frame STRICTLY BEFORE the action whose stack read equals ``value``.
 
     Bounded deliberately: a stack often returns to the same figure later in a
     hand, so an unbounded scan offers the terminal settlement frame as

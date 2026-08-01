@@ -137,3 +137,31 @@ def test_a_v5_payload_without_provenance_still_imports() -> None:
     assert restored.amount == 6.5
     db.close()
     target.close()
+
+
+def test_update_action_does_not_carry_provenance_from_the_caller() -> None:
+    """A7 round 7 M1: the earlier tests used model_copy, which carries
+    source_image forward, so the UPDATE's omission was never exercised. The UI
+    builds a FRESH Action with no source_image — mutating the UPDATE to write
+    the column left the whole suite green."""
+    db = make_db()
+    saved = _seed(db)
+    # Exactly how app.py's edit form rebuilds the row: a new Action carrying
+    # only the form fields.
+    db.update_action(
+        Action(
+            id=saved.id,
+            hand_id=saved.hand_id,
+            street=saved.street,
+            action_index=saved.action_index,
+            player_name=saved.player_name,
+            position=saved.position,
+            action_type="raise",
+            amount=18.0,
+        ),
+        correction_notes="retyped from the frame",
+    )
+    edited = db.fetch_actions_by_hand(saved.hand_id)[0]
+    assert edited.action_type == "raise"
+    assert edited.source_image == "/frames/t000069.00.jpg"
+    db.close()

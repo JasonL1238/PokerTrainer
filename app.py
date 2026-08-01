@@ -207,6 +207,7 @@ from poker_tracker.ui.reconstruction_review import (
     match_db_action_to_timeline_action,
     observed_facts,
     states_for_hand,
+    timeline_action_by_frame_and_seat,
     timeline_actions_for_image,
     timeline_path_for_job,
     timeline_source_image_for_slot,
@@ -5798,70 +5799,134 @@ def _cv_issues_for_db_action(
     *,
     fallback_frame_index: int | None = None,
 ) -> list[ActionCvIssue]:
-    """CV read failures behind one saved action line, or [] without a timeline."""
+    """CV read failures behind one saved action line, or [] without a timeline.
+
+    Provenance decides which reconstructed line this row came from. The slot
+    match is only a fallback for rows saved before schema 16: it follows the
+    row's CURRENT street and order, so after a correction it can land on a
+    different line — and that line's amounts and stacks belong to real frames,
+    which is what makes borrowing them dangerous.
+    """
 
     if frame_context is None:
         return []
-    timeline_action = match_db_action_to_timeline_action(
-        frame_context.timeline_hand,
-        street=action.street,
-        action_index=action.action_index,
-        action_type=action.action_type,
-        position=action.position,
-        player_name=action.player_name,
+    seat = _seat_index_for_action(action, frame_context)
+    origin = timeline_action_by_frame_and_seat(
+        frame_context.timeline_hand, action.source_image, seat
     )
-    if timeline_action is None:
-        # An edited or hand-added line no longer maps to a reconstructed line,
-        # so its read issues no longer apply. Two things must still surface:
-        # an empty money amount, and the frame-level facts (coverage gaps,
-        # unmeasured transitions) that belong to the source frame regardless
-        # of how the row was edited.
-        issues: list[ActionCvIssue] = []
+    detached = origin is not None
+    if origin is None:
+        origin = match_db_action_to_timeline_action(
+            frame_context.timeline_hand,
+            street=action.street,
+            action_index=action.action_index,
+            action_type=action.action_type,
+            position=action.position,
+            player_name=action.player_name,
+        )
+        # A stored frame that disagrees with the slot match means the row was
+        # moved: the slot now holds someone else's line.
         if (
-            action.amount is None
-            and action.action_type.replace("-", "_") in MONEY_ACTION_TYPES
+            origin is not None
+            and action.source_image
+            and str(origin.get("source_image") or "") != action.source_image
         ):
-            # Fall back to the identity-free slot lookup the badge and
-            # frame-fact paths already use, so this message never says
-            # "read the frames" while the panel above names one.
-            own_image = _timeline_source_image_for_action(
-                action, frame_context
-            ) or _slot_source_image_ignoring_identity(action, frame_context)
-            # A re-added row has no timeline slot at all, but the badge match
-            # may still have found its frame; never say "read the frames"
-            # while the panel above names one.
-            own_index = (
-                _frame_index_for_image(own_image, frame_context)
-                if own_image
-                else fallback_frame_index
-            )
-            where = (
-                f"It came from frame {own_index + 1} — open that frame, read "
-                "the chips this seat added, and enter that below."
-                if own_index is not None
-                else "Read the amount off the frames and enter it below."
-            )
-            issues.append(
-                ActionCvIssue(
-                    kind="Amount unknown",
-                    detail=(
-                        "This line was edited or added, so the import's amount "
-                        "read no longer applies to it — and its amount is "
-                        f"still empty. {where}"
-                    ),
-                    frame_index=own_index,
-                )
-            )
-        issues.extend(_frame_level_issues_for_action(action, frame_context))
-        return issues
-    return cv_issues_for_timeline_action(
-        timeline_action,
+            origin = None
+    else:
+        # Keyed by frame and seat, so it stays correct through any edit. It is
+        # "detached" only when the row no longer occupies that line's slot.
+        detached = not _row_still_matches_origin(action, origin)
+
+    if origin is None:
+        return _issues_for_unattributable_row(
+            action, frame_context, fallback_frame_index
+        )
+
+    issues = cv_issues_for_timeline_action(
+        origin,
         frame_context.timeline_hand,
         frame_context.states,
         db_amount=action.amount,
         db_stack_before=action.stack_before,
         recording_start_s=frame_context.recording_start_s,
     )
+    if detached and issues:
+        # Never let a correction silently clear a live warning: say the
+        # warnings are re-derived from the frame this row came from.
+        note = (
+            "This line no longer matches the reconstructed line it came "
+            "from, so the following is re-derived from its source frame."
+        )
+        issues = [
+            ActionCvIssue(kind="Edited line", detail=note, frame_index=None),
+            *issues,
+        ]
+    return issues
+
+
+def _row_still_matches_origin(action: Action, origin: dict[str, object]) -> bool:
+    """Whether a saved row still claims the same street, order and type."""
+
+    return (
+        action.street.lower() == str(origin.get("street", "")).lower()
+        and action.action_index == origin.get("action_index")
+        and action.action_type.replace("-", "_")
+        == str(origin.get("action_type") or "").replace("-", "_")
+    )
+
+
+def _issues_for_unattributable_row(
+    action: Action,
+    frame_context: ValidationFrameContext,
+    fallback_frame_index: int | None,
+) -> list[ActionCvIssue]:
+    """Rows the reconstruction can no longer be tied to: added, or re-pointed.
+
+    An empty money amount must stay visibly flagged, and the frame-level facts
+    still apply when a frame can be named at all.
+    """
+
+    issues: list[ActionCvIssue] = []
+    if (
+        action.amount is None
+        and action.action_type.replace("-", "_") in MONEY_ACTION_TYPES
+    ):
+        own_image = _timeline_source_image_for_action(
+            action, frame_context
+        ) or _slot_source_image_ignoring_identity(action, frame_context)
+        own_index = (
+            _frame_index_for_image(own_image, frame_context)
+            if own_image
+            else fallback_frame_index
+        )
+        if own_index is None:
+            where = "Read the amount off the frames and enter it below."
+        elif action.source_image:
+            where = (
+                f"It came from frame {own_index + 1} — open that frame, read "
+                "the chips this seat added, and enter that below."
+            )
+        else:
+            # No stored provenance: the frame was inferred from the row's
+            # current slot or its badge match, so do not assert origin.
+            where = (
+                f"Frame {own_index + 1} is the closest the reconstruction can "
+                "attribute to this line — open it, read the chips this seat "
+                "added, and enter that below."
+            )
+        issues.append(
+            ActionCvIssue(
+                kind="Amount unknown",
+                detail=(
+                    "This line was edited or added, so the import's amount "
+                    "read no longer applies to it — and its amount is still "
+                    f"empty. {where}"
+                ),
+                frame_index=own_index,
+            )
+        )
+    issues.extend(_frame_level_issues_for_action(action, frame_context))
+    return issues
 
 
 def _render_action_cv_issues(
@@ -6027,9 +6092,9 @@ def _render_edit_one_action(
                 )
             elif stack_value_not_supplied:
                 caption = (
-                    "A warning on this action needs Stack before, but no "
-                    "frame gives a usable value — work it out from the "
-                    "frames rather than copying the figure above."
+                    "A warning on this action needs Stack before, and the "
+                    "figure it mentions is not one you can copy — read the "
+                    "value off the frame yourself."
                 )
             else:
                 caption = (

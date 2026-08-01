@@ -16,6 +16,7 @@ from poker_tracker.ui.reconstruction_review import (
     resolve_study_approve_key_frames,
     select_key_frames_for_review,
     states_for_hand,
+    timeline_action_by_frame_and_seat,
     timeline_source_image_for_slot,
 )
 
@@ -1624,3 +1625,83 @@ def test_phantom_evidence_is_what_the_frames_establish() -> None:
         if issue.kind == ACTION_MAY_NOT_BELONG
     )
     assert "may not have been in the hand at all" in issue.detail
+
+
+def test_saved_stack_taken_from_the_action_frame_is_flagged() -> None:
+    """B7 round 7 H3: the rule that an action's own frame reads the stack
+    AFTER the chips moved governed only frames the panel cites. A saved value
+    copied from that frame was never checked."""
+    hand, states = _cv_issue_fixture()
+    states[1]["stacks"] = {"7": 212.2}
+    action = dict(hand["actions"][1], stack_before=None)
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, hand, states, db_amount=12.0, db_stack_before=212.2
+        )
+        if issue.kind == "Stack before looks post-action"
+    )
+    assert "after this seat's chips moved" in issue.detail
+    assert "not before it" in issue.detail
+    assert issue.frame_index == 1
+
+    # A pre-action figure is fine and must stay silent.
+    assert not [
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, hand, states, db_amount=12.0, db_stack_before=224.2
+        )
+        if issue.kind == "Stack before looks post-action"
+    ]
+
+
+def test_source_frame_from_another_street_is_hedged() -> None:
+    """B7 round 7 M2: stored provenance keeps naming the old frame after a row
+    is repurposed onto a different street."""
+    hand, states = _cv_issue_fixture()
+    states[1]["board_cards"] = ["2c", "3d", "4h", "5s"]  # a turn frame
+    repurposed = dict(hand["actions"][1], street="river")
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            repurposed, hand, states, db_amount=None, db_stack_before=224.2
+        )
+        if issue.kind == "Source frame is from another street"
+    )
+    assert "is a turn frame" in issue.detail
+    assert "this line is on the river" in issue.detail
+
+
+def test_timeline_action_by_frame_and_seat_is_edit_proof_but_refuses_ties() -> None:
+    """The key that survives every correction, and declines to guess."""
+    hand, _states = _cv_issue_fixture()
+    found = timeline_action_by_frame_and_seat(hand, "/tmp/f0.jpg", 1)
+    assert found is not None
+    assert found["action_index"] == 1
+    assert timeline_action_by_frame_and_seat(hand, "/tmp/f0.jpg", 99) is None
+    assert timeline_action_by_frame_and_seat(hand, None, 1) is None
+
+    # Two lines by one seat on one frame is ambiguous: refuse rather than guess.
+    ambiguous = dict(
+        hand,
+        actions=[*hand["actions"], dict(hand["actions"][0], action_index=9)],
+    )
+    assert timeline_action_by_frame_and_seat(ambiguous, "/tmp/f0.jpg", 1) is None
+
+
+def test_malformed_amount_and_stack_degrade_instead_of_raising() -> None:
+    """A7 round 7 H2/H3: the previous 'guarded cast' repair turned a
+    ValueError into a TypeError, and left one raw float() ahead of the guard."""
+    hand, states = _cv_issue_fixture()
+    for field, value in (
+        ("amount", "unknown"),
+        ("amount", []),
+        ("stack_before", "n/a"),
+        ("stack_before", {}),
+        ("stack_before", "1,5"),
+    ):
+        action = dict(hand["actions"][0], **{field: value})
+        issues = cv_issues_for_timeline_action(
+            action, hand, states, db_amount=None, db_stack_before=None
+        )
+        assert isinstance(issues, list)
