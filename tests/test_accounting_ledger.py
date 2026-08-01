@@ -619,3 +619,84 @@ def test_dead_money_and_a_live_overbet_are_settled_independently() -> None:
     assert ledger.refunds == pytest.approx({"A": 30, "B": 0})
     assert ledger.gross_pot == pytest.approx(43)
     assert sum(ledger.net_results.values()) == pytest.approx(0)
+
+
+# --- Adversarial round 2 findings -------------------------------------------
+
+
+def test_a_player_all_in_for_their_ante_can_still_win_the_pot() -> None:
+    """Eligibility must follow the chips, including dead ones.
+
+    Deriving pot eligibility from live contributions alone left a player whose
+    entire stack went in as an ante eligible for no pot at all — while their
+    chips sat in one they could not be declared the winner of. A hand the short
+    stack won became unrecordable, which is routine once a stack is at or below
+    the ante.
+    """
+    players = [
+        _player("short", stack=5),
+        _player("B", stack=100),
+        _player("C", stack=100),
+    ]
+    actions = [
+        _action("short", "ante", 5),
+        _action("B", "bet", 15),
+        _action("C", "call", 15),
+    ]
+    unsettled = build_hand_ledger(players, actions)
+    assert "short" in unsettled.pots[0].eligible_players
+
+    ledger = build_hand_ledger(players, actions, {0: ("short",)})
+    assert ledger.payouts["short"] == pytest.approx(35)
+    assert ledger.net_results["short"] == pytest.approx(30)
+    assert sum(ledger.net_results.values()) == pytest.approx(0)
+    assert ledger.is_balanced is True
+
+
+def test_a_folded_ante_poster_is_not_eligible() -> None:
+    """Dead money reaching the pot does not buy a folded player a claim on it."""
+    players = [_player("A"), _player("B"), _player("C")]
+    actions = [
+        _action("C", "ante", 1),
+        _action("C", "fold"),
+        _action("A", "bet", 10),
+        _action("B", "call", 10),
+    ]
+    ledger = build_hand_ledger(players, actions)
+    assert "C" not in ledger.pots[0].eligible_players
+
+
+def test_antes_do_not_coarsen_an_evenly_chopped_pot() -> None:
+    """The split quantum is the finest denomination the hand demonstrates.
+
+    Summing four 0.25 antes into a single 1.00 destroyed the hundredths those
+    antes prove the table deals in, so an exactly-even chop derived an odd
+    split — and which seat gained the extra chip was decided by award order.
+    """
+    players = [_player(name) for name in ("A", "B", "C", "D")]
+    actions = [_action(name, "ante", 0.25) for name in ("A", "B", "C", "D")]
+    actions += [
+        _action("A", "bet", 10),
+        _action("B", "call", 10),
+        _action("C", "fold"),
+        _action("D", "fold"),
+    ]
+    layers = build_hand_ledger(players, actions).pots
+    ledger = build_hand_ledger(
+        players,
+        actions,
+        {pot.index: ("A", "B") for pot in layers},
+        odd_chip_order=("A", "B"),
+    )
+    assert ledger.gross_pot == pytest.approx(21.0)
+    # Exactly even, and the same whichever way the odd-chip order runs.
+    assert ledger.payouts["A"] == pytest.approx(10.5)
+    assert ledger.payouts["B"] == pytest.approx(10.5)
+
+    reversed_order = build_hand_ledger(
+        players,
+        actions,
+        {pot.index: ("A", "B") for pot in layers},
+        odd_chip_order=("B", "A"),
+    )
+    assert reversed_order.payouts == pytest.approx(ledger.payouts)

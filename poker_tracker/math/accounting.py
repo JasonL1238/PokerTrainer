@@ -381,7 +381,13 @@ def build_hand_ledger(
     # Dead money pools into the main pot rather than forming a layer only its
     # poster is eligible for: a lone button ante belongs to whoever wins the hand.
     total_dead = dead + sum(dead_contributions.values(), _ZERO)
-    raw_pots = _build_pots(player_order, settled_contributions, folded, total_dead)
+    raw_pots = _build_pots(
+        player_order,
+        settled_contributions,
+        folded,
+        total_dead,
+        dead_contributions,
+    )
     _validate_winners(winner_map, raw_pots, starting, folded)
 
     gross = sum((pot["amount"] for pot in raw_pots), _ZERO)
@@ -404,7 +410,12 @@ def build_hand_ledger(
     # unit" -- is deliberately NOT passed and neither is anything computed from
     # it: it rounds the rake and nothing else, so the granularity a chopped pot
     # is divided at is the same at every declared value, at every rake rate.
-    split_unit = _split_granularity(settled_contributions.values(), total_dead)
+    # Each dead contribution individually: summing four 0.25 antes into 1.00
+    # destroys the hundredths the hand demonstrably deals in, and coarsening
+    # the quantum turns an exactly-even chop into an odd one.
+    split_unit = _split_granularity(
+        [*settled_contributions.values(), *dead_contributions.values()], dead
+    )
 
     for index, pot in enumerate(raw_pots):
         pot_winners = winner_map.get(index, ())
@@ -655,16 +666,31 @@ def _build_pots(
     contributions: Mapping[str, Decimal],
     folded: set[str],
     dead_money: Decimal,
+    dead_contributions: Mapping[str, Decimal] | None = None,
 ) -> list[dict]:
+    dead_contributions = dead_contributions or {}
     levels = sorted({amount for amount in contributions.values() if amount > 0})
     pots: list[dict] = []
     previous = _ZERO
     for level in levels:
         contributors = tuple(name for name in order if contributions[name] >= level)
         amount = (level - previous) * len(contributors)
+        eligible = tuple(name for name in contributors if name not in folded)
         if not pots:
             amount += dead_money
-        eligible = tuple(name for name in contributors if name not in folded)
+            # Dead money joins this layer, so everyone still in the hand can win
+            # it -- including a player whose ENTIRE commitment was a forced post.
+            # Deriving eligibility from live contributions alone left a player
+            # all-in for their ante eligible for no pot at all, while their
+            # chips sat in one they could not be declared the winner of. That
+            # made a hand the short stack won unrecordable, which is routine
+            # once a stack is at or below the ante.
+            eligible = tuple(
+                name
+                for name in order
+                if name not in folded
+                and (name in contributors or dead_contributions.get(name, _ZERO) > 0)
+            )
         if amount > 0:
             if not eligible:
                 raise LedgerError("A pot has no eligible player.")

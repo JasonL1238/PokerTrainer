@@ -153,3 +153,78 @@ def test_session_id_is_not_treated_as_a_credential():
 
     scrubbed = redact_text('{"session_id": 42}', include_environment=False)
     assert json.loads(scrubbed)["session_id"] == 42
+
+
+# --- Adversarial round 2 findings -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "scheme", ["Bearer", "Basic", "Token", "ApiKey", "Digest", "Negotiate", "SSWS"]
+)
+def test_every_authorization_scheme_is_redacted_not_just_two(scheme):
+    """Enumerating schemes printed "<redacted>" beside an intact credential.
+
+    That reads as scrubbed, which is worse than no redaction at all.
+    """
+    secret = "4f9a2b7c1d8e6f3a0b5c9d2e0f1a2b3c"
+    scrubbed = redact_text(f"Authorization: {scheme} {secret}", include_environment=False)
+    assert secret not in scrubbed
+    assert REDACTED in scrubbed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'password="correct horse battery staple"',
+        'password="p,ssw0rd"',
+        'password="p;ssw0rd"',
+        'password="p)ssw0rd"',
+        "password='p,ssw0rd'",
+        'api_key="two words here"',
+    ],
+)
+def test_a_quoted_value_containing_a_delimiter_is_still_redacted(text):
+    """Quoting a secret used to make redaction strictly worse than leaving it bare.
+
+    The value class stopped at the first delimiter and the closing-quote
+    backreference then failed, so the whole match failed and nothing was hidden.
+    """
+    scrubbed = redact_text(text, include_environment=False)
+    assert REDACTED in scrubbed
+    for fragment in ("correct horse", "p,ssw0rd", "p;ssw0rd", "p)ssw0rd", "two words"):
+        assert fragment not in scrubbed
+
+
+def test_redact_structure_survives_json_encoding():
+    """json.dumps escapes quotes, which stops the assignment pattern matching."""
+    import json
+
+    from poker_tracker.safety.redaction import redact_structure
+
+    payload = {
+        "notes": 'pasted upstream body: {"api_key": "AIzaSyD9x1QwErTyUiOpAsDf"}',
+        "description": "Authorization: Token 4f9a2b7c1d8e6f3a0b5c9d2e",
+    }
+    serialized = json.dumps(redact_structure(payload, include_environment=False))
+    assert "AIzaSyD9x1QwErTyUiOpAsDf" not in serialized
+    assert "4f9a2b7c1d8e6f3a0b5c9d2e" not in serialized
+    # Still valid JSON afterwards.
+    assert json.loads(serialized)
+
+
+def test_redact_structure_recurses_and_redacts_by_key_name():
+    from poker_tracker.safety.redaction import redact_structure
+
+    scrubbed = redact_structure(
+        {"outer": [{"APP_PASSWORD": "hunter2", "port": 8501}]},
+        include_environment=False,
+    )
+    assert scrubbed["outer"][0]["APP_PASSWORD"] == REDACTED
+    assert scrubbed["outer"][0]["port"] == 8501
+
+
+@pytest.mark.parametrize("limit", [0, -1, -100])
+def test_a_non_positive_limit_bounds_rather_than_slicing_from_the_end(limit):
+    """collapsed[:limit-1] counts backwards for limit <= 0."""
+    message = safe_error_message(ValueError("x" * 200), limit=limit)
+    assert len(message) <= max(0, limit)

@@ -3741,6 +3741,11 @@ class PokerDatabase:
         ("solver_runs.result_path", "SELECT result_path FROM solver_runs"),
         ("solver_runs.log_path", "SELECT log_path FROM solver_runs"),
         ("solver_runs.command_path", "SELECT command_path FROM solver_runs"),
+        # A regression fixture is frequently a frame or a recording under a
+        # managed directory, so omitting these let retention delete the very
+        # evidence that proves a closed issue stays closed.
+        ("regression_cases.fixture_path", "SELECT fixture_path FROM regression_cases"),
+        ("regression_cases.report_path", "SELECT report_path FROM regression_cases"),
     )
 
     def referenced_artifact_paths(self) -> tuple[set[str], list[str]]:

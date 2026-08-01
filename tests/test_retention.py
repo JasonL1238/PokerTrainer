@@ -274,3 +274,48 @@ def test_invalid_window_is_rejected_rather_than_defaulted(monkeypatch, bad):
 def test_every_managed_category_has_an_env_var_and_a_default():
     assert set(RETENTION_ENV_VARS) == set(DEFAULT_RETENTION_DAYS)
     assert not set(RETENTION_ENV_VARS) & NEVER_MANAGED
+
+
+# --- Adversarial round 2 findings -------------------------------------------
+
+
+def test_a_regression_fixture_is_never_deleted(workspace):
+    """The evidence proving a closed issue stays closed must survive a sweep.
+
+    Regression fixtures are frequently a frame or a recording under a managed
+    directory, so omitting their column from the reference list let retention
+    delete exactly the file the gate depends on.
+    """
+    from poker_tracker.persistence.models import Hand, HandIssue, Session
+    from poker_tracker.services.regression_promotion import promote_issue_to_regression
+
+    db, paths = workspace
+    fixture = _write(paths["frames"] / "issue_evidence.jpg", age_days=400)
+    session = db.create_session(Session(name="Regression"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+    issue = db.create_hand_issue(
+        HandIssue(hand_id=hand.id, issue_types=["cards"], description="misread")
+    )
+    promote_issue_to_regression(
+        db, issue.id, kind="cropped_frame", fixture_path=str(fixture.resolve())
+    )
+
+    audit = _audit(db, paths)
+    entry = next(f for f in audit.files if f.path == fixture)
+    assert entry.referenced is True
+    assert entry.deletable is False
+
+
+def test_an_orphan_video_does_not_claim_to_have_been_unused(workspace):
+    """Age is the file's mtime, not how long nothing pointed at it.
+
+    A recording orphaned one second ago by a session delete still carries
+    whatever mtime it was written with, so an "unused for 600 days" claim would
+    be one the data cannot support.
+    """
+    db, paths = workspace
+    video = _write(paths["videos"] / "orphan.mov", age_days=600)
+    audit = _audit(db, paths, include_orphan_videos=True)
+    entry = next(f for f in audit.files if f.path == video)
+    assert entry.deletable is True
+    assert "does NOT mean it has been unused" in entry.reason

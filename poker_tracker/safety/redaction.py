@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+from typing import Any
 
 REDACTED = "<redacted>"
 
@@ -50,10 +51,24 @@ _ASSIGNMENT_PATTERN = re.compile(
         [A-Za-z0-9_.\-]*)
     (?P<keyquote>["']?)
     (?P<sep>\s*(?:=>|[:=])\s*)
-    (?P<quote>["']?)
-    (?P<value>[^\s"',;}\)]+)
-    (?P=quote)
+    (?:
+        # Quoted: consume everything up to the closing quote, so a passphrase
+        # with spaces or commas is redacted. The old class stopped at the first
+        # delimiter and the backreference then demanded a quote that was not
+        # there, so the whole match failed and NOTHING was redacted -- quoting a
+        # secret made redaction strictly worse than leaving it bare.
+        (?P<q>["'])(?P<qvalue>(?:\\.|[^\\])*?)(?P=q)
+      |
+        (?P<value>[^\s"',;}\)]+)
+    )
     """
+)
+
+# Any HTTP authorization scheme, not an enumerated few. Matching only Bearer and
+# Basic meant `Authorization: Token <secret>` printed "<redacted>" beside the
+# intact credential, which reads as scrubbed and is worse than no redaction.
+_AUTHORIZATION_HEADER_RE = re.compile(
+    r"(?i)\b(authorization\s*:\s*)([A-Za-z][A-Za-z0-9\-]{2,})\s+\S+"
 )
 
 # Environment variables whose literal values must never appear in output, even
@@ -88,9 +103,10 @@ def redact_text(text: str, *, include_environment: bool = True) -> str:
     if include_environment:
         for literal in _environment_literals():
             scrubbed = scrubbed.replace(literal, REDACTED)
-    # Token shapes first. Running the assignment rule first would consume
-    # "Authorization: Bearer" as a key/value pair, redact the word "Bearer", and
-    # leave the actual token standing in the message.
+    # Authorization headers first, whole-line, whatever the scheme. Running the
+    # assignment rule first would consume "Authorization: Token" as a key/value
+    # pair, redact the scheme word, and leave the credential standing.
+    scrubbed = _AUTHORIZATION_HEADER_RE.sub(rf"\1\2 {REDACTED}", scrubbed)
     for pattern in _TOKEN_PATTERNS:
         scrubbed = pattern.sub(_replace_token, scrubbed)
     scrubbed = _ASSIGNMENT_PATTERN.sub(_replace_assignment, scrubbed)
@@ -108,7 +124,7 @@ def _replace_assignment(match: re.Match[str]) -> str:
     so the replacement is quoted there too. In prose the value stays bare, which
     is what ``api_key=<redacted>`` should look like.
     """
-    quote = match.group("quote")
+    quote = match.group("q") or ""
     if not quote and match.group("keyquote"):
         quote = match.group("keyquote")
     return (
@@ -124,6 +140,34 @@ def _replace_token(match: re.Match[str]) -> str:
     return REDACTED
 
 
+def redact_structure(value: Any, *, include_environment: bool = True) -> Any:
+    """Scrub strings inside a nested structure, before it is serialized.
+
+    Redacting a serialized document does not work: ``json.dumps`` escapes the
+    quotes inside every string field, and an escaped key no longer matches the
+    assignment pattern. A credential pasted into a free-text field as JSON --
+    the single most likely paste -- therefore survived the pass that existed to
+    catch exactly that. Scrubbing the values first sidesteps the encoder.
+    """
+    if isinstance(value, str):
+        return redact_text(value, include_environment=include_environment)
+    if isinstance(value, dict):
+        return {
+            key: (
+                REDACTED
+                if isinstance(key, str) and _SENSITIVE_ENV_NAMES.search(key)
+                else redact_structure(item, include_environment=include_environment)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [
+            redact_structure(item, include_environment=include_environment)
+            for item in value
+        ]
+    return value
+
+
 def safe_error_message(exc: BaseException, *, limit: int = 500) -> str:
     """A single-line, secret-free, bounded description of a failure.
 
@@ -136,6 +180,10 @@ def safe_error_message(exc: BaseException, *, limit: int = 500) -> str:
     collapsed = re.sub(r"\s{2,}", " ", scrubbed).strip()
     if not collapsed:
         return type(exc).__name__
+    if limit <= 0:
+        # A non-positive limit would slice from the END of the string, which is
+        # the opposite of bounding it.
+        return ""
     if len(collapsed) <= limit:
         return collapsed
     return collapsed[: limit - 1].rstrip() + "…"

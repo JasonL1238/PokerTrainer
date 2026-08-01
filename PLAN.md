@@ -2766,6 +2766,16 @@ GTO analysis.
 
 ### Licensing/distribution gate
 
+**Newly discovered release blocker: `ultralytics` is AGPL-3.0.** The
+reconstruction pipeline depends on it, so the same distribution question that
+applies to TexasSolver applies to the *base* image as well — not only to a
+solver-enabled one. Local use is unaffected; publishing an image is what
+triggers the obligation. `python -m poker_tracker.maintenance.sbom --format
+notices` lists it, and `--fail-on-review` exits nonzero while any such component
+is present. Resolve by obtaining an Ultralytics commercial license, replacing
+the inference dependency, or satisfying AGPL source-offer obligations, before
+publishing any image. This is not legal advice; obtain qualified review.
+
 - Treat TexasSolver’s license as a release blocker for any distributed or
   hosted solver-enabled image.
 - Before publishing an image or enabling a hosted solver, retain either:

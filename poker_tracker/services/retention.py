@@ -15,6 +15,13 @@ Source videos are deliberately never expired by age. They are the irreplaceable
 input; every derived artifact can be rebuilt from them and they cannot be
 rebuilt from anything. Only an unreferenced *orphan* video is ever offered, and
 only through an explicit opt-in.
+
+One limit is worth stating plainly, because the obvious reading of the output is
+wrong: the age shown is the FILE's mtime, not how long it has been unreferenced.
+Nothing records when a row stopped pointing at a file, so a recording orphaned
+one second ago by a session delete still reports whatever age it was written
+with. The reason text for videos says so rather than implying a dormancy the
+data cannot demonstrate.
 """
 
 from __future__ import annotations
@@ -45,8 +52,9 @@ DEFAULT_RETENTION_DAYS: dict[str, int] = {
     "job_logs": 30,
     "exports": 90,
     "roi_previews": 30,
-    # Orphan videos are only ever removed on explicit opt-in; the window still
-    # applies so a video orphaned seconds ago by an in-flight edit is safe.
+    # Orphan videos are only ever removed on explicit opt-in. The window is
+    # measured against file mtime, which is NOT when the file became
+    # unreferenced -- see the module docstring.
     "videos": 365,
 }
 
@@ -255,8 +263,18 @@ def _classify(
     if category == "videos" and not rules.include_orphan_videos:
         return False, "source recording; orphan removal not requested"
     if age_days < window:
-        return False, f"unreferenced but only {age_days:.1f}d old (window {window}d)"
-    return True, f"unreferenced and {age_days:.1f}d old (window {window}d)"
+        return False, f"unreferenced but file is only {age_days:.1f}d old (window {window}d)"
+    # The age is the FILE's, not how long it has been unreferenced -- nothing
+    # records when a row stopped pointing at it. Saying "unused for N days"
+    # would be a claim this cannot support: a recording orphaned one second ago
+    # by a session delete still carries whatever mtime it was written with.
+    if category == "videos":
+        return True, (
+            f"no database row references it; file is {age_days:.1f}d old. "
+            "This does NOT mean it has been unused that long -- it may have "
+            "been orphaned moments ago."
+        )
+    return True, f"unreferenced, file is {age_days:.1f}d old (window {window}d)"
 
 
 @dataclass(frozen=True)

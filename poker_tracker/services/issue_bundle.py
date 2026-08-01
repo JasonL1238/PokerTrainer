@@ -24,7 +24,7 @@ from typing import Any
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.release_gate.environment import collect_environment
 from poker_tracker.release_gate.models import resolve_models
-from poker_tracker.safety.redaction import redact_text
+from poker_tracker.safety.redaction import redact_structure
 from poker_tracker.validation.hashing import sha256_file
 
 BUNDLE_SCHEMA_VERSION = 1
@@ -159,5 +159,8 @@ def serialize_issue_bundle(bundle: dict[str, Any]) -> str:
     description, a correction note, a resolution comment -- which is exactly
     where an operator pastes one without thinking.
     """
-    payload = json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=False)
-    return redact_text(payload)
+    # Scrub first, serialize second. json.dumps escapes the quotes inside every
+    # string field, and an escaped key stops matching the assignment pattern --
+    # so a credential pasted in as JSON survived a pass run over the output.
+    scrubbed = redact_structure(bundle)
+    return json.dumps(scrubbed, indent=2, sort_keys=True, ensure_ascii=False)

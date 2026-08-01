@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import hmac
 import os
+import time
 
 import streamlit as st
 
 from poker_tracker.ui.components import product_hero
+from poker_tracker.ui.login_throttle import (
+    DEFAULT_FAILURE_DELAY_SECONDS,
+    shared_throttle,
+)
 from poker_tracker.ui.poker_visuals import poker_table_html
 from poker_tracker.ui.ui_theme import brand_header
 
@@ -50,12 +55,33 @@ def check_password() -> bool:
                     "Password", type="password", autocomplete="current-password"
                 )
                 submitted = st.form_submit_button("Continue", type="primary", width="stretch")
-            if submitted:
+            throttle = shared_throttle()
+            locked_for = throttle.retry_after()
+            if locked_for > 0:
+                st.error(
+                    "Too many failed sign-in attempts. Try again in "
+                    f"{int(locked_for) + 1} seconds."
+                )
+            elif submitted:
                 if hmac.compare_digest(candidate.encode("utf-8"), configured.encode("utf-8")):
+                    throttle.record_success()
                     st.session_state["authed"] = True
                     st.rerun()
                 else:
+                    # Delay first, then record: a constant cost on every wrong
+                    # guess is cheap for a person and expensive for a loop, and
+                    # it applies before the window fills rather than only after.
+                    time.sleep(DEFAULT_FAILURE_DELAY_SECONDS)
+                    wait = throttle.record_failure()
+                    # The same message either way: telling an attacker which
+                    # half of the credential was wrong, or that they have run
+                    # out of attempts on a real account, is free information.
                     st.error("Unable to sign in with those credentials.")
+                    if wait > 0:
+                        st.caption(
+                            "Further attempts are paused for "
+                            f"{int(wait) + 1} seconds."
+                        )
             st.caption("Completed-session analysis only. No live assistance.")
     return False
 
