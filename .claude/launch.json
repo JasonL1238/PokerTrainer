@@ -3,16 +3,11 @@
   "configurations": [
     {
       "name": "pokertrainer",
-      "runtimeExecutable": "streamlit",
+      "//": "Launched through an interactive login shell so the developer's own profile is sourced. Optional runtime settings (TEXAS_SOLVER_PATH, TEXAS_SOLVER_RESOURCE_DIR, ANTHROPIC_API_KEY) are per-machine environment variables and must not be hardcoded here.",
+      "runtimeExecutable": "zsh",
       "runtimeArgs": [
-        "run",
-        "app.py",
-        "--server.port",
-        "8501",
-        "--server.headless",
-        "true",
-        "--browser.gatherUsageStats",
-        "false"
+        "-lic",
+        "exec streamlit run app.py --server.port 8501 --server.headless true --browser.gatherUsageStats false"
       ],
       "port": 8501
     }
