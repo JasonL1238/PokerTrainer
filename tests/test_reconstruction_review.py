@@ -3,6 +3,7 @@ from pathlib import Path
 
 from poker_tracker.persistence.completion import parse_completion_evidence
 from poker_tracker.ui.reconstruction_review import (
+    UNKNOWN_AMOUNT_CODE_TEXT,
     cv_issues_for_timeline_action,
     frame_issue_targets,
     history_impacts,
@@ -13,6 +14,7 @@ from poker_tracker.ui.reconstruction_review import (
     resolve_study_approve_key_frames,
     select_key_frames_for_review,
     states_for_hand,
+    timeline_source_image_for_slot,
 )
 
 
@@ -105,7 +107,7 @@ def test_frame_issue_targets_link_flagged_frames_to_actions() -> None:
     assert targets[0].frame_index == 1
     assert targets[0].issue_types == ("Action / player",)
     assert targets[0].action_labels() == (
-        "Preflop · BTN Seat4 · raise 3 BB",
+        "Preflop · BTN Seat4 · Raise 3 BB",
     )
     matched = match_db_action_to_frame_target(
         street="preflop",
@@ -499,7 +501,7 @@ def test_cv_issues_report_refused_amount_with_code_and_remedy() -> None:
     assert "Amount unknown" in kinds
     amount_issue = next(issue for issue in issues if issue.kind == "Amount unknown")
     assert "refused to guess" in amount_issue.detail
-    assert "enter it in the Amount field" in amount_issue.detail
+    assert "enter the chips this seat added" in amount_issue.detail
     assert "1272×896" in amount_issue.detail
     assert amount_issue.frame_index == 0
     # Seat 1 committed before the recording started (t_start == 0):
@@ -641,8 +643,9 @@ def test_amount_issue_uses_readable_bet_before_generic_fallback() -> None:
         db_stack_before=212.2,
     )
     amount_issue = next(issue for issue in issues if issue.kind == "Amount unknown")
-    assert "12.8 BB in this seat's bet box" in amount_issue.detail
+    assert "12.8 BB total in this seat's bet box" in amount_issue.detail
     assert "could not be isolated" in amount_issue.detail
+    assert "chips this seat added here" in amount_issue.detail
     assert "No readable frame" not in amount_issue.detail
 
 
@@ -709,7 +712,7 @@ def test_stack_issue_scans_backward_for_the_latest_refusal() -> None:
         issue for issue in issues if issue.kind == "Stack before unknown"
     )
     assert "On frame 1" in stack_issue.detail
-    assert "no digit run" in stack_issue.detail
+    assert "no digits were found" in stack_issue.detail
     # Jump goes to the frame with the refusal, not the action's source frame.
     assert stack_issue.frame_index == 0
     # A readable stack closer to the action stops the scan: no story then.
@@ -743,7 +746,7 @@ def test_inferred_stack_issue_points_at_visible_stack() -> None:
         issue for issue in issues if issue.kind == "Stack before unknown"
     )
     assert "shows this seat at 269.1 BB" in stack_issue.detail
-    assert "enter it below" in stack_issue.detail
+    assert "More fields \u2192 Stack before (BB)" in stack_issue.detail
 
 
 def test_recording_start_offset_keeps_mid_hand_claim_honest() -> None:
@@ -843,5 +846,305 @@ def test_stack_issue_names_unknown_amount_as_the_blocker() -> None:
     stack_issue = next(
         issue for issue in issues if issue.kind == "Stack before unknown"
     )
-    assert "because the action's own amount is unknown" in stack_issue.detail
-    assert "Resolve the amount first" in stack_issue.detail
+    assert "this line's own amount is unknown" in stack_issue.detail
+    assert "More fields \u2192 Stack before (BB)" in stack_issue.detail
+
+
+def test_stack_issue_names_the_real_starting_stack_mechanism() -> None:
+    """A3 round 3: committed_at_start_unknown means the stack READ FINE but the
+    chips already on the felt could not be sized. Saying 'never established
+    cleanly' there is disprovable by looking at the frame."""
+    hand, states = _cv_issue_fixture()
+    hand = dict(
+        hand,
+        t_start=48.0,
+        players=[
+            {
+                "seat": 1,
+                "player_name": "Seat1",
+                "position": "UTG+1",
+                "starting_stack": None,
+                "starting_stack_unknown": "committed_at_start_unknown",
+            }
+        ],
+    )
+    states[0]["stacks"] = {"1": 406.1}
+    issues = cv_issues_for_timeline_action(
+        hand["actions"][0], hand, states, db_amount=6.0, db_stack_before=None
+    )
+    stack_issue = next(
+        issue for issue in issues if issue.kind == "Stack before unknown"
+    )
+    assert "stack read fine" in stack_issue.detail
+    assert "could not be sized" in stack_issue.detail
+    assert "never established cleanly" not in stack_issue.detail
+    # And it points at a frame that actually carries the value.
+    assert "shows this seat at 406.1 BB" in stack_issue.detail
+
+
+def test_inferred_line_on_a_frame_without_cards_offers_deletion() -> None:
+    """B2 round 3: three of hand 2's inferred checks cited a frame where the
+    seat holds no cards. That frame is evidence the action did not happen, so
+    the next step must not be 'enter a number'."""
+    hand, states = _cv_issue_fixture()
+    states[1]["dealt_in"] = [0, 2, 4]
+    states[1]["stacks"] = {"7": 269.1}
+    inferred = {
+        "street": "turn",
+        "action_index": 2,
+        "seat": 7,
+        "player_name": "Seat7",
+        "position": "BB",
+        "action_type": "check",
+        "amount": None,
+        "source_image": "/tmp/f1.jpg",
+        "derivation": "inferred_round_complete",
+    }
+    issues = cv_issues_for_timeline_action(
+        inferred, hand, states, db_amount=None, db_stack_before=None
+    )
+    stack_issue = next(
+        issue for issue in issues if issue.kind == "Stack before unknown"
+    )
+    assert "does not show this seat holding cards" in stack_issue.detail
+    assert "delete this action" in stack_issue.detail
+    assert "269.1" not in stack_issue.detail
+
+
+def test_stack_blocker_tracks_the_saved_amount_not_the_timeline() -> None:
+    """B2 round 3: the 'own amount is unknown' branch keyed off the timeline
+    amount, so it persisted verbatim after the operator filled the amount in."""
+    hand, states = _cv_issue_fixture()
+    unresolved = {
+        "street": "preflop",
+        "action_index": 3,
+        "seat": 7,
+        "player_name": "Seat7",
+        "position": "BB",
+        "action_type": "bet",
+        "amount": None,
+        "source_image": "/tmp/f1.jpg",
+        "derivation": "amount_unknown",
+    }
+    before = cv_issues_for_timeline_action(
+        unresolved, hand, states, db_amount=None, db_stack_before=None
+    )
+    assert any(
+        "this line's own amount is unknown" in issue.detail for issue in before
+    )
+    after = cv_issues_for_timeline_action(
+        unresolved, hand, states, db_amount=3.0, db_stack_before=None
+    )
+    assert not any(
+        "own amount is unknown" in issue.detail for issue in after
+    ), "stale dependency claim survived the operator resolving the amount"
+
+
+def test_stack_hints_name_a_frame_that_carries_the_value() -> None:
+    """B2 round 3: 'read it off the nearest legible frame' while jumping to the
+    illegible one — and sometimes no legible frame exists at all."""
+    hand, states = _cv_issue_fixture()
+    states[0]["stacks_unknown"] = {"7": "no_digit_run"}
+    states[1]["stacks"] = {"7": 224.2}
+    action = {
+        "street": "preflop",
+        "action_index": 3,
+        "seat": 7,
+        "player_name": "Seat7",
+        "position": "BB",
+        "action_type": "bet",
+        "amount": 4.0,
+        "source_image": "/tmp/f0.jpg",
+        "derivation": "bet_text",
+    }
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, hand, states, db_amount=4.0, db_stack_before=None
+        )
+        if issue.kind == "Stack before unknown"
+    )
+    assert "Frame 2 shows this seat at 224.2 BB" in issue.detail
+    # The jump must land on the legible frame, not the refused one.
+    assert issue.frame_index == 1
+
+    # No frame shows it anywhere: say so rather than send them hunting.
+    states[1].pop("stacks")
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, hand, states, db_amount=4.0, db_stack_before=None
+        )
+        if issue.kind == "Stack before unknown"
+    )
+    assert "No frame in this hand shows this seat's stack" in issue.detail
+    assert "leave the field empty" in issue.detail
+
+
+def test_every_stack_message_names_the_control_that_holds_the_field() -> None:
+    """B2 round 3 S1: 'enter it below' pointed at a field hidden behind an
+    unchecked More-fields box."""
+    hand, states = _cv_issue_fixture()
+    variants = [
+        dict(hand["actions"][0], stack_before=212.2),
+        dict(hand["actions"][0], derivation="inferred_round_complete"),
+        dict(hand["actions"][0], derivation="amount_unknown"),
+    ]
+    for timeline_action in variants:
+        issues = cv_issues_for_timeline_action(
+            timeline_action, hand, states, db_amount=None, db_stack_before=None
+        )
+        stack_issue = next(
+            (issue for issue in issues if issue.kind == "Stack before unknown"),
+            None,
+        )
+        if stack_issue is None:
+            continue
+        assert "More fields → Stack before (BB)" in stack_issue.detail
+
+
+def test_generic_amount_fallback_requires_an_all_frames_scan() -> None:
+    """A3 round 3: 'No readable frame showed this amount' was asserted after
+    checking exactly one frame."""
+    hand, states = _cv_issue_fixture()
+    states[0]["bets_unknown"] = {}
+    states[1]["bets"] = {"1": 9.5}
+    action = dict(hand["actions"][0], derivation="amount_unknown")
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, hand, states, db_amount=None, db_stack_before=212.2
+        )
+        if issue.kind == "Amount unknown"
+    )
+    assert "Frame 2 shows 9.5 BB there" in issue.detail
+    assert "No frame in this hand" not in issue.detail
+
+    # Genuinely absent everywhere: the absolute claim is now licensed.
+    states[1].pop("bets")
+    later_hand = dict(hand, t_start=48.0)
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, later_hand, states, db_amount=None, db_stack_before=212.2
+        )
+        if issue.kind == "Amount unknown"
+    )
+    assert "No frame in this hand shows this seat's bet box" in issue.detail
+
+    # On the mid-hand opener the same absence gets the stronger explanation,
+    # but only after the scan confirms no frame shows it.
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, hand, states, db_amount=None, db_stack_before=212.2
+        )
+        if issue.kind == "Amount unknown"
+    )
+    assert "recording starts mid-hand" in issue.detail
+    assert "no frame shows this seat's bet box" in issue.detail
+
+
+def test_ambiguity_guard_inspects_every_top_scoring_candidate() -> None:
+    """A3 round 3: with two candidates on one frame and a third elsewhere, the
+    top-2 comparison passed and silently wired the row to the wrong frame."""
+    hand_payload = {
+        "actions": [
+            {
+                "street": "preflop",
+                "position": "BTN",
+                "player_name": "Seat4",
+                "action_type": "call",
+                "amount": None,
+                "source_image": "/tmp/x.jpg",
+            },
+            {
+                "street": "preflop",
+                "position": "BTN",
+                "player_name": "Seat4",
+                "action_type": "call",
+                "amount": None,
+                "source_image": "/tmp/x.jpg",
+            },
+            {
+                "street": "preflop",
+                "position": "BTN",
+                "player_name": "Seat4",
+                "action_type": "call",
+                "amount": None,
+                "source_image": "/tmp/y.jpg",
+            },
+        ]
+    }
+    states = [
+        {"image": "/tmp/x.jpg", "time_s": 1.0},
+        {"image": "/tmp/y.jpg", "time_s": 2.0},
+    ]
+    reviews = {
+        image: {"status": "incorrect", "issue_types": ["Pot"], "notes": ""}
+        for image in ("/tmp/x.jpg", "/tmp/y.jpg")
+    }
+    targets = frame_issue_targets(hand_payload, states, reviews)
+    assert (
+        match_db_action_to_frame_target(
+            street="preflop",
+            action_type="call",
+            player_name="Seat4",
+            position="BTN",
+            amount=None,
+            targets=targets,
+        )
+        is None
+    )
+
+
+def test_source_image_lookup_ignores_type_but_not_identity() -> None:
+    """The frame a row came from must survive a type correction, without
+    letting a different actor borrow it."""
+    hand, _states = _cv_issue_fixture()
+    assert (
+        timeline_source_image_for_slot(
+            hand,
+            street="preflop",
+            action_index=1,
+            position="UTG+1",
+            player_name="Seat1",
+        )
+        == "/tmp/f0.jpg"
+    )
+    # Type is irrelevant here (no type argument at all), but a different actor
+    # in the slot must not resolve.
+    assert (
+        timeline_source_image_for_slot(
+            hand,
+            street="preflop",
+            action_index=1,
+            position="BB",
+            player_name="Seat7",
+        )
+        is None
+    )
+    assert (
+        timeline_source_image_for_slot(
+            hand,
+            street="preflop",
+            action_index=None,
+            position="UTG+1",
+            player_name="Seat1",
+        )
+        is None
+    )
+
+
+def test_refusal_codes_all_have_human_text() -> None:
+    """A3/B2 round 3: three codes present in real timelines fell through to
+    machine-speak."""
+    for code in (
+        "below_calibrated_render_size",
+        "no_digit_run",
+        "bet_boxes_disagree",
+        "stack_boxes_disagree",
+        "ambiguous_longest_run",
+    ):
+        assert code in UNKNOWN_AMOUNT_CODE_TEXT
+        assert "_" not in UNKNOWN_AMOUNT_CODE_TEXT[code]

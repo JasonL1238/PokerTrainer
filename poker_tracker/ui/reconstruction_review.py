@@ -40,7 +40,8 @@ class TimelineActionRef:
         amount = "" if self.amount is None else f" {self.amount:g} BB"
         return (
             f"{self.street.title()} · {actor} · "
-            f"{self.action_type.replace('_', ' ')}{amount}"
+            f"{self.action_type.replace('_', ' ').replace('-', ' ').title()}"
+            f"{amount}"
         )
 
 
@@ -85,7 +86,18 @@ UNKNOWN_AMOUNT_CODE_TEXT: dict[str, str] = {
         "the on-screen text rendered below the size the reader is calibrated "
         "to trust, so it refused to guess"
     ),
-    "no_digit_run": "no digit run was found in the text region",
+    "no_digit_run": "no digits were found in the text region",
+    "bet_boxes_disagree": (
+        "two reads of the same bet box returned different numbers, so neither "
+        "was trusted"
+    ),
+    "stack_boxes_disagree": (
+        "two reads of the same stack box returned different numbers, so "
+        "neither was trusted"
+    ),
+    "ambiguous_longest_run": (
+        "more than one digit run was equally plausible, so none was chosen"
+    ),
 }
 
 MONEY_ACTION_TYPES = {"bet", "raise", "call", "all_in", "all-in", "post_blind", "ante"}
@@ -553,10 +565,16 @@ def match_db_action_to_frame_target(
     if not candidates:
         return None
     candidates.sort(key=lambda item: (-item[0], item[1].frame_index))
-    # Ambiguous equal-score matches are unsafe for jump/badge wiring.
-    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
-        if candidates[0][1].source_image != candidates[1][1].source_image:
-            return None
+    # Ambiguous equal-score matches are unsafe for jump/badge wiring. Compare
+    # EVERY top-scoring candidate, not just the runner-up: two candidates on
+    # one frame plus a third elsewhere would otherwise pass the guard and
+    # silently wire the row to the wrong frame.
+    best_score = candidates[0][0]
+    best_images = {
+        target.source_image for score, target in candidates if score == best_score
+    }
+    if len(best_images) > 1:
+        return None
     return candidates[0][1]
 
 
@@ -599,6 +617,41 @@ def match_db_action_to_timeline_action(
         if not position_declared and not player_declared:
             return None
         return action
+    return None
+
+
+def timeline_source_image_for_slot(
+    hand: dict[str, Any],
+    *,
+    street: str,
+    action_index: int | None,
+    position: str,
+    player_name: str,
+) -> str | None:
+    """Source frame of the timeline line occupying this street/index slot.
+
+    Deliberately ignores the action type, unlike
+    :func:`match_db_action_to_timeline_action`: this answers "which frame did
+    this row come from" for frame-level facts that survive a type correction,
+    not "may this row inherit that line's read issues". ``(street,
+    action_index)`` is unique in a timeline hand, so no ambiguity arises.
+    """
+
+    if action_index is None:
+        return None
+    street_key = street.lower()
+    for action in hand.get("actions") or []:
+        if str(action.get("street", "")).lower() != street_key:
+            continue
+        if action.get("action_index") != action_index:
+            continue
+        t_position = str(action.get("position") or "")
+        t_player = str(action.get("player_name") or "")
+        if position and t_position and t_position != position:
+            return None
+        if player_name and t_player and t_player != player_name:
+            return None
+        return str(action.get("source_image") or "") or None
     return None
 
 
@@ -660,9 +713,18 @@ def cv_issues_for_timeline_action(
         readable_bet = _seat_value(state.get("bets") if state else None, seat)
         if timeline_amount is not None:
             detail = (
-                f"The reconstruction read {float(timeline_amount):g} BB for this "
-                "line, but the saved amount is empty — confirm it against "
-                f"{frame_ref} and re-enter it in the Amount field below."
+                f"The reconstruction read {float(timeline_amount):g} BB as the "
+                "chips this seat added here, but the saved amount is empty — "
+                f"confirm it against {frame_ref} (whose bet box shows the "
+                "seat's total for the street) and re-enter it in the Amount "
+                "field below."
+            )
+        elif not _seat_holds_cards(state, seat):
+            detail = (
+                f"{frame_ref.capitalize()} does not show this seat holding "
+                "cards, so this line may not belong to the hand at all. Open "
+                "that frame and delete this action if the seat was already "
+                "out; otherwise enter the amount below."
             )
         elif derivation.startswith("inferred"):
             detail = (
@@ -674,7 +736,8 @@ def cv_issues_for_timeline_action(
         elif code_text is not None:
             detail = (
                 f"On {frame_ref}, {code_text}. Read the amount off that frame "
-                "and enter it in the Amount field below."
+                "and enter the chips this seat added in the Amount field "
+                "below."
             )
             if code == "below_calibrated_render_size":
                 detail += (
@@ -683,23 +746,37 @@ def cv_issues_for_timeline_action(
                 )
         elif readable_bet is not None:
             detail = (
-                f"{frame_ref.capitalize()} shows {readable_bet:g} BB in this "
-                "seat's bet box, but the increment belonging to this action "
-                "could not be isolated from it — confirm the amount and enter "
-                "it below."
-            )
-        elif frame_index == 0 and _recording_starts_mid_hand(
-            hand, recording_start_s
-        ):
-            detail = (
-                "The recording starts mid-hand, so this amount may never have "
-                "been on screen. Enter it below if a frame shows it."
+                f"{frame_ref.capitalize()} shows {readable_bet:g} BB total in "
+                "this seat's bet box, but the share belonging to this action "
+                "could not be isolated from it — work out the chips this seat "
+                "added here and enter that below."
             )
         else:
-            detail = (
-                f"No readable frame showed this amount (source: {frame_ref}). "
-                "Enter it in the Amount field below."
-            )
+            # Naming a frame that carries the number always beats a vaguer
+            # claim, so the all-frames scan runs before the mid-hand branch —
+            # and only that scan licenses an all-frames statement.
+            elsewhere = _nearest_readable(states, frame_index, seat, "bets")
+            if elsewhere is not None:
+                value, at_index = elsewhere
+                detail = (
+                    f"This seat's bet box was not read on {frame_ref}. Frame "
+                    f"{at_index + 1} shows {value:g} BB there — work out the "
+                    "chips added on this action and enter that below."
+                )
+            elif frame_index == 0 and _recording_starts_mid_hand(
+                hand, recording_start_s
+            ):
+                detail = (
+                    "The recording starts mid-hand and no frame shows this "
+                    "seat's bet box, so this amount was never on screen. "
+                    "Enter it below only if you can establish it another way."
+                )
+            else:
+                detail = (
+                    "No frame in this hand shows this seat's bet box, so the "
+                    "amount was never on screen. Enter it below only if you "
+                    "can establish it another way."
+                )
         issues.append(
             ActionCvIssue(
                 kind="Amount unknown", detail=detail, frame_index=frame_index
@@ -715,6 +792,7 @@ def cv_issues_for_timeline_action(
             seat=seat,
             frame_ref=frame_ref,
             frame_index=frame_index,
+            db_amount=db_amount,
             recording_start_s=recording_start_s,
         )
         if stack_issue is not None:
@@ -745,8 +823,10 @@ def cv_issues_for_timeline_action(
                     detail=(
                         f"Seat {seat}'s committed chips could not be tracked "
                         f"continuously around {frame_ref}, so part of this "
-                        "transition was not measured. Double-check this "
-                        "line's amount against the neighboring frames."
+                        "transition was not measured. Check this line's "
+                        "amount against the frames on either side of "
+                        f"{frame_ref} and correct it in the Amount field "
+                        "below if it is wrong."
                     ),
                     frame_index=frame_index,
                 )
@@ -763,13 +843,15 @@ def _stack_before_issue(
     seat: int | None,
     frame_ref: str,
     frame_index: int | None,
+    db_amount: float | None,
     recording_start_s: float | None,
 ) -> ActionCvIssue | None:
     """Explain a missing stack-before without asserting a mechanism we can't prove.
 
     Returns None when nothing in the timeline explains the gap — an unexplained
     hole stays visible through the empty field itself rather than earning a
-    fabricated story.
+    fabricated story. Every branch that asks the operator for a value points at
+    a frame that actually carries one, or says plainly that none does.
     """
 
     kind = "Stack before unknown"
@@ -780,28 +862,39 @@ def _stack_before_issue(
             detail=(
                 f"The reconstruction computed {float(timeline_stack):g} BB "
                 "for this seat's stack before the action, but the saved field "
-                "is empty — confirm it and re-enter it below."
+                "is empty — confirm it and re-enter it under **More fields → "
+                "Stack before (BB)**."
             ),
             frame_index=frame_index,
         )
+    nearest = _nearest_readable(states, frame_index, seat, "stacks")
+    hint_value, hint_index = nearest if nearest is not None else (None, None)
+    hint = _stack_field_hint(hint_index, hint_value)
     derivation = str(timeline_action.get("derivation") or "")
     if derivation.startswith("inferred"):
-        readable_stack = _seat_value(state.get("stacks") if state else None, seat)
-        if readable_stack is not None:
-            detail = (
+        if not _seat_holds_cards(state, seat):
+            # The frame that produced this line shows the seat holding no
+            # cards: the honest reading is that the line may not belong here,
+            # so do not push the operator to legitimize it with a number.
+            return ActionCvIssue(
+                kind=kind,
+                detail=(
+                    f"This line was inferred from the betting round "
+                    f"completing, but {frame_ref} does not show this seat "
+                    "holding cards — it may not belong to the hand. Open that "
+                    "frame and delete this action if the seat was already "
+                    "out."
+                ),
+                frame_index=frame_index,
+            )
+        return ActionCvIssue(
+            kind=kind,
+            detail=(
                 "This line was inferred from the betting round completing, so "
-                "the import did not attach a stack to it. "
-                f"{frame_ref.capitalize()} shows this seat at "
-                f"{readable_stack:g} BB — confirm it and enter it below."
-            )
-        else:
-            detail = (
-                "This line was inferred from the betting round completing "
-                "rather than observed on a specific frame, so no stack "
-                "reading is tied to it. Read the seat's stack off a nearby "
-                "frame and enter it below."
-            )
-        return ActionCvIssue(kind=kind, detail=detail, frame_index=frame_index)
+                f"the import did not attach a stack to it. {hint}"
+            ),
+            frame_index=hint_index if hint_index is not None else frame_index,
+        )
     # A missing stack-before is usually caused by reads on EARLIER frames
     # (that is where the value would have come from), so scan backward for
     # the seat's most recent refusal before giving up.
@@ -810,37 +903,56 @@ def _stack_before_issue(
         code_text, at_index = refusal
         return ActionCvIssue(
             kind=kind,
-            detail=(
-                f"On frame {at_index + 1}, {code_text}. Read the stack off "
-                "the nearest legible frame and enter it below."
-            ),
-            frame_index=at_index,
+            detail=f"On frame {at_index + 1}, {code_text}. {hint}",
+            frame_index=hint_index if hint_index is not None else at_index,
         )
-    if _player_starting_stack_unknown(hand, seat):
-        if _recording_starts_mid_hand(hand, recording_start_s):
+    starting_code = _starting_stack_unknown_code(hand, seat)
+    if starting_code is not None:
+        committed = starting_code.startswith("committed_at_start")
+        unrecorded = starting_code == "unknown"
+        if (committed or unrecorded) and _recording_starts_mid_hand(
+            hand, recording_start_s
+        ):
             detail = (
                 "The recording starts mid-hand: this seat had already "
-                "committed chips before the first frame, so its starting "
-                "stack is unknown. Enter your best-supported value below."
+                "committed chips before the first frame, and those could not "
+                f"be sized. {hint}"
             )
-        else:
+        elif committed:
+            # The stack itself read fine; the chips already on the felt when
+            # the hand opened could not be sized. Saying "never established
+            # cleanly" here is disprovable on sight.
+            detail = (
+                "This seat's stack read fine, but the chips already in front "
+                "of it when the hand opened could not be sized, so its "
+                f"starting stack is unknown. {hint}"
+            )
+        elif unrecorded:
             detail = (
                 "This seat's starting stack was never established cleanly "
-                "during the hand, so the stack before this action could not "
-                "be back-computed. Read it off a legible frame and enter it "
-                "below."
+                f"during the hand. {hint}"
             )
-        return ActionCvIssue(kind=kind, detail=detail, frame_index=frame_index)
+        else:
+            code_text = _unknown_code_text(starting_code) or "the read was refused"
+            detail = (
+                f"This seat's starting stack could not be read ({code_text}), "
+                f"so the stack before this action could not be back-computed. "
+                f"{hint}"
+            )
+        return ActionCvIssue(
+            kind=kind,
+            detail=detail,
+            frame_index=hint_index if hint_index is not None else frame_index,
+        )
     action_type = str(timeline_action.get("action_type") or "").replace("-", "_")
-    if timeline_action.get("amount") is None and action_type in MONEY_ACTION_TYPES:
+    if db_amount is None and action_type in MONEY_ACTION_TYPES:
         return ActionCvIssue(
             kind=kind,
             detail=(
-                "The stack before this action could not be back-computed "
-                "because the action's own amount is unknown. Resolve the "
-                "amount first, then fill this in from the neighboring frames."
+                "The import could not derive this seat's stack before the "
+                f"action, because this line's own amount is unknown. {hint}"
             ),
-            frame_index=frame_index,
+            frame_index=hint_index if hint_index is not None else frame_index,
         )
     return None
 
@@ -901,13 +1013,75 @@ def _seat_value(mapping: Any, seat: int | None) -> float | None:
     return None if value is None else float(value)
 
 
-def _player_starting_stack_unknown(hand: dict[str, Any], seat: int | None) -> bool:
+def _seat_holds_cards(state: dict[str, Any] | None, seat: int | None) -> bool:
+    """Whether this seat was dealt in on the frame — i.e. still in the hand."""
+
+    if state is None or seat is None:
+        return True
+    dealt_in = state.get("dealt_in")
+    if not isinstance(dealt_in, list):
+        return True
+    return int(seat) in {int(item) for item in dealt_in}
+
+
+def _nearest_readable(
+    states: list[dict[str, Any]],
+    frame_index: int | None,
+    seat: int | None,
+    field: str,
+) -> tuple[float, int] | None:
+    """Nearest frame to ``frame_index`` whose ``field`` read this seat, if any.
+
+    Searches outward so the operator is sent to the closest legible evidence
+    rather than to the frame that by definition could not be read. Returns the
+    value and its frame index, or None when no frame in the hand shows it.
+    """
+
+    if seat is None or not states:
+        return None
+    origin = 0 if frame_index is None else frame_index
+    order = sorted(range(len(states)), key=lambda index: (abs(index - origin), index))
+    for index in order:
+        value = _seat_value(states[index].get(field), seat)
+        if value is not None:
+            return value, index
+    return None
+
+
+def _stack_field_hint(frame_index: int | None, value: float | None) -> str:
+    """Point at the control that actually holds this field, by its real path."""
+
+    where = "under **More fields → Stack before (BB)**"
+    if value is not None and frame_index is not None:
+        return (
+            f"Frame {frame_index + 1} shows this seat at {value:g} BB — "
+            f"confirm it and enter it {where}."
+        )
+    return (
+        "No frame in this hand shows this seat's stack, so leave the field "
+        f"empty unless you know the value; it lives {where}."
+    )
+
+
+def _starting_stack_unknown_code(hand: dict[str, Any], seat: int | None) -> str | None:
+    """Why this seat's starting stack is unknown, per the timeline's own code.
+
+    The reconstruction distinguishes "the stack read was refused" from
+    "the stack read fine but the chips already committed could not be sized"
+    (``committed_at_start_*``). Collapsing the two produces a message the
+    operator can disprove by looking at the frame.
+    """
+
     if seat is None:
-        return False
+        return None
     for player in hand.get("players") or []:
-        if player.get("seat") == seat:
-            return player.get("starting_stack") is None
-    return False
+        if player.get("seat") != seat:
+            continue
+        if player.get("starting_stack") is not None:
+            return None
+        code = player.get("starting_stack_unknown")
+        return str(code) if code else "unknown"
+    return None
 
 
 def _review_status(review: Any) -> str | None:

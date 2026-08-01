@@ -208,6 +208,7 @@ from poker_tracker.ui.reconstruction_review import (
     states_for_hand,
     timeline_actions_for_image,
     timeline_path_for_job,
+    timeline_source_image_for_slot,
 )
 from poker_tracker.ui.roi import ROI_TYPES, validate_roi_bounds
 from poker_tracker.ui.roi_profiles import (
@@ -5502,16 +5503,27 @@ def show_action_editor_contents(
             )
             if linked is None:
                 # Frame flags belong to the frame, not the action's identity:
-                # a type or amount correction must not detach the row from
-                # its flagged source frame. Only adopt actual flags this way.
-                relaxed = match_db_action_to_frame_target(
-                    street=action.street,
-                    action_type=action.action_type,
-                    player_name=action.player_name,
-                    position=action.position,
-                    amount=action.amount,
-                    targets=targets,
-                    identity_only=True,
+                # a type or amount correction must not detach the row from its
+                # flagged source frame. Scope the relaxed match to THIS row's
+                # own source frame — matching on identity alone across every
+                # frame is ambiguous, and resolves either to nothing or to a
+                # neighbouring frame's flag.
+                own_image = _timeline_source_image_for_action(action, frame_context)
+                own_targets = [
+                    target for target in targets if target.source_image == own_image
+                ] if own_image else []
+                relaxed = (
+                    match_db_action_to_frame_target(
+                        street=action.street,
+                        action_type=action.action_type,
+                        player_name=action.player_name,
+                        position=action.position,
+                        amount=action.amount,
+                        targets=own_targets,
+                        identity_only=True,
+                    )
+                    if own_targets
+                    else None
                 )
                 if relaxed is not None and relaxed.status == "incorrect":
                     linked = relaxed
@@ -5521,7 +5533,8 @@ def show_action_editor_contents(
             badge_parts: list[str] = []
             if linked is not None and linked.status == "incorrect":
                 badge_parts.append(
-                    "flagged: " + (", ".join(linked.issue_types) or "frame")
+                    "source frame flagged: "
+                    + (", ".join(linked.issue_types) or "frame")
                 )
             cv_issues = _cv_issues_for_db_action(action, frame_context)
             if cv_issues:
@@ -5570,10 +5583,90 @@ def show_action_editor_contents(
                         issues=cv_issues,
                         frame_context=frame_context,
                     )
-                _render_edit_one_action(db, action, players)
+                _render_edit_one_action(
+                    db,
+                    action,
+                    players,
+                    needs_stack_before=any(
+                        issue.kind == "Stack before unknown" for issue in cv_issues
+                    ),
+                )
 
     with st.expander("Add a missing action", expanded=not editable):
         _show_add_corrected_action(db, players)
+
+
+def _timeline_source_image_for_action(
+    action: Action,
+    frame_context: ValidationFrameContext | None,
+) -> str | None:
+    """Which frame this row came from, regardless of later type corrections."""
+
+    if frame_context is None:
+        return None
+    return timeline_source_image_for_slot(
+        frame_context.timeline_hand,
+        street=action.street,
+        action_index=action.action_index,
+        position=action.position,
+        player_name=action.player_name,
+    )
+
+
+def _frame_level_issues_for_action(
+    action: Action,
+    frame_context: ValidationFrameContext | None,
+) -> list[ActionCvIssue]:
+    """Coverage gaps and unmeasured transitions for an edited row's own frame.
+
+    These are properties of the frame, not of the action's identity, so they
+    must survive a type or actor correction that detaches the row from its
+    reconstructed line.
+    """
+
+    if frame_context is None:
+        return []
+    own_image = _timeline_source_image_for_action(action, frame_context)
+    if not own_image:
+        return []
+    stub = {
+        "source_image": own_image,
+        "seat": _seat_index_for_action(action, frame_context),
+        "action_type": action.action_type,
+        "amount": action.amount,
+        "stack_before": action.stack_before,
+        "derivation": "",
+    }
+    return [
+        issue
+        for issue in cv_issues_for_timeline_action(
+            stub,
+            frame_context.timeline_hand,
+            frame_context.states,
+            db_amount=action.amount,
+            db_stack_before=action.stack_before,
+            recording_start_s=frame_context.recording_start_s,
+        )
+        if issue.kind in {"Coverage gap", "Unmeasured transition"}
+    ]
+
+
+def _seat_index_for_action(
+    action: Action,
+    frame_context: ValidationFrameContext,
+) -> int | None:
+    """Seat number for a saved row, via the timeline hand's player list."""
+
+    for player in frame_context.timeline_hand.get("players") or []:
+        name = str(player.get("player_name") or "")
+        position = str(player.get("position") or "")
+        if action.player_name and name and name == action.player_name:
+            seat = player.get("seat")
+            return None if seat is None else int(seat)
+        if action.position and position and position == action.position:
+            seat = player.get("seat")
+            return None if seat is None else int(seat)
+    return None
 
 
 def _cv_issues_for_db_action(
@@ -5593,23 +5686,35 @@ def _cv_issues_for_db_action(
         player_name=action.player_name,
     )
     if timeline_action is None:
-        # An edited or hand-added line no longer maps to the reconstruction.
-        # An empty amount on a money action must stay visibly flagged anyway.
+        # An edited or hand-added line no longer maps to a reconstructed line,
+        # so its read issues no longer apply. Two things must still surface:
+        # an empty money amount, and the frame-level facts (coverage gaps,
+        # unmeasured transitions) that belong to the source frame regardless
+        # of how the row was edited.
+        issues: list[ActionCvIssue] = []
         if (
             action.amount is None
             and action.action_type.replace("-", "_") in MONEY_ACTION_TYPES
         ):
-            return [
+            own_image = _timeline_source_image_for_action(action, frame_context)
+            where = (
+                "Its closest source frame is shown above — read the amount "
+                "there and enter it below."
+                if own_image
+                else "Read the amount off the frames and enter it below."
+            )
+            issues.append(
                 ActionCvIssue(
                     kind="Amount unknown",
                     detail=(
-                        "This line was edited or added, so no CV amount read "
-                        "is linked to it — and its amount is still empty. "
-                        "Read the amount off the frames and enter it below."
+                        "This line was edited or added, so the import's amount "
+                        "read no longer applies to it — and its amount is "
+                        f"still empty. {where}"
                     ),
                 )
-            ]
-        return []
+            )
+        issues.extend(_frame_level_issues_for_action(action, frame_context))
+        return issues
     return cv_issues_for_timeline_action(
         timeline_action,
         frame_context.timeline_hand,
@@ -5680,8 +5785,14 @@ def _render_edit_one_action(
     db: PokerDatabase,
     action: Action,
     players: list[HandPlayer],
+    *,
+    needs_stack_before: bool = False,
 ) -> None:
-    """Simple per-action editor: Who / What / Amount first; advanced fields optional."""
+    """Simple per-action editor: Who / What / Amount first; advanced fields optional.
+
+    ``needs_stack_before`` opens the advanced block by default, because a CV
+    issue on this row asks the operator to fill in a field that lives there.
+    """
 
     if action.id is None:
         return
@@ -5711,6 +5822,9 @@ def _render_edit_one_action(
         ),
     )
     advanced_key = f"action_advanced_{action.id}"
+    if needs_stack_before and advanced_key not in st.session_state:
+        # A warning on this row asks for Stack before, which lives here.
+        st.session_state[advanced_key] = True
     show_advanced = st.checkbox(
         "More fields (order, pot/stack before, forced posts)",
         key=advanced_key,
@@ -5741,7 +5855,11 @@ def _render_edit_one_action(
             "Amount (BB)",
             min_value=0.0,
             value=action.amount,
-            placeholder="Not applicable",
+            placeholder=(
+                "Unknown — enter it"
+                if action.action_type.replace("-", "_") in MONEY_ACTION_TYPES
+                else "Not applicable"
+            ),
         )
 
         action_index = action.action_index or 1
@@ -5758,7 +5876,12 @@ def _render_edit_one_action(
             else "dead"
         )
         if show_advanced:
-            st.caption("Usually leave these alone unless the ledger still fails.")
+            st.caption(
+                "Stack before is requested by a warning on this action — "
+                "fill it in from the frame that warning names."
+                if needs_stack_before
+                else "Usually leave these alone unless the ledger still fails."
+            )
             order_col, notes_col = st.columns([1, 2])
             action_index = order_col.number_input(
                 "Order",
