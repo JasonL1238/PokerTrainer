@@ -190,6 +190,7 @@ from poker_tracker.ui.poker_visuals import (
 from poker_tracker.ui.reconstruction_review import (
     ISSUE_GUIDANCE,
     MONEY_ACTION_TYPES,
+    STACK_VALUE_KINDS,
     ActionCvIssue,
     FrameIssueTarget,
     ValidationFrameContext,
@@ -5493,13 +5494,22 @@ def show_action_editor_contents(
         st.info("No actions saved yet. Add the missing lines below.")
     else:
         for index, action in editable:
+            # Scope BOTH lookups to the row's own source frame: an unscoped
+            # match can hand a row a neighbouring frame's flag, thumbnail and
+            # jump button after a type correction.
+            own_image = _timeline_source_image_for_action(action, frame_context)
+            scoped_targets = (
+                [target for target in targets if target.source_image == own_image]
+                if own_image
+                else targets
+            )
             linked = match_db_action_to_frame_target(
                 street=action.street,
                 action_type=action.action_type,
                 player_name=action.player_name,
                 position=action.position,
                 amount=action.amount,
-                targets=targets,
+                targets=scoped_targets,
             )
             if linked is None:
                 # Frame flags belong to the frame, not the action's identity:
@@ -5508,10 +5518,7 @@ def show_action_editor_contents(
                 # own source frame — matching on identity alone across every
                 # frame is ambiguous, and resolves either to nothing or to a
                 # neighbouring frame's flag.
-                own_image = _timeline_source_image_for_action(action, frame_context)
-                own_targets = [
-                    target for target in targets if target.source_image == own_image
-                ] if own_image else []
+                own_targets = scoped_targets if own_image else []
                 relaxed = (
                     match_db_action_to_frame_target(
                         street=action.street,
@@ -5587,8 +5594,13 @@ def show_action_editor_contents(
                     db,
                     action,
                     players,
+                    # Only open the stack field when an issue actually asks
+                    # for a value. A row questioning whether the action
+                    # happened must not invite the operator to legitimize it.
                     needs_stack_before=any(
-                        issue.kind == "Stack before unknown" for issue in cv_issues
+                        issue.kind in STACK_VALUE_KINDS
+                        and "leave the field empty" not in issue.detail
+                        for issue in cv_issues
                     ),
                 )
 
@@ -5613,6 +5625,44 @@ def _timeline_source_image_for_action(
     )
 
 
+def _slot_source_image_ignoring_identity(
+    action: Action,
+    frame_context: ValidationFrameContext,
+) -> str | None:
+    """Source frame for a row whose actor was reassigned.
+
+    Used only for seat-independent frame facts (coverage gaps): those describe
+    the frame itself, so losing them because the operator renamed a player is
+    pure signal loss. Never used to attribute a seat-specific read.
+    """
+
+    return timeline_source_image_for_slot(
+        frame_context.timeline_hand,
+        street=action.street,
+        action_index=action.action_index,
+        position="",
+        player_name="",
+    )
+
+
+def _frame_index_for_image(
+    image: str | None,
+    frame_context: ValidationFrameContext | None,
+) -> int | None:
+    """Position of a source image in the hand's frame list, for jump wiring."""
+
+    if not image or frame_context is None:
+        return None
+    return next(
+        (
+            index
+            for index, state in enumerate(frame_context.states)
+            if str(state.get("image") or "") == image
+        ),
+        None,
+    )
+
+
 def _frame_level_issues_for_action(
     action: Action,
     frame_context: ValidationFrameContext | None,
@@ -5621,22 +5671,39 @@ def _frame_level_issues_for_action(
 
     These are properties of the frame, not of the action's identity, so they
     must survive a type or actor correction that detaches the row from its
-    reconstructed line.
+    reconstructed line. A coverage gap is seat-independent, so it survives
+    even when the actor was reassigned and the slot no longer resolves.
     """
 
     if frame_context is None:
         return []
-    own_image = _timeline_source_image_for_action(action, frame_context)
+    own_image = _timeline_source_image_for_action(
+        action, frame_context
+    )
+    identity_resolved = bool(own_image)
+    if not own_image:
+        own_image = _slot_source_image_ignoring_identity(action, frame_context)
     if not own_image:
         return []
     stub = {
         "source_image": own_image,
-        "seat": _seat_index_for_action(action, frame_context),
+        # Without a confirmed identity the seat is a guess, so only
+        # seat-independent facts may be reported below.
+        "seat": (
+            _seat_index_for_action(action, frame_context)
+            if identity_resolved
+            else None
+        ),
         "action_type": action.action_type,
         "amount": action.amount,
         "stack_before": action.stack_before,
         "derivation": "",
     }
+    allowed = (
+        {"Coverage gap", "Unmeasured transition"}
+        if identity_resolved
+        else {"Coverage gap"}
+    )
     return [
         issue
         for issue in cv_issues_for_timeline_action(
@@ -5647,7 +5714,7 @@ def _frame_level_issues_for_action(
             db_stack_before=action.stack_before,
             recording_start_s=frame_context.recording_start_s,
         )
-        if issue.kind in {"Coverage gap", "Unmeasured transition"}
+        if issue.kind in allowed
     ]
 
 
@@ -5655,14 +5722,21 @@ def _seat_index_for_action(
     action: Action,
     frame_context: ValidationFrameContext,
 ) -> int | None:
-    """Seat number for a saved row, via the timeline hand's player list."""
+    """Seat number for a saved row, via the timeline hand's player list.
 
-    for player in frame_context.timeline_hand.get("players") or []:
+    Player name is the stronger key, so it is resolved across every player
+    before falling back to position — otherwise an earlier player's matching
+    position outranks a later player's matching name.
+    """
+
+    players = frame_context.timeline_hand.get("players") or []
+    for player in players:
         name = str(player.get("player_name") or "")
-        position = str(player.get("position") or "")
         if action.player_name and name and name == action.player_name:
             seat = player.get("seat")
             return None if seat is None else int(seat)
+    for player in players:
+        position = str(player.get("position") or "")
         if action.position and position and position == action.position:
             seat = player.get("seat")
             return None if seat is None else int(seat)
@@ -5697,10 +5771,11 @@ def _cv_issues_for_db_action(
             and action.action_type.replace("-", "_") in MONEY_ACTION_TYPES
         ):
             own_image = _timeline_source_image_for_action(action, frame_context)
+            own_index = _frame_index_for_image(own_image, frame_context)
             where = (
-                "Its closest source frame is shown above — read the amount "
-                "there and enter it below."
-                if own_image
+                f"It came from frame {own_index + 1} — open that frame, read "
+                "the chips this seat added, and enter that below."
+                if own_index is not None
                 else "Read the amount off the frames and enter it below."
             )
             issues.append(
@@ -5711,6 +5786,7 @@ def _cv_issues_for_db_action(
                         "read no longer applies to it — and its amount is "
                         f"still empty. {where}"
                     ),
+                    frame_index=own_index,
                 )
             )
         issues.extend(_frame_level_issues_for_action(action, frame_context))

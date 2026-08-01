@@ -3,6 +3,8 @@ from pathlib import Path
 
 from poker_tracker.persistence.completion import parse_completion_evidence
 from poker_tracker.ui.reconstruction_review import (
+    ACTION_MAY_NOT_BELONG,
+    STACK_VALUE_KINDS,
     UNKNOWN_AMOUNT_CODE_TEXT,
     cv_issues_for_timeline_action,
     frame_issue_targets,
@@ -396,6 +398,20 @@ def _cv_issue_fixture():
             "coverage_gap": True,
             "prior_gap_s": 9.0,
         },
+        # A terminal frame, so "seat holds no cards" on the LAST frame (where
+        # the table has already cleared) is distinguishable from mid-hand.
+        {
+            "state_index": 2,
+            "time_s": 12.0,
+            "image": "/tmp/f2.jpg",
+            "stage": "preflop",
+            "bets": {},
+            "bets_unknown": {},
+            "stacks_unknown": {},
+            "unmeasured_transitions": [],
+            "coverage_gap": False,
+            "prior_gap_s": 3.0,
+        },
     ]
     hand = {
         "hand_number": 1,
@@ -666,7 +682,7 @@ def test_amount_issue_names_inference_for_inferred_lines() -> None:
         inferred_call, hand, states, db_amount=None, db_stack_before=212.2
     )
     amount_issue = next(issue for issue in issues if issue.kind == "Amount unknown")
-    assert "inferred from how the betting round completed" in amount_issue.detail
+    assert "inferred from the seat still being in the hand" in amount_issue.detail
     # Not an OCR failure: no refusal-code story.
     assert "refused" not in amount_issue.detail
 
@@ -727,7 +743,9 @@ def test_inferred_stack_issue_points_at_visible_stack() -> None:
     """B2 round 2: when the jump-target frame shows the seat's stack, say so
     and tell the operator to enter it."""
     hand, states = _cv_issue_fixture()
-    states[1]["stacks"] = {"7": 269.1}
+    # The value must come from a frame BEFORE the action: the action's own
+    # frame shows the stack after the chips moved.
+    states[0]["stacks"] = {"7": 269.1}
     inferred = {
         "street": "turn",
         "action_index": 2,
@@ -745,8 +763,9 @@ def test_inferred_stack_issue_points_at_visible_stack() -> None:
     stack_issue = next(
         issue for issue in issues if issue.kind == "Stack before unknown"
     )
-    assert "shows this seat at 269.1 BB" in stack_issue.detail
+    assert "read 269.1 BB for this seat on frame 1" in stack_issue.detail
     assert "More fields \u2192 Stack before (BB)" in stack_issue.detail
+    assert stack_issue.frame_index == 0
 
 
 def test_recording_start_offset_keeps_mid_hand_claim_honest() -> None:
@@ -869,8 +888,9 @@ def test_stack_issue_names_the_real_starting_stack_mechanism() -> None:
         ],
     )
     states[0]["stacks"] = {"1": 406.1}
+    later = dict(hand["actions"][0], source_image="/tmp/f1.jpg")
     issues = cv_issues_for_timeline_action(
-        hand["actions"][0], hand, states, db_amount=6.0, db_stack_before=None
+        later, hand, states, db_amount=6.0, db_stack_before=None
     )
     stack_issue = next(
         issue for issue in issues if issue.kind == "Stack before unknown"
@@ -879,7 +899,7 @@ def test_stack_issue_names_the_real_starting_stack_mechanism() -> None:
     assert "could not be sized" in stack_issue.detail
     assert "never established cleanly" not in stack_issue.detail
     # And it points at a frame that actually carries the value.
-    assert "shows this seat at 406.1 BB" in stack_issue.detail
+    assert "read 406.1 BB for this seat on frame 1" in stack_issue.detail
 
 
 def test_inferred_line_on_a_frame_without_cards_offers_deletion() -> None:
@@ -903,12 +923,14 @@ def test_inferred_line_on_a_frame_without_cards_offers_deletion() -> None:
     issues = cv_issues_for_timeline_action(
         inferred, hand, states, db_amount=None, db_stack_before=None
     )
-    stack_issue = next(
-        issue for issue in issues if issue.kind == "Stack before unknown"
+    issue = next(
+        issue for issue in issues if issue.kind == ACTION_MAY_NOT_BELONG
     )
-    assert "does not show this seat holding cards" in stack_issue.detail
-    assert "delete this action" in stack_issue.detail
-    assert "269.1" not in stack_issue.detail
+    assert "shows no cards for this seat" in issue.detail
+    assert "confirm this action happened before accepting it" in issue.detail
+    assert "269.1" not in issue.detail
+    # It must NOT ask for a stack: that field is what legitimizes a fake row.
+    assert all(issue.kind != "Stack before unknown" for issue in issues)
 
 
 def test_stack_blocker_tracks_the_saved_amount_not_the_timeline() -> None:
@@ -944,8 +966,8 @@ def test_stack_hints_name_a_frame_that_carries_the_value() -> None:
     """B2 round 3: 'read it off the nearest legible frame' while jumping to the
     illegible one — and sometimes no legible frame exists at all."""
     hand, states = _cv_issue_fixture()
-    states[0]["stacks_unknown"] = {"7": "no_digit_run"}
-    states[1]["stacks"] = {"7": 224.2}
+    states[0]["stacks"] = {"7": 224.2}
+    states[1]["stacks_unknown"] = {"7": "no_digit_run"}
     action = {
         "street": "preflop",
         "action_index": 3,
@@ -954,7 +976,7 @@ def test_stack_hints_name_a_frame_that_carries_the_value() -> None:
         "position": "BB",
         "action_type": "bet",
         "amount": 4.0,
-        "source_image": "/tmp/f0.jpg",
+        "source_image": "/tmp/f1.jpg",
         "derivation": "bet_text",
     }
     issue = next(
@@ -964,12 +986,12 @@ def test_stack_hints_name_a_frame_that_carries_the_value() -> None:
         )
         if issue.kind == "Stack before unknown"
     )
-    assert "Frame 2 shows this seat at 224.2 BB" in issue.detail
+    assert "read 224.2 BB for this seat on frame 1" in issue.detail
     # The jump must land on the legible frame, not the refused one.
-    assert issue.frame_index == 1
+    assert issue.frame_index == 0
 
-    # No frame shows it anywhere: say so rather than send them hunting.
-    states[1].pop("stacks")
+    # No frame BEFORE the action shows it: say so rather than send them hunting.
+    states[0].pop("stacks")
     issue = next(
         issue
         for issue in cv_issues_for_timeline_action(
@@ -977,7 +999,7 @@ def test_stack_hints_name_a_frame_that_carries_the_value() -> None:
         )
         if issue.kind == "Stack before unknown"
     )
-    assert "No frame in this hand shows this seat's stack" in issue.detail
+    assert "No frame before this action shows this seat's stack" in issue.detail
     assert "leave the field empty" in issue.detail
 
 
@@ -1017,7 +1039,7 @@ def test_generic_amount_fallback_requires_an_all_frames_scan() -> None:
         )
         if issue.kind == "Amount unknown"
     )
-    assert "Frame 2 shows 9.5 BB there" in issue.detail
+    assert "read 9.5 BB there on frame 2" in issue.detail
     assert "No frame in this hand" not in issue.detail
 
     # Genuinely absent everywhere: the absolute claim is now licensed.
@@ -1148,3 +1170,185 @@ def test_refusal_codes_all_have_human_text() -> None:
     ):
         assert code in UNKNOWN_AMOUNT_CODE_TEXT
         assert "_" not in UNKNOWN_AMOUNT_CODE_TEXT[code]
+
+
+def test_showdown_cards_are_not_evidence_a_seat_was_out() -> None:
+    """A4 round 4 [critical]: dealt_in counts card BACKS. At showdown villain
+    cards flip face-up into villain_cards, so absence from dealt_in accused six
+    real actions of never happening — and told the operator to delete them."""
+    hand, states = _cv_issue_fixture()
+    states[1]["dealt_in"] = [0, 2, 4]
+    states[1]["villain_cards"] = {"7": ["Kd", "7d"]}
+    inferred = {
+        "street": "river",
+        "action_index": 2,
+        "seat": 7,
+        "player_name": "Seat7",
+        "position": "BB",
+        "action_type": "check",
+        "amount": None,
+        "source_image": "/tmp/f1.jpg",
+        "derivation": "inferred_round_complete",
+    }
+    issues = cv_issues_for_timeline_action(
+        inferred, hand, states, db_amount=None, db_stack_before=None
+    )
+    assert all(issue.kind != ACTION_MAY_NOT_BELONG for issue in issues)
+    assert not any("delete" in issue.detail.lower() for issue in issues)
+
+
+def test_terminal_frame_absence_is_not_evidence_a_seat_was_out() -> None:
+    """A4 round 4 [critical]: a hand's last retained frame has already cleared
+    the table, so nobody holds cards there."""
+    hand, states = _cv_issue_fixture()
+    states[-1]["dealt_in"] = [0]
+    inferred = {
+        "street": "river",
+        "action_index": 2,
+        "seat": 7,
+        "player_name": "Seat7",
+        "position": "BB",
+        "action_type": "check",
+        "amount": None,
+        "source_image": states[-1]["image"],
+        "derivation": "inferred_round_complete",
+    }
+    issues = cv_issues_for_timeline_action(
+        inferred, hand, states, db_amount=None, db_stack_before=None
+    )
+    assert all(issue.kind != ACTION_MAY_NOT_BELONG for issue in issues)
+
+
+def test_deletion_offer_never_asks_for_a_stack_value() -> None:
+    """B4 round 4 H1: the delete branch reused the stack kind, so the editor
+    pre-opened the stack field and captioned it as requested — recreating the
+    phantom row one control below."""
+    hand, states = _cv_issue_fixture()
+    states[1]["dealt_in"] = [0, 2, 4]
+    states[1]["stacks"] = {"7": 269.1}
+    inferred = {
+        "street": "turn",
+        "action_index": 2,
+        "seat": 7,
+        "player_name": "Seat7",
+        "position": "BB",
+        "action_type": "check",
+        "amount": None,
+        "source_image": "/tmp/f1.jpg",
+        "derivation": "inferred_round_complete",
+    }
+    issues = cv_issues_for_timeline_action(
+        inferred, hand, states, db_amount=None, db_stack_before=None
+    )
+    assert any(issue.kind == ACTION_MAY_NOT_BELONG for issue in issues)
+    assert all(issue.kind not in STACK_VALUE_KINDS for issue in issues)
+
+
+def test_stack_hint_never_offers_a_post_action_reading() -> None:
+    """A4 round 4 F2: the scan started at distance 0, so 30 of 32 hints named
+    the action's own frame — which shows the stack AFTER the chips moved."""
+    hand, states = _cv_issue_fixture()
+    # Seat 1's starting stack is unknown in the fixture, so a hint is offered.
+    states[0]["stacks"] = {"1": 200.0}   # before
+    states[1]["stacks"] = {"1": 188.0}   # after this action's chips moved
+    action = {
+        "street": "preflop",
+        "action_index": 3,
+        "seat": 1,
+        "player_name": "Seat1",
+        "position": "UTG+1",
+        "action_type": "bet",
+        "amount": 12.0,
+        "source_image": "/tmp/f1.jpg",
+        "derivation": "bet_text",
+    }
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, hand, states, db_amount=12.0, db_stack_before=None
+        )
+        if issue.kind == "Stack before unknown"
+    )
+    assert "200 BB" in issue.detail
+    assert "188" not in issue.detail
+    assert issue.frame_index == 0
+
+
+def test_stack_hints_attribute_numbers_to_the_reader_not_the_image() -> None:
+    """A4 round 4 F3: OCR misreads exist in this corpus (a 10x decimal error),
+    so 'the frame shows X' overstates what is known."""
+    hand, states = _cv_issue_fixture()
+    states[0]["stacks"] = {"1": 142.8}
+    action = dict(
+        hand["actions"][0], source_image="/tmp/f1.jpg", action_index=9
+    )
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, hand, states, db_amount=12.0, db_stack_before=None
+        )
+        if issue.kind == "Stack before unknown"
+    )
+    assert "The reconstruction read 142.8 BB" in issue.detail
+    assert "frame shows" not in issue.detail.lower()
+
+
+def test_computed_stack_message_jumps_to_a_frame_carrying_that_value() -> None:
+    """B4 round 4 H3: 194 of 468 'confirm it' messages jumped to a frame
+    showing a different number."""
+    hand, states = _cv_issue_fixture()
+    states[0]["stacks"] = {"7": 224.2}
+    states[1]["stacks"] = {"7": 212.2}
+    action = dict(hand["actions"][1], stack_before=224.2, source_image="/tmp/f1.jpg")
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            action, hand, states, db_amount=12.0, db_stack_before=None
+        )
+        if issue.kind == "Stack before unknown"
+    )
+    assert "computed 224.2 BB" in issue.detail
+    assert "Frame 1 shows that value" in issue.detail
+    assert issue.frame_index == 0
+
+
+def test_inferred_reasons_distinguish_the_two_mechanisms() -> None:
+    """B4 round 4 M4: 'inferred from the betting round completing' was asserted
+    on inferred_still_in lines, collapsing two distinct mechanisms."""
+    hand, states = _cv_issue_fixture()
+    still_in = dict(
+        hand["actions"][0], action_type="call", derivation="inferred_still_in"
+    )
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            still_in, hand, states, db_amount=None, db_stack_before=212.2
+        )
+        if issue.kind == "Amount unknown"
+    )
+    assert "seat still being in the hand" in issue.detail
+    assert "betting round completing" not in issue.detail
+
+
+def test_every_amount_message_warns_that_bet_boxes_show_street_totals() -> None:
+    """B4 round 4 M1: the caveat that prevents entering a street total instead
+    of the increment appeared in only 2 of 6 branches."""
+    hand, states = _cv_issue_fixture()
+    variants = [
+        dict(hand["actions"][0]),
+        dict(hand["actions"][0], derivation="inferred_still_in"),
+        dict(hand["actions"][1], amount=None, source_image="/tmp/f0.jpg"),
+    ]
+    for timeline_action in variants:
+        issues = cv_issues_for_timeline_action(
+            timeline_action, hand, states, db_amount=None, db_stack_before=212.2
+        )
+        amount_issue = next(
+            (issue for issue in issues if issue.kind == "Amount unknown"), None
+        )
+        if amount_issue is None:
+            continue
+        assert (
+            "chips this seat added" in amount_issue.detail
+            or "total for the street" in amount_issue.detail
+        ), amount_issue.detail

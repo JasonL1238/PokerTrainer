@@ -102,6 +102,31 @@ UNKNOWN_AMOUNT_CODE_TEXT: dict[str, str] = {
 
 MONEY_ACTION_TYPES = {"bet", "raise", "call", "all_in", "all-in", "post_blind", "ante"}
 
+# Distinct from a missing-value issue: this one questions whether the action
+# happened at all, so it must never drive a "fill this field in" affordance.
+ACTION_MAY_NOT_BELONG = "Action may not belong to this hand"
+
+# Kinds that ask the operator to supply a stack-before value.
+STACK_VALUE_KINDS = {"Stack before unknown"}
+
+_INFERRED_REASONS: dict[str, str] = {
+    "inferred_round_complete": (
+        "This line was inferred from the betting round completing rather than "
+        "observed on a frame"
+    ),
+    "inferred_still_in": (
+        "This line was inferred from the seat still being in the hand when the "
+        "round completed, rather than observed on a frame"
+    ),
+}
+
+
+def _inferred_reason(derivation: str) -> str:
+    return _INFERRED_REASONS.get(
+        derivation,
+        "This line was inferred rather than observed on a frame",
+    )
+
 
 @dataclass(frozen=True)
 class ValidationFrameContext:
@@ -728,16 +753,15 @@ def cv_issues_for_timeline_action(
             )
         elif derivation.startswith("inferred"):
             detail = (
-                "This line was inferred from how the betting round completed "
-                "rather than observed on a frame, so no amount reading is "
-                "tied to it. Work the amount out from the neighboring frames "
-                "and enter it below."
+                f"{_inferred_reason(derivation)}, so no amount reading is "
+                "tied to it. Work out the chips this seat added here from the "
+                "neighboring frames and enter that in the Amount field below."
             )
         elif code_text is not None:
             detail = (
-                f"On {frame_ref}, {code_text}. Read the amount off that frame "
-                "and enter the chips this seat added in the Amount field "
-                "below."
+                f"On {frame_ref}, {code_text}. Read that frame and enter the "
+                "chips this seat added on this action — the bet box shows "
+                "the seat's running total for the street, not the increment."
             )
             if code == "below_calibrated_render_size":
                 detail += (
@@ -759,9 +783,11 @@ def cv_issues_for_timeline_action(
             if elsewhere is not None:
                 value, at_index = elsewhere
                 detail = (
-                    f"This seat's bet box was not read on {frame_ref}. Frame "
-                    f"{at_index + 1} shows {value:g} BB there — work out the "
-                    "chips added on this action and enter that below."
+                    f"This seat's bet box was not read on {frame_ref}. The "
+                    f"reconstruction read {value:g} BB there on frame "
+                    f"{at_index + 1} — that is the seat's running total for "
+                    "the street, so work out the chips added on this action "
+                    "and enter that below."
                 )
             elif frame_index == 0 and _recording_starts_mid_hand(
                 hand, recording_start_s
@@ -823,10 +849,9 @@ def cv_issues_for_timeline_action(
                     detail=(
                         f"Seat {seat}'s committed chips could not be tracked "
                         f"continuously around {frame_ref}, so part of this "
-                        "transition was not measured. Check this line's "
-                        "amount against the frames on either side of "
-                        f"{frame_ref} and correct it in the Amount field "
-                        "below if it is wrong."
+                        "transition was not measured. Whatever amount this "
+                        "line ends up with, check it against the frames on "
+                        f"either side of {frame_ref}."
                     ),
                     frame_index=frame_index,
                 )
@@ -855,43 +880,53 @@ def _stack_before_issue(
     """
 
     kind = "Stack before unknown"
+    nearest = _nearest_readable(states, frame_index, seat, "stacks", before_only=True)
+    hint_value, hint_index = nearest if nearest is not None else (None, None)
     timeline_stack = timeline_action.get("stack_before")
     if timeline_stack is not None:
+        # Jump to a frame that actually carries this number when one exists;
+        # the action's own frame shows the stack AFTER the chips moved.
+        carrier = _frame_carrying_stack(states, seat, float(timeline_stack))
+        where = (
+            f" Frame {carrier + 1} shows that value."
+            if carrier is not None
+            else ""
+        )
         return ActionCvIssue(
             kind=kind,
             detail=(
                 f"The reconstruction computed {float(timeline_stack):g} BB "
                 "for this seat's stack before the action, but the saved field "
-                "is empty — confirm it and re-enter it under **More fields → "
-                "Stack before (BB)**."
+                f"is empty — confirm it and re-enter it under **More fields → "
+                f"Stack before (BB)**.{where}"
             ),
-            frame_index=frame_index,
+            frame_index=carrier if carrier is not None else frame_index,
         )
-    nearest = _nearest_readable(states, frame_index, seat, "stacks")
-    hint_value, hint_index = nearest if nearest is not None else (None, None)
     hint = _stack_field_hint(hint_index, hint_value)
     derivation = str(timeline_action.get("derivation") or "")
     if derivation.startswith("inferred"):
-        if not _seat_holds_cards(state, seat):
-            # The frame that produced this line shows the seat holding no
-            # cards: the honest reading is that the line may not belong here,
-            # so do not push the operator to legitimize it with a number.
+        if _line_may_not_belong(timeline_action, states, state, seat, frame_index):
+            # The frame that produced this line shows no sign of the seat: the
+            # honest reading is that the line may not belong here, so do not
+            # push the operator to legitimize it with a number. Deliberately
+            # phrased as a check to run, not an instruction to delete — a
+            # wrong accusation here destroys real data.
             return ActionCvIssue(
-                kind=kind,
+                kind=ACTION_MAY_NOT_BELONG,
                 detail=(
-                    f"This line was inferred from the betting round "
-                    f"completing, but {frame_ref} does not show this seat "
-                    "holding cards — it may not belong to the hand. Open that "
-                    "frame and delete this action if the seat was already "
-                    "out."
+                    f"This line was not observed — it was inferred because the "
+                    f"betting round completed. {frame_ref.capitalize()} shows "
+                    "no cards for this seat, so it may not have been in the "
+                    "hand at all. Open that frame and confirm this action "
+                    "happened before accepting it; delete it if it did not."
                 ),
                 frame_index=frame_index,
             )
         return ActionCvIssue(
             kind=kind,
             detail=(
-                "This line was inferred from the betting round completing, so "
-                f"the import did not attach a stack to it. {hint}"
+                f"{_inferred_reason(derivation)}, so the import did not attach "
+                f"a stack to it. {hint}"
             ),
             frame_index=hint_index if hint_index is not None else frame_index,
         )
@@ -1014,14 +1049,65 @@ def _seat_value(mapping: Any, seat: int | None) -> float | None:
 
 
 def _seat_holds_cards(state: dict[str, Any] | None, seat: int | None) -> bool:
-    """Whether this seat was dealt in on the frame — i.e. still in the hand."""
+    """Whether this seat still holds cards on the frame.
+
+    ``dealt_in`` counts face-DOWN card backs only. At showdown the client
+    flips villain cards face up and they move to ``villain_cards``, and a
+    hand's terminal frame clears the table entirely — so absence from
+    ``dealt_in`` alone is not evidence that a seat was out of the hand.
+    Fails open: an unreadable frame must never be read as proof of absence.
+    """
 
     if state is None or seat is None:
         return True
     dealt_in = state.get("dealt_in")
     if not isinstance(dealt_in, list):
         return True
-    return int(seat) in {int(item) for item in dealt_in}
+    if int(seat) in {int(item) for item in dealt_in}:
+        return True
+    villain_cards = state.get("villain_cards")
+    if isinstance(villain_cards, dict) and (
+        str(seat) in villain_cards or seat in villain_cards
+    ):
+        return True
+    return False
+
+
+def _frame_carrying_stack(
+    states: list[dict[str, Any]],
+    seat: int | None,
+    value: float,
+) -> int | None:
+    """Index of the last frame whose stack read for this seat equals ``value``."""
+
+    if seat is None:
+        return None
+    for index in range(len(states) - 1, -1, -1):
+        read = _seat_value(states[index].get("stacks"), seat)
+        if read is not None and abs(read - value) < 1e-6:
+            return index
+    return None
+
+
+def _line_may_not_belong(
+    timeline_action: dict[str, Any],
+    states: list[dict[str, Any]],
+    state: dict[str, Any] | None,
+    seat: int | None,
+    frame_index: int | None,
+) -> bool:
+    """Whether an inferred line has no evidence its seat was in the hand.
+
+    Deliberately conservative: this drives an offer to delete an action, and a
+    false positive destroys real data. A hand's terminal frame has already
+    cleared the table, so absence there proves nothing.
+    """
+
+    if _seat_holds_cards(state, seat):
+        return False
+    if frame_index is not None and frame_index >= len(states) - 1:
+        return False
+    return True
 
 
 def _nearest_readable(
@@ -1029,18 +1115,27 @@ def _nearest_readable(
     frame_index: int | None,
     seat: int | None,
     field: str,
+    *,
+    before_only: bool = False,
 ) -> tuple[float, int] | None:
     """Nearest frame to ``frame_index`` whose ``field`` read this seat, if any.
 
     Searches outward so the operator is sent to the closest legible evidence
     rather than to the frame that by definition could not be read. Returns the
     value and its frame index, or None when no frame in the hand shows it.
+
+    ``before_only`` restricts the search to frames strictly before the action.
+    A stack read on the action's own frame is the stack AFTER the chips moved,
+    so offering it as "the stack before this action" states a wrong number.
     """
 
     if seat is None or not states:
         return None
     origin = 0 if frame_index is None else frame_index
-    order = sorted(range(len(states)), key=lambda index: (abs(index - origin), index))
+    indexes = range(len(states))
+    if before_only:
+        indexes = range(min(origin, len(states)))
+    order = sorted(indexes, key=lambda index: (abs(index - origin), index))
     for index in order:
         value = _seat_value(states[index].get(field), seat)
         if value is not None:
@@ -1049,17 +1144,22 @@ def _nearest_readable(
 
 
 def _stack_field_hint(frame_index: int | None, value: float | None) -> str:
-    """Point at the control that actually holds this field, by its real path."""
+    """Point at the control that actually holds this field, by its real path.
+
+    Attributes the number to the reader rather than to the image: these values
+    come from OCR, which does misread (a 10x decimal error exists in this
+    corpus), so claiming "the frame shows X" overstates what is known.
+    """
 
     where = "under **More fields → Stack before (BB)**"
     if value is not None and frame_index is not None:
         return (
-            f"Frame {frame_index + 1} shows this seat at {value:g} BB — "
-            f"confirm it and enter it {where}."
+            f"The reconstruction read {value:g} BB for this seat on frame "
+            f"{frame_index + 1} — check that frame and enter the value {where}."
         )
     return (
-        "No frame in this hand shows this seat's stack, so leave the field "
-        f"empty unless you know the value; it lives {where}."
+        "No frame before this action shows this seat's stack, so leave the "
+        f"field empty unless you can establish it; it lives {where}."
     )
 
 
