@@ -15,3 +15,25 @@ cv_lab/labeling_poker/data
 .yolo_config
 yolo11s.pt
 yolo11s-cls.pt
+
+# Mirrors .gitignore for cv_lab/models, so the build context contains exactly
+# what a clean checkout contains. Without this a COPY of an untracked weight
+# would keep succeeding on the machine that happens to hold it and fail
+# everywhere else -- which is how the image came to depend on one developer's
+# disk in the first place. Weights reach a running container through the data
+# mount; see deploy/provision_models.py.
+cv_lab/models/*
+!cv_lab/models/ocr_templates.npz
+
+# Research material and documentation are not part of the runtime image. Kept
+# out of the context so a build on a small arm64 host does not ship hundreds of
+# megabytes of frames and notes to the daemon before the first instruction.
+cv_lab/crops
+cv_lab/frames
+cv_lab/harvest
+cv_lab/hand01
+cv_lab/logs
+cv_lab/notes
+tests
+docs
+deploy/oci/.env

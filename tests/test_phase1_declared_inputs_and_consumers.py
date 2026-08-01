@@ -636,6 +636,10 @@ _RAW_VERDICT_READERS = {
     # Coach Review's fallback branch, reached only once nothing is unattested,
     # to tell an unreconciled hand apart from an unanswered one.
     ("app.py", "show_hand_coach_review"),
+    # The recovery drill's hand read-back transcribes the raw verdict into its
+    # report beside the readiness blockers; it decides nothing and publishes no
+    # figure, so the ledger's own answer is what an operator needs to read there.
+    ("poker_tracker/maintenance/recovery.py", "_read_hand_end_to_end"),
 }
 
 
@@ -695,7 +699,7 @@ def test_no_consumer_decides_on_is_authoritative_alone() -> None:
     six; the count is derived here so the sentence cannot drift from the set.)
     """
     assert _is_authoritative_readers() == _RAW_VERDICT_READERS
-    assert len(_RAW_VERDICT_READERS) == 6
+    assert len(_RAW_VERDICT_READERS) == 7
 
 
 def test_every_derived_figure_surface_refuses_an_unattested_reconciliation(

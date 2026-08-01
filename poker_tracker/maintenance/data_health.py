@@ -18,7 +18,20 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+from poker_tracker.persistence.backup import EVIDENCE_CLASSES, ROUTINE, resolve_artifact_path
 from poker_tracker.persistence.backup import PINNED_GLOB as _PINNED_GLOB
+from poker_tracker.persistence.backup_inventory import (
+    inventory_findings,
+    inventory_path,
+    load_inventory,
+    timeline_dir_for,
+    timeline_paths,
+)
+from poker_tracker.persistence.db import (
+    SCHEMA_VERSION,
+    PokerDatabase,
+    inspect_schema_integrity,
+)
 
 CheckStatus = Literal["pass", "warning", "fail"]
 
@@ -27,18 +40,41 @@ DEFAULT_DATABASE_PATH = Path(
     os.environ.get("POKER_DB_PATH", PROJECT_ROOT / "poker_tracker.db")
 )
 DEFAULT_DATA_DIR = Path(os.environ.get("POKER_DATA_DIR", PROJECT_ROOT / "data"))
-BACKUP_GLOB = "poker_tracker_*.sqlite3"
-# Kept in step with backup.PINNED_GLOB by import rather than by a second literal:
-# the two drifting apart is exactly what hid the pre-migration snapshot from this
-# audit in the first place.
+# Taken from the retention classes rather than re-spelled here: a literal that
+# drifted from the one backup_database writes is exactly what hid the
+# pre-migration snapshot from this audit in the first place. Every evidence class
+# is scanned, so a purpose added there is audited here without an edit.
+BACKUP_GLOB = ROUTINE.glob
 PINNED_GLOB = _PINNED_GLOB
 DETAIL_LIMIT = 20
 
-_ARTIFACT_REFERENCES: tuple[tuple[str, str, str], ...] = (
-    ("videos", "id", "stored_path"),
-    ("extracted_frames", "id", "image_path"),
-    ("reconstruction_frame_reviews", "id", "source_image"),
-)
+
+def _artifact_reference_columns() -> tuple[tuple[str, str], ...]:
+    """Derive the audited path columns from the list retention already trusts.
+
+    The audit used to carry its own list of three columns while
+    ``ARTIFACT_PATH_COLUMNS`` named nine, so solver outputs, per-action frame
+    provenance and regression fixtures could all dangle under a report that said
+    every recorded artifact was present. Deriving removes the possibility rather
+    than the instance: a column added there is audited here without an edit.
+
+    The import-time check is on the pairing, which derivation cannot guarantee on
+    its own -- a label that disagreed with its own SQL would silently audit a
+    different set of rows than retention protects.
+    """
+    references: list[tuple[str, str]] = []
+    for label, sql in PokerDatabase.ARTIFACT_PATH_COLUMNS:
+        table, _, column = label.partition(".")
+        if not table or not column or sql.strip() != f"SELECT {column} FROM {table}":
+            raise RuntimeError(
+                "ARTIFACT_PATH_COLUMNS entry cannot be audited: "
+                f"{label!r} does not describe {sql!r}"
+            )
+        references.append((table, column))
+    return tuple(references)
+
+
+_ARTIFACT_REFERENCES: tuple[tuple[str, str], ...] = _artifact_reference_columns()
 
 # Stable minimum contract shared by all supported PokerTrainer databases. Newer
 # version-specific tables may be additive, but these tables and columns are
@@ -112,7 +148,7 @@ def audit_data_health(
     data_dir: str | Path = DEFAULT_DATA_DIR,
     backup_dir: str | Path | None = None,
     expected_schema_version: int | None = None,
-    restore_backups: bool = False,
+    restore_backups: bool = True,
 ) -> HealthReport:
     """Audit the live SQLite file, recorded artifacts, and retained backups.
 
@@ -120,6 +156,11 @@ def audit_data_health(
     mode. SQLite may still maintain its WAL shared-memory sidecars while reading.
     A restore drill copies each backup into an isolated temporary database; it
     never overwrites the live database or any backup file.
+
+    ``restore_backups`` defaults to True. An opt-in verification that nothing in
+    the product ever asked for meant a snapshot truncated by a full disk stayed
+    undetected until the day it was needed; the drill costs one temporary copy
+    per snapshot, which is the cheapest thing in this report worth having.
     """
 
     database = _absolute_path(database_path)
@@ -141,6 +182,7 @@ def audit_data_health(
         _audit_backups(
             backups,
             live_database=database,
+            data_dir=data,
             expected_schema_version=expected_schema_version,
             restore_backups=restore_backups,
         )
@@ -216,6 +258,7 @@ def _audit_database(
             results.append(_schema_contract_check(connection))
             results.append(_attestation_corroboration_check(connection))
             results.append(_artifact_check(connection, database_path, data_dir))
+            results.append(_timeline_check(connection, data_dir))
     except (OSError, sqlite3.Error) as exc:
         results.append(
             CheckResult(
@@ -483,6 +526,36 @@ def _schema_contract_check(connection: sqlite3.Connection) -> CheckResult:
             f"Core schema is incomplete in {len(problems)} place(s).",
             _limited_details(problems),
         )
+    # The contract above names tables and columns only, and its version list
+    # stops wherever someone last remembered to extend it, so a database missing
+    # idx_actions_hand_street_order -- the unique index migration 8 exists to
+    # create -- reported "present" while duplicate action order was being
+    # written. inspect_schema_integrity derives the requirement from a database
+    # this build creates, so it cannot fall behind the schema.
+    #
+    # Reported as a warning rather than a failure because opening the file is
+    # what repairs it: init_db recreates every missing index and restores a
+    # column its DDL can default, and refuses outright over anything else. The
+    # audit reads without opening, so what it adds here is naming the damage
+    # before the operator meets it, not blocking on it.
+    #
+    # Only meaningful for a file already at the current version: an older one
+    # legitimately lacks later additions, and a newer one is not ours to judge.
+    derived: list[str] = []
+    if stored_version == SCHEMA_VERSION:
+        report = inspect_schema_integrity(connection, check_foreign_keys=False)
+        derived.extend(f"missing table: {name}" for name in report.missing_tables)
+        derived.extend(f"missing column: {name}" for name in report.missing_columns)
+        derived.extend(f"missing index: {name}" for name in report.missing_indexes)
+    if derived:
+        return CheckResult(
+            "schema_contract",
+            "warning",
+            f"Core tables and columns are present, but this database is missing "
+            f"{len(derived)} structure(s) the current schema declares; opening it "
+            f"restores what can be restored and refuses over the rest.",
+            _limited_details(derived),
+        )
     return CheckResult(
         "schema_contract",
         "pass",
@@ -499,20 +572,34 @@ def _artifact_check(
     missing_count = 0
     size_mismatch_count = 0
     reference_count = 0
+    absent_sources: list[str] = []
 
-    for table, id_column, path_column in _ARTIFACT_REFERENCES:
-        required_columns = {id_column, path_column}
+    for table, path_column in _ARTIFACT_REFERENCES:
+        required_columns = {path_column}
         if table == "videos":
             required_columns.add("file_size_bytes")
         if not _table_has_columns(connection, table, required_columns):
+            # An older shape genuinely has no such column. Saying so is the
+            # difference between "nine references all present" and "three of nine
+            # looked at", which is the whole failure this check used to have.
+            absent_sources.append(f"{table}.{path_column}")
             continue
         extra = ", file_size_bytes" if table == "videos" else ""
-        query = f"SELECT {id_column}, {path_column}{extra} FROM {table}"
+        # rowid, not a named id column: every one of these tables declares
+        # INTEGER PRIMARY KEY, and rowid keeps the query derivable from the
+        # column list alone rather than from a second table-to-key mapping.
+        query = f"SELECT rowid AS _rowid, {path_column}{extra} FROM {table}"
         for row in connection.execute(query):
+            raw = row[path_column]
+            # Several of these columns default to the empty string, meaning "no
+            # file recorded" rather than "a file that should be there";
+            # referenced_artifact_paths skips them for the same reason.
+            if not isinstance(raw, str) or not raw.strip():
+                continue
             reference_count += 1
-            stored_path = str(row[path_column])
-            resolved = _resolve_artifact_path(stored_path, database_path, data_dir)
-            label = f"{table} row {row[id_column]}"
+            stored_path = raw.strip()
+            resolved = resolve_artifact_path(stored_path, database_path, data_dir)
+            label = f"{table} row {row['_rowid']}"
             try:
                 is_file = resolved.is_file()
             except OSError as exc:
@@ -555,35 +642,91 @@ def _artifact_check(
             ),
             _details_with_hidden_count(problem_details, problem_count),
         )
+    scope = ""
+    if absent_sources:
+        scope = f" ({len(absent_sources)} source column(s) absent from this schema)"
     return CheckResult(
         "artifact_files",
         "pass",
-        f"All {reference_count} recorded artifact reference(s) are present.",
+        f"All {reference_count} recorded artifact reference(s) are present{scope}.",
+        tuple(f"not in this schema: {source}" for source in absent_sources),
     )
 
 
-def _resolve_artifact_path(
-    stored_path: str,
-    database_path: Path,
-    data_dir: Path,
-) -> Path:
-    path = Path(stored_path).expanduser()
-    if path.is_absolute():
-        return path
-    candidates = (database_path.parent / path, data_dir / path)
-    for candidate in candidates:
+def _timeline_check(connection: sqlite3.Connection, data_dir: Path) -> CheckResult:
+    """Reconstruction timelines are referenced by convention, not by a column.
+
+    Nothing in the database points at ``cv_timelines/job_<id>_timeline.json``, so
+    the artifact check cannot see it, yet a completed job whose timeline is gone
+    can no longer have any of its remaining hands imported. A warning rather than
+    a failure: once every hand from a job has been imported the timeline is
+    genuinely disposable, and retention is entitled to remove it.
+    """
+    if not _table_has_columns(
+        connection, "processing_jobs", {"id", "job_type", "status"}
+    ):
+        return CheckResult(
+            "timeline_files",
+            "warning",
+            "Reconstruction timelines could not be audited.",
+            ("processing_jobs is missing the columns that name a CV job",),
+        )
+    details: list[str] = []
+    missing_count = 0
+    checked = 0
+    for stored in timeline_paths(connection, timeline_dir_for(data_dir)):
+        checked += 1
         try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
-            continue
-    return candidates[0]
+            present = Path(stored).is_file()
+        except OSError as exc:
+            present = False
+            stored = f"{stored} ({exc})"
+        if not present:
+            missing_count += 1
+            _append_limited(details, stored)
+    if missing_count:
+        return CheckResult(
+            "timeline_files",
+            "warning",
+            f"{missing_count} completed reconstruction timeline(s) are missing.",
+            _details_with_hidden_count(details, missing_count),
+        )
+    return CheckResult(
+        "timeline_files",
+        "pass",
+        f"All {checked} completed reconstruction timeline(s) are present.",
+    )
+
+
+@dataclass(frozen=True)
+class _StoreCounts:
+    """How much study history a database actually holds."""
+
+    sessions: int
+    hands: int
+    completed_hands: int
+
+    def __str__(self) -> str:
+        return (
+            f"{self.sessions} session(s), {self.hands} hand(s), "
+            f"{self.completed_hands} completed"
+        )
+
+
+@dataclass(frozen=True)
+class _BackupOutcome:
+    """One snapshot's verification result, and what it was found to contain."""
+
+    failures: tuple[str, ...]
+    warnings: tuple[str, ...]
+    summary: str
 
 
 def _audit_backups(
     backup_dir: Path,
     *,
     live_database: Path,
+    data_dir: Path,
     expected_schema_version: int | None,
     restore_backups: bool,
 ) -> CheckResult:
@@ -622,14 +765,22 @@ def _audit_backups(
             (f"{type(exc).__name__}: {exc}",),
         )
     rotating = [path for path in names if fnmatch.fnmatchcase(path.name, BACKUP_GLOB)]
-    # Pinned pre-migration snapshots sit outside BACKUP_GLOB so the five-slot
-    # rotation cannot delete them. That also made them invisible here: right after
-    # a migration the report said no backups existed about a directory holding
-    # exactly the one snapshot that can undo it, and the restore drill never opened
-    # it, so a truncated rollback point stayed undetectable until it was needed.
-    # They are stamped at the OLD schema version, which is why they are verified
-    # and restore-drilled without an expected-version comparison.
-    pinned = [path for path in names if fnmatch.fnmatchcase(path.name, PINNED_GLOB)]
+    # Evidence snapshots -- pre-migration and pre-import -- sit outside BACKUP_GLOB
+    # so the routine rotation cannot delete them. That also made them invisible
+    # here: right after a migration the report said no backups existed about a
+    # directory holding exactly the one snapshot that can undo it, and the restore
+    # drill never opened it, so a truncated rollback point stayed undetectable
+    # until it was needed. They are stamped at the state that preceded the
+    # operation, which is why they are verified and restore-drilled without an
+    # expected-version comparison.
+    pinned = [
+        path
+        for path in names
+        if any(
+            fnmatch.fnmatchcase(path.name, snapshot_class.glob)
+            for snapshot_class in EVIDENCE_CLASSES
+        )
+    ]
     backups = [*rotating, *pinned]
     if not backups:
         return CheckResult(
@@ -639,79 +790,173 @@ def _audit_backups(
             (str(backup_dir),),
         )
 
+    live_counts = _live_counts(live_database)
     failures: list[str] = []
     warnings: list[str] = []
+    summaries: list[str] = []
     for backup, expected in (
         *((path, expected_schema_version) for path in rotating),
         *((path, None) for path in pinned),
     ):
-        backup_failures, backup_warnings = _backup_issues(
+        outcome = _backup_issues(
             backup,
             live_database=live_database,
+            data_dir=data_dir,
             expected_schema_version=expected,
             restore=restore_backups,
+            live_counts=live_counts,
         )
-        failures.extend(backup_failures)
-        warnings.extend(backup_warnings)
+        failures.extend(outcome.failures)
+        warnings.extend(outcome.warnings)
+        summaries.append(f"{backup.name}: {outcome.summary}")
+    # A snapshot from an older build carries no inventory, so nothing can say
+    # which recordings, frames, timelines and solver outputs it needs. Counting
+    # them here states that limitation instead of leaving "passed a restore
+    # drill" to imply an answer nobody has.
+    inventoried = sum(1 for path in backups if inventory_path(path).is_file())
+    summaries.append(
+        f"artifact inventory: {inventoried} of {len(backups)} snapshot(s) carry one"
+    )
+    if live_counts is not None:
+        # The counts to compare the snapshots against, so the operator is not
+        # asked to look them up by hand as the runbook used to require.
+        summaries.insert(0, f"live database: {live_counts}")
+
+    action = "passed a restore drill" if restore_backups else "were read"
     if failures:
         return CheckResult(
             "backups",
             "fail",
             f"{len(failures)} backup verification problem(s) were found.",
-            _limited_details(failures),
+            _limited_details([*failures, *summaries]),
         )
     if warnings:
         return CheckResult(
             "backups",
             "warning",
-            f"Backups are readable but have {len(warnings)} compatibility warning(s).",
-            _limited_details(warnings),
+            (
+                f"All {len(backups)} retained backup(s) {action} "
+                f"with {len(warnings)} warning(s)."
+            ),
+            _limited_details([*warnings, *summaries]),
         )
-
-    action = "passed a restore drill" if restore_backups else "are readable"
     return CheckResult(
         "backups",
         "pass",
         f"All {len(backups)} retained backup(s) {action}.",
+        _limited_details(summaries),
+    )
+
+
+def verify_snapshot(
+    snapshot_path: str | Path,
+    *,
+    live_database: str | Path | None = None,
+    data_dir: str | Path = DEFAULT_DATA_DIR,
+    expected_schema_version: int | None = None,
+) -> CheckResult:
+    """Restore one snapshot into an isolated temporary root and read it back.
+
+    The caller is whatever just wrote the snapshot. A rollback point is worth
+    exactly what it can be shown to restore, and the moment it was written is the
+    only moment at which a caller can still refuse to proceed; a verification
+    that waits for an operator to remember a flag verifies nothing for months.
+
+    Never touches the live database or the snapshot: the restore target is a
+    file inside a temporary directory that is removed on the way out.
+    """
+    snapshot = _absolute_path(snapshot_path)
+    live = _absolute_path(live_database) if live_database is not None else None
+    outcome = _backup_issues(
+        snapshot,
+        live_database=live,
+        data_dir=_absolute_path(data_dir),
+        expected_schema_version=expected_schema_version,
+        restore=True,
+        live_counts=None if live is None else _live_counts(live),
+    )
+    if outcome.failures:
+        return CheckResult(
+            "backup_verification",
+            "fail",
+            f"{snapshot.name} did not survive an isolated restore.",
+            _limited_details([*outcome.failures, outcome.summary]),
+        )
+    if outcome.warnings:
+        return CheckResult(
+            "backup_verification",
+            "warning",
+            f"{snapshot.name} restored with {len(outcome.warnings)} warning(s).",
+            _limited_details([*outcome.warnings, outcome.summary]),
+        )
+    return CheckResult(
+        "backup_verification",
+        "pass",
+        f"{snapshot.name} passed an isolated restore ({outcome.summary}).",
     )
 
 
 def _backup_issues(
     backup_path: Path,
     *,
-    live_database: Path,
+    live_database: Path | None,
+    data_dir: Path,
     expected_schema_version: int | None,
     restore: bool,
-) -> tuple[list[str], list[str]]:
+    live_counts: _StoreCounts | None,
+) -> _BackupOutcome:
     if backup_path.is_symlink():
-        return (
-            [f"{backup_path.name}: symlinks are not independent backups"],
-            [],
+        return _BackupOutcome(
+            (f"{backup_path.name}: symlinks are not independent backups",),
+            (),
+            "not verified",
         )
     try:
         backup_stat = backup_path.stat()
         if not stat.S_ISREG(backup_stat.st_mode):
-            return ([f"{backup_path.name}: not a regular file"], [])
-        try:
-            same_as_live = os.path.samefile(backup_path, live_database)
-        except FileNotFoundError:
-            same_as_live = False
-        if same_as_live or backup_stat.st_nlink > 1:
-            return (
-                [f"{backup_path.name}: hard-linked files are not independent backups"],
-                [],
+            return _BackupOutcome(
+                (f"{backup_path.name}: not a regular file",), (), "not verified"
             )
+        same_as_live = False
+        if live_database is not None:
+            try:
+                same_as_live = os.path.samefile(backup_path, live_database)
+            except FileNotFoundError:
+                same_as_live = False
+        if same_as_live or backup_stat.st_nlink > 1:
+            return _BackupOutcome(
+                (f"{backup_path.name}: hard-linked files are not independent backups",),
+                (),
+                "not verified",
+            )
+        warnings = [
+            f"{backup_path.name}: {finding}"
+            for finding in _inventory_warnings(
+                # A relative artifact path is stored relative to the live
+                # database; with no live database named, the snapshot's own
+                # location is the closest thing to that root.
+                backup_path,
+                database_path=live_database or backup_path,
+                data_dir=data_dir,
+            )
+        ]
         with tempfile.TemporaryDirectory(prefix="pokertrainer-audit-") as temp_dir:
             staging = Path(temp_dir)
             with closing(_open_snapshot_read_only(backup_path, staging)) as source:
-                failures, warnings = _connection_issues(
+                failures, connection_warnings = _connection_issues(
                     source,
                     expected_schema_version=expected_schema_version,
                 )
+                warnings.extend(
+                    f"{backup_path.name}: {warning}" for warning in connection_warnings
+                )
                 if failures or not restore:
-                    return (
-                        [f"{backup_path.name}: {failure}" for failure in failures],
-                        [f"{backup_path.name}: {warning}" for warning in warnings],
+                    return _BackupOutcome(
+                        tuple(
+                            f"{backup_path.name}: {failure}" for failure in failures
+                        ),
+                        tuple(warnings),
+                        "not restored" if failures else "read without restoring",
                     )
                 restored_path = staging / "restored.sqlite3"
                 with closing(sqlite3.connect(restored_path)) as restored:
@@ -721,15 +966,193 @@ def _backup_issues(
                         restored,
                         expected_schema_version=None,
                     )
-            return (
-                [
+                    content = _restored_content_issues(
+                        restored, live_counts=live_counts
+                    )
+            return _BackupOutcome(
+                tuple(
                     f"{backup_path.name} restore: {failure}"
-                    for failure in restore_failures
-                ],
-                [f"{backup_path.name}: {warning}" for warning in warnings],
+                    for failure in [*restore_failures, *content.failures]
+                ),
+                tuple(
+                    [
+                        *warnings,
+                        *(
+                            f"{backup_path.name} restore: {warning}"
+                            for warning in content.warnings
+                        ),
+                    ]
+                ),
+                content.summary,
             )
     except (OSError, sqlite3.Error) as exc:
-        return ([f"{backup_path.name}: {type(exc).__name__}: {exc}"], [])
+        return _BackupOutcome(
+            (f"{backup_path.name}: {type(exc).__name__}: {exc}",), (), "not verified"
+        )
+
+
+def _inventory_warnings(
+    backup_path: Path, *, database_path: Path, data_dir: Path
+) -> list[str]:
+    """What the snapshot's artifact inventory says about the files it needs now.
+
+    A snapshot written by an older build has no inventory. That is reported in
+    the check's message as a count rather than as a warning per file: the absence
+    is a limitation of the snapshot, not a defect in the data, and drowning the
+    real findings would defeat the point.
+    """
+    inventory = load_inventory(backup_path)
+    if inventory is None:
+        return []
+    return inventory_findings(
+        inventory, database_path=database_path, data_dir=data_dir
+    )
+
+
+def _restored_content_issues(
+    connection: sqlite3.Connection, *, live_counts: _StoreCounts | None
+) -> _BackupOutcome:
+    """Verify the restored copy holds usable study history, not merely valid pages.
+
+    quick_check and foreign_key_check prove the file is a well-formed database.
+    They pass just as happily on an empty one, so a snapshot taken from a
+    truncated file was reported as having "passed a restore drill". What a
+    recovery point has to be able to do is hand back the history: countable
+    sessions and hands, issue evidence that still parses, and at least one hand
+    that reads end to end -- its players, its actions and its settlement.
+    """
+    failures: list[str] = []
+    warnings: list[str] = []
+    counts = _counts_from(connection)
+    if counts is None:
+        return _BackupOutcome(
+            ("sessions and hands could not be counted",), (), "unreadable"
+        )
+    if counts.hands == 0 and live_counts is not None and live_counts.hands > 0:
+        warnings.append(
+            f"holds no hands while the live database holds {live_counts.hands}; "
+            "this snapshot cannot restore any study history"
+        )
+    issue_failures, issue_warnings = _issue_evidence_issues(connection)
+    failures.extend(issue_failures)
+    warnings.extend(issue_warnings)
+    attestations = _attestation_corroboration_check(connection)
+    if attestations.status == "warning":
+        warnings.append(f"settlement_attestations: {attestations.message}")
+    hand_failures, hand_warnings = _hand_readback_issues(connection)
+    failures.extend(hand_failures)
+    warnings.extend(hand_warnings)
+    return _BackupOutcome(tuple(failures), tuple(warnings), str(counts))
+
+
+def _issue_evidence_issues(
+    connection: sqlite3.Connection,
+) -> tuple[list[str], list[str]]:
+    """Frozen issue evidence is the only record of what a flagged hand looked like.
+
+    It is written as JSON by ``create_hand_issue`` and never re-derived, so an
+    unparseable snapshot is a corrupt one and an empty snapshot is an issue that
+    can no longer be reproduced at all.
+    """
+    if not _table_has_columns(connection, "hand_issues", {"id", "evidence_snapshot"}):
+        return [], []
+    failures: list[str] = []
+    warnings: list[str] = []
+    for row in connection.execute("SELECT id, evidence_snapshot FROM hand_issues"):
+        try:
+            evidence = json.loads(row["evidence_snapshot"] or "")
+        except (TypeError, ValueError):
+            _append_limited(
+                failures, f"issue {row['id']}: evidence_snapshot is not readable JSON"
+            )
+            continue
+        if not isinstance(evidence, dict):
+            _append_limited(
+                failures, f"issue {row['id']}: evidence_snapshot is not an object"
+            )
+        elif not evidence:
+            _append_limited(warnings, f"issue {row['id']}: evidence_snapshot is empty")
+    return failures, warnings
+
+
+def _hand_readback_issues(
+    connection: sqlite3.Connection,
+) -> tuple[list[str], list[str]]:
+    """Read one hand end to end, preferring a completed one.
+
+    The point is not the row count: it is that the tables a study session
+    actually joins still join, and that the JSON columns the readers parse still
+    parse, on the RESTORED copy rather than on the original.
+    """
+    if not _table_exists(connection, "hands"):
+        return [], []
+    columns = _table_columns(connection, "hands")
+    order = (
+        "ORDER BY CASE WHEN completion_status = 'complete' THEN 0 ELSE 1 END, id"
+        if "completion_status" in columns
+        else "ORDER BY id"
+    )
+    try:
+        hand = connection.execute(f"SELECT * FROM hands {order} LIMIT 1").fetchone()
+    except sqlite3.Error as exc:
+        return [f"no hand could be read back: {exc}"], []
+    if hand is None:
+        return [], []
+    hand_id = hand["id"]
+    failures: list[str] = []
+    warnings: list[str] = []
+    if "completion_evidence" in columns:
+        try:
+            json.loads(hand["completion_evidence"] or "{}")
+        except (TypeError, ValueError):
+            failures.append(
+                f"hand {hand_id}: completion_evidence is not readable JSON"
+            )
+    related = {
+        "hand_players": "SELECT COUNT(*) FROM hand_players WHERE hand_id = ?",
+        "actions": "SELECT COUNT(*) FROM actions WHERE hand_id = ?",
+        "hand_settlements": "SELECT COUNT(*) FROM hand_settlements WHERE hand_id = ?",
+    }
+    present: dict[str, int] = {}
+    for table, sql in related.items():
+        if not _table_exists(connection, table):
+            continue
+        try:
+            present[table] = int(connection.execute(sql, (hand_id,)).fetchone()[0])
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            failures.append(f"hand {hand_id}: {table} could not be read back: {exc}")
+    for table in ("hand_players", "actions"):
+        if present.get(table) == 0:
+            warnings.append(
+                f"hand {hand_id} restored with no {table} row; "
+                "it would read back as an empty hand"
+            )
+    return failures, warnings
+
+
+def _live_counts(database_path: Path) -> _StoreCounts | None:
+    """The live counts a snapshot is compared against, or None when unreadable."""
+    try:
+        with closing(_connect_read_only(database_path)) as connection:
+            return _counts_from(connection)
+    except (OSError, sqlite3.Error):
+        return None
+
+
+def _counts_from(connection: sqlite3.Connection) -> _StoreCounts | None:
+    try:
+        sessions = int(connection.execute("SELECT COUNT(*) FROM sessions").fetchone()[0])
+        hands = int(connection.execute("SELECT COUNT(*) FROM hands").fetchone()[0])
+        completed = 0
+        if "completion_status" in _table_columns(connection, "hands"):
+            completed = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM hands WHERE completion_status = 'complete'"
+                ).fetchone()[0]
+            )
+    except (sqlite3.Error, TypeError, ValueError):
+        return None
+    return _StoreCounts(sessions=sessions, hands=hands, completed_hands=completed)
 
 
 def _connection_issues(
@@ -828,7 +1251,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--restore-backups",
         action="store_true",
-        help="Copy each retained backup into memory and verify the restored database.",
+        default=True,
+        help=(
+            "Restore each retained backup into an isolated temporary directory "
+            "and verify it (default)."
+        ),
+    )
+    parser.add_argument(
+        "--no-restore-backups",
+        dest="restore_backups",
+        action="store_false",
+        help="Only open each retained backup; skip the isolated restore drill.",
     )
     parser.add_argument(
         "--json",
@@ -840,8 +1273,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    from poker_tracker.persistence.db import SCHEMA_VERSION
-
     report = audit_data_health(
         args.db,
         data_dir=args.data_dir,

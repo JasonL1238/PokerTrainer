@@ -1,7 +1,6 @@
 import json
 
 import pytest
-from pydantic import ValidationError
 
 from poker_tracker.math.analytics import compute_session_stats
 from poker_tracker.persistence.completion import (
@@ -16,6 +15,7 @@ from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.import_export import (
     EXPORT_VERSION,
     SUPPORTED_IMPORT_VERSIONS,
+    ImportValidationError,
     export_hand,
     export_session,
     import_hands_into_session,
@@ -181,9 +181,15 @@ def test_json_import_preserves_review_status_tags_and_action_order() -> None:
 
 
 def test_json_import_rejects_bad_payload_without_creating_session() -> None:
+    """A truncated payload names the missing part, rather than raising KeyError.
+
+    ``payload["session"]`` used to raise a bare ``KeyError('session')``. It was
+    caught, so nothing broke, but the operator was shown a one-word key name for
+    a file they may have spent an hour producing.
+    """
     db = make_db()
 
-    with pytest.raises(KeyError):
+    with pytest.raises(ImportValidationError, match="no 'session' object"):
         import_session(db, {"hands": []})
 
     assert db.fetch_sessions() == []
@@ -205,7 +211,9 @@ def test_json_import_rejects_invalid_hand_without_partial_session() -> None:
         ],
     }
 
-    with pytest.raises(ValidationError):
+    # The pydantic detail is preserved verbatim; what is added is which record of
+    # the file carried it.
+    with pytest.raises(ImportValidationError, match=r"hands\[0\].hand: .*validation error"):
         import_session(db, payload)
 
     assert db.fetch_sessions() == []

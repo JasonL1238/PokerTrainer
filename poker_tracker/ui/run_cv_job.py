@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from cv_lab.scripts.pipeline.export_yolo_card_hands_for_app import export_timeline
+from poker_tracker.maintenance.data_health import verify_snapshot
 from poker_tracker.persistence.backup import BACKUP_KEEP_COUNT, backup_database
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import Session
@@ -132,7 +133,14 @@ def run_job(
         _check_deadline(deadline)
         _assert_not_cancelled(db, job_id)
         _heartbeat(db, job_id, 92, "Backing up study database")
-        backup_path = backup_database(db_path, Path(paths["backups"]))
+        data_root = Path(paths.get("data", Path(paths["backups"]).parent))
+        backup_path = backup_database(
+            db_path, Path(paths["backups"]), data_dir=data_root
+        )
+        _heartbeat(db, job_id, 94, "Verifying the study database backup")
+        backup_note = _verified_backup_note(
+            backup_path, db_path=db_path, data_dir=data_root
+        )
         _assert_not_cancelled(db, job_id)
         _heartbeat(db, job_id, 96, "Preparing session for validation")
         _assert_not_cancelled(db, job_id)
@@ -154,7 +162,7 @@ def run_job(
             message = (
                 f"Ready for validation; {exported_count} hands exported for "
                 f"session #{destination.id} — add each when validated or as a "
-                f"draft; backup {backup_path.name}"
+                f"draft; {backup_note}"
             )
             current = db.fetch_processing_job(job_id)
             if current is not None and current.status in {"cancelling", "cancelled"}:
@@ -191,6 +199,30 @@ def run_job(
     finally:
         progress_path.unlink(missing_ok=True)
         db.close()
+
+
+def _verified_backup_note(
+    backup_path: Path, *, db_path: Path, data_dir: Path
+) -> str:
+    """Restore the snapshot just written, and say in the job message what happened.
+
+    A snapshot nothing ever opens is a recovery point on paper. This is the one
+    place in the product that both writes one and has an operator-visible surface
+    to report it on, so the drill runs here rather than waiting for someone to
+    remember a maintenance flag. A failed verification does not fail the job --
+    the reconstruction is finished and worth keeping -- but it must never be
+    reported as a completed backup either.
+    """
+    verification = verify_snapshot(
+        backup_path, live_database=db_path, data_dir=data_dir
+    )
+    if verification.status == "fail":
+        detail = "; ".join(verification.details[:2]) or verification.message
+        return f"backup {backup_path.name} FAILED VERIFICATION: {detail}"
+    if verification.status == "warning":
+        detail = "; ".join(verification.details[:2]) or verification.message
+        return f"backup {backup_path.name} verified with warnings: {detail}"
+    return f"backup {backup_path.name} verified"
 
 
 def _run_pipeline(

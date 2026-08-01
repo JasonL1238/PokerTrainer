@@ -1,6 +1,10 @@
 [tool.pytest.ini_options]
 pythonpath = ["."]
-testpaths = ["tests"]
+# deploy/tests holds the container build contract -- that every Dockerfile COPY
+# source exists in a clean checkout, that the stage running pip has a compiler.
+# It lives outside tests/ because it needs no application imports, but leaving it
+# out of testpaths meant a bare `pytest`, and therefore CI, never ran it.
+testpaths = ["tests", "deploy/tests"]
 
 [tool.ruff]
 line-length = 100

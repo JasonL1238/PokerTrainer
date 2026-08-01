@@ -836,7 +836,28 @@ SOLVER_EVIDENCE: dict[str, object] = {
     "hero_combo": "AhQs",
     "range_ip_name": "BTN open",
     "range_oop_name": "BB defend",
+    # A completed run that saved no frequencies establishes nothing, and an
+    # explanation of it can no longer be generated at all, so the promotion
+    # gate below is exercised against a run that actually produced evidence.
+    "action_frequencies": [
+        {"action": "CHECK", "frequency": 0.6},
+        {"action": "BET 15", "frequency": 0.4},
+    ],
 }
+
+
+class _SolverStubProvider(_StubProvider):
+    """Preserves the saved frequencies, as the solver grounding check requires."""
+
+    def generate_hand_review(self, prompt: str) -> str:
+        return (
+            "Hand Summary: Hero checked the flop.\n"
+            "Theory Coach: CHECK 60% and BET 15 40% form a genuine mix.\n"
+            "Exploit Coach: Villain folds too often on this texture.\n"
+            "EV / Math Notes: Recorded facts only.\n"
+            "Study Lesson: Keep the checking range protected.\n"
+            "Next Review Question: Would a larger size still get folds?\n"
+        )
 
 
 def _seed_completed_solver_run(path: Path, hand_id: int) -> None:
@@ -900,7 +921,7 @@ def test_solver_explanation_does_not_promote_a_blocked_hand(
     _seed_completed_solver_run(path, hand_id)
     monkeypatch.setattr(
         "app.get_provider_from_env",
-        lambda *args, **kwargs: _StubProvider(),
+        lambda *args, **kwargs: _SolverStubProvider(),
     )
 
     app = _run_solver_surface(path, monkeypatch, hand_id)

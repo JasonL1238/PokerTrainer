@@ -9,6 +9,11 @@ from pathlib import Path
 
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.safety.redaction import safe_error_message
+from poker_tracker.solver.jobs import (
+    _terminate_solver_group,
+    configured_memory_limit_bytes,
+    solver_child_pid_path,
+)
 from poker_tracker.solver.models import ResolvedRange, SolverSpot
 from poker_tracker.solver.texassolver import (
     DEFAULT_TIMEOUT_SECONDS,
@@ -17,6 +22,15 @@ from poker_tracker.solver.texassolver import (
     parse_final_exploitability,
     parse_strategy_result,
 )
+
+try:
+    import resource
+except ImportError:  # Windows: RLIMIT_AS does not exist there.
+    resource = None  # type: ignore[assignment]
+
+# A solver inside a CFR iteration answers a signal late, so it is given longer
+# to exit than the UI gives the worker before escalating.
+TERMINATION_GRACE_SECONDS = 5.0
 
 
 def run_solver_job(
@@ -49,30 +63,64 @@ def run_solver_job(
             )
         db.close()
         return
-    binary = configured_binary()
-    resource_dir = configured_resource_dir(binary)
-    spot = SolverSpot.model_validate(run.spot)
-    range_ip = ResolvedRange.model_validate(run.range_ip)
-    range_oop = ResolvedRange.model_validate(run.range_oop)
-    command_path = Path(run.command_path)
-    result_path = Path(run.result_path)
-    log_path = Path(run.log_path)
-    if not command_path.is_file():
-        raise FileNotFoundError(f"Solver command file was not found: {command_path}")
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     process: subprocess.Popen[bytes] | None = None
+    pid_path: Path | None = None
     try:
+        # Setup lives inside the try because a worker that cannot start is a
+        # failure the operator has to see now. Raising above it left the row
+        # queued and healthy-looking until the stale reconciler noticed minutes
+        # later, which is the same silence a missing binary or a rejected
+        # memory cap would otherwise hide behind.
+        binary = configured_binary()
+        resource_dir = configured_resource_dir(binary)
+        memory_limit_bytes = configured_memory_limit_bytes()
+        spot = SolverSpot.model_validate(run.spot)
+        range_ip = ResolvedRange.model_validate(run.range_ip)
+        range_oop = ResolvedRange.model_validate(run.range_oop)
+        command_path = Path(run.command_path)
+        result_path = Path(run.result_path)
+        log_path = Path(run.log_path)
+        if not command_path.is_file():
+            raise FileNotFoundError(f"Solver command file was not found: {command_path}")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        pid_path = solver_child_pid_path(command_path.parent)
         with log_path.open("ab") as log:
-            process = subprocess.Popen(
-                [str(binary), "-i", str(command_path), "-r", str(resource_dir)],
-                cwd=str(command_path.parent),
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                close_fds=True,
-                preexec_fn=_memory_limit if os.name == "posix" else None,
-            )
+            try:
+                process = subprocess.Popen(
+                    [str(binary), "-i", str(command_path), "-r", str(resource_dir)],
+                    cwd=str(command_path.parent),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    close_fds=True,
+                    # Its own session makes the solve a process group this worker
+                    # can terminate whole, including anything the solve forks,
+                    # without signalling itself out of existence before it can
+                    # record why the run ended.
+                    start_new_session=os.name == "posix",
+                    preexec_fn=(
+                        _memory_limiter(memory_limit_bytes)
+                        if os.name == "posix" and memory_limit_bytes is not None
+                        else None
+                    ),
+                )
+            except subprocess.SubprocessError as exc:
+                if memory_limit_bytes is None:
+                    raise
+                # subprocess reports a hook failure as a bare "Exception occurred
+                # in preexec_fn", so the reason the operator needs has to be
+                # restated here. Refusing to solve is the point: a cap that was
+                # asked for and not applied is how a river tree reaches the host
+                # OOM killer while the operator believes it is bounded.
+                raise RuntimeError(
+                    f"The {memory_limit_bytes / 1024**3:g} GB solver memory cap from "
+                    "POKERTRAINER_SOLVER_MEMORY_GB could not be applied, so the solve "
+                    "was not started. macOS rejects RLIMIT_AS outright; unset the "
+                    "variable to solve without a cap, or run the solver in the Linux "
+                    "container where the cap holds."
+                ) from exc
+            pid_path.write_text(str(process.pid), encoding="utf-8")
             owner_pid = run.pid or process.pid
             claimed = db.update_solver_run(
                 run_id,
@@ -83,7 +131,7 @@ def run_solver_job(
                 started_at=run.started_at or datetime.now(UTC),
             )
             if claimed.status != "running" or claimed.pid != owner_pid:
-                _terminate_process(process)
+                _terminate_solver_child(process)
                 if claimed.status == "cancelling":
                     db.update_solver_run(
                         run_id,
@@ -96,21 +144,24 @@ def run_solver_job(
             deadline = started + timeout_seconds
             while process.poll() is None:
                 if time.monotonic() >= deadline:
-                    _terminate_process(process)
-                    try:
-                        process.wait(timeout=10)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                    raise TimeoutError(
-                        f"TexasSolver exceeded the {timeout_seconds}-second timeout."
-                    )
+                    stopped = _terminate_solver_child(process)
+                    message = f"TexasSolver exceeded the {timeout_seconds}-second timeout."
+                    if not stopped:
+                        # An orphaned solver keeps holding its memory and
+                        # threads, so the operator has to be told to go find it
+                        # rather than assume the timeout cleaned up after itself.
+                        message += (
+                            f" The solver process (pid {process.pid}) could not be "
+                            "confirmed stopped and may still be running."
+                        )
+                    raise TimeoutError(message)
                 time.sleep(2)
                 current = db.fetch_solver_run(run_id)
                 if current is None:
-                    _terminate_process(process)
+                    _terminate_solver_child(process)
                     return
                 if current.status != "running":
-                    _terminate_process(process)
+                    _terminate_solver_child(process)
                     if current.status == "cancelling":
                         db.update_solver_run(
                             run_id,
@@ -184,30 +235,69 @@ def run_solver_job(
             )
         raise
     finally:
+        # Every exit from here is an exit of the worker, so nothing may be left
+        # solving: a DB error while claiming the run used to leave console_solver
+        # running with its pid recorded nowhere.
+        if process is not None:
+            _terminate_solver_child(process)
+        if pid_path is not None:
+            pid_path.unlink(missing_ok=True)
         db.close()
 
 
-def _memory_limit() -> None:
+def _memory_limiter(limit_bytes: int):
+    """Build the between-fork-and-exec hook that caps the solver's address space.
+
+    subprocess re-raises whatever this hook raises in the parent, which is the
+    point: a cap that could not be applied fails the run instead of leaving the
+    operator believing a cap is in force.
+    """
+
+    def apply_limit() -> None:
+        if resource is None:
+            raise RuntimeError(
+                "POKERTRAINER_SOLVER_MEMORY_GB was set but this platform has no "
+                "RLIMIT_AS support."
+            )
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+
+    return apply_limit
+
+
+def _terminate_solver_child(
+    process: subprocess.Popen[bytes],
+    *,
+    grace_seconds: float | None = None,
+) -> bool:
+    """Stop the solver and everything it forked. True only when it is reaped.
+
+    Signalling the direct child alone is not enough: a solve that forks leaves
+    a grandchild that is reparented away and keeps the memory and threads the
+    run was supposed to release. The solver is a session leader, so its pid is
+    also its group id and one killpg reaches the whole tree.
+    """
+    grace = TERMINATION_GRACE_SECONDS if grace_seconds is None else grace_seconds
+    if process.poll() is not None:
+        return True
+    if os.name == "posix":
+        _terminate_solver_group(process.pid, grace_seconds=grace)
+    else:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            return True
     try:
-        import resource
-
-        configured = os.environ.get("POKERTRAINER_SOLVER_MEMORY_GB", "").strip()
-        if not configured:
-            return
-        limit_gb = float(configured)
-        if limit_gb <= 0:
-            return
-        limit = int(limit_gb * 1024**3)
-        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-    except (ImportError, OSError, ValueError):
-        return
-
-
-def _terminate_process(process: subprocess.Popen[bytes]) -> None:
-    try:
-        process.terminate()
-    except ProcessLookupError:
-        return
+        process.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return True
+        try:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            return False
+    return True
 
 
 def main() -> None:

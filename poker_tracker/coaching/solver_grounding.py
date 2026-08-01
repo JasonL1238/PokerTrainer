@@ -53,6 +53,31 @@ _UNSUPPORTED_BB_LOSS = re.compile(
     r"[^.!?\n]{0,40}\s-\d+(?:\.\d+)?\s*" + _BB_UNIT
     + r")"
 )
+_ACTION_STEM = r"(?:check|bet|call|rais|fold|jam|shov|all[\s-]?in)"
+# An EV claim needs no number to exceed the evidence: the retained dump is a
+# strategy, so it establishes how often an action is taken and nothing about
+# what it is worth. Deliberately narrow -- the hand-review format carries an
+# "EV / Math Notes" heading, so rejecting the bare token would reject every
+# well-formed response -- this matches only EV attached to an action.
+_UNSUPPORTED_EV_CLAIM = re.compile(
+    rf"""(?ix)
+    (?:expected\s+value|\bev\b)\s+(?:of|for|from)\s+(?:the\s+|a\s+)?{_ACTION_STEM}
+    | {_ACTION_STEM}\w*\s+(?:has|had|carries|offers|gives)\s+
+      (?:a\s+|the\s+)?(?:much\s+)?
+      (?:higher|lower|better|worse|greater|more|less|positive|negative)?\s*
+      (?:expected\s+value|\bev\b)
+    | {_ACTION_STEM}\w*(?:'s|s')\s+(?:expected\s+value|\bev\b)
+    """
+)
+# The dumped strategy exposes no regret of any kind, so a claim about regret is
+# unfalsifiable against the retained evidence whether or not it names a number.
+# The plain-English sense of the word is rejected along with the technical one
+# on purpose: inside an explanation of a solver result the reader cannot tell
+# them apart, and a coach that must not quantify regret should not gesture at
+# it either.
+_UNSUPPORTED_REGRET = re.compile(
+    r"(?ix)\b(?:counterfactual|regrets?|regretting|regretted|cfr)\b"
+)
 
 
 def validate_solver_coaching_response(
@@ -61,12 +86,30 @@ def validate_solver_coaching_response(
 ) -> None:
     """Reject explanations that alter or exceed the saved solver evidence."""
 
-    if _contains_action_amount_claim(response, evidence) or _UNSUPPORTED_BB_LOSS.search(
-        response
+    if not evidence.action_frequencies and not evidence.range_action_frequencies:
+        # Without frequencies there is nothing to check a claim against, and the
+        # frequency validator degrades to permitting everything precisely when
+        # the retained output established nothing. An explanation of an empty
+        # result is unfalsifiable, so it is refused rather than waved through.
+        raise ValueError(
+            "The saved solver output established no action frequencies, so an "
+            "explanation of it cannot be grounded."
+        )
+
+    if (
+        _contains_action_amount_claim(response, evidence)
+        or _UNSUPPORTED_BB_LOSS.search(response)
+        or _UNSUPPORTED_EV_CLAIM.search(response)
     ):
         raise ValueError(
             "The explanation claimed action EV or BB loss that TexasSolver's "
             "saved strategy output does not establish."
+        )
+
+    if _UNSUPPORTED_REGRET.search(response):
+        raise ValueError(
+            "The explanation claimed action EV or BB loss in the form of solver "
+            "regret, which TexasSolver's saved strategy output does not expose."
         )
 
     frequencies = (

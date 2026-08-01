@@ -338,6 +338,70 @@ def test_init_db_refuses_newer_schema_version() -> None:
     db.close()
 
 
+@pytest.mark.parametrize("ahead_by", [1, 5, 100])
+def test_the_refusal_names_both_versions_and_repeats(tmp_path, ahead_by: int) -> None:
+    """The message has to say what to do, and saying it once is not enough.
+
+    An operator who runs an older build against a newer database sees this at
+    every start until they upgrade; a refusal that degraded into an open on the
+    second attempt would be worse than one that never happened.
+    """
+    path = tmp_path / "newer.sqlite3"
+    seeded = PokerDatabase(path)
+    seeded.init_db()
+    future_version = SCHEMA_VERSION + ahead_by
+    seeded._execute(
+        "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
+        (str(future_version),),
+    )
+    seeded._commit()
+    seeded.close()
+
+    for _ in range(2):
+        reopened = PokerDatabase(path)
+        with pytest.raises(RuntimeError) as caught:
+            reopened.init_db()
+        message = str(caught.value)
+        assert str(future_version) in message
+        assert str(SCHEMA_VERSION) in message
+        assert "Update the app" in message
+        assert reopened.schema_version() == future_version
+        reopened.close()
+
+
+def test_a_newer_database_cannot_be_written_even_without_init_db(tmp_path) -> None:
+    """The constructor cannot raise, so the refusal has to survive into the writes.
+
+    It returns before switching the file to WAL on purpose: converting a newer
+    database's journal mode is itself a write to a file this build does not
+    understand. That left the object it returns holding a live connection on a
+    database whose tables are all present -- a newer build's schema is a superset
+    of this one's -- so a caller that skipped init_db wrote to it and nothing
+    complained.
+    """
+    path = tmp_path / "newer-write.sqlite3"
+    seeded = PokerDatabase(path)
+    seeded.init_db()
+    seeded.create_session(Session(name="Written by the newer build"))
+    seeded._execute(
+        "UPDATE schema_metadata SET value = ? WHERE key = 'schema_version'",
+        (str(SCHEMA_VERSION + 1),),
+    )
+    seeded._commit()
+    seeded.close()
+    before = path.read_bytes()
+
+    refused = PokerDatabase(path)
+    with pytest.raises(RuntimeError, match="newer than this app"):
+        refused.create_session(Session(name="Written by the older build"))
+    # Reads still work: the version and the backup path both need them.
+    assert refused.schema_version() == SCHEMA_VERSION + 1
+    assert len(refused.fetch_sessions()) == 1
+    refused.close()
+
+    assert path.read_bytes() == before
+
+
 def _v12_hands_table_columns() -> list[str]:
     """The exact hands columns a schema-12 database holds, in order."""
     return [

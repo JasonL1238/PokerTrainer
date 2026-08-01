@@ -6,6 +6,12 @@ environment. The setup runs one Streamlit/CV container behind Caddy and keeps
 SQLite, uploaded videos, timelines, logs, and backups on an attached block
 volume.
 
+It layers a TLS front end and a provider-specific volume path onto the
+provider-neutral definition in the repository root (`compose.yaml`). Read
+[docs/CONTAINER.md](../../docs/CONTAINER.md) first: the build, the model
+provisioning step, the environment variables and the verification drill are the
+same here, and this file only covers what is specific to Oracle Cloud.
+
 ## Release gates
 
 Do not use this host until all gates pass:
@@ -32,9 +38,24 @@ the result and continue running PokerTrainer locally.
 Create the durable directory:
 
 ```bash
-sudo mkdir -p /srv/pokertrainer/data
+sudo mkdir -p /srv/pokertrainer/data/models
 sudo chown -R 10001:10001 /srv/pokertrainer
 ```
+
+The CV model weights are not in the repository and not in the image. Install
+them onto the volume before the first reconstruction, from wherever this
+deployment keeps them:
+
+```bash
+python deploy/provision_models.py \
+  --models-dir /srv/pokertrainer/data/models \
+  --source <directory-or-https-base>
+```
+
+Each file is verified against the SHA-256 in `deploy/model_manifest.json` before
+it is installed. Without them the application starts and every feature except
+video reconstruction works; reconstruction fails rather than producing a partial
+timeline.
 
 ## Configure and deploy
 

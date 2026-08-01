@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -522,6 +523,162 @@ def test_cli_json_fails_for_inaccessible_explicit_backup_directory(
     assert backup_check["message"] == "Backup directory cannot be read."
 
 
+def _current_schema_database(path: Path) -> PokerDatabase:
+    db = PokerDatabase(path)
+    db.init_db()
+    return db
+
+
+def test_every_recorded_path_column_is_audited(tmp_path: Path) -> None:
+    """Solver outputs, per-action frames and regression fixtures were unaudited.
+
+    _ARTIFACT_REFERENCES listed three of the nine columns retention protects, so
+    a report could say every recorded artifact reference was present while six
+    kinds of file dangled.
+    """
+    from poker_tracker.persistence.models import Hand, Session
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    database = tmp_path / "poker_tracker.db"
+    db = _current_schema_database(database)
+    session = db.create_session(Session(name="Artifacts"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+    files = {}
+    for name in ("solver_result.json", "action_frame.jpg", "fixture.json"):
+        path = data_dir / name
+        path.write_bytes(b"present")
+        files[name] = path
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO actions ("
+            "  hand_id, street, action_index, action_type, player_name, source_image"
+            ") VALUES (?, 'preflop', 1, 'bet', 'Hero', ?)",
+            (hand.id, str(files["action_frame.jpg"])),
+        )
+        connection.execute(
+            "INSERT INTO solver_runs (hand_id, input_hash, result_path, created_at)"
+            " VALUES (?, 'hash', ?, '2026-01-01T00:00:00+00:00')",
+            (hand.id, str(files["solver_result.json"])),
+        )
+        connection.execute(
+            "INSERT INTO hand_issues (hand_id, description, created_at, updated_at)"
+            " VALUES (?, 'issue', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')"
+        , (hand.id,))
+        connection.execute(
+            "INSERT INTO regression_cases (issue_id, kind, fixture_path, created_at, updated_at)"
+            " VALUES (1, 'timeline', ?, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')",
+            (str(files["fixture.json"]),),
+        )
+    db.close()
+
+    healthy = audit_data_health(
+        database, data_dir=data_dir, restore_backups=False
+    )
+    assert _checks_by_name(healthy)["artifact_files"].status == "pass"
+    assert _checks_by_name(healthy)["artifact_files"].message.startswith("All 3")
+
+    for path in files.values():
+        path.unlink()
+    report = audit_data_health(database, data_dir=data_dir, restore_backups=False)
+
+    check = _checks_by_name(report)["artifact_files"]
+    assert check.status == "fail"
+    assert "Found 3 missing artifact(s)" in check.message
+    joined = " ".join(check.details)
+    assert "actions row" in joined
+    assert "solver_runs row" in joined
+    assert "regression_cases row" in joined
+
+
+def test_audited_path_columns_are_exactly_the_retention_list() -> None:
+    """The audit and retention must never disagree about what a path column is."""
+    from poker_tracker.maintenance.data_health import _ARTIFACT_REFERENCES
+
+    assert {f"{table}.{column}" for table, column in _ARTIFACT_REFERENCES} == {
+        label for label, _ in PokerDatabase.ARTIFACT_PATH_COLUMNS
+    }
+
+
+def test_a_path_column_whose_query_disagrees_with_its_label_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Derivation only helps if the label and the SQL describe the same rows."""
+    from poker_tracker.maintenance.data_health import _artifact_reference_columns
+
+    monkeypatch.setattr(
+        PokerDatabase,
+        "ARTIFACT_PATH_COLUMNS",
+        (("videos.stored_path", "SELECT stored_path FROM extracted_frames"),),
+    )
+    with pytest.raises(RuntimeError, match="cannot be audited"):
+        _artifact_reference_columns()
+
+
+def test_blank_path_columns_are_not_reported_as_missing_files(tmp_path: Path) -> None:
+    """Most path columns default to '', which means "no file", not "a lost file"."""
+    from poker_tracker.persistence.models import Hand, Session
+
+    database = tmp_path / "poker_tracker.db"
+    db = _current_schema_database(database)
+    session = db.create_session(Session(name="Blank"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO solver_runs (hand_id, input_hash, created_at)"
+            " VALUES (?, 'hash', '2026-01-01T00:00:00+00:00')",
+            (hand.id,),
+        )
+    db.close()
+
+    report = audit_data_health(
+        database, data_dir=tmp_path / "data", restore_backups=False
+    )
+
+    check = _checks_by_name(report)["artifact_files"]
+    assert check.status == "pass"
+    assert check.message.startswith("All 0")
+
+
+def test_missing_reconstruction_timeline_is_reported(tmp_path: Path) -> None:
+    """A timeline has no column anywhere, and a missing one blocks every import."""
+    from poker_tracker.persistence.models import ProcessingJob, Session, VideoRecord
+
+    data_dir = tmp_path / "data"
+    (data_dir / "cv_timelines").mkdir(parents=True)
+    video_file = data_dir / "clip.mp4"
+    video_file.write_bytes(b"clip")
+    database = tmp_path / "poker_tracker.db"
+    db = _current_schema_database(database)
+    session = db.create_session(Session(name="Timelines"))
+    video = db.create_video(
+        VideoRecord(
+            original_filename="clip.mp4",
+            stored_path=str(video_file),
+            file_size_bytes=video_file.stat().st_size,
+            session_id=session.id,
+        )
+    )
+    job = db.create_processing_job(
+        ProcessingJob(
+            video_id=video.id, job_type="cv_reconstruction", status="completed"
+        )
+    )
+    timeline = data_dir / "cv_timelines" / f"job_{job.id}_timeline.json"
+    timeline.write_text("{}", encoding="utf-8")
+    db.close()
+
+    present = audit_data_health(database, data_dir=data_dir, restore_backups=False)
+    assert _checks_by_name(present)["timeline_files"].status == "pass"
+
+    timeline.unlink()
+    report = audit_data_health(database, data_dir=data_dir, restore_backups=False)
+
+    check = _checks_by_name(report)["timeline_files"]
+    assert check.status == "warning"
+    assert f"job_{job.id}_timeline.json" in check.details[0]
+
+
 def test_minimum_schema_does_not_require_completion_columns() -> None:
     """A retained pre-v13 backup must stay healthy: a missing contract column is a
     hard fail that _connection_issues escalates to a backup failure."""
@@ -569,6 +726,73 @@ def test_schema_contract_still_passes_for_a_pre_v13_database(tmp_path: Path) -> 
         data_dir=tmp_path,
         backup_dir=tmp_path / "backups",
         expected_schema_version=SCHEMA_VERSION,
+    )
+
+    assert _checks_by_name(report)["schema_contract"].status == "pass"
+
+
+def test_a_lost_index_is_named_by_the_schema_check(tmp_path: Path) -> None:
+    """The audit judged a database by a hand-written table-and-column list.
+
+    ``idx_actions_hand_street_order`` is the unique index migration 8 exists to
+    create, and it is the only thing stopping two actions claiming one slot in a
+    street's order. Dropped, the audit reported "Core PokerTrainer tables and
+    columns are present." and HEALTHY while duplicate ordering was written --
+    the audit's own subject matter, invisible to the audit.
+    """
+    database = tmp_path / "poker_tracker.db"
+    _current_schema_database(database).close()
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP INDEX idx_actions_hand_street_order")
+
+    report = audit_data_health(
+        database, data_dir=tmp_path / "data", restore_backups=False
+    )
+
+    check = _checks_by_name(report)["schema_contract"]
+    assert check.status == "warning"
+    assert any("idx_actions_hand_street_order" in detail for detail in check.details)
+
+
+def test_a_column_added_after_the_hand_written_list_is_still_required(
+    tmp_path: Path,
+) -> None:
+    """The versioned contract stopped at 14 while the schema reached 18.
+
+    Anything added later was outside what the audit knew to ask for, so the list
+    protected exactly as much as whoever last remembered to extend it. The
+    requirement is derived from the schema this build creates instead, which is
+    why this test names a column nobody had to add here.
+    """
+    database = tmp_path / "poker_tracker.db"
+    _current_schema_database(database).close()
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE solver_runs DROP COLUMN run_parameters")
+
+    report = audit_data_health(
+        database, data_dir=tmp_path / "data", restore_backups=False
+    )
+
+    check = _checks_by_name(report)["schema_contract"]
+    assert check.status == "warning"
+    assert any("solver_runs.run_parameters" in detail for detail in check.details)
+
+
+def test_an_older_database_is_not_judged_against_todays_schema(tmp_path: Path) -> None:
+    """A retained file from an older build legitimately lacks later additions.
+
+    The derived check is only meaningful at the current version; applied to a
+    v13 file it would report every object added since as damage, which is how a
+    check earns its way into being ignored.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from legacy_schema_fixtures import write_legacy_database
+
+    database = tmp_path / "poker_tracker.db"
+    write_legacy_database(database, stored_version=13)
+
+    report = audit_data_health(
+        database, data_dir=tmp_path / "data", restore_backups=False
     )
 
     assert _checks_by_name(report)["schema_contract"].status == "pass"

@@ -6,7 +6,9 @@ import math
 import os
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, NamedTuple
 
 from poker_tracker.solver.models import (
     ActionFrequency,
@@ -22,6 +24,31 @@ DEFAULT_ACCURACY_PCT = 0.5
 DEFAULT_MAX_ITERATIONS = 200
 DEFAULT_TIMEOUT_SECONDS = 30 * 60
 TEXASSOLVER_MIN_WEIGHT = 0.005
+# How far a recorded bet may sit from the nearest size the tree offers, measured
+# against the pot it was made into. Chips are the wrong unit: two blinds of
+# substitution into a five blind pot is a different decision, while the same two
+# blinds into a two hundred blind pot is rounding.
+#
+# The flop abstraction offers 33% and 75% pot, so the widest gap between
+# neighbouring sizes is 42% of pot and any bet strictly between them lands at
+# most 21% of pot from one of them; turn and river offer 50% and 100%, where the
+# same figure is 25%. A quarter-pot ceiling therefore admits every size the
+# abstraction was built to approximate -- including a pot-sized flop bet, which
+# sits exactly on the bound -- and refuses everything the abstraction was never
+# meant to stand in for. Below 2% of pot the difference is unit conversion
+# rather than a decision, so it is not worth an operator's attention.
+ACTION_MAPPING_EXACT_POT_FRACTION = 0.02
+ACTION_MAPPING_MAX_POT_FRACTION = 0.25
+# The share of the submitted range, by the operator's own weights, that the
+# dumped strategy map must describe before the result counts as a solve of the
+# range that was asked about. The only legitimate way for combinations to go
+# missing is TexasSolver's internal minimum-weight pruning, and parse_range
+# already refuses to submit anything at or below that cutoff, so a correct dump
+# covers essentially the whole range. Half is a wide margin below any plausible
+# legitimate loss: under it, the map describes a different node's range or the
+# file is incomplete, and neither is evidence about this hand.
+MIN_STRATEGY_RANGE_COVERAGE = 0.5
+FULL_STRATEGY_RANGE_COVERAGE = 0.999
 TREE_SPEC = {
     "flop_bets": [33, 75],
     "turn_river_bets": [50, 100],
@@ -38,6 +65,45 @@ _EXPLOITABILITY = re.compile(
     re.IGNORECASE,
 )
 _NUMBER = re.compile(r"([0-9]+(?:\.[0-9]+)?)")
+
+
+class SolverResultUnusableError(ValueError):
+    """A dump that cannot be read as evidence about the recorded hand.
+
+    Subclasses ValueError because the worker and the cache materializer already
+    turn a parse failure into a failed run with a message the operator sees.
+    Refusing costs one study spot; accepting would file frequencies computed for
+    some other decision under this hand's number, where nothing downstream can
+    tell them apart from a real result.
+    """
+
+
+@dataclass(frozen=True)
+class ActionMapping:
+    """How a recorded action lines up with the branches the solve tree offers.
+
+    ``label`` is set only when the branch may actually be used, so a caller that
+    ignores ``quality`` still cannot descend into a branch that answers a
+    different question. ``detail`` is written to be shown to an operator and
+    handed to the coaching model verbatim.
+    """
+
+    label: str | None
+    quality: Literal["exact", "approximate", "unusable", "absent"]
+    detail: str
+    pot_fraction_error: float | None = None
+
+    @property
+    def is_usable(self) -> bool:
+        return self.quality in {"exact", "approximate"}
+
+
+class NodeStrategy(NamedTuple):
+    actions: list[str]
+    combo_frequencies: list[ActionFrequency]
+    range_frequencies: list[ActionFrequency]
+    range_coverage: float
+    strategy_combos: int
 
 
 def configured_binary() -> Path:
@@ -185,8 +251,6 @@ def parse_strategy_result(
 
     hero = spot.oop if spot.oop.is_hero else spot.ip
     node: Mapping[str, object] = root
-    recorded_hero_action = ""
-    mapped_hero_action = ""
     warnings: list[str] = []
     if exploitability_pct is None:
         warnings.append(
@@ -199,40 +263,82 @@ def parse_strategy_result(
             f"{DEFAULT_ACCURACY_PCT:g}% target after at most "
             f"{DEFAULT_MAX_ITERATIONS} iterations."
         )
+    recorded_hero: RecordedSolverAction | None = None
+    hero_mapping = ActionMapping(None, "absent", "no Hero decision was reached")
     for recorded in spot.recorded_line:
+        mapping = map_recorded_action(
+            node, recorded, pot_reference=_pot_reference(recorded, spot)
+        )
         if recorded.player_key == hero.player_key:
-            recorded_hero_action = _action_label(recorded)
-            mapped_hero_action = map_recorded_action(node, recorded) or ""
+            recorded_hero = recorded
+            hero_mapping = mapping
             break
-        selected = map_recorded_action(node, recorded)
-        if selected is None:
-            warnings.append(
-                f"Could not map {recorded.player_name}'s recorded {_action_label(recorded)} "
-                "to the solver tree."
+        # Everything below this point is read out of the node the walk lands on,
+        # so a villain action that has no honest counterpart in the tree cannot
+        # be approximated away: descending anyway would swap the decision the
+        # evidence is about while leaving the recorded line beside it unchanged.
+        if not mapping.is_usable:
+            raise SolverResultUnusableError(
+                f"{recorded.player_name}'s recorded {_action_label(recorded)} cannot be "
+                f"placed in the solver tree: {mapping.detail}. Strategy read past that "
+                "point would describe a different decision."
             )
-            break
         children = node.get("childrens")
-        if not isinstance(children, dict) or selected not in children:
-            warnings.append(f"Solver output did not include the recorded branch {selected}.")
-            break
-        child = children[selected]
+        if not isinstance(children, dict) or mapping.label not in children:
+            raise SolverResultUnusableError(
+                f"The solver output has no {mapping.label} branch for "
+                f"{recorded.player_name}'s recorded {_action_label(recorded)}."
+            )
+        child = children[mapping.label]
         if not isinstance(child, dict):
-            break
+            raise SolverResultUnusableError(
+                f"The solver output's {mapping.label} branch is not a decision node."
+            )
+        if mapping.quality == "approximate":
+            warnings.append(
+                f"{recorded.player_name}'s recorded {_action_label(recorded)} was solved "
+                f"as {mapping.label}: {mapping.detail}."
+            )
         node = child
+    if recorded_hero is None:
+        raise SolverResultUnusableError(
+            "The recorded line reaches no Hero decision, so this solve is not evidence "
+            "about a choice Hero made."
+        )
+
+    recorded_hero_action = _action_label(recorded_hero)
+    mapped_hero_action = hero_mapping.label or ""
+    if not hero_mapping.is_usable:
+        warnings.append(
+            f"Hero's recorded {recorded_hero_action} has no counterpart in the solve "
+            f"tree: {hero_mapping.detail}. The frequencies below are the equilibrium "
+            "for this decision, but they cannot be compared with what Hero did."
+        )
+    elif hero_mapping.quality == "approximate":
+        warnings.append(
+            f"Hero's recorded {recorded_hero_action} was matched to "
+            f"{mapped_hero_action}: {hero_mapping.detail}."
+        )
 
     hero_range = range_oop if hero.role == "oop" else range_ip
-    actions, combo_frequencies, range_frequencies = _node_strategy(
-        node, spot.hero_cards, hero_range.solver_notation
-    )
-    if not combo_frequencies:
+    strategy = _node_strategy(node, spot.hero_cards, hero_range.solver_notation)
+    _require_usable_strategy(node, strategy, hero_range)
+    if not strategy.combo_frequencies:
         warnings.append(
             "The recorded Hero combo was not present at the mapped decision node; "
             "only range-level frequencies are available."
         )
-    if recorded_hero_action and not mapped_hero_action:
-        warnings.append("The recorded Hero action could not be mapped to an allowed solver size.")
-    if actions and mapped_hero_action and mapped_hero_action not in actions:
-        warnings.append("The nearest recorded action is not available at the mapped strategy node.")
+    if strategy.range_coverage < FULL_STRATEGY_RANGE_COVERAGE:
+        warnings.append(
+            f"The dumped strategy covered {strategy.range_coverage * 100:.1f}% of the "
+            f"submitted {hero_range.role.upper()} range by weight; range frequencies "
+            "are averaged over that subset only."
+        )
+    if mapped_hero_action and mapped_hero_action not in strategy.actions:
+        warnings.append(
+            f"The mapped Hero branch {mapped_hero_action} is not one of the actions "
+            "the strategy node reports."
+        )
 
     return SolverEvidence(
         backend="TexasSolver",
@@ -245,8 +351,8 @@ def parse_strategy_result(
         hero_combo=spot.hero_cards,
         recorded_action=recorded_hero_action,
         mapped_action=mapped_hero_action,
-        action_frequencies=combo_frequencies,
-        range_action_frequencies=range_frequencies,
+        action_frequencies=strategy.combo_frequencies,
+        range_action_frequencies=strategy.range_frequencies,
         exploitability_pct=exploitability_pct,
         runtime_seconds=runtime_seconds,
         range_ip_name=range_ip.profile_name,
@@ -257,40 +363,204 @@ def parse_strategy_result(
 
 
 def map_recorded_action(
-    node: Mapping[str, object], action: RecordedSolverAction
-) -> str | None:
-    children = node.get("childrens")
-    available = list(children) if isinstance(children, dict) else []
+    node: Mapping[str, object],
+    action: RecordedSolverAction,
+    *,
+    pot_reference: float,
+) -> ActionMapping:
+    """Line a recorded action up with a branch of the solve tree.
+
+    The tree offers a handful of discrete sizes, so a recorded bet rarely equals
+    one of them and some substitution is unavoidable. What is not tolerable is
+    an unbounded one: the substitution is measured against the pot the action
+    was made into and refused past ACTION_MAPPING_MAX_POT_FRACTION, because past
+    that the branch is a different decision no matter how near it is in chips.
+
+    Actions that carry no size are matched by name or not at all. A check is not
+    a small bet and a raise is not a call, so when the tree omits the recorded
+    action there is no nearer branch, only a different one.
+    """
+
+    available = _available_actions(node)
     if not available:
-        raw_actions = node.get("actions")
-        available = [str(item) for item in raw_actions] if isinstance(raw_actions, list) else []
-    desired = action.action_type.lower()
-    exact = {
-        "check": "CHECK",
-        "call": "CALL",
-        "fold": "FOLD",
-    }.get(desired)
-    if exact and exact in available:
-        return exact
-    prefix = "RAISE" if desired == "raise" else "BET"
+        return ActionMapping(None, "absent", "the node offers no actions")
+    offered = ", ".join(available)
+    desired = action.action_type.strip().lower()
+    unsized = {"check": "CHECK", "call": "CALL", "fold": "FOLD"}.get(desired)
+    if unsized is not None:
+        if unsized in available:
+            return ActionMapping(unsized, "exact", f"{unsized} is offered at this node")
+        return ActionMapping(
+            None, "absent", f"{unsized} is not offered at this node (offered: {offered})"
+        )
     if desired == "all-in":
-        all_in = next((item for item in available if "ALLIN" in item.replace("-", "")), None)
-        if all_in:
-            return all_in
-        candidates = [
-            item for item in available if item.startswith("BET") or item.startswith("RAISE")
-        ]
-        return max(candidates, key=_action_number, default=None)
-    candidates = [item for item in available if item.startswith(prefix)]
-    if not candidates:
-        return None
-    target = float(action.amount or 0)
-    return min(candidates, key=lambda item: abs(_action_number(item) - target))
+        all_in = next(
+            (item for item in available if "ALLIN" in re.sub(r"[-_\s]", "", item).upper()),
+            None,
+        )
+        if all_in is not None:
+            return ActionMapping(all_in, "exact", "the tree's all-in branch")
+        sized = _sized_actions(available, ("BET", "RAISE"))
+        if not sized:
+            return ActionMapping(
+                None,
+                "absent",
+                f"the tree offers neither an all-in nor a sized bet (offered: {offered})",
+            )
+        if action.amount is None:
+            return ActionMapping(
+                None,
+                "unusable",
+                "the recorded all-in carries no amount, so a sized branch cannot "
+                "stand in for it",
+            )
+        label, amount = max(sized, key=lambda pair: pair[1])
+        return _bounded_mapping(
+            label, amount, action, pot_reference, "the largest sized branch"
+        )
+    if desired not in {"bet", "raise"}:
+        return ActionMapping(
+            None, "absent", f"'{action.action_type}' is not a postflop tree action"
+        )
+    prefix = "RAISE" if desired == "raise" else "BET"
+    sized = _sized_actions(available, (prefix,))
+    if not sized:
+        return ActionMapping(
+            None, "absent", f"the node offers no {prefix} branch (offered: {offered})"
+        )
+    if action.amount is None:
+        return ActionMapping(
+            None,
+            "unusable",
+            f"the recorded {desired} carries no amount, so it cannot be sized "
+            "against the tree",
+        )
+    target = float(action.amount)
+    label, amount = min(sized, key=lambda pair: abs(pair[1] - target))
+    return _bounded_mapping(label, amount, action, pot_reference, "the nearest branch")
+
+
+def _require_usable_strategy(
+    node: Mapping[str, object], strategy: NodeStrategy, hero_range: ResolvedRange
+) -> None:
+    """State what a dump must contain before it is retained as study evidence.
+
+    The conditions are checked one at a time so the failure names the one that
+    was not met. An operator whose dump reached a chance node, one whose dump
+    lists no actions, and one whose dump describes a range they did not submit
+    have three different problems, and a single "malformed output" would hide
+    which of them they have.
+    """
+
+    node_type = node.get("node_type")
+    if isinstance(node_type, str) and node_type.strip() and "action" not in node_type.lower():
+        raise SolverResultUnusableError(
+            f"The mapped solver node is a {node_type}, not a node where a player acts."
+        )
+    if not strategy.actions:
+        raise SolverResultUnusableError(
+            "The mapped solver node lists no actions to choose between."
+        )
+    if not strategy.strategy_combos:
+        raise SolverResultUnusableError(
+            "The mapped solver node carries no per-combination strategy."
+        )
+    if not _exact_combo_weights(hero_range.solver_notation):
+        raise SolverResultUnusableError(
+            f"The submitted {hero_range.role.upper()} range names no exact "
+            "combinations to check the dumped strategy against."
+        )
+    if strategy.range_coverage < MIN_STRATEGY_RANGE_COVERAGE:
+        raise SolverResultUnusableError(
+            f"The dumped strategy covers {strategy.range_coverage * 100:.1f}% of the "
+            f"submitted {hero_range.role.upper()} range by weight, short of the "
+            f"{MIN_STRATEGY_RANGE_COVERAGE * 100:.0f}% a usable result must reach; it "
+            "describes a different range or the file is incomplete."
+        )
+
+
+def _available_actions(node: Mapping[str, object]) -> list[str]:
+    children = node.get("childrens")
+    if isinstance(children, dict) and children:
+        return [str(item) for item in children]
+    raw_actions = node.get("actions")
+    return [str(item) for item in raw_actions] if isinstance(raw_actions, list) else []
+
+
+def _sized_actions(
+    available: list[str], prefixes: tuple[str, ...]
+) -> list[tuple[str, float]]:
+    """Branches of the given kind that carry a size the walk can measure.
+
+    A label with no number in it -- an all-in branch, say -- cannot be compared
+    with a recorded amount, and including it would let a nearest-match resolve
+    to a size nobody can check.
+    """
+
+    sized: list[tuple[str, float]] = []
+    for item in available:
+        if not item.startswith(prefixes):
+            continue
+        amount = _action_number(item)
+        if amount is not None:
+            sized.append((item, amount))
+    return sized
+
+
+def _bounded_mapping(
+    label: str,
+    tree_amount: float,
+    action: RecordedSolverAction,
+    pot_reference: float,
+    context: str,
+) -> ActionMapping:
+    recorded = float(action.amount or 0)
+    if pot_reference <= 0:
+        return ActionMapping(
+            None,
+            "unusable",
+            "the pot the action was made into is unknown, so the substitution "
+            "cannot be bounded",
+        )
+    error = abs(tree_amount - recorded) / pot_reference
+    if error <= ACTION_MAPPING_EXACT_POT_FRACTION:
+        return ActionMapping(label, "exact", f"{label} matches the recorded size", error)
+    if error <= ACTION_MAPPING_MAX_POT_FRACTION:
+        return ActionMapping(
+            label,
+            "approximate",
+            f"{context} {label} stands in for {recorded:g} BB into a "
+            f"{pot_reference:g} BB pot, {error * 100:.0f}% of that pot away",
+            error,
+        )
+    return ActionMapping(
+        None,
+        "unusable",
+        f"{context} {label} is {error * 100:.0f}% of the {pot_reference:g} BB pot "
+        f"away from the recorded {recorded:g} BB, past the "
+        f"{ACTION_MAPPING_MAX_POT_FRACTION * 100:.0f}% substitution limit",
+        error,
+    )
+
+
+def _pot_reference(action: RecordedSolverAction, spot: SolverSpot) -> float:
+    """The pot the substitution is proportional to.
+
+    Each recorded action carries the pot it faced, which is what a size means
+    something relative to. The spot's starting pot is the fallback for a line
+    recorded before that snapshot existed; it is the same number for the first
+    action of the street and an underestimate afterwards, which makes the bound
+    stricter rather than looser.
+    """
+
+    if action.pot_before is not None and action.pot_before > 0:
+        return action.pot_before
+    return spot.pot
 
 
 def _node_strategy(
     node: Mapping[str, object], hero_cards: str, range_notation: str
-) -> tuple[list[str], list[ActionFrequency], list[ActionFrequency]]:
+) -> NodeStrategy:
     strategy_wrapper = node.get("strategy")
     actions: list[str] = []
     strategy_map: Mapping[str, object] = {}
@@ -306,7 +576,7 @@ def _node_strategy(
         if isinstance(raw_actions, list):
             actions = [str(item) for item in raw_actions]
     if not actions or not strategy_map:
-        return actions, [], []
+        return NodeStrategy(actions, [], [], 0.0, len(strategy_map))
 
     hero_tokens = hero_cards.split()
     hero_keys = set()
@@ -366,7 +636,18 @@ def _node_strategy(
         if total_weight
         else []
     )
-    return actions, combo_frequencies, range_frequencies
+    # Coverage is weighted rather than counted so that a dump missing only
+    # combinations the operator had already discounted costs proportionally
+    # less than one missing the body of the range.
+    submitted_weight = sum(weights.values())
+    coverage = total_weight / submitted_weight if submitted_weight else 0.0
+    return NodeStrategy(
+        actions,
+        combo_frequencies,
+        range_frequencies,
+        min(1.0, coverage),
+        len(strategy_map),
+    )
 
 
 def _action_label(action: RecordedSolverAction) -> str:
@@ -377,9 +658,9 @@ def _action_label(action: RecordedSolverAction) -> str:
     )
 
 
-def _action_number(action: str) -> float:
+def _action_number(action: str) -> float | None:
     match = _NUMBER.search(action)
-    return float(match.group(1)) if match else 0.0
+    return float(match.group(1)) if match else None
 
 
 def _exact_combo_weights(notation: str) -> dict[str, float]:

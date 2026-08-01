@@ -9,6 +9,7 @@ import time
 from ast import literal_eval
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, TypeVar, get_args
@@ -75,7 +76,7 @@ DEFAULT_DB_PATH = os.environ.get(
     "POKER_DB_PATH",
     str(Path(__file__).resolve().parent.parent.parent / "poker_tracker.db"),
 )
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 _PROCESSING_JOB_PID_UNSET = object()
 # A migration on a real database can outlast SQLite's 5s default, and a second
 # opener must wait for it rather than failing startup with "database is locked".
@@ -351,6 +352,215 @@ def _assert_supported_schema_version(version: int | None) -> None:
         )
 
 
+@dataclass(frozen=True)
+class SchemaIntegrityReport:
+    """Which structures a database lacks compared with the schema this build creates.
+
+    Reported rather than raised, because the callers want different things:
+    ``init_db`` restores what it can and refuses over the rest, while an audit
+    wants to describe every gap at once so the operator sees the whole damage
+    rather than the first item of it.
+
+    The reference is the schema a fresh database of THIS build ends up with, so
+    the report is only meaningful for a file that has been migrated to
+    ``SCHEMA_VERSION``. A retained snapshot written by an older build
+    legitimately lacks later additions; migrate a copy of it first, which is what
+    an isolated restore does anyway.
+    """
+
+    missing_tables: tuple[str, ...] = ()
+    missing_columns: tuple[str, ...] = ()
+    missing_indexes: tuple[str, ...] = ()
+    foreign_key_violations: tuple[str, ...] = ()
+
+    @property
+    def is_intact(self) -> bool:
+        return not (
+            self.missing_tables
+            or self.missing_columns
+            or self.missing_indexes
+            or self.foreign_key_violations
+        )
+
+    def describe(self) -> str:
+        """Name what is missing, so the message is actionable without a schema dump."""
+        parts: list[str] = []
+        for label, items in (
+            ("missing table(s)", self.missing_tables),
+            ("missing column(s)", self.missing_columns),
+            ("missing index(es)", self.missing_indexes),
+            ("foreign-key violation(s)", self.foreign_key_violations),
+        ):
+            if not items:
+                continue
+            shown = ", ".join(items[:_INTEGRITY_DETAIL_LIMIT])
+            if len(items) > _INTEGRITY_DETAIL_LIMIT:
+                shown += f", and {len(items) - _INTEGRITY_DETAIL_LIMIT} more"
+            parts.append(f"{label}: {shown}")
+        return "; ".join(parts) if parts else "nothing missing"
+
+
+_INTEGRITY_DETAIL_LIMIT = 10
+
+
+def _read_physical_schema(
+    connection: sqlite3.Connection,
+) -> tuple[dict[str, frozenset[str]], dict[str, str]]:
+    """The file's own tables with their columns, and its indexes with their tables.
+
+    SQLite's implicit ``sqlite_autoindex_*`` entries are left out: they follow
+    from a UNIQUE constraint in the table DDL, so comparing them would report a
+    difference that the table comparison has already reported.
+    """
+    tables: dict[str, frozenset[str]] = {}
+    for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchall():
+        name = str(row[0])
+        tables[name] = frozenset(
+            str(column[1])
+            for column in connection.execute(f"PRAGMA table_info({name})").fetchall()
+        )
+    indexes = {
+        str(row[0]): str(row[1])
+        for row in connection.execute(
+            "SELECT name, tbl_name FROM sqlite_master "
+            "WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    }
+    return tables, indexes
+
+
+def _read_column_declarations(
+    connection: sqlite3.Connection,
+) -> dict[str, dict[str, str | None]]:
+    """Each column's ``ALTER TABLE ADD COLUMN`` spec, or None when it has none.
+
+    None means SQLite cannot add the column back: it is NOT NULL without a
+    default, or part of the primary key. A table missing one of those cannot be
+    repaired, only restored.
+    """
+    declarations: dict[str, dict[str, str | None]] = {}
+    for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchall():
+        table = str(row[0])
+        columns: dict[str, str | None] = {}
+        for column in connection.execute(f"PRAGMA table_info({table})").fetchall():
+            name, kind, notnull, default, primary_key = (
+                str(column[1]),
+                str(column[2]),
+                bool(column[3]),
+                column[4],
+                bool(column[5]),
+            )
+            if primary_key or (notnull and default is None):
+                columns[name] = None
+                continue
+            spec = kind
+            if notnull:
+                spec += " NOT NULL"
+            if default is not None:
+                spec += f" DEFAULT {default}"
+            columns[name] = spec
+        declarations[table] = columns
+    return declarations
+
+
+@dataclass(frozen=True)
+class _ReferenceSchema:
+    tables: dict[str, frozenset[str]]
+    indexes: dict[str, str]
+    column_declarations: dict[str, dict[str, str | None]]
+
+
+_REFERENCE_SCHEMA: _ReferenceSchema | None = None
+
+
+def _reference_schema() -> _ReferenceSchema:
+    """The schema a fresh database of this build ends up with, built by creating one.
+
+    Derived rather than hand-listed on purpose: a contract written out as a
+    literal falls behind the DDL the moment somebody adds a table, and the audit
+    then reports a database that is missing it as healthy. Creating the schema
+    the product creates cannot fall behind it.
+
+    Cached for the process; it costs one in-memory database.
+    """
+    global _REFERENCE_SCHEMA
+    if _REFERENCE_SCHEMA is None:
+        reference = PokerDatabase(":memory:")
+        # The reference cannot verify itself against the reference it is building.
+        reference._verify_schema_on_init = False
+        try:
+            reference.init_db()
+            tables, indexes = _read_physical_schema(reference._connection)
+            _REFERENCE_SCHEMA = _ReferenceSchema(
+                tables=tables,
+                indexes=indexes,
+                column_declarations=_read_column_declarations(reference._connection),
+            )
+        finally:
+            reference.close()
+    return _REFERENCE_SCHEMA
+
+
+def _foreign_key_violations(
+    connection: sqlite3.Connection, *, limit: int = 100
+) -> tuple[str, ...]:
+    """Rows whose parent no longer exists, named by table and rowid.
+
+    Bounded: a database with a broken relationship usually has many, and the
+    report is read by a person.
+    """
+    try:
+        rows = connection.execute("PRAGMA foreign_key_check").fetchmany(limit)
+    except sqlite3.DatabaseError:
+        return ()
+    return tuple(
+        f"{row[0]} row {row[1]} references a missing {row[2]} row" for row in rows
+    )
+
+
+def inspect_schema_integrity(
+    connection: sqlite3.Connection, *, check_foreign_keys: bool = True
+) -> SchemaIntegrityReport:
+    """Compare a database against the schema this build requires.
+
+    Works on any connection, including a read-only one opened over a retained
+    snapshot, so a restore drill can ask the same question of a recovered file
+    that ``init_db`` asks of the live one.
+    """
+    reference = _reference_schema()
+    expected_tables, expected_indexes = reference.tables, reference.indexes
+    actual_tables, actual_indexes = _read_physical_schema(connection)
+    missing_tables = tuple(sorted(set(expected_tables) - set(actual_tables)))
+    missing_columns = tuple(
+        sorted(
+            f"{table}.{column}"
+            for table, columns in expected_tables.items()
+            if table in actual_tables
+            for column in columns - actual_tables[table]
+        )
+    )
+    # An index on a table that is itself missing is not reported twice.
+    missing_indexes = tuple(
+        sorted(
+            name
+            for name, table in expected_indexes.items()
+            if name not in actual_indexes and table not in missing_tables
+        )
+    )
+    return SchemaIntegrityReport(
+        missing_tables=missing_tables,
+        missing_columns=missing_columns,
+        missing_indexes=missing_indexes,
+        foreign_key_violations=(
+            _foreign_key_violations(connection) if check_foreign_keys else ()
+        ),
+    )
+
+
 def _finalize_correction_notes(
     notes: str, *, rejection_codes: tuple[str, ...]
 ) -> str:
@@ -376,11 +586,22 @@ class PokerDatabase:
     ) -> None:
         self.db_path = str(db_path)
         self._busy_timeout_ms = max(int(busy_timeout_ms), 0)
+        # Cleared only by _reference_schema, which opens one of these to learn
+        # what a complete schema looks like and so cannot be checked against it.
+        self._verify_schema_on_init = True
         # One connection is shared across Streamlit's script-run threads, so every
         # statement goes through _execute() under a re-entrant lock, and grouped
         # writes use transaction() for atomicity.
         self._lock = threading.RLock()
         self._txn_depth = 0
+        # Why this file was refused, or None when it was accepted. Read by every
+        # commit, so a caller that never reaches init_db still cannot write to a
+        # database this build does not understand.
+        self._refusal: str | None = None
+        # Columns init_db had to add back because the file arrived without them.
+        # Empty for every healthy database; non-empty means the file was damaged
+        # and an audit should say so.
+        self.restored_columns: tuple[str, ...] = ()
         self._connection = sqlite3.connect(self.db_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._execute("PRAGMA foreign_keys = ON")
@@ -402,7 +623,14 @@ class PokerDatabase:
             _assert_schema_matches_stamp(
                 opened_version, _physical_schema_ceiling(self._connection)
             )
-        except RuntimeError:
+        except RuntimeError as exc:
+            # Every production caller reaches init_db immediately and gets this
+            # message there. Recording it also closes the other door: the object
+            # this constructor hands back has a live connection on a file whose
+            # tables may all be present -- a database from a NEWER build has every
+            # table this one knows -- so a caller that skipped init_db could write
+            # to it, and the write would look completely ordinary.
+            self._refusal = str(exc)
             return
         self._enter_wal_mode()
         self._execute("PRAGMA synchronous = NORMAL")
@@ -472,8 +700,25 @@ class PokerDatabase:
     def _commit(self) -> None:
         # Inside transaction() the outermost exit owns the commit/rollback.
         with self._lock:
+            self._refuse_if_unsupported()
             if self._txn_depth == 0:
                 self._connection.commit()
+
+    def _refuse_if_unsupported(self) -> None:
+        """Fail every commit on a database the constructor refused.
+
+        The commit is the chokepoint: sqlite3 keeps DML and DDL alike inside the
+        implicit transaction, so a statement that is never committed is never
+        durable. Reads stay available on purpose -- ``schema_version()`` and the
+        backup path both have to work on a file this build will not write.
+        """
+        if self._refusal is None:
+            return
+        # Discard whatever the caller already executed. It is not durable without
+        # the commit, but leaving it pending would let a later read on this same
+        # connection see a write this build refused to make.
+        self._connection.rollback()
+        raise RuntimeError(self._refusal)
 
     @contextmanager
     def transaction(self, *, immediate: bool = False) -> Iterator[PokerDatabase]:
@@ -486,6 +731,7 @@ class PokerDatabase:
         allowing check-then-insert policies to serialize across connections.
         """
         with self._lock:
+            self._refuse_if_unsupported()
             if self._txn_depth == 0 and immediate:
                 self._connection.execute("BEGIN IMMEDIATE")
             self._txn_depth += 1
@@ -591,6 +837,78 @@ class PokerDatabase:
             # already committed the statements before it, and the pre-migration
             # snapshot inside the transaction was never reached.
             self._create_base_indexes()
+            if self._verify_schema_on_init:
+                self._assert_schema_is_intact()
+
+    def _assert_schema_is_intact(self) -> None:
+        """Refuse a database still missing structures once the whole chain has run.
+
+        ``CREATE TABLE IF NOT EXISTS``, the legacy backfill and the versioned
+        migrations between them repair everything this build knows how to
+        repair, so anything still absent here is damage no migration covers: a
+        hand-edited file, a half-applied ALTER, a table rebuilt by a repair
+        script, a database assembled from two restores. Those all used to open
+        cleanly and then fail one write at a time with a bare
+        ``sqlite3.OperationalError`` naming a single column, which reads as "this
+        feature is broken" rather than "this file is not usable" -- and a missing
+        UNIQUE index is worse than that, because nothing fails at all: the rows
+        it forbids simply start being written.
+
+        A missing column is restored rather than refused when the current DDL
+        declares a default for it, because this schema is forward-only and
+        additive: the value that restores is exactly the value the migration that
+        introduced the column would have written, and the alternative is a
+        database that cannot be opened at all. The one column whose absence
+        genuinely cannot be repaired that way -- ``hands.completion_status``, on a
+        file stamped past 13 -- never reaches here: ``_assert_schema_matches_stamp``
+        refuses it in the constructor, because re-running that migration is what
+        discards operator confirmations. What was restored is recorded on
+        ``restored_columns`` so an audit can report the repair rather than
+        discovering it later.
+
+        Foreign keys are deliberately not scanned here. ``PRAGMA
+        foreign_key_check`` walks every row of every child table, which is
+        startup latency proportional to the size of the database; the audit
+        surfaces, which run on demand, ask ``inspect_schema_integrity`` for it.
+        """
+        report = inspect_schema_integrity(self._connection, check_foreign_keys=False)
+        if report.is_intact:
+            return
+        self._restore_missing_columns(report.missing_columns)
+        report = inspect_schema_integrity(self._connection, check_foreign_keys=False)
+        if report.is_intact:
+            return
+        raise RuntimeError(
+            f"The database at {self.db_path} is missing structures this app "
+            f"requires ({report.describe()}). The migration chain ran and could "
+            "not supply them, so this build will not use the file. Restore it "
+            f"from a backup in {backup_module.BACKUPS_DIR} before opening it "
+            "again."
+        )
+
+    def _restore_missing_columns(self, missing: tuple[str, ...]) -> None:
+        """Add back every missing column the current DDL can declare a default for.
+
+        The same operation ``_apply_legacy_backfill`` performs for the columns
+        that predate versioning, driven by the reference schema instead of by a
+        list, so it covers a column added tomorrow. A column SQLite cannot add --
+        NOT NULL with no default, or part of the primary key -- is left for the
+        caller to refuse over.
+        """
+        declarations = _reference_schema().column_declarations
+        for reference in missing:
+            table, _, column = reference.partition(".")
+            spec = declarations.get(table, {}).get(column)
+            if spec is None:
+                continue
+            self._ensure_column(table, column, spec)
+            self.restored_columns = (*self.restored_columns, reference)
+        self._commit()
+
+    def schema_integrity(self) -> SchemaIntegrityReport:
+        """What this database lacks compared with the schema this build requires."""
+        with self._lock:
+            return inspect_schema_integrity(self._connection)
 
     def _has_user_tables(self) -> bool:
         row = self._execute(
@@ -627,8 +945,8 @@ class PokerDatabase:
             # write and say that nothing was migrated.
             raise RuntimeError(
                 "Could not write the pre-migration backup to "
-                f"{backup_module.BACKUPS_DIR}; the migration was not applied and "
-                "the database "
+                f"{backup_module.backups_dir_for(Path(self.db_path))}; the migration "
+                "was not applied and the database "
                 "is unchanged. Make that directory writable with free space, then "
                 f"start again. Underlying error: {type(exc).__name__}: {exc}"
             ) from exc
@@ -641,6 +959,21 @@ class PokerDatabase:
         implicitly COMMITs, which is exactly what used to strand a brand-new file
         at schema-13 structures with no version stamp when the first start was
         interrupted.
+
+        MIGRATION IMPACT (no version change)
+
+        ``hand_settlements`` and ``settlement_entries`` were added to this DDL
+        without a new schema version, because every database that legitimately
+        reaches this build already has them: migration 7 creates them, they are
+        declared here exactly as it declares them, and CREATE TABLE IF NOT EXISTS
+        makes both statements a no-op for such a file. No row is read, written or
+        deleted, and the version stamp does not move. What changes is the file
+        that DOES NOT have them -- one whose stamp is 7 or later, so the chain
+        never replays step 7 -- which previously stayed permanently without a
+        settlements table and failed every accounting read against it. They were
+        the last two tables of the current schema that existed only inside their
+        migration; hand_corrections, hand_issues, solver_runs and
+        regression_cases were already declared in both places.
         """
         self._execute_script(
             """
@@ -752,6 +1085,41 @@ class PokerDatabase:
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
             );
 
+            -- Also created by migration 7, like hand_corrections, hand_issues,
+            -- solver_runs and regression_cases below. These two were the only
+            -- tables of the current schema that lived ONLY in their migration,
+            -- so a database stamped 7 or later that lost them never got them
+            -- back: the chain was already past the step that creates them.
+            CREATE TABLE IF NOT EXISTS hand_settlements (
+                hand_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'unsettled',
+                dead_money REAL NOT NULL DEFAULT 0,
+                rake_rate REAL NOT NULL DEFAULT 0,
+                rake_cap REAL,
+                rake_rounding_unit REAL NOT NULL DEFAULT 0.01,
+                no_flop_no_drop INTEGER NOT NULL DEFAULT 0,
+                gross_pot REAL,
+                rake_amount REAL,
+                net_pot REAL,
+                is_balanced INTEGER NOT NULL DEFAULT 0,
+                warnings TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (hand_id) REFERENCES hands(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS settlement_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hand_id INTEGER NOT NULL,
+                entry_type TEXT NOT NULL,
+                pot_index INTEGER,
+                player_key TEXT,
+                player_name TEXT NOT NULL,
+                amount REAL,
+                entry_order INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY (hand_id) REFERENCES hands(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS hand_corrections (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 hand_id INTEGER NOT NULL,
@@ -818,6 +1186,7 @@ class PokerDatabase:
                 status TEXT NOT NULL DEFAULT 'queued',
                 backend_name TEXT NOT NULL DEFAULT 'texassolver',
                 backend_version TEXT NOT NULL DEFAULT '',
+                run_parameters TEXT NOT NULL DEFAULT '{}',
                 input_hash TEXT NOT NULL,
                 spot TEXT NOT NULL DEFAULT '{}',
                 range_ip TEXT NOT NULL DEFAULT '{}',
@@ -934,6 +1303,33 @@ class PokerDatabase:
         )
 
     def _create_base_indexes(self) -> None:
+        """Every index the current schema requires, created idempotently on each open.
+
+        The uniqueness indexes at the end are also created by migrations 7 and 8,
+        and they are repeated here because a migration only ever runs once: an
+        index lost after its migration -- a hand-edited file, a table rebuilt by a
+        repair script, a restore that mixed two files -- would never come back,
+        and unlike a missing column nothing would fail. The duplicate action
+        order or the second seat that index forbids would simply start being
+        written, silently. Recreating them costs nothing on a database that
+        already has them.
+        """
+        try:
+            self._create_index_script()
+        except sqlite3.IntegrityError as exc:
+            # Only reachable when the rows already violate the rule, which means
+            # they were written while the index was absent. SQLite reports it as
+            # a bare constraint failure, which reads as an app bug rather than as
+            # a database this build cannot safely use.
+            raise RuntimeError(
+                f"The database at {self.db_path} holds rows that break a "
+                "uniqueness rule this app requires, so the index that enforces "
+                f"it could not be created ({exc}). The rows were written while "
+                "the index was missing. Restore the database from a backup in "
+                f"{backup_module.BACKUPS_DIR} before opening it again."
+            ) from exc
+
+    def _create_index_script(self) -> None:
         self._connection.executescript(
             """
             CREATE INDEX IF NOT EXISTS idx_hands_session_id ON hands(session_id);
@@ -961,6 +1357,17 @@ class PokerDatabase:
                 ON reconstruction_frame_reviews(job_id, hand_number);
             CREATE INDEX IF NOT EXISTS idx_roi_profiles_active ON roi_profiles(is_active);
             CREATE INDEX IF NOT EXISTS idx_roi_regions_profile_id ON roi_regions(profile_id);
+            CREATE INDEX IF NOT EXISTS idx_actions_player_key
+                ON actions(hand_id, player_key);
+            CREATE INDEX IF NOT EXISTS idx_settlement_entries_hand
+                ON settlement_entries(hand_id, entry_type, pot_index, entry_order);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_hand_players_hand_key
+                ON hand_players(hand_id, player_key);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_hand_players_hand_seat
+                ON hand_players(hand_id, seat_index)
+                WHERE seat_index IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_actions_hand_street_order
+                ON actions(hand_id, street, action_index);
             """
         )
 
@@ -3477,19 +3884,21 @@ class PokerDatabase:
         cursor = self._execute(
             """
             INSERT INTO solver_runs (
-                hand_id, status, backend_name, backend_version, input_hash,
+                hand_id, status, backend_name, backend_version, run_parameters,
+                input_hash,
                 spot, range_ip, range_oop, assumptions, evidence,
                 command_path, result_path, log_path, exploitability_pct,
                 runtime_seconds, error_message, pid, heartbeat_at, created_at,
                 started_at, completed_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload["hand_id"],
                 payload["status"],
                 payload["backend_name"],
                 payload["backend_version"],
+                _serialize_json(payload["run_parameters"]),
                 payload["input_hash"],
                 _serialize_json(payload["spot"]),
                 _serialize_json(payload["range_ip"]),
@@ -4647,6 +5056,36 @@ def _migrate_to_v17(db: PokerDatabase) -> None:
     db._commit()
 
 
+def _migrate_to_v18(db: PokerDatabase) -> None:
+    """Keep what a solver run solved on the run, not only in its run directory.
+
+    MIGRATION IMPACT (schema 17 -> 18)
+
+    Added:
+      - solver_runs.run_parameters TEXT NOT NULL DEFAULT '{}'
+
+    Purely additive and deliberately unbackfilled. Existing solver runs read
+    ``{}``, which ``SolverRunParameters`` reports as not retained, and the UI
+    then says the abstraction behind those frequencies is unknown. Backfilling
+    them with today's tree would be the failure this column exists to stop: it
+    would assert that an old result was produced under settings nobody recorded.
+    No existing row is deleted, rewritten, or read differently, and no file on
+    disk is touched. The column is write-once at INSERT and is absent from
+    ``update_solver_run``'s allowed fields, so the settings a retained result
+    was produced under cannot be edited after the fact.
+
+    Why it is needed: the betting abstraction, accuracy target and iteration
+    cap existed only as text inside the run directory's ``input.txt``. The
+    product deletes that directory when a hand or session is deleted, operators
+    prune it, and a container without a persistent mount never has it -- while
+    the row goes on presenting its frequencies as evidence. A frequency vector
+    with no record of the tree it came from is a claim that cannot be checked,
+    which is exactly what must not survive silently.
+    """
+
+    db._ensure_column("solver_runs", "run_parameters", "TEXT NOT NULL DEFAULT '{}'")
+
+
 # Versioned migrations run in order and refuse databases written by newer apps.
 _MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {
     6: _migrate_to_v6,
@@ -4661,6 +5100,7 @@ _MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {
     15: _migrate_to_v15,
     16: _migrate_to_v16,
     17: _migrate_to_v17,
+    18: _migrate_to_v18,
 }
 
 
@@ -5384,7 +5824,10 @@ def _solver_range_profile_from_row(row: sqlite3.Row) -> SolverRangeProfile:
 
 def _solver_run_from_row(row: sqlite3.Row) -> SolverRun:
     data = _row_dict(row)
-    for key in ("spot", "range_ip", "range_oop", "evidence"):
+    # run_parameters is read back explicitly, including the empty object a
+    # pre-18 row carries, so the model default never backfills an old run with
+    # settings it was not solved under.
+    for key in ("spot", "range_ip", "range_oop", "evidence", "run_parameters"):
         data[key] = _parse_json_object(data.get(key, "{}"), {})
     data["assumptions"] = _parse_json_object(data.get("assumptions", "[]"), [])
     try:

@@ -8,21 +8,28 @@ services:
       - path: .env
         required: false
     environment:
-      PORT: "8501"
+      # Compose merges env_file first and environment second, so a literal here
+      # silently beats whatever the operator set in .env. Reading through the
+      # shell keeps .env authoritative and still gives the same default.
+      PORT: ${PORT:-8501}
       POKER_DB_PATH: /data/poker_tracker.db
       POKER_DATA_DIR: /data
       POKERTRAINER_REQUIRE_AUTH: "true"
+      # The block volume is the system of record. Starting without it would
+      # write a study database into a container layer that the next `compose
+      # build` throws away.
+      POKERTRAINER_REQUIRE_DATA_MOUNT: "true"
       YOLO_CONFIG_DIR: /data/.ultralytics
     volumes:
       - /srv/pokertrainer/data:/data
     expose:
-      - "8501"
+      - "${PORT:-8501}"
     healthcheck:
       test:
-        - CMD
-        - python
-        - -c
-        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3)"
+        - CMD-SHELL
+        - >-
+          python -c "import os, urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT', '8501') + '/_stcore/health', timeout=3)"
       interval: 30s
       timeout: 5s
       retries: 3

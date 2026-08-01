@@ -23,12 +23,12 @@ from cv_lab.scripts.pipeline.export_yolo_card_hands_for_app import (
     _completion_evidence_for_hand,
 )
 from poker_tracker.maintenance.data_health import audit_data_health
-from poker_tracker.persistence import backup as backup_module
 from poker_tracker.persistence.backup import (
     BACKUP_KEEP_COUNT,
     PINNED_KEEP_COUNT,
     PINNED_PREFIX,
     backup_database,
+    backups_dir_for,
 )
 from poker_tracker.persistence.completion import (
     EVIDENCE_SCHEMA_VERSION,
@@ -977,7 +977,9 @@ def test_an_unwritable_backup_directory_names_the_backup_directory(
     The live database is fine; only the backups mount is unwritable. Every other
     init_db refusal names the real cause and the fact that nothing was migrated.
     """
-    database = tmp_path / "live.db"
+    read_only = tmp_path / "locked"
+    read_only.mkdir()
+    database = read_only / "live.db"
     seed = sqlite3.connect(database)
     seed.executescript(
         """
@@ -990,20 +992,20 @@ def test_an_unwritable_backup_directory_names_the_backup_directory(
     seed.commit()
     seed.close()
 
-    read_only = tmp_path / "locked"
-    read_only.mkdir()
-    monkeypatch.setattr(backup_module, "BACKUPS_DIR", read_only / "backups")
-    (read_only / "backups").mkdir()
-    os.chmod(read_only / "backups", stat.S_IRUSR | stat.S_IXUSR)
+    # The snapshot goes where the database it protects lives, so making that
+    # directory read-only is what an unwritable backups mount actually looks like.
+    backups = backups_dir_for(database)
+    backups.mkdir()
+    os.chmod(backups, stat.S_IRUSR | stat.S_IXUSR)
     try:
         db = PokerDatabase(str(database))
         with pytest.raises(RuntimeError) as caught:
             db.init_db()
     finally:
-        os.chmod(read_only / "backups", stat.S_IRWXU)
+        os.chmod(backups, stat.S_IRWXU)
     message = str(caught.value)
     assert "pre-migration backup" in message
-    assert str(read_only / "backups") in message
+    assert str(backups) in message
     assert "was not applied" in message
 
     # Fails closed: the live database is untouched at its old version.

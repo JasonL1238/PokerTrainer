@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "description": "Every model artifact the application resolves out of cv_lab/models, with the digest that identifies it. The repository cannot carry the large ones (see .gitignore), so this file is what makes them nameable, verifiable and provisionable instead of implicit knowledge on one developer's disk.",
+  "artifacts": [
+    {
+      "role": "region_detector",
+      "filename": "region_spine_v1.pt",
+      "sha256": "11c10d09fe3838608406363cfa70ce2f076815dcff947a3799723ad17b3a867f",
+      "bytes": 19168154,
+      "required": true,
+      "shipped_in_repository": false,
+      "resolved_by": "cv_lab/scripts/pipeline/run_two_model_pipeline.py DEFAULT_DETECTOR",
+      "purpose": "YOLO region detector; without it no reconstruction can start."
+    },
+    {
+      "role": "card_classifier",
+      "filename": "card_cls_v1.pt",
+      "sha256": "28dcbe8356a9951b8b7ba8ca48a3ffa57a0fa7cd19bbd139ca6e37f4802c5364",
+      "bytes": 11156482,
+      "required": true,
+      "shipped_in_repository": false,
+      "resolved_by": "cv_lab/scripts/pipeline/card_classifier.py DEFAULT_CLS_WEIGHTS",
+      "purpose": "52-class card classifier applied to every face_card crop."
+    },
+    {
+      "role": "ocr_templates",
+      "filename": "ocr_templates.npz",
+      "sha256": "dbcc98902c502416ec803dc5320b3a648e5d4b5db83b0b805e566dde2493fe2e",
+      "bytes": 21186,
+      "required": true,
+      "shipped_in_repository": true,
+      "resolved_by": "cv_lab/scripts/pipeline/ocr_readers.py",
+      "purpose": "Averaged glyph vectors for stack, pot and bet OCR. Small enough to track in git and negated out of .gitignore, so it ships inside the image rather than on the mount."
+    },
+    {
+      "role": "card_templates",
+      "filename": "card_templates.npz",
+      "sha256": "78206a0c589b6f9a6ca9dd6c4ef1ce64b430a171d9c795235108e47b42b7eadb",
+      "bytes": 73285,
+      "required": false,
+      "shipped_in_repository": false,
+      "resolved_by": "cv_lab/scripts/pipeline/read_table.py load_models",
+      "purpose": "Template-matching card bank used by the cv_lab evaluation scripts. The product reconstruction path never loads it, so the image runs without it."
+    },
+    {
+      "role": "pot_digits",
+      "filename": "pot_digits.npz",
+      "sha256": "a95ff5c0c516349a066a1043c8f218a817bf5c288f711d55d9a0e7d30027dfda",
+      "bytes": 31732,
+      "required": false,
+      "shipped_in_repository": false,
+      "resolved_by": "cv_lab/scripts/pipeline/read_table.py load_models",
+      "purpose": "Digit bank for the pre-YOLO table reader kept for evaluation comparisons. Not on the product path."
+    }
+  ]
+}

@@ -2,24 +2,37 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
 
 from poker_tracker.persistence import backup as backup_module
 from poker_tracker.persistence import db as db_module
+from poker_tracker.persistence.backup import backups_dir_for
 from poker_tracker.persistence.db import SCHEMA_VERSION, PokerDatabase
 from poker_tracker.persistence.import_export import import_session
 from poker_tracker.persistence.models import (
     Action,
     CoachingResponse,
+    ExtractedFrame,
     Hand,
+    HandCorrection,
     HandIssue,
     HandPlayer,
     HandReview,
     HandSettlement,
+    ProcessingJob,
+    ReconstructionFrameReview,
     Session,
+    SettlementEntry,
     SolverRun,
+    VideoRecord,
+)
+from poker_tracker.services.regression_promotion import (
+    fetch_regression_case,
+    promote_issue_to_regression,
+    regressions_for_issue,
 )
 
 
@@ -576,12 +589,17 @@ def test_migration_backup_is_created_for_a_real_file_database(
 ) -> None:
     path = tmp_path / "backed-up.sqlite3"
     _seed_v12_database(path)
-    assert list(isolated_backup_dir.glob("*.sqlite3")) == []
+    # A snapshot lives with the database it can roll back, so a database that is
+    # not the live one is looked for beside itself rather than in the operator's
+    # retained set -- which the fixture keeps empty either way.
+    snapshot_dir = backups_dir_for(path)
+    assert list(snapshot_dir.glob("*.sqlite3")) == []
 
     migrated = _make_db(path)
 
-    snapshots = list(isolated_backup_dir.glob("*.sqlite3"))
+    snapshots = list(snapshot_dir.glob("*.sqlite3"))
     assert len(snapshots) == 1
+    assert list(isolated_backup_dir.glob("*.sqlite3")) == []
     assert migrated.schema_version() == SCHEMA_VERSION
     migrated.close()
 
@@ -589,8 +607,10 @@ def test_migration_backup_is_created_for_a_real_file_database(
 def test_migration_backup_is_skipped_for_a_fresh_file(
     tmp_path: Path, isolated_backup_dir: Path
 ) -> None:
-    db = _make_db(tmp_path / "fresh.sqlite3")
+    fresh = tmp_path / "fresh.sqlite3"
+    db = _make_db(fresh)
 
+    assert list(backups_dir_for(fresh).glob("*.sqlite3")) == []
     assert list(isolated_backup_dir.glob("*.sqlite3")) == []
     db.close()
 
@@ -607,13 +627,15 @@ def test_migration_backup_is_skipped_for_memory_database(
 def test_migration_aborts_when_the_backup_cannot_be_written(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    path = tmp_path / "unwritable.sqlite3"
-    _seed_v12_database(path)
-    blocker = tmp_path / "not-a-directory"
-    blocker.write_text("occupied")
-    monkeypatch.setattr(backup_module, "BACKUPS_DIR", blocker / "backups")
+    database = tmp_path / "blocked" / "unwritable.sqlite3"
+    database.parent.mkdir()
+    _seed_v12_database(database)
+    # An ordinary file where the snapshot directory belongs: mkdir cannot pass,
+    # so the migration meets a directory it genuinely cannot write.
+    snapshot_dir = backups_dir_for(database)
+    snapshot_dir.write_text("occupied")
 
-    failed = PokerDatabase(path)
+    failed = PokerDatabase(database)
     # The raw sqlite3/OS error said "unable to open database file", which reads as
     # "your poker_tracker.db is broken". It names the backup directory now.
     with pytest.raises(RuntimeError) as caught:
@@ -621,10 +643,10 @@ def test_migration_aborts_when_the_backup_cannot_be_written(
     failed.close()
     message = str(caught.value)
     assert "pre-migration backup" in message
-    assert str(blocker / "backups") in message
+    assert str(snapshot_dir) in message
     assert "was not applied" in message
 
-    checked = _make_db_without_init(path)
+    checked = _make_db_without_init(database)
     assert checked.schema_version() == 12
     columns = {row["name"] for row in checked._execute("PRAGMA table_info(hands)").fetchall()}
     assert "completion_status" not in columns
@@ -686,15 +708,17 @@ def test_a_second_open_of_a_current_database_writes_no_further_backup(
     """Snapshots are taken before migrating, not on every startup."""
     path = tmp_path / "repeat-open.sqlite3"
     _seed_v12_database(path)
+    snapshot_dir = backups_dir_for(path)
 
     first = _make_db(path)
     first.close()
-    assert len(list(isolated_backup_dir.glob("*.sqlite3"))) == 1
+    assert len(list(snapshot_dir.glob("*.sqlite3"))) == 1
 
     second = _make_db(path)
     second.close()
 
-    assert len(list(isolated_backup_dir.glob("*.sqlite3"))) == 1
+    assert len(list(snapshot_dir.glob("*.sqlite3"))) == 1
+    assert list(isolated_backup_dir.glob("*.sqlite3")) == []
 
 
 def test_a_snapshot_is_self_contained_and_read_only_verifiable(tmp_path: Path) -> None:
@@ -740,6 +764,619 @@ def test_rotation_removes_a_rotated_snapshot_sidecars(tmp_path: Path) -> None:
     assert not oldest.exists()
     assert not Path(f"{oldest}-shm").exists()
     assert not Path(f"{oldest}-wal").exists()
+
+
+# --------------------------------------------------------------------------
+# Connection settings the rest of the phase is built on
+# --------------------------------------------------------------------------
+
+
+def test_the_live_connection_settles_on_the_documented_pragmas(tmp_path: Path) -> None:
+    """Read the settings back off the connection, not off the code that sets them.
+
+    Every guarantee in this file rests on these four. The cascade tests below
+    prove foreign_keys is on only while the DDL also declares the cascade, so a
+    change that dropped ``PRAGMA foreign_keys = ON`` and the cascade together
+    would have left the suite green with orphaned rows accumulating.
+    """
+    db = PokerDatabase(tmp_path / "pragmas.sqlite3", busy_timeout_ms=4321)
+    db.init_db()
+
+    def pragma(name: str) -> object:
+        return db._execute(f"PRAGMA {name}").fetchone()[0]
+
+    assert pragma("journal_mode") == "wal"
+    assert pragma("foreign_keys") == 1
+    assert pragma("busy_timeout") == 4321
+    assert pragma("synchronous") == 1  # NORMAL
+    db.close()
+
+
+def test_the_default_busy_timeout_is_the_documented_constant(tmp_path: Path) -> None:
+    db = PokerDatabase(tmp_path / "default-timeout.sqlite3")
+    db.init_db()
+
+    assert db._execute("PRAGMA busy_timeout").fetchone()[0] == db_module.BUSY_TIMEOUT_MS
+    db.close()
+
+
+def test_two_threads_writing_through_one_database_lose_no_row(tmp_path: Path) -> None:
+    """Streamlit reruns the script on its own threads against one PokerDatabase.
+
+    The single shared connection is guarded by an RLock, and nothing exercised
+    two threads writing through it: sqlite3 with check_same_thread=False will
+    happily interleave two statements on one connection and corrupt the cursor
+    state or raise "recursive use of cursors not allowed".
+    """
+    db = PokerDatabase(tmp_path / "threads.sqlite3")
+    db.init_db()
+    session = db.create_session(Session(name="Two threads"))
+    failures: list[BaseException] = []
+
+    def write(first_hand_number: int) -> None:
+        try:
+            for offset in range(25):
+                db.create_hand(
+                    Hand(session_id=session.id, hand_number=first_hand_number + offset)
+                )
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the assertion
+            failures.append(exc)
+
+    threads = [
+        threading.Thread(target=write, args=(start,)) for start in (1, 1001)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert failures == []
+    assert len(db.fetch_hands_by_session(session.id)) == 50
+    db.close()
+
+
+def test_a_worker_and_the_ui_writing_as_separate_connections_both_land(
+    tmp_path: Path,
+) -> None:
+    """The CV worker and the app open the same file separately.
+
+    ``test_phase1_adversarial_round7`` proves three processes can OPEN one file
+    together; this is the other half, that they can both WRITE. Under WAL a
+    second writer gets SQLITE_BUSY immediately, and only the busy timeout turns
+    that into a wait rather than a lost write.
+    """
+    path = tmp_path / "two-writers.sqlite3"
+    opener = PokerDatabase(path)
+    opener.init_db()
+    session = opener.create_session(Session(name="Two writers"))
+    opener.close()
+    failures: list[BaseException] = []
+
+    def write(first_hand_number: int) -> None:
+        writer = PokerDatabase(path, busy_timeout_ms=15000)
+        try:
+            for offset in range(25):
+                writer.create_hand(
+                    Hand(session_id=session.id, hand_number=first_hand_number + offset)
+                )
+        except BaseException as exc:  # noqa: BLE001 - re-raised in the assertion
+            failures.append(exc)
+        finally:
+            writer.close()
+
+    threads = [threading.Thread(target=write, args=(start,)) for start in (1, 1001)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert failures == []
+    reader = PokerDatabase(path)
+    assert len(reader.fetch_hands_by_session(session.id)) == 50
+    reader.close()
+
+
+def test_an_open_transaction_is_not_visible_to_another_connection_until_commit(
+    tmp_path: Path,
+) -> None:
+    """The transaction boundary has to hold across connections, not just in-process."""
+    path = tmp_path / "boundary.sqlite3"
+    writer = PokerDatabase(path)
+    writer.init_db()
+    session = writer.create_session(Session(name="Boundary"))
+    observer = PokerDatabase(path)
+
+    with writer.transaction():
+        writer.create_hand(Hand(session_id=session.id, hand_number=1))
+        assert observer.fetch_hands_by_session(session.id) == []
+
+    assert len(observer.fetch_hands_by_session(session.id)) == 1
+    observer.close()
+    writer.close()
+
+
+# --------------------------------------------------------------------------
+# Missing tables, columns, indexes and broken references
+# --------------------------------------------------------------------------
+
+
+def test_an_intact_database_reports_nothing_missing(tmp_path: Path) -> None:
+    db = _make_db(tmp_path / "intact.sqlite3")
+
+    report = db.schema_integrity()
+
+    assert report.is_intact
+    assert report.describe() == "nothing missing"
+    db.close()
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected"),
+    [
+        ("DROP TABLE regression_cases", "missing table(s): regression_cases"),
+        (
+            "ALTER TABLE hands DROP COLUMN study_inclusion",
+            "missing column(s): hands.study_inclusion",
+        ),
+        (
+            "DROP INDEX idx_actions_hand_street_order",
+            "missing index(es): idx_actions_hand_street_order",
+        ),
+    ],
+)
+def test_the_integrity_report_names_what_is_missing(
+    tmp_path: Path, damage: str, expected: str
+) -> None:
+    """An audit that says "incomplete" and stops there is not actionable.
+
+    Each of these passed the schema contract before: it inspected table names and
+    column names only, so a database missing the unique index that migration 8
+    exists to create -- the one thing standing between the product and silently
+    duplicated action order -- reported a clean bill of health.
+    """
+    db = _make_db(tmp_path / "damaged.sqlite3")
+    db._execute(damage)
+    db._commit()
+
+    report = db.schema_integrity()
+
+    assert not report.is_intact
+    assert expected in report.describe()
+    db.close()
+
+
+def test_the_integrity_report_names_the_rows_whose_parent_is_gone(
+    tmp_path: Path,
+) -> None:
+    db = _make_db(tmp_path / "orphans.sqlite3")
+    session = db.create_session(Session(name="Orphans"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+    db.create_action(
+        Action(hand_id=hand.id, street="river", player_name="Hero", action_type="check")
+    )
+    # Only reachable with the enforcement off, which is how a file assembled by
+    # hand or by another tool arrives.
+    db._execute("PRAGMA foreign_keys = OFF")
+    db._execute("DELETE FROM hands WHERE id = ?", (hand.id,))
+    db._commit()
+
+    report = db.schema_integrity()
+
+    assert not report.is_intact
+    assert any("actions row" in violation for violation in report.foreign_key_violations)
+    assert "foreign-key violation(s)" in report.describe()
+    db.close()
+
+
+def test_a_column_the_current_ddl_declares_is_restored_and_recorded(
+    tmp_path: Path, isolated_backup_dir: Path
+) -> None:
+    """The silent-corruption case: stamped current, physically incomplete.
+
+    A file assembled from two restores, or edited by hand, keeps its current
+    stamp, so no migration runs and ``CREATE TABLE IF NOT EXISTS`` leaves the
+    damaged table alone. Every read of that table then failed one at a time with
+    a bare sqlite3.OperationalError naming one column.
+
+    The schema is forward-only and additive, so the column comes back carrying
+    exactly what the migration that introduced it would have written -- and the
+    repair is recorded, because a database that needed one is damaged whether or
+    not it now opens.
+    """
+    path = tmp_path / "incomplete.sqlite3"
+    seeded = _make_db(path)
+    session = seeded.create_session(Session(name="Incomplete"))
+    hand = seeded.create_hand(Hand(session_id=session.id, hand_number=1))
+    seeded.create_hand_issue(
+        HandIssue(
+            hand_id=hand.id,
+            issue_types=["hand_boundary"],
+            description="Boundary is unclear.",
+            evidence_snapshot={"hand_number": 1},
+        )
+    )
+    seeded._execute("ALTER TABLE hand_issues DROP COLUMN evidence_snapshot")
+    seeded._commit()
+    seeded.close()
+
+    reopened = _make_db(path)
+
+    assert reopened.restored_columns == ("hand_issues.evidence_snapshot",)
+    assert reopened.schema_integrity().is_intact
+    assert (
+        reopened._execute("SELECT evidence_snapshot FROM hand_issues").fetchone()[0]
+        == "{}"
+    )
+    reopened.close()
+
+
+def test_init_db_refuses_a_column_that_cannot_be_declared_back(
+    tmp_path: Path, isolated_backup_dir: Path
+) -> None:
+    """A NOT NULL column with no default cannot be added, so it has to be loud."""
+    path = tmp_path / "unrepairable.sqlite3"
+    seeded = _make_db(path)
+    seeded._execute("ALTER TABLE hand_reviews DROP COLUMN hand_summary")
+    seeded._commit()
+    seeded.close()
+
+    reopened = PokerDatabase(path)
+    with pytest.raises(RuntimeError) as caught:
+        reopened.init_db()
+    reopened.close()
+
+    message = str(caught.value)
+    assert "hand_reviews.hand_summary" in message
+    assert "Restore it from a backup" in message
+
+
+def test_a_lost_index_is_restored_on_the_next_open(tmp_path: Path) -> None:
+    """A migration runs once, so an index lost afterwards never came back.
+
+    Nothing failed when it went: the duplicate rows it forbids simply started
+    being written. Recreating every index on open is idempotent for a healthy
+    database and is the only repair path a file that lost one has.
+    """
+    path = tmp_path / "lost-index.sqlite3"
+    seeded = _make_db(path)
+    seeded._execute("DROP INDEX idx_actions_hand_street_order")
+    seeded._execute("DROP INDEX idx_hand_players_hand_key")
+    seeded._commit()
+    assert not seeded.schema_integrity().is_intact
+    seeded.close()
+
+    reopened = _make_db(path)
+
+    assert reopened.schema_integrity().is_intact
+    reopened.close()
+
+
+@pytest.mark.parametrize("table", ["hand_settlements", "settlement_entries"])
+def test_a_table_that_only_its_migration_created_is_restored_on_the_next_open(
+    tmp_path: Path, isolated_backup_dir: Path, table: str
+) -> None:
+    """These two lived only inside migration 7, unlike every other table.
+
+    A database stamped 7 or later that lost one never got it back: the chain is
+    long past the step that creates it, and the base DDL did not declare it. The
+    settlement is where a hand's chips are accounted for, so its absence blocks
+    every accounting read on every hand -- silently, because a hand with no
+    settlement row is also a legitimate state.
+    """
+    path = tmp_path / f"lost-{table}.sqlite3"
+    seeded = _make_db(path)
+    seeded._execute(f"DROP TABLE {table}")
+    seeded._commit()
+    assert table in seeded.schema_integrity().missing_tables
+    seeded.close()
+
+    reopened = _make_db(path)
+
+    assert reopened.schema_integrity().is_intact
+    session = reopened.create_session(Session(name="After repair"))
+    hand = reopened.create_hand(Hand(session_id=session.id, hand_number=1))
+    reopened.upsert_hand_settlement(HandSettlement(hand_id=hand.id, status="settled"))
+    assert reopened.fetch_hand_settlement(hand.id).status == "settled"
+    reopened.close()
+
+
+def test_rows_that_broke_a_uniqueness_rule_are_reported_not_swallowed(
+    tmp_path: Path, isolated_backup_dir: Path
+) -> None:
+    """Restoring the index cannot be silent when the rows already violate it."""
+    path = tmp_path / "duplicate-seats.sqlite3"
+    seeded = _make_db(path)
+    session = seeded.create_session(Session(name="Duplicates"))
+    hand = seeded.create_hand(Hand(session_id=session.id, hand_number=1))
+    seeded._execute("DROP INDEX idx_hand_players_hand_key")
+    for _ in range(2):
+        seeded._execute(
+            "INSERT INTO hand_players (hand_id, player_key, player_name) "
+            "VALUES (?, 'hero', 'Hero')",
+            (hand.id,),
+        )
+    seeded._commit()
+    seeded.close()
+
+    reopened = PokerDatabase(path)
+    with pytest.raises(RuntimeError) as caught:
+        reopened.init_db()
+    reopened.close()
+
+    message = str(caught.value)
+    assert "uniqueness rule" in message
+    assert "hand_players.player_key" in message
+    assert "while the index was missing" in message
+
+
+def test_the_integrity_reference_is_the_schema_the_product_creates(
+    tmp_path: Path,
+) -> None:
+    """The contract is derived, so a table added tomorrow is covered tomorrow.
+
+    A hand-maintained list of required tables is a list that falls behind the
+    DDL, and the audit then reports a database missing the newest table as
+    healthy -- which is exactly what happened to every version after 14.
+    """
+    fresh = _make_db(tmp_path / "reference.sqlite3")
+    reference = db_module._reference_schema()
+    actual_tables = {
+        row["name"]
+        for row in fresh._execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    }
+    actual_indexes = {
+        row["name"]
+        for row in fresh._execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    }
+
+    assert set(reference.tables) == actual_tables
+    assert set(reference.indexes) == actual_indexes
+    assert set(reference.column_declarations) == actual_tables
+    fresh.close()
+
+
+# --------------------------------------------------------------------------
+# Cascade behaviour, for every entity the release plan names
+# --------------------------------------------------------------------------
+
+
+def _seed_full_history(db: PokerDatabase) -> dict[str, int]:
+    """One session with every dependent record type attached to one hand."""
+    session = db.create_session(Session(name="Cascade"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+    other_hand = db.create_hand(Hand(session_id=session.id, hand_number=2))
+    db.create_hand_player(
+        HandPlayer(
+            hand_id=hand.id, player_key="hero", player_name="Hero", is_hero=True
+        )
+    )
+    db.create_action(
+        Action(
+            hand_id=hand.id,
+            player_key="hero",
+            street="river",
+            player_name="Hero",
+            action_type="bet",
+            amount=10,
+        )
+    )
+    db.create_hand_review(_review(hand.id))
+    db.create_coaching_response(_coaching_response(review_type="hand", hand_id=hand.id))
+    db.create_coaching_response(
+        _coaching_response(review_type="session", session_id=session.id)
+    )
+    db.upsert_hand_settlement(HandSettlement(hand_id=hand.id, status="settled"))
+    db.replace_settlement_entries(
+        hand.id,
+        [
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=0,
+                player_key="hero",
+                player_name="Hero",
+                amount=20,
+            )
+        ],
+    )
+    correction = db.create_hand_correction(
+        HandCorrection(hand_id=hand.id, correction_type="hand_facts", notes="pot")
+    )
+    issue = db.create_hand_issue(
+        HandIssue(
+            hand_id=hand.id,
+            issue_types=["hand_boundary"],
+            description="Boundary is unclear.",
+        )
+    )
+    case = promote_issue_to_regression(
+        db,
+        issue.id,
+        kind="cached_state",
+        fixture_path="tests/fixtures/boundary.json",
+        correction_id=correction.id,
+    )
+    db.create_solver_run(SolverRun(hand_id=hand.id, input_hash="cascade-hash"))
+    video = db.create_video(
+        VideoRecord(
+            session_id=session.id,
+            original_filename="session.mp4",
+            stored_path="videos/session.mp4",
+            file_size_bytes=1024,
+        )
+    )
+    job = db.create_processing_job(
+        ProcessingJob(job_type="cv_reconstruction", video_id=video.id)
+    )
+    db.create_extracted_frame(
+        ExtractedFrame(
+            video_id=video.id,
+            job_id=job.id,
+            timestamp_seconds=1.0,
+            frame_index=30,
+            image_path="frames/job/frame_000030.png",
+        )
+    )
+    db.upsert_reconstruction_frame_review(
+        ReconstructionFrameReview(
+            job_id=job.id,
+            hand_number=1,
+            source_image="frames/job/frame_000030.png",
+            timestamp_seconds=1.0,
+        )
+    )
+    return {
+        "session": session.id,
+        "hand": hand.id,
+        "other_hand": other_hand.id,
+        "correction": correction.id,
+        "issue": issue.id,
+        "case": case.id,
+        "video": video.id,
+        "job": job.id,
+    }
+
+
+def _count(db: PokerDatabase, table: str, where: str, parameter: int) -> int:
+    return db._execute(
+        f"SELECT COUNT(*) FROM {table} WHERE {where} = ?", (parameter,)
+    ).fetchone()[0]
+
+
+def test_deleting_a_hand_removes_its_dependents_and_nothing_else(
+    tmp_path: Path,
+) -> None:
+    """Every category the release plan names, in one place.
+
+    Individually these were untested for corrections, issues, settlements,
+    settlement entries, reviews and regression cases; and in the other direction
+    nothing pinned that a recording, a job, its frames or another hand SURVIVE,
+    which is the half that loses an operator's data when it goes wrong.
+    """
+    db = _make_db(tmp_path / "cascade-hand.sqlite3")
+    ids = _seed_full_history(db)
+
+    db.delete_hand(ids["hand"])
+
+    for table in (
+        "hand_players",
+        "actions",
+        "hand_reviews",
+        "hand_corrections",
+        "hand_issues",
+        "hand_settlements",
+        "settlement_entries",
+        "solver_runs",
+    ):
+        assert _count(db, table, "hand_id", ids["hand"]) == 0, table
+    assert _count(db, "coaching_reviews", "hand_id", ids["hand"]) == 0
+    assert _count(db, "regression_cases", "id", ids["case"]) == 0
+    # Kept: the recording and its derived files outlive the hand they described,
+    # and the session review is staled rather than deleted.
+    assert db.fetch_video(ids["video"]) is not None
+    assert _count(db, "processing_jobs", "id", ids["job"]) == 1
+    assert _count(db, "extracted_frames", "job_id", ids["job"]) == 1
+    assert _count(db, "reconstruction_frame_reviews", "job_id", ids["job"]) == 1
+    assert db.fetch_hand(ids["other_hand"]) is not None
+    session_coaching = db.fetch_coaching_reviews_by_session(ids["session"])
+    assert len(session_coaching) == 1
+    assert session_coaching[0].is_stale is True
+    db.close()
+
+
+def test_deleting_a_session_keeps_the_recording_and_unlinks_it(
+    tmp_path: Path,
+) -> None:
+    """videos.session_id is ON DELETE SET NULL on purpose.
+
+    A recording is a file on the operator's disk that the database only
+    references. Cascading it would delete the row that says where that file is,
+    leaving the file itself orphaned and unfindable.
+    """
+    db = _make_db(tmp_path / "cascade-session.sqlite3")
+    ids = _seed_full_history(db)
+
+    db.delete_session(ids["session"])
+
+    assert db.fetch_session(ids["session"]) is None
+    assert db.fetch_hands_by_session(ids["session"]) == []
+    for table in ("hand_settlements", "hand_issues", "hand_corrections", "solver_runs"):
+        assert _count(db, table, "hand_id", ids["hand"]) == 0, table
+    assert _count(db, "regression_cases", "id", ids["case"]) == 0
+    video = db.fetch_video(ids["video"])
+    assert video is not None
+    assert video.session_id is None
+    assert _count(db, "processing_jobs", "id", ids["job"]) == 1
+    # Session-scoped coaching describes a session that no longer exists.
+    assert db.fetch_coaching_reviews_by_session(ids["session"]) == []
+    db.close()
+
+
+def test_deleting_a_video_takes_its_jobs_and_frames_and_leaves_the_session(
+    tmp_path: Path,
+) -> None:
+    db = _make_db(tmp_path / "cascade-video.sqlite3")
+    ids = _seed_full_history(db)
+
+    db.delete_video(ids["video"])
+
+    assert db.fetch_video(ids["video"]) is None
+    assert _count(db, "processing_jobs", "id", ids["job"]) == 0
+    assert _count(db, "extracted_frames", "job_id", ids["job"]) == 0
+    assert _count(db, "reconstruction_frame_reviews", "job_id", ids["job"]) == 0
+    assert db.fetch_session(ids["session"]) is not None
+    assert db.fetch_hand(ids["hand"]) is not None
+    db.close()
+
+
+def test_a_regression_case_outlives_its_correction_but_not_its_issue(
+    tmp_path: Path,
+) -> None:
+    """The two foreign keys on regression_cases say different things deliberately.
+
+    The correction is context: which edit was made when the bug was found. The
+    issue is the subject: a regression case with no issue is proof of nothing,
+    and its issue_id is NOT NULL, so cascade is the only coherent behaviour.
+    """
+    db = _make_db(tmp_path / "regression-fks.sqlite3")
+    ids = _seed_full_history(db)
+
+    db._execute("DELETE FROM hand_corrections WHERE id = ?", (ids["correction"],))
+    db._commit()
+
+    case = fetch_regression_case(db, ids["case"])
+    assert case.correction_id is None
+    assert case.status == "proposed"
+
+    db._execute("DELETE FROM hand_issues WHERE id = ?", (ids["issue"],))
+    db._commit()
+
+    assert regressions_for_issue(db, ids["issue"]) == []
+    assert _count(db, "regression_cases", "id", ids["case"]) == 0
+    db.close()
+
+
+def test_cascades_leave_no_row_whose_parent_is_gone(tmp_path: Path) -> None:
+    """The invariant behind all of the above, stated once.
+
+    Any future table that hangs off a hand or a session is covered by this
+    without being named here, which the per-table assertions cannot be.
+    """
+    db = _make_db(tmp_path / "cascade-invariant.sqlite3")
+    ids = _seed_full_history(db)
+
+    db.delete_hand(ids["hand"])
+    db.delete_session(ids["session"])
+    db.delete_video(ids["video"])
+
+    assert db.schema_integrity().foreign_key_violations == ()
+    db.close()
 
 
 def test_backups_dir_has_exactly_one_definition() -> None:

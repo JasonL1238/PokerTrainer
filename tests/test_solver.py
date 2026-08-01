@@ -33,7 +33,11 @@ from poker_tracker.solver.jobs import (
 )
 from poker_tracker.solver.models import (
     ActionFrequency,
+    RecordedSolverAction,
+    ResolvedRange,
     SolverEvidence,
+    SolverPlayer,
+    SolverSpot,
 )
 from poker_tracker.solver.profile_io import export_range_profiles, import_range_profiles
 from poker_tracker.solver.ranges import (
@@ -46,10 +50,14 @@ from poker_tracker.solver.ranges import (
 )
 from poker_tracker.solver.run_job import run_solver_job
 from poker_tracker.solver.texassolver import (
+    ACTION_MAPPING_MAX_POT_FRACTION,
+    MIN_STRATEGY_RANGE_COVERAGE,
     PINNED_CONSOLE_COMMIT,
+    SolverResultUnusableError,
     build_command_file,
     configured_resource_dir,
     input_hash,
+    map_recorded_action,
     parse_final_exploitability,
     parse_strategy_result,
 )
@@ -219,6 +227,153 @@ def _completed_cash_spot(table_size: int = 6):
     return hand, players, actions, accounting, prepared.spot
 
 
+def _covering_strategy(
+    hero_range: ResolvedRange,
+    actions: list[str],
+    *,
+    overrides: dict[str, list[float]] | None = None,
+    omit: int = 0,
+) -> dict[str, list[float]]:
+    """A dump's strategy map for every combination of a submitted range.
+
+    A real solve reports a vector per combination of the acting player's range,
+    so this is what a healthy dump looks like. ``omit`` drops combinations from
+    the end to build the partial dumps the coverage rule is there to catch.
+    """
+
+    uniform = [round(1 / len(actions), 6)] * (len(actions) - 1)
+    uniform.append(round(1 - sum(uniform), 6))
+    combos = [token.split(":", 1)[0] for token in hero_range.solver_notation.split(",")]
+    kept = combos[: len(combos) - omit] if omit else combos
+    strategy = {combo: list(uniform) for combo in kept}
+    for combo, vector in (overrides or {}).items():
+        if combo in strategy:
+            strategy[combo] = vector
+    return strategy
+
+
+def _resolved_range(
+    role: str,
+    notation: str,
+    *,
+    player_key: str,
+    player_name: str,
+    name: str = "Test range",
+) -> ResolvedRange:
+    return ResolvedRange(
+        player_key=player_key,
+        player_name=player_name,
+        position="BTN" if role == "ip" else "BB",
+        role=role,
+        source="custom",
+        profile_name=name,
+        notation=notation,
+        solver_notation=notation,
+        combo_count=len(notation.split(",")),
+        range_percent=0.01,
+    )
+
+
+def _recorded(
+    player_key: str,
+    action_type: str,
+    amount: float | None = None,
+    *,
+    pot_before: float = 5.0,
+) -> RecordedSolverAction:
+    return RecordedSolverAction(
+        player_key=player_key,
+        player_name="Hero" if player_key == "hero" else "Villain",
+        street="flop",
+        action_type=action_type,
+        amount=amount,
+        pot_before=pot_before,
+    )
+
+
+def _walk_spot(
+    recorded_line: list[RecordedSolverAction],
+    *,
+    hero_role: str = "ip",
+    pot: float = 5.0,
+    effective_stack: float = 97.5,
+) -> SolverSpot:
+    """A spot built directly, so a test can name the exact line being walked.
+
+    ``prepare_solver_spot`` only ever produces lines where Hero acts first or
+    second on one street; the mapping rules have to hold for whatever a dump and
+    a recorded line happen to be, so these tests state both explicitly.
+    """
+
+    hero = SolverPlayer(
+        player_key="hero",
+        player_name="Hero",
+        position="BTN" if hero_role == "ip" else "BB",
+        role=hero_role,
+        is_hero=True,
+    )
+    villain_role = "oop" if hero_role == "ip" else "ip"
+    villain = SolverPlayer(
+        player_key="villain",
+        player_name="Villain",
+        position="BB" if villain_role == "oop" else "BTN",
+        role=villain_role,
+        is_hero=False,
+    )
+    return SolverSpot(
+        hand_id=1,
+        table_size=6,
+        street="flop",
+        board="Qd 7s 2c",
+        pot=pot,
+        effective_stack=effective_stack,
+        pot_type="single_raised",
+        preflop_aggressor_key="villain",
+        oop=hero if hero_role == "oop" else villain,
+        ip=hero if hero_role == "ip" else villain,
+        hero_cards="Ah Qs",
+        recorded_line=recorded_line,
+    )
+
+
+def _action_node(
+    actions: list[str],
+    strategy: dict[str, list[float]] | None = None,
+    *,
+    children: dict[str, object] | None = None,
+) -> dict[str, object]:
+    node: dict[str, object] = {"node_type": "action_node", "actions": list(actions)}
+    if strategy is not None:
+        node["strategy"] = {"actions": list(actions), "strategy": strategy}
+    if children is not None:
+        node["childrens"] = children
+    return node
+
+
+def _parse_dump(
+    tmp_path,
+    dump: object,
+    spot: SolverSpot,
+    hero_range: ResolvedRange,
+    villain_range: ResolvedRange,
+    *,
+    exploitability_pct: float | None = 0.4,
+) -> SolverEvidence:
+    result_path = tmp_path / "result.json"
+    result_path.write_text(json.dumps(dump), encoding="utf-8")
+    hero_is_oop = spot.oop.is_hero
+    return parse_strategy_result(
+        result_path,
+        spot=spot,
+        range_ip=villain_range if hero_is_oop else hero_range,
+        range_oop=hero_range if hero_is_oop else villain_range,
+        backend_version=PINNED_CONSOLE_COMMIT,
+        exploitability_pct=exploitability_pct,
+        runtime_seconds=1.0,
+        assumptions=[],
+    )
+
+
 def test_weighted_range_accepts_texassolver_colon_syntax() -> None:
     assert normalize_weighted_notation("TT+,AJs+:0.5,AQo+") == "TT+,50%(AJs+),AQo+"
     parsed = parse_range("TT+,AJs+:0.5,AQo+", dead_cards="Qd 7s 2c")
@@ -386,6 +541,446 @@ def test_solver_parser_rejects_invalid_strategy_vectors(
             runtime_seconds=1,
             assumptions=[],
         )
+
+
+_HERO_RANGE = _resolved_range(
+    "ip", "AhQs,AsQh,KhKs,JdJc", player_key="hero", player_name="Hero"
+)
+_VILLAIN_RANGE = _resolved_range(
+    "oop", "AcKc,QhQc,7h6h,5d5c", player_key="villain", player_name="Villain"
+)
+
+
+def _hero_facing_bet_dump(
+    tree_sizes: list[str], hero_actions: list[str]
+) -> dict[str, object]:
+    """A root where the OOP villain acts, with a Hero node under each branch."""
+
+    hero_node = _action_node(
+        hero_actions, _covering_strategy(_HERO_RANGE, hero_actions)
+    )
+    root_actions = ["CHECK", *tree_sizes]
+    return _action_node(
+        root_actions,
+        _covering_strategy(_VILLAIN_RANGE, root_actions),
+        children=dict.fromkeys(root_actions, hero_node),
+    )
+
+
+def test_recorded_size_far_from_every_tree_size_is_refused(tmp_path) -> None:
+    spot = _walk_spot(
+        [
+            _recorded("villain", "bet", 25.0, pot_before=5.0),
+            _recorded("hero", "call", 25.0, pot_before=30.0),
+        ]
+    )
+    dump = _hero_facing_bet_dump(
+        ["BET 1.65", "BET 3.75"], ["FOLD", "CALL", "RAISE 12"]
+    )
+    with pytest.raises(SolverResultUnusableError) as failure:
+        _parse_dump(tmp_path, dump, spot, _HERO_RANGE, _VILLAIN_RANGE)
+    message = str(failure.value)
+    assert "BET 3.75" in message
+    assert "425% of the 5 BB pot" in message
+    assert "substitution limit" in message
+
+
+def test_substitution_bound_is_proportional_to_the_pot(tmp_path) -> None:
+    small_pot = _walk_spot(
+        [
+            _recorded("villain", "bet", 5.75, pot_before=5.0),
+            _recorded("hero", "call", 5.75, pot_before=10.75),
+        ]
+    )
+    with pytest.raises(SolverResultUnusableError, match="40% of the 5 BB pot"):
+        _parse_dump(
+            tmp_path,
+            _hero_facing_bet_dump(["BET 3.75"], ["FOLD", "CALL"]),
+            small_pot,
+            _HERO_RANGE,
+            _VILLAIN_RANGE,
+        )
+
+    # The same two blinds of substitution against a pot forty times larger is a
+    # rounding difference, not a different decision.
+    large_pot = _walk_spot(
+        [
+            _recorded("villain", "bet", 77.0, pot_before=100.0),
+            _recorded("hero", "call", 77.0, pot_before=177.0),
+        ],
+        pot=100.0,
+    )
+    evidence = _parse_dump(
+        tmp_path,
+        _hero_facing_bet_dump(["BET 75"], ["FOLD", "CALL"]),
+        large_pot,
+        _HERO_RANGE,
+        _VILLAIN_RANGE,
+    )
+    assert not any("substitution" in item for item in evidence.warnings)
+    assert not any("solved as" in item for item in evidence.warnings)
+
+
+def test_nontrivial_substitution_warns_in_evidence_and_reaches_the_coach(
+    tmp_path,
+) -> None:
+    hand, players, actions, _, _ = _completed_cash_spot()
+    spot = _walk_spot(
+        [
+            _recorded("villain", "bet", 5.0, pot_before=5.0),
+            _recorded("hero", "call", 5.0, pot_before=10.0),
+        ]
+    )
+    evidence = _parse_dump(
+        tmp_path,
+        _hero_facing_bet_dump(["BET 3.75"], ["FOLD", "CALL"]),
+        spot,
+        _HERO_RANGE,
+        _VILLAIN_RANGE,
+    )
+    substitution = [item for item in evidence.warnings if "BET 3.75" in item]
+    assert substitution, evidence.warnings
+    assert "5 BB into a 5 BB pot" in substitution[0]
+    assert "25% of that pot away" in substitution[0]
+
+    prompt = build_hand_review_prompt(
+        Session(id=1, name="Solver session"),
+        hand,
+        actions,
+        players,
+        solver_evidence=evidence,
+    )
+    assert substitution[0] in prompt
+
+
+def test_recorded_action_absent_from_the_tree_is_refused(tmp_path) -> None:
+    spot = _walk_spot(
+        [
+            _recorded("villain", "raise", 12.0, pot_before=5.0),
+            _recorded("hero", "fold", pot_before=17.0),
+        ]
+    )
+    with pytest.raises(SolverResultUnusableError, match="no RAISE branch"):
+        _parse_dump(
+            tmp_path,
+            _hero_facing_bet_dump(["BET 3.75"], ["FOLD", "CALL"]),
+            spot,
+            _HERO_RANGE,
+            _VILLAIN_RANGE,
+        )
+
+
+def test_raise_is_never_mapped_to_a_call(tmp_path) -> None:
+    spot = _walk_spot(
+        [
+            _recorded("villain", "raise", 12.0, pot_before=5.0),
+            _recorded("hero", "fold", pot_before=17.0),
+        ]
+    )
+    hero_node = _action_node(["FOLD", "CALL"], _covering_strategy(_HERO_RANGE, ["FOLD", "CALL"]))
+    dump = _action_node(
+        ["FOLD", "CALL"],
+        _covering_strategy(_VILLAIN_RANGE, ["FOLD", "CALL"]),
+        children={"FOLD": hero_node, "CALL": hero_node},
+    )
+    with pytest.raises(SolverResultUnusableError, match="no RAISE branch"):
+        _parse_dump(tmp_path, dump, spot, _HERO_RANGE, _VILLAIN_RANGE)
+
+
+def test_check_is_never_mapped_to_a_bet(tmp_path) -> None:
+    spot = _walk_spot(
+        [
+            _recorded("villain", "check", pot_before=5.0),
+            _recorded("hero", "bet", 1.65, pot_before=5.0),
+        ]
+    )
+    hero_node = _action_node(
+        ["CHECK", "BET 1.65"], _covering_strategy(_HERO_RANGE, ["CHECK", "BET 1.65"])
+    )
+    dump = _action_node(
+        ["BET 1.65", "BET 3.75"],
+        _covering_strategy(_VILLAIN_RANGE, ["BET 1.65", "BET 3.75"]),
+        children={"BET 1.65": hero_node, "BET 3.75": hero_node},
+    )
+    with pytest.raises(SolverResultUnusableError, match="CHECK is not offered"):
+        _parse_dump(tmp_path, dump, spot, _HERO_RANGE, _VILLAIN_RANGE)
+
+
+def test_all_in_uses_the_all_in_branch_and_is_bounded_without_one(tmp_path) -> None:
+    spot = _walk_spot(
+        [
+            _recorded("villain", "all-in", 97.5, pot_before=5.0),
+            _recorded("hero", "call", 97.5, pot_before=102.5),
+        ]
+    )
+    hero_actions = ["FOLD", "CALL"]
+    hero_node = _action_node(hero_actions, _covering_strategy(_HERO_RANGE, hero_actions))
+    with_all_in = _action_node(
+        ["CHECK", "BET 3.75", "ALLIN"],
+        _covering_strategy(_VILLAIN_RANGE, ["CHECK", "BET 3.75", "ALLIN"]),
+        children={"CHECK": hero_node, "BET 3.75": hero_node, "ALLIN": hero_node},
+    )
+    evidence = _parse_dump(tmp_path, with_all_in, spot, _HERO_RANGE, _VILLAIN_RANGE)
+    assert evidence.action_frequencies
+    assert not any("substitution limit" in item for item in evidence.warnings)
+
+    with pytest.raises(SolverResultUnusableError, match="substitution limit"):
+        _parse_dump(
+            tmp_path,
+            _hero_facing_bet_dump(["BET 3.75"], hero_actions),
+            spot,
+            _HERO_RANGE,
+            _VILLAIN_RANGE,
+        )
+
+
+def test_single_action_tree_cannot_absorb_a_different_action(tmp_path) -> None:
+    spot = _walk_spot(
+        [
+            _recorded("villain", "bet", 3.75, pot_before=5.0),
+            _recorded("hero", "call", 3.75, pot_before=8.75),
+        ]
+    )
+    hero_node = _action_node(["CALL"], _covering_strategy(_HERO_RANGE, ["CALL"]))
+    dump = _action_node(
+        ["CHECK"],
+        _covering_strategy(_VILLAIN_RANGE, ["CHECK"]),
+        children={"CHECK": hero_node},
+    )
+    with pytest.raises(SolverResultUnusableError, match="no BET branch"):
+        _parse_dump(tmp_path, dump, spot, _HERO_RANGE, _VILLAIN_RANGE)
+
+
+def test_missing_recorded_branch_is_refused(tmp_path) -> None:
+    spot = _walk_spot(
+        [
+            _recorded("villain", "bet", 3.75, pot_before=5.0),
+            _recorded("hero", "call", 3.75, pot_before=8.75),
+        ]
+    )
+    # A dump whose action list advertises a branch its subtree does not carry:
+    # the recorded line maps cleanly and there is still nothing to descend into.
+    dump = _action_node(
+        ["CHECK", "BET 3.75"],
+        _covering_strategy(_VILLAIN_RANGE, ["CHECK", "BET 3.75"]),
+        children={},
+    )
+    with pytest.raises(SolverResultUnusableError, match="no BET 3.75 branch"):
+        _parse_dump(tmp_path, dump, spot, _HERO_RANGE, _VILLAIN_RANGE)
+
+
+def test_unmappable_hero_action_is_reported_rather_than_silently_matched(
+    tmp_path,
+) -> None:
+    spot = _walk_spot(
+        [_recorded("hero", "bet", 25.0, pot_before=5.0)], hero_role="oop"
+    )
+    hero_range = _resolved_range(
+        "oop", _HERO_RANGE.solver_notation, player_key="hero", player_name="Hero"
+    )
+    villain_range = _resolved_range(
+        "ip", _VILLAIN_RANGE.solver_notation, player_key="villain", player_name="Villain"
+    )
+    actions = ["CHECK", "BET 1.65", "BET 3.75"]
+    dump = _action_node(actions, _covering_strategy(hero_range, actions))
+    evidence = _parse_dump(tmp_path, dump, spot, hero_range, villain_range)
+    # Hero's own node is still the equilibrium for the decision Hero faced, so
+    # the strategy is retained; what cannot be claimed is a correspondence with
+    # what Hero did.
+    assert evidence.action_frequencies
+    assert evidence.mapped_action == ""
+    assert evidence.recorded_action == "bet 25 BB"
+    assert any(
+        "no counterpart in the solve tree" in item for item in evidence.warnings
+    )
+
+
+def test_empty_result_document_is_refused(tmp_path) -> None:
+    spot = _walk_spot([_recorded("hero", "check", pot_before=5.0)], hero_role="oop")
+    hero_range = _resolved_range(
+        "oop", _HERO_RANGE.solver_notation, player_key="hero", player_name="Hero"
+    )
+    villain_range = _resolved_range(
+        "ip", _VILLAIN_RANGE.solver_notation, player_key="villain", player_name="Villain"
+    )
+    with pytest.raises(SolverResultUnusableError, match="lists no actions"):
+        _parse_dump(tmp_path, {}, spot, hero_range, villain_range)
+
+
+def test_result_without_a_strategy_map_is_refused(tmp_path) -> None:
+    spot = _walk_spot([_recorded("hero", "check", pot_before=5.0)], hero_role="oop")
+    hero_range = _resolved_range(
+        "oop", _HERO_RANGE.solver_notation, player_key="hero", player_name="Hero"
+    )
+    villain_range = _resolved_range(
+        "ip", _VILLAIN_RANGE.solver_notation, player_key="villain", player_name="Villain"
+    )
+    with pytest.raises(SolverResultUnusableError, match="no per-combination strategy"):
+        _parse_dump(
+            tmp_path,
+            _action_node(["CHECK", "BET 3.75"]),
+            spot,
+            hero_range,
+            villain_range,
+        )
+
+
+def test_strategy_for_a_range_that_was_not_submitted_is_refused(tmp_path) -> None:
+    spot = _walk_spot([_recorded("hero", "check", pot_before=5.0)], hero_role="oop")
+    hero_range = _resolved_range(
+        "oop", _HERO_RANGE.solver_notation, player_key="hero", player_name="Hero"
+    )
+    villain_range = _resolved_range(
+        "ip", _VILLAIN_RANGE.solver_notation, player_key="villain", player_name="Villain"
+    )
+    actions = ["CHECK", "BET 3.75"]
+    dump = _action_node(actions, _covering_strategy(villain_range, actions))
+    with pytest.raises(SolverResultUnusableError, match="covers 0.0% of the submitted"):
+        _parse_dump(tmp_path, dump, spot, hero_range, villain_range)
+
+
+def test_partial_strategy_coverage_is_refused_below_the_floor_and_named_above_it(
+    tmp_path,
+) -> None:
+    spot = _walk_spot([_recorded("hero", "check", pot_before=5.0)], hero_role="oop")
+    hero_range = _resolved_range(
+        "oop",
+        "AhQs,AsQh,KhKs,JdJc,ThTs,9h9s,8h8s,7h7s",
+        player_key="hero",
+        player_name="Hero",
+    )
+    villain_range = _resolved_range(
+        "ip", _VILLAIN_RANGE.solver_notation, player_key="villain", player_name="Villain"
+    )
+    actions = ["CHECK", "BET 3.75"]
+    truncated = _action_node(actions, _covering_strategy(hero_range, actions, omit=5))
+    with pytest.raises(SolverResultUnusableError, match="covers 37.5% of the submitted"):
+        _parse_dump(tmp_path, truncated, spot, hero_range, villain_range)
+
+    partial = _action_node(actions, _covering_strategy(hero_range, actions, omit=2))
+    evidence = _parse_dump(tmp_path, partial, spot, hero_range, villain_range)
+    assert any("covered 75.0% of the submitted OOP range" in item for item in evidence.warnings)
+    assert MIN_STRATEGY_RANGE_COVERAGE == 0.5
+    assert ACTION_MAPPING_MAX_POT_FRACTION == 0.25
+
+
+def test_non_action_node_is_refused(tmp_path) -> None:
+    spot = _walk_spot([_recorded("hero", "check", pot_before=5.0)], hero_role="oop")
+    hero_range = _resolved_range(
+        "oop", _HERO_RANGE.solver_notation, player_key="hero", player_name="Hero"
+    )
+    villain_range = _resolved_range(
+        "ip", _VILLAIN_RANGE.solver_notation, player_key="villain", player_name="Villain"
+    )
+    actions = ["CHECK", "BET 3.75"]
+    dump = _action_node(actions, _covering_strategy(hero_range, actions))
+    dump["node_type"] = "chance_node"
+    with pytest.raises(SolverResultUnusableError, match="is a chance_node"):
+        _parse_dump(tmp_path, dump, spot, hero_range, villain_range)
+
+
+def test_recorded_line_without_a_hero_decision_is_refused(tmp_path) -> None:
+    spot = _walk_spot([_recorded("villain", "check", pot_before=5.0)], hero_role="ip")
+    actions = ["CHECK", "BET 3.75"]
+    dump = _action_node(
+        actions,
+        _covering_strategy(_VILLAIN_RANGE, actions),
+        children={"CHECK": _action_node(actions, _covering_strategy(_HERO_RANGE, actions))},
+    )
+    with pytest.raises(SolverResultUnusableError, match="no Hero decision"):
+        _parse_dump(tmp_path, dump, spot, _HERO_RANGE, _VILLAIN_RANGE)
+
+
+def test_action_mapping_reports_its_own_quality() -> None:
+    node = _action_node(["CHECK", "BET 1.65", "BET 3.75"])
+    exact = map_recorded_action(
+        node, _recorded("villain", "bet", 3.7, pot_before=5.0), pot_reference=5.0
+    )
+    assert (exact.label, exact.quality) == ("BET 3.75", "exact")
+    approximate = map_recorded_action(
+        node, _recorded("villain", "bet", 5.0, pot_before=5.0), pot_reference=5.0
+    )
+    assert (approximate.label, approximate.quality) == ("BET 3.75", "approximate")
+    unusable = map_recorded_action(
+        node, _recorded("villain", "bet", 25.0, pot_before=5.0), pot_reference=5.0
+    )
+    assert unusable.label is None
+    assert unusable.quality == "unusable"
+    sizeless = map_recorded_action(
+        node, _recorded("villain", "bet", None, pot_before=5.0), pot_reference=5.0
+    )
+    assert sizeless.label is None
+    assert not sizeless.is_usable
+
+
+def test_semantically_empty_dump_fails_the_run_instead_of_completing_it(
+    tmp_path, monkeypatch
+) -> None:
+    fake_solver = tmp_path / "console_solver"
+    fake_solver.write_text(
+        """#!/usr/bin/env python3
+import pathlib
+import sys
+
+command = pathlib.Path(sys.argv[2]).read_text()
+output = next(line.split(" ", 1)[1] for line in command.splitlines() if line.startswith("dump_result "))
+pathlib.Path(output).write_text("{}")
+print("Total exploitability 0.33 percent")
+""",
+        encoding="utf-8",
+    )
+    fake_solver.chmod(0o755)
+    evaluator = tmp_path / "resources" / "compairer" / "card5_dic_sorted.txt"
+    evaluator.parent.mkdir(parents=True)
+    evaluator.write_text("test", encoding="utf-8")
+    monkeypatch.setenv("TEXAS_SOLVER_PATH", str(fake_solver))
+
+    _, _, _, _, spot = _completed_cash_spot()
+    oop = resolve_custom_range(spot, spot.oop, "AQo+,AA", name="Hero custom")
+    ip = resolve_custom_range(spot, spot.ip, "22+,A2s+", name="Villain custom")
+    db_path = tmp_path / "empty-dump.db"
+    db = PokerDatabase(db_path)
+    db.init_db()
+    session = db.create_session(Session(name="Empty dump"))
+    hand = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=1,
+            game_type="NLHE cash",
+            table_size=6,
+        )
+    )
+    spot = spot.model_copy(update={"hand_id": hand.id})
+    command_path = tmp_path / "input.txt"
+    command_path.write_text(
+        build_command_file(
+            spot, ip, oop, output_path=tmp_path / "result.json", thread_count=1
+        ),
+        encoding="utf-8",
+    )
+    run = db.create_solver_run(
+        SolverRun(
+            hand_id=hand.id,
+            input_hash="c" * 64,
+            backend_version=PINNED_CONSOLE_COMMIT,
+            spot=spot.model_dump(mode="json"),
+            range_ip=ip.model_dump(mode="json"),
+            range_oop=oop.model_dump(mode="json"),
+            command_path=str(command_path),
+            result_path=str(tmp_path / "result.json"),
+            log_path=str(tmp_path / "solver.log"),
+        )
+    )
+    with pytest.raises(SolverResultUnusableError):
+        run_solver_job(db, run.id, timeout_seconds=30)
+
+    check = PokerDatabase(db_path)
+    saved = check.fetch_solver_run(run.id)
+    assert saved is not None
+    assert saved.status == "failed"
+    assert not saved.evidence
+    assert "no actions" in (saved.error_message or "")
+    check.close()
 
 
 def test_solver_persistence_and_range_profile_round_trip(tmp_path) -> None:
@@ -637,13 +1232,21 @@ command = pathlib.Path(sys.argv[2]).read_text()
 resources = pathlib.Path(sys.argv[sys.argv.index("-r") + 1])
 assert (resources / "compairer" / "card5_dic_sorted.txt").is_file()
 output = next(line.split(" ", 1)[1] for line in command.splitlines() if line.startswith("dump_result "))
+# A real dump carries a vector for every combination of the acting player's
+# submitted range, so the stub reads that range back out of the command file
+# rather than emitting a single combo the parser now rejects as incomplete.
+hero_range = next(line.split(" ", 1)[1] for line in command.splitlines() if line.startswith("set_range_oop "))
+strategy = {}
+for token in hero_range.split(","):
+    combo = token.split(":", 1)[0].strip()
+    strategy[combo] = [0.7, 0.3] if combo == "AhQs" else [0.45, 0.55]
 pathlib.Path(output).write_text(json.dumps({
     "node_type": "action_node",
     "actions": ["CHECK", "BET 3.75"],
     "childrens": {},
     "strategy": {
         "actions": ["CHECK", "BET 3.75"],
-        "strategy": {"AhQs": [0.7, 0.3]}
+        "strategy": strategy
     }
 }))
 print("Total exploitability 0.33 percent")
@@ -792,7 +1395,7 @@ def test_cache_hit_creates_current_hand_run_with_independent_artifacts(
                 "actions": ["CHECK", "BET 3.75"],
                 "strategy": {
                     "actions": ["CHECK", "BET 3.75"],
-                    "strategy": {"AhQs": [0.7, 0.3]},
+                    "strategy": _covering_strategy(oop, ["CHECK", "BET 3.75"]),
                 },
             }
         ),

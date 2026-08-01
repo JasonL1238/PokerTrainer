@@ -450,6 +450,22 @@ class SolverRangeProfile(PersistedModel):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+def _default_solver_run_parameters() -> dict[str, object]:
+    """Stamp the solving settings this build uses onto every new run row.
+
+    Defaulted on the model rather than filled in by the job starter so that no
+    producer -- the UI, the cache-reuse path, a future script -- can create a
+    run whose retained frequencies have no record of the tree behind them. Rows
+    read back from the database supply the column explicitly, including the
+    empty value pre-migration rows carry, so an old run stays honestly blank
+    instead of being backfilled with today's abstraction.
+    """
+
+    from poker_tracker.solver.models import current_run_parameters
+
+    return current_run_parameters().model_dump(mode="json")
+
+
 class SolverRun(PersistedModel):
     """Durable metadata for one external postflop solve."""
 
@@ -458,6 +474,9 @@ class SolverRun(PersistedModel):
     status: SolverRunStatus = "queued"
     backend_name: str = "texassolver"
     backend_version: str = ""
+    run_parameters: dict[str, object] = Field(
+        default_factory=_default_solver_run_parameters
+    )
     input_hash: str = Field(min_length=1)
     spot: dict[str, object] = Field(default_factory=dict)
     range_ip: dict[str, object] = Field(default_factory=dict)

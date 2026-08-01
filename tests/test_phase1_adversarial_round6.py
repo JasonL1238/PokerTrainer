@@ -1039,11 +1039,11 @@ def test_rotation_never_deletes_a_backup_the_product_did_not_write(
     assert set(operator_files) <= survivors
     # ...and the product's own snapshots are still rotated.
     assert (
-        len([name for name in survivors if backup_module._ROTATING_NAME.match(name)])
+        len([name for name in survivors if backup_module.ROUTINE.name.match(name)])
         == BACKUP_KEEP_COUNT
     )
     assert (
-        len([name for name in survivors if backup_module._PINNED_NAME.match(name)])
+        len([name for name in survivors if backup_module.PREMIGRATION.name.match(name)])
         == backup_module.PINNED_KEEP_COUNT
     )
 

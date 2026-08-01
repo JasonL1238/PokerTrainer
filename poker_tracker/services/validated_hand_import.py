@@ -7,6 +7,7 @@ the hand is full / not mid-start, or ``draft`` when the operator explicitly asks
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -16,7 +17,8 @@ from cv_lab.scripts.pipeline.export_yolo_card_hands_for_app import (
     hand_to_import_payload,
     timeline_hand_number_from_notes,
 )
-from poker_tracker.persistence.backup import backup_database
+from poker_tracker.maintenance.data_health import verify_snapshot
+from poker_tracker.persistence.backup import backup_database, find_snapshots
 from poker_tracker.persistence.completion import (
     OBSERVED_TERMINAL_EVENTS,
     parse_completion_evidence,
@@ -336,7 +338,16 @@ def ensure_hand_imported(
         )
 
     paths = ensure_data_directories(data_dir)
-    backup_database(Path(db.db_path), Path(paths["backups"]))
+    refusal = ensure_preimport_snapshot(
+        db, job_id=job_id, backups=Path(paths["backups"]), data_dir=Path(paths["data"])
+    )
+    if refusal is not None:
+        return HandImportResult(
+            status="blocked",
+            session_id=session_id,
+            reasons=("pre-import snapshot unavailable",),
+            message=refusal,
+        )
     with db.transaction(immediate=True):
         existing = find_existing_imported_hand(
             db,
@@ -374,6 +385,65 @@ def ensure_hand_imported(
         session_id=session_id,
         message=f"Added {label} #{timeline_hand_number} to session #{session_id}.",
     )
+
+
+def ensure_preimport_snapshot(
+    db: PokerDatabase,
+    *,
+    job_id: int,
+    backups: Path,
+    data_dir: Path,
+) -> str | None:
+    """Take one verified rollback point per CV job. Returns a refusal, or None.
+
+    The snapshot used to be taken per imported HAND, and unpinned: importing
+    eight validated hands wrote eight full copies of the database and pushed the
+    pre-import state out of the five-slot rotation, so the oldest surviving copy
+    was one taken after three hands had already landed. The rollback point the
+    snapshot exists to provide was destroyed by the act of taking it repeatedly.
+
+    What is being protected is the state before this job's hands land, and that
+    state stops existing after the first import, so one snapshot per job is not
+    an economy -- it is the correct number. The retained snapshot is its own
+    marker: its filename carries the job, so the interactive one-hand-at-a-time
+    path and the batch scan both find it and neither takes a second.
+
+    It is verified before the import proceeds and refuses the import if it does
+    not survive an isolated restore, on the same reasoning as the pre-migration
+    snapshot: an unverified rollback point is not a rollback point, and the
+    moment before the write is the last moment at which refusing still helps.
+
+    Once enough other jobs have pushed this job's snapshot out of its pool, a
+    later visit to the same job takes a fresh one. That snapshot precedes the
+    hands still to land rather than all of them, which is the most any snapshot
+    taken at that moment could be.
+    """
+    scope = f"job{job_id}"
+    if find_snapshots(backups, purpose="preimport", scope=scope):
+        return None
+    try:
+        snapshot = backup_database(
+            Path(db.db_path),
+            backups,
+            purpose="preimport",
+            scope=scope,
+            data_dir=data_dir,
+        )
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        return (
+            f"Could not write a pre-import snapshot to {backups}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    verification = verify_snapshot(
+        snapshot, live_database=Path(db.db_path), data_dir=data_dir
+    )
+    if verification.status == "fail":
+        detail = "; ".join(verification.details) or verification.message
+        return (
+            f"The pre-import snapshot {snapshot.name} did not survive an isolated "
+            f"restore, so this import has no rollback point: {detail}"
+        )
+    return None
 
 
 def import_all_autonomous_eligible(

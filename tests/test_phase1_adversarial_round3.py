@@ -26,6 +26,7 @@ from poker_tracker.persistence.backup import (
     BACKUP_KEEP_COUNT,
     PINNED_PREFIX,
     backup_database,
+    backups_dir_for,
 )
 from poker_tracker.persistence.completion import (
     CompletionEvidence,
@@ -580,12 +581,16 @@ def test_the_pre_migration_snapshot_is_pinned_against_rotation(
     db.init_db()
     db.close()
 
-    pinned = list(isolated_backup_dir.glob(f"{PINNED_PREFIX}*.sqlite3"))
+    # The snapshot lives with the database it can roll back, which for anything
+    # but the live database is beside that database.
+    snapshot_dir = backups_dir_for(path)
+    pinned = list(snapshot_dir.glob(f"{PINNED_PREFIX}*.sqlite3"))
     assert len(pinned) == 1, "the pre-migration snapshot must be pinned"
-    assert not list(isolated_backup_dir.glob("poker_tracker_*.sqlite3"))
+    assert not list(snapshot_dir.glob("poker_tracker_*.sqlite3"))
+    assert not list(isolated_backup_dir.glob("*.sqlite3"))
 
     for _ in range(BACKUP_KEEP_COUNT + 2):
-        backup_database(path, isolated_backup_dir)
+        backup_database(path, snapshot_dir)
 
     assert pinned[0].exists(), "rotation deleted the only migration rollback point"
 

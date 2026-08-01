@@ -134,7 +134,11 @@ from poker_tracker.solver.jobs import (
     reconcile_stale_solver_runs,
     start_solver_job,
 )
-from poker_tracker.solver.models import ResolvedRange, SolverEvidence
+from poker_tracker.solver.models import (
+    ResolvedRange,
+    SolverEvidence,
+    SolverRunParameters,
+)
 from poker_tracker.solver.profile_io import export_range_profiles, import_range_profiles
 from poker_tracker.solver.ranges import (
     BUILTIN_RANGE_PROFILES,
@@ -144,7 +148,12 @@ from poker_tracker.solver.ranges import (
     resolve_profile,
     resolve_selected_profile,
 )
-from poker_tracker.solver.storage import remove_solver_run_artifacts
+from poker_tracker.solver.storage import (
+    backend_identity_assumption,
+    missing_run_artifacts,
+    remove_solver_run_artifacts,
+    resolved_backend_identity,
+)
 from poker_tracker.solver.texassolver import (
     PINNED_CONSOLE_COMMIT,
     configured_binary,
@@ -2980,14 +2989,37 @@ def show_study_coach_review(
             if run.status == "completed" and run.evidence
         ]
         if completed_runs:
+            latest_run = completed_runs[0]
             try:
-                solver_evidence = SolverEvidence.model_validate(completed_runs[0].evidence)
-                st.caption(
-                    f"Solver evidence attached · run #{completed_runs[0].id} · "
-                    f"{solver_evidence.backend} {solver_evidence.backend_version}"
-                )
+                candidate = SolverEvidence.model_validate(latest_run.evidence)
             except ValidationError:
                 st.warning("Latest saved solver evidence is invalid and was not attached.")
+            else:
+                if candidate.action_frequencies or candidate.range_action_frequencies:
+                    solver_evidence = candidate
+                    st.caption(
+                        f"Solver evidence attached · run #{latest_run.id} · "
+                        f"{candidate.backend} {candidate.backend_version}"
+                    )
+                    # This panel feeds the provider the same solver block the
+                    # solver panel does, so it owes the reader the same
+                    # conditions beside the explanation it produces.
+                    _show_solver_run_provenance(latest_run)
+                    for item in candidate.assumptions:
+                        st.caption(f"· {item}")
+                    for item in candidate.warnings:
+                        st.warning(item)
+                    st.caption(
+                        "Action EV and exact BB loss are unavailable and are not inferred."
+                    )
+                else:
+                    # Attaching it would put a solver heading over nothing and
+                    # ask the model to explain a result that established none.
+                    st.warning(
+                        f"Solver run #{latest_run.id} saved no action frequencies, "
+                        "so it was not attached to this coaching prompt. Re-run "
+                        "the spot to attach solver evidence."
+                    )
     if unattested_assumption_dependence(hand, accounting):
         # Naming the ledger here was false on exactly the hands that reach it:
         # the ledger IS legal and balanced, which is why a dependence could be
@@ -3158,11 +3190,23 @@ def show_solver_review(
 
     st.markdown("###### 3. Run TexasSolver")
     binary_ready = True
+    binary = None
     try:
         binary = configured_binary()
         configured_resource_dir(binary)
         st.success("TexasSolver is installed and ready.")
-        st.caption(f"Pinned backend · {PINNED_CONSOLE_COMMIT} · {binary}")
+        # The pinned commit is what this build asks for, not what it found. It
+        # used to be printed alone, which read as verified provenance for
+        # whatever file TEXAS_SOLVER_PATH happens to name.
+        identity = resolved_backend_identity(binary)
+        st.caption(f"Configured backend · {binary}")
+        st.caption(
+            f"Binary identity · {identity} · pinned commit {PINNED_CONSOLE_COMMIT} "
+            "is a configuration claim and is not verified against this binary."
+            if identity
+            else "Binary identity · unreadable · the pinned commit "
+            f"{PINNED_CONSOLE_COMMIT} cannot be verified against this binary."
+        )
     except (FileNotFoundError, PermissionError) as exc:
         binary_ready = False
         st.warning(str(exc))
@@ -3198,7 +3242,13 @@ def show_solver_review(
                 spot,
                 ip_range,
                 oop_range,
-                assumptions=prepared.eligibility.warnings,
+                assumptions=[
+                    *prepared.eligibility.warnings,
+                    # Retained with the frequencies because the row's
+                    # backend_version column records the pin this build asserts,
+                    # which is true of every run whatever binary produced it.
+                    backend_identity_assumption(binary, PINNED_CONSOLE_COMMIT),
+                ],
             )
             flash(
                 f"Solver run #{run.id} is {run.status}."
@@ -3328,6 +3378,32 @@ def _solver_range_selector(
         return None, str(exc)
 
 
+def _show_solver_run_provenance(run) -> None:
+    """Say what produced these frequencies and whether it can still be checked.
+
+    Both halves are shown beside the numbers rather than in a separate panel,
+    because a reader who has to go looking for them will read the frequencies
+    without them.
+    """
+    parameters = SolverRunParameters.model_validate(run.run_parameters or {})
+    if parameters.is_retained:
+        for line in parameters.summary_lines():
+            st.caption(f"· {line}")
+    else:
+        st.warning(
+            "The betting abstraction and convergence target behind these "
+            "frequencies were not retained on this run, so what was solved "
+            "cannot be established. Re-run the spot before relying on it."
+        )
+    missing = missing_run_artifacts(run)
+    if missing:
+        st.warning(
+            "Retained solver artifacts are gone (" + "; ".join(missing) + "). "
+            "The saved frequencies are still shown, but this run can no longer "
+            "be reproduced or audited from its inputs."
+        )
+
+
 def _show_resolved_range(resolved: ResolvedRange) -> None:
     st.caption(
         f"{resolved.role.upper()} resolved range · {resolved.profile_name} · "
@@ -3356,7 +3432,9 @@ def _show_solver_runs(
     st.markdown(f"##### Solver result · run #{latest.id}")
     st.caption(
         f"Status · {latest.status.replace('_', ' ').title()} · "
-        f"backend {latest.backend_name} {latest.backend_version}"
+        # Named as the pin because that is what the column holds: the commit this
+        # build asks for, stamped whatever binary the run actually used.
+        f"backend {latest.backend_name} · configured pin {latest.backend_version}"
     )
     if latest.status in {"queued", "running", "cancelling"}:
         st.info("Solver work is running in the background. Refresh to check progress.")
@@ -3421,9 +3499,25 @@ def _show_solver_runs(
             f"Recorded · {evidence.recorded_action} · mapped solver branch · "
             f"{evidence.mapped_action or 'unavailable'}"
         )
-    for item in [*evidence.assumptions, *evidence.warnings]:
+    _show_solver_run_provenance(latest)
+    for item in evidence.assumptions:
         st.caption(f"· {item}")
+    # An assumption describes how every solve of this kind was set up; a warning
+    # says something about THIS result is not what it appears to be -- a size
+    # substituted for one the tree does not offer, a range only partly covered.
+    # Rendered as captions the two were indistinguishable, so the reader scanned
+    # past the one sentence that changes what the frequencies mean.
+    for item in evidence.warnings:
+        st.warning(item)
     st.caption("Action EV and exact BB loss are unavailable and are not inferred.")
+
+    groundable = bool(evidence.action_frequencies or evidence.range_action_frequencies)
+    if not groundable:
+        st.error(
+            "This run saved no action frequencies at all, so there is nothing an "
+            "explanation could be checked against. Re-run the spot instead of "
+            "explaining this result."
+        )
 
     provider_choice = st.selectbox(
         "Explanation provider",
@@ -3448,6 +3542,7 @@ def _show_solver_runs(
         key=f"solver_explain_{latest.id}",
         disabled=(
             provider is None
+            or not groundable
             or not _accounting_is_established(hand, accounting)
             or readiness.has("OPEN_DEBUGGING_ISSUE")
             or readiness.has("STUDY_EXCLUDED_BY_OPERATOR")
@@ -7749,6 +7844,30 @@ def select_session_review_hands(hands: list[Hand]) -> list[Hand]:
     return selected[:8]
 
 
+def retained_solver_assumptions(raw_prompt: str) -> list[str]:
+    """Recover the solver conditions a saved explanation was generated under.
+
+    A stored explanation outlives the screen that produced it, and the run it
+    rests on can be deleted or superseded, so the assumptions cannot be re-read
+    from the current run without risking pairing an explanation with conditions
+    that are not its own. The prompt is the one record that is certainly the
+    explanation's own, and it carries the solver block verbatim.
+    """
+    lines: list[str] = []
+    for line in raw_prompt.splitlines():
+        for prefix, label in (
+            ("- assumptions:", "Solver assumption"),
+            ("- warnings:", "Solver warning"),
+        ):
+            if not line.startswith(prefix):
+                continue
+            body = line[len(prefix) :].strip()
+            if body in {"", "none", "none recorded"}:
+                continue
+            lines.extend(f"{label} · {item.strip()}" for item in body.split(";") if item.strip())
+    return lines
+
+
 def show_saved_provider_reviews(reviews) -> None:
     st.markdown("##### Saved Provider Reviews")
     if not reviews:
@@ -7763,6 +7882,8 @@ def show_saved_provider_reviews(reviews) -> None:
             st.write({"Review type": review.review_type, "Safety mode": review.safety_mode})
             if review.is_stale:
                 st.warning(review.stale_reason or "Underlying evidence changed.")
+            for item in retained_solver_assumptions(review.raw_prompt):
+                st.caption(f"· {item}")
             st.write(review.parsed_sections or {})
             st.code(review.raw_response, language="text")
 

@@ -172,6 +172,84 @@ version is current, foreign keys pass, and one completed hand opens in Study.
 The health report's artifact check reports missing video, frame, timeline and
 solver files — those live outside SQLite and are backed up separately.
 
+### Fresh-machine recovery drill
+
+The procedure above verifies a *file*. This one verifies a *recovery*: it
+restores a chosen snapshot into a throwaway location, migrates it, and answers
+whether the study history came back. Run it on the machine you would actually
+recover onto, and run it before you need it.
+
+**Bring three things.** Nothing else in this section works without all three.
+
+| Input | Where it comes from | If it is missing | If it is stale |
+|---|---|---|---|
+| Environment configuration | `deploy/.env.example`, copied to `.env`, plus `POKER_DB_PATH` and `POKER_DATA_DIR` | The application starts against `./poker_tracker.db` and `./data` — an empty install that looks healthy | `POKER_DATA_DIR` pointing somewhere the artifacts are not makes every recording, frame and timeline report missing |
+| Persistent data directory | Your `$DATA` mount: `videos/`, `frames/`, `cv_timelines/`, `solver/`, `job_logs/` | The drill exits `2` and verifies nothing — there is nowhere to look for artifacts | The drill reports `PARTIAL RECOVERY` and names each file, including artifacts that are present but no longer the bytes the snapshot recorded |
+| Verified backup | `$DATA/backups/`, with its `.inventory.json` beside it | Nothing to restore | An older snapshot restores and migrates fine; everything recorded after it is gone |
+
+**Mount the data directory at the same path it had on the machine that wrote
+it.** Recorded artifact paths are absolute. A data directory mounted somewhere
+new restores a database whose every reference dangles, and the drill will say so
+rather than let you find out during a session.
+
+From nothing to a verified application:
+
+```bash
+git clone <repo-url> pokertrainer && cd pokertrainer
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+cp /path/to/brought/.env .env            # environment configuration
+export POKER_DATA_DIR=/mnt/pokertrainer/data
+export POKER_DB_PATH=/mnt/pokertrainer/poker_tracker.db
+
+# Prove the backup recovers BEFORE putting it in place.
+DRILL=$(mktemp -d)
+BACKUP=$(ls -t "$POKER_DATA_DIR"/backups/*.sqlite3 | head -1)
+python -m poker_tracker.maintenance.recovery \
+  --backup "$BACKUP" --data-dir "$POKER_DATA_DIR" --target "$DRILL"
+echo "drill exit: $?"
+
+# Only once the drill exits 0: put the database in place and start.
+cp "$BACKUP" "$POKER_DB_PATH"
+python -m poker_tracker.maintenance --restore-backups
+streamlit run app.py
+```
+
+**Read the exit code:**
+
+| Exit | Verdict | Meaning |
+|---|---|---|
+| `0` | `RECOVERED` | The history came back and every check verified it |
+| `1` | `PARTIAL` | Something is provably gone — rows, artifacts, or a hand the application cannot read |
+| `1` | `UNVERIFIED` | The database restored cleanly, but no inventory accompanied the snapshot, so completeness is unproven |
+| `2` | `NOT PERFORMED` | The drill refused or could not run; **nothing was checked** |
+
+The drill will not run at all if its target overlaps `POKER_DATA_DIR`, contains
+`POKER_DB_PATH`, or already holds a database. That refusal is exit `2`, not a
+warning — a drill that restored a three-month-old snapshot over the live file
+would destroy exactly the history it was run to protect.
+
+What each failing check means:
+
+| Check | Failing means |
+|---|---|
+| `restored_open` | This build cannot open the snapshot. Usually a database written by a newer build; run the drill with the matching version |
+| `study_history_counts` | The restored history is empty, or short of what the inventory records. This is the failure a bare `quick_check` cannot see |
+| `backup_inventory` | No inventory beside the snapshot, or one that will not parse. Take a fresh backup; `backup_database` writes the inventory itself |
+| `issue_evidence` | A `hand_issues` row came back without the frozen evidence that is the reason it exists |
+| `completed_hand_readback` | Rows exist that the application cannot compose into a hand. SQLite is happy; Study would not be |
+| `recovered_artifacts` | Recordings, frames, timelines or solver outputs the history references are absent from the data directory, or no longer match the snapshot |
+
+Add `--json` for a machine-readable report; `counts` and `missing_artifacts` are
+the two fields worth diffing between drills.
+
+**Known gap, reported on every run.** The inventory records artifacts but no
+session or hand counts, so on a snapshot taken today the drill verifies the
+artifact set and *self-reports* the totals — `backup_inventory` says so as a
+warning. Until the inventory carries counts, compare the reported `counts`
+against what you know the source held.
+
 ---
 
 ## 7. Failed job recovery

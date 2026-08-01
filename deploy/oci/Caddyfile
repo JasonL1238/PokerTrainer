@@ -1,6 +1,6 @@
 {$POKERTRAINER_HOST} {
     encode zstd gzip
-    reverse_proxy app:8501
+    reverse_proxy app:{$PORT:8501}
 
     header {
         X-Content-Type-Options nosniff

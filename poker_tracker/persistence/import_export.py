@@ -1,9 +1,30 @@
+"""Session export and import.
+
+Duplicate import is an APPEND, never an overwrite. ``import_session`` drops the
+payload's session id and always calls ``db.create_session``: importing the same
+file twice leaves two independent sessions, and no payload can address, replace
+or edit a session that already exists. Appending to a session the operator
+picked is the separate, explicit ``import_hands_into_session``. There is no
+update path in this module, which is why silent overwrite is not merely
+unlikely but unreachable.
+
+Every claim a payload makes about its own trustworthiness is re-derived here
+rather than believed: coaching lands stale, issues land open, ``reviewed`` lands
+demoted, and completion status is recomputed from the evidence. See the
+individual docstrings for why each one cannot travel in the file that carries
+the evidence for it.
+"""
+
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
+
+from pydantic import BaseModel, ValidationError
 
 from poker_tracker.persistence.completion import (
     DERIVED_EVIDENCE_KEYS,
@@ -17,6 +38,7 @@ from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import (
     Action,
     CoachingResponse,
+    CompletionStatus,
     Hand,
     HandCorrection,
     HandIssue,
@@ -31,6 +53,60 @@ EXPORT_VERSION = 6
 # The literal 4 must stay listed: bumping EXPORT_VERSION alone would silently
 # drop support for payloads written by the previous release.
 SUPPORTED_IMPORT_VERSIONS = {1, 2, 3, 4, 5, EXPORT_VERSION}
+
+# Ceilings on the payload itself, enforced by import_session rather than by its
+# callers. The equivalent 10 MB limit used to live only at the three Streamlit
+# upload widgets, so the CV pipeline exporter and any future upload surface were
+# bounded by nothing at all.
+MAX_IMPORT_PAYLOAD_TEXT_CHARS = 10 * 1024 * 1024
+MAX_IMPORT_PAYLOAD_VALUES = 2_000_000
+MAX_IMPORT_PAYLOAD_DEPTH = 64
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
+class ImportValidationError(ValueError):
+    """A refused import payload, named down to the record that broke it.
+
+    Subclasses ``ValueError`` because every import surface already funnels
+    payload problems through ``except ValueError``; a new exception type would
+    have turned refusals into unhandled tracebacks at call sites this module
+    does not own. ``location`` is the path to the offending record --
+    ``hands[2].players[1]`` -- so the message says WHICH record is wrong in a
+    file the operator may have spent an hour producing, rather than that
+    something somewhere in it was.
+    """
+
+    def __init__(self, location: str, problem: str) -> None:
+        self.location = location
+        self.problem = problem
+        super().__init__(f"{location}: {problem}" if location else problem)
+
+
+@dataclass(frozen=True)
+class ValidatedHand:
+    """One hand's records, already constructed and cross-checked, ready to write."""
+
+    hand: Hand
+    unreadable_columns: dict[str, object]
+    players: list[HandPlayer]
+    actions: list[Action]
+    settlement: HandSettlement | None
+    settlement_entries: list[SettlementEntry]
+    reviews: list[HandReview]
+    coaching_reviews: list[CoachingResponse]
+    corrections: list[HandCorrection]
+    issues: list[HandIssue]
+
+
+@dataclass(frozen=True)
+class ValidatedImport:
+    """A whole payload, accepted. Everything the write pass is allowed to read."""
+
+    export_version: int
+    session: Session
+    hands: list[ValidatedHand] = field(default_factory=list)
+    session_coaching_reviews: list[CoachingResponse] = field(default_factory=list)
 
 
 def export_hand(db: PokerDatabase, hand_id: int) -> dict[str, Any]:
@@ -85,161 +161,119 @@ def export_session_json(db: PokerDatabase, session_id: int, path: str | Path) ->
     Path(path).write_text(json.dumps(export_session(db, session_id), indent=2), encoding="utf-8")
 
 
-def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
-    """Import a previously exported session into the current database."""
-    version = payload.get("export_version", 1)
-    if version not in SUPPORTED_IMPORT_VERSIONS:
-        raise ValueError(
-            f"Unsupported export_version {version}; this app understands "
-            f"{sorted(SUPPORTED_IMPORT_VERSIONS)}."
+def validate_import_payload(payload: object) -> ValidatedImport:
+    """Turn a payload into records, or refuse it, without touching any database.
+
+    Every check the import performs lives here: ceilings, shape, field types,
+    duplicate identifiers, and the relationships between a hand's records.
+    ``import_session`` calls this once and its write block then reads nothing
+    but the returned object, so "import validation completes before any
+    application-data write" is a property of the call graph rather than a claim
+    about statement order that the next edit can quietly invalidate.
+
+    It used to be a claim, and it was false: uniqueness and relational problems
+    were left to SQLite's constraints and to the writers' own guards, so a
+    payload with two players sharing a ``player_key`` inserted the session and
+    the hand and then raised ``sqlite3.IntegrityError`` -- an exception no
+    import surface caught -- from the middle of the write pass. The transaction
+    rolled it all back, so nothing was corrupted, but the operator got a
+    traceback naming an index instead of a message naming their record.
+    """
+
+    _assert_within_ceilings(payload)
+    root = _require_mapping(payload, "payload")
+    version = root.get("export_version", 1)
+    # The type test comes first because `version` is raw payload data: a hand
+    # edit to `"export_version": []` made the set membership below raise
+    # `TypeError: unhashable type: 'list'`. `bool` is excluded because it is an
+    # `int` subclass, so `True` would otherwise read as version 1.
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version not in SUPPORTED_IMPORT_VERSIONS
+    ):
+        raise ImportValidationError(
+            "",
+            # Repr, so a payload declaring the string "6" is distinguishable from
+            # one declaring the integer 6 in the message the operator reads.
+            f"Unsupported export_version {version!r}; this app understands "
+            f"{sorted(SUPPORTED_IMPORT_VERSIONS)}.",
         )
-    session_data = dict(payload["session"])
+    if "session" not in root:
+        raise ImportValidationError(
+            "payload", "no 'session' object; this is not an exported session file."
+        )
+    session_data = dict(_require_mapping(root["session"], "session"))
+    # The payload's own id is dropped, not honoured: an import creates a session,
+    # it never addresses one. See the module docstring.
     session_data.pop("id", None)
-    session_model = Session(**session_data)
-    validated_hands: list[
-        tuple[
-            Hand,
-            dict[str, object],
-            list[HandPlayer],
-            list[Action],
-            HandSettlement | None,
-            list[SettlementEntry],
-            list[HandReview],
-            list[CoachingResponse],
-            list[HandCorrection],
-            list[HandIssue],
-        ]
-    ] = []
+    session_model = _build(Session, session_data, "session")
 
-    for hand_payload in payload.get("hands", []):
-        hand_data = dict(hand_payload["hand"])
-        hand_data.pop("id", None)
-        hand_data["session_id"] = 0
-        # Captured BEFORE the markers are stripped. They are the only surviving
-        # record of a column the exporting database could not read, and without
-        # them INVALID_HERO_OR_BOARD_CARDS and UNREADABLE_HAND_COLUMNS are
-        # consumers whose producer -- the corrupt column, which the exporter has
-        # already degraded to a fallback -- disappears across the round trip.
-        unreadable = _recorded_unreadable_columns(hand_data.get("completion_evidence"))
-        _apply_completion_import_defaults(hand_data)
-        hand = Hand(**hand_data)
-
-        players: list[HandPlayer] = []
-        for player_data in hand_payload.get("players", []):
-            imported = dict(player_data)
-            imported.pop("id", None)
-            imported["hand_id"] = 0
-            players.append(HandPlayer(**imported))
-
-        actions: list[Action] = []
-        for action_data in hand_payload.get("actions", []):
-            imported = dict(action_data)
-            imported.pop("id", None)
-            imported["hand_id"] = 0
-            if "amount_semantics" not in imported:
-                imported["amount_semantics"] = "unknown"
-            actions.append(Action(**imported))
-        _link_actions_to_players(actions, players)
-        _normalize_duplicate_action_indexes(actions)
-
-        settlement_data = hand_payload.get("settlement")
-        settlement: HandSettlement | None = None
-        if settlement_data is not None:
-            imported_settlement = dict(settlement_data)
-            imported_settlement["hand_id"] = 0
-            settlement = HandSettlement(**imported_settlement)
-
-        settlement_entries: list[SettlementEntry] = []
-        for entry_data in hand_payload.get("settlement_entries", []):
-            imported = dict(entry_data)
-            imported.pop("id", None)
-            imported["hand_id"] = 0
-            settlement_entries.append(SettlementEntry(**imported))
-
-        reviews: list[HandReview] = []
-        for review_data in hand_payload.get("reviews", []):
-            imported = dict(review_data)
-            imported.pop("id", None)
-            imported["hand_id"] = 0
-            _mark_imported_analysis_stale(imported)
-            reviews.append(HandReview(**imported))
-
-        coaching_reviews: list[CoachingResponse] = []
-        for review_data in hand_payload.get("coaching_reviews", []):
-            imported = dict(review_data)
-            imported.pop("id", None)
-            imported["hand_id"] = 0
-            imported["session_id"] = 0
-            _mark_imported_analysis_stale(imported)
-            coaching_reviews.append(CoachingResponse(**imported))
-
-        corrections: list[HandCorrection] = []
-        for correction_data in hand_payload.get("corrections", []):
-            imported = dict(correction_data)
-            imported.pop("id", None)
-            imported["hand_id"] = 0
-            corrections.append(HandCorrection(**imported))
-
-        issues: list[HandIssue] = []
-        for issue_data in hand_payload.get("issues", []):
-            imported = dict(issue_data)
-            imported.pop("id", None)
-            imported["hand_id"] = 0
-            _mark_imported_issue_unresolved(imported)
-            issues.append(HandIssue(**imported))
-
-        validated_hands.append(
-            (
-                hand,
-                unreadable,
-                players,
-                actions,
-                settlement,
-                settlement_entries,
-                reviews,
-                coaching_reviews,
-                corrections,
-                issues,
+    validated_hands: list[ValidatedHand] = []
+    hand_numbers: dict[int, int] = {}
+    for index, hand_payload in enumerate(_require_sequence(root, "hands", "payload")):
+        location = f"hands[{index}]"
+        validated = _validate_hand(_require_mapping(hand_payload, location), location)
+        previous = hand_numbers.setdefault(validated.hand.hand_number, index)
+        if previous != index:
+            raise ImportValidationError(
+                location,
+                f"hand_number {validated.hand.hand_number} is already used by "
+                f"hands[{previous}]; a hand number addresses a hand within its "
+                "session and cannot be shared.",
             )
-        )
+        validated_hands.append(validated)
 
     session_coaching_reviews: list[CoachingResponse] = []
-    for review_data in payload.get("coaching_reviews", []):
-        imported = dict(review_data)
+    for index, review_data in enumerate(
+        _require_sequence(root, "coaching_reviews", "payload")
+    ):
+        location = f"coaching_reviews[{index}]"
+        imported = dict(_require_mapping(review_data, location))
         imported.pop("id", None)
         imported["hand_id"] = None
         imported["session_id"] = 0
         _mark_imported_analysis_stale(imported)
-        session_coaching_reviews.append(CoachingResponse(**imported))
+        session_coaching_reviews.append(_build(CoachingResponse, imported, location))
+
+    return ValidatedImport(
+        export_version=int(version),
+        session=session_model,
+        hands=validated_hands,
+        session_coaching_reviews=session_coaching_reviews,
+    )
+
+
+def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
+    """Import a previously exported session as a NEW session.
+
+    Never updates or replaces an existing session, whatever ids the payload
+    carries; re-importing the same file appends a second copy. See the module
+    docstring for why that is the whole of the duplicate-import contract.
+    """
+    validated = validate_import_payload(payload)
 
     with db.transaction():
-        session = db.create_session(session_model)
+        session = db.create_session(validated.session)
         if session.id is None:
             raise RuntimeError("Imported session did not receive an id.")
-        for (
-            hand,
-            unreadable,
-            players,
-            actions,
-            settlement,
-            settlement_entries,
-            reviews,
-            coaching_reviews,
-            corrections,
-            issues,
-        ) in validated_hands:
-            saved_hand = db.create_hand(hand.model_copy(update={"session_id": session.id}))
+        for entry in validated.hands:
+            saved_hand = db.create_hand(
+                entry.hand.model_copy(update={"session_id": session.id})
+            )
             if saved_hand.id is None:
                 raise RuntimeError("Imported hand did not receive an id.")
-            if unreadable:
-                db.restore_unreadable_columns(saved_hand.id, unreadable)
-            for player in players:
+            if entry.unreadable_columns:
+                db.restore_unreadable_columns(saved_hand.id, entry.unreadable_columns)
+            for player in entry.players:
                 db.create_hand_player(player.model_copy(update={"hand_id": saved_hand.id}))
-            for action in actions:
+            for action in entry.actions:
                 db.create_action(action.model_copy(update={"hand_id": saved_hand.id}))
-            if settlement is not None:
-                db.upsert_hand_settlement(settlement.model_copy(update={"hand_id": saved_hand.id}))
-            if settlement_entries:
+            if entry.settlement is not None:
+                db.upsert_hand_settlement(
+                    entry.settlement.model_copy(update={"hand_id": saved_hand.id})
+                )
+            if entry.settlement_entries:
                 # Never nested under `settlement is not None`: a settlement row is
                 # not required to declare a winner (`create_settlement_entry` needs
                 # none, and the exporter emits the entries regardless), so nesting
@@ -248,34 +282,369 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
                 db.replace_settlement_entries(
                     saved_hand.id,
                     [
-                        entry.model_copy(update={"hand_id": saved_hand.id})
-                        for entry in settlement_entries
+                        settlement_entry.model_copy(update={"hand_id": saved_hand.id})
+                        for settlement_entry in entry.settlement_entries
                     ],
                 )
-            for review in reviews:
+            for review in entry.reviews:
                 db.create_hand_review(review.model_copy(update={"hand_id": saved_hand.id}))
-            for review in coaching_reviews:
+            for review in entry.coaching_reviews:
                 db.create_coaching_response(
                     review.model_copy(
                         update={"hand_id": saved_hand.id, "session_id": session.id}
                     )
                 )
-            for correction in corrections:
+            for correction in entry.corrections:
                 db.create_hand_correction(
                     correction.model_copy(update={"hand_id": saved_hand.id})
                 )
-            for issue in issues:
+            for issue in entry.issues:
                 db.create_hand_issue(
                     issue.model_copy(update={"hand_id": saved_hand.id}),
                     apply_workflow=False,
                 )
-            _enforce_review_status_floor(db, saved_hand.id, hand.review_status)
-        for review in session_coaching_reviews:
+            _enforce_review_status_floor(db, saved_hand.id, entry.hand.review_status)
+        for review in validated.session_coaching_reviews:
             db.create_coaching_response(
                 review.model_copy(update={"session_id": session.id})
             )
 
     return session
+
+
+def _validate_hand(hand_payload: Mapping[str, Any], location: str) -> ValidatedHand:
+    """Build and cross-check one hand entry's records. No database access."""
+
+    if "hand" not in hand_payload:
+        raise ImportValidationError(
+            location, "no 'hand' object; every entry in 'hands' must carry one."
+        )
+    hand_data = dict(_require_mapping(hand_payload["hand"], f"{location}.hand"))
+    hand_data.pop("id", None)
+    hand_data["session_id"] = 0
+    # Captured BEFORE the markers are stripped. They are the only surviving
+    # record of a column the exporting database could not read, and without
+    # them INVALID_HERO_OR_BOARD_CARDS and UNREADABLE_HAND_COLUMNS are
+    # consumers whose producer -- the corrupt column, which the exporter has
+    # already degraded to a fallback -- disappears across the round trip.
+    unreadable = _recorded_unreadable_columns(hand_data.get("completion_evidence"))
+    try:
+        _apply_completion_import_defaults(hand_data)
+    except (ValueError, TypeError) as exc:
+        # TypeError as well as ValueError: the completion defaults run on raw
+        # payload data, ahead of the model that would reject a field's type, so a
+        # hand-edited value of the wrong shape reaches comparisons and lookups
+        # written for strings. Located and refused rather than propagated, so no
+        # import surface has to grow a new except clause to stay whole.
+        raise ImportValidationError(f"{location}.hand", str(exc)) from exc
+    hand = _build(Hand, hand_data, f"{location}.hand")
+
+    players = [
+        _build(HandPlayer, imported, item_location)
+        for imported, item_location in _records(hand_payload, "players", location)
+    ]
+    actions: list[Action] = []
+    for imported, item_location in _records(hand_payload, "actions", location):
+        if "amount_semantics" not in imported:
+            imported["amount_semantics"] = "unknown"
+        actions.append(_build(Action, imported, item_location))
+    _link_actions_to_players(actions, players)
+    _normalize_duplicate_action_indexes(actions)
+    _assign_missing_action_indexes(actions)
+
+    settlement_data = hand_payload.get("settlement")
+    settlement: HandSettlement | None = None
+    if settlement_data is not None:
+        imported_settlement = dict(
+            _require_mapping(settlement_data, f"{location}.settlement")
+        )
+        imported_settlement["hand_id"] = 0
+        settlement = _build(
+            HandSettlement, imported_settlement, f"{location}.settlement"
+        )
+
+    settlement_entries = [
+        _build(SettlementEntry, imported, item_location)
+        for imported, item_location in _records(
+            hand_payload, "settlement_entries", location
+        )
+    ]
+
+    reviews: list[HandReview] = []
+    for imported, item_location in _records(hand_payload, "reviews", location):
+        _mark_imported_analysis_stale(imported)
+        reviews.append(_build(HandReview, imported, item_location))
+
+    coaching_reviews: list[CoachingResponse] = []
+    for imported, item_location in _records(hand_payload, "coaching_reviews", location):
+        imported["session_id"] = 0
+        _mark_imported_analysis_stale(imported)
+        coaching_reviews.append(_build(CoachingResponse, imported, item_location))
+
+    corrections = [
+        _build(HandCorrection, imported, item_location)
+        for imported, item_location in _records(hand_payload, "corrections", location)
+    ]
+
+    issues: list[HandIssue] = []
+    for imported, item_location in _records(hand_payload, "issues", location):
+        _mark_imported_issue_unresolved(imported)
+        issues.append(_build(HandIssue, imported, item_location))
+
+    _validate_hand_relationships(
+        location,
+        players=players,
+        actions=actions,
+        settlement_entries=settlement_entries,
+    )
+
+    return ValidatedHand(
+        hand=hand,
+        unreadable_columns=unreadable,
+        players=players,
+        actions=actions,
+        settlement=settlement,
+        settlement_entries=settlement_entries,
+        reviews=reviews,
+        coaching_reviews=coaching_reviews,
+        corrections=corrections,
+        issues=issues,
+    )
+
+
+def _validate_hand_relationships(
+    location: str,
+    *,
+    players: list[HandPlayer],
+    actions: list[Action],
+    settlement_entries: list[SettlementEntry],
+) -> None:
+    """Refuse duplicate player identifiers and references to players who are absent.
+
+    Each of these was previously enforced somewhere downstream, if at all: two by
+    a UNIQUE index, so they surfaced as ``sqlite3.IntegrityError`` from the
+    middle of the write pass; one by ``create_hand_player``; the dangling keys by
+    the writers' own reference checks; and the unresolvable NAME by nothing until
+    the ledger refused the hand, inside an accounting panel, long after it had
+    been stored.
+
+    The unattributed-action rule is deliberately conditional on the hand
+    declaring a roster at all. A hand with players and an action naming somebody
+    outside them has a broken relationship in a file that claims to be complete.
+    A hand with NO players is a different, older shape -- a legacy payload, or a
+    hand entered as prose -- where there is no roster to contradict; the ledger
+    already refuses to derive accounting for it, so it arrives visibly blocked
+    rather than silently wrong, and rejecting the whole file would make a
+    coverage limitation unimportable instead.
+    """
+
+    seen_keys: dict[str, int] = {}
+    seen_seats: dict[int, int] = {}
+    hero_index: int | None = None
+    for index, player in enumerate(players):
+        first = seen_keys.setdefault(player.player_key, index)
+        if first != index:
+            raise ImportValidationError(
+                f"{location}.players[{index}]",
+                f"player_key {player.player_key!r} is already used by "
+                f"players[{first}]; a player key identifies one player in a hand.",
+            )
+        if player.seat_index is not None:
+            seated = seen_seats.setdefault(player.seat_index, index)
+            if seated != index:
+                raise ImportValidationError(
+                    f"{location}.players[{index}]",
+                    f"seat_index {player.seat_index} is already used by "
+                    f"players[{seated}]; two players cannot occupy one seat.",
+                )
+        if player.is_hero:
+            if hero_index is not None:
+                raise ImportValidationError(
+                    f"{location}.players[{index}]",
+                    f"a second player is flagged is_hero; players[{hero_index}] "
+                    "already is, and a hand can have only one Hero player.",
+                )
+            hero_index = index
+
+    names: dict[str, int] = {}
+    for player in players:
+        names[player.player_name] = names.get(player.player_name, 0) + 1
+
+    for index, action in enumerate(actions):
+        item_location = f"{location}.actions[{index}]"
+        if action.player_key is not None:
+            if action.player_key not in seen_keys:
+                raise ImportValidationError(
+                    item_location,
+                    f"player_key {action.player_key!r} matches no player in this "
+                    "hand; the action cannot be attributed.",
+                )
+            continue
+        if not players:
+            continue
+        matches = names.get(action.player_name, 0)
+        if matches == 0:
+            raise ImportValidationError(
+                item_location,
+                f"player {action.player_name!r} is not among this hand's "
+                f"{len(players)} player(s); the action cannot be attributed.",
+            )
+        if matches > 1:
+            raise ImportValidationError(
+                item_location,
+                f"player {action.player_name!r} is shared by {matches} players in "
+                "this hand and the action carries no player_key, so it cannot be "
+                "attributed to one of them.",
+            )
+
+    for index, entry in enumerate(settlement_entries):
+        item_location = f"{location}.settlement_entries[{index}]"
+        if entry.player_key is not None:
+            if entry.player_key not in seen_keys:
+                raise ImportValidationError(
+                    item_location,
+                    f"player_key {entry.player_key!r} matches no player in this "
+                    "hand; the award cannot be attributed.",
+                )
+            continue
+        if not players:
+            continue
+        matches = names.get(entry.player_name, 0)
+        if matches == 0:
+            raise ImportValidationError(
+                item_location,
+                f"player {entry.player_name!r} is not among this hand's "
+                f"{len(players)} player(s); the award cannot be attributed.",
+            )
+        if matches > 1:
+            raise ImportValidationError(
+                item_location,
+                f"player {entry.player_name!r} is shared by {matches} players in "
+                "this hand and the award carries no player_key, so it cannot be "
+                "attributed to one of them.",
+            )
+
+
+def _assert_within_ceilings(payload: object) -> None:
+    """Refuse a payload too large to be a session before anything else walks it.
+
+    The equivalent ceiling used to exist only at the Streamlit upload widgets, so
+    ``import_session`` itself accepted an arbitrarily large or deeply nested
+    dict from any programmatic caller. Measured by traversal rather than by
+    re-serialising, because this function is also handed dicts that were never
+    JSON text and because ``json.dumps`` of a hostile payload is itself the
+    allocation being guarded against. Strings dominate an export's size, so their
+    combined length stands in for the byte ceiling; the value and depth limits
+    bound the shapes that are cheap on disk and expensive in memory. The walk
+    keeps its own stack so a deeply nested payload cannot exhaust Python's.
+    """
+
+    values = 0
+    text = 0
+    stack: list[tuple[object, int]] = [(payload, 1)]
+    while stack:
+        value, depth = stack.pop()
+        values += 1
+        if values > MAX_IMPORT_PAYLOAD_VALUES:
+            raise ImportValidationError(
+                "",
+                f"Import payload holds more than {MAX_IMPORT_PAYLOAD_VALUES} "
+                "values, which is far larger than any exported session.",
+            )
+        if depth > MAX_IMPORT_PAYLOAD_DEPTH:
+            raise ImportValidationError(
+                "",
+                f"Import payload nests deeper than {MAX_IMPORT_PAYLOAD_DEPTH} "
+                "levels; an exported session is a handful deep.",
+            )
+        if isinstance(value, str):
+            text += len(value)
+        elif isinstance(value, Mapping):
+            for key, item in value.items():
+                text += len(str(key))
+                stack.append((item, depth + 1))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                stack.append((item, depth + 1))
+        if text > MAX_IMPORT_PAYLOAD_TEXT_CHARS:
+            raise ImportValidationError(
+                "",
+                f"Import payload holds more than "
+                f"{MAX_IMPORT_PAYLOAD_TEXT_CHARS // (1024 * 1024)} MB of text.",
+            )
+
+
+def _require_mapping(value: object, location: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ImportValidationError(
+            location, f"expected an object, found {type(value).__name__}."
+        )
+    return value
+
+
+def _require_sequence(
+    container: Mapping[str, Any], key: str, location: str
+) -> Sequence[Any]:
+    value = container.get(key)
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ImportValidationError(
+            f"{location}.{key}", f"expected a list, found {type(value).__name__}."
+        )
+    return value
+
+
+def _records(
+    hand_payload: Mapping[str, Any], key: str, location: str
+) -> list[tuple[dict[str, Any], str]]:
+    """Each record under `key`, copied, re-parented, and paired with its location."""
+
+    prepared: list[tuple[dict[str, Any], str]] = []
+    for index, item in enumerate(_require_sequence(hand_payload, key, location)):
+        item_location = f"{location}.{key}[{index}]"
+        imported = dict(_require_mapping(item, item_location))
+        imported.pop("id", None)
+        imported["hand_id"] = 0
+        prepared.append((imported, item_location))
+    return prepared
+
+
+def _read_time_only_fields(model: type[BaseModel]) -> frozenset[str]:
+    """Fields the models mark ``exclude=True``: derivations about the current row.
+
+    ``Hand.derived_result_substituted`` and ``PersistedModel.unreadable_columns``
+    both document that no export, payload or database row can carry them -- and
+    both were true only of the EXPORT half. Nothing dropped them on the way IN,
+    so a hand-edited ``"derived_result_substituted": true`` was accepted by the
+    model and then refused by ``create_hand`` from the middle of the write pass.
+    Derived from the model rather than listed here, so a field added with
+    ``exclude=True`` later is covered without anyone remembering this exists.
+    """
+    return frozenset(
+        name for name, spec in model.model_fields.items() if spec.exclude
+    )
+
+
+def _build(model: type[ModelT], data: Mapping[str, Any], location: str) -> ModelT:
+    """Construct one record, reporting a field failure against its own location.
+
+    Pydantic already names the field and the value it refused; what it cannot
+    know is which of a session's several hundred records it was looking at, and
+    that is the part an operator needs to fix the file.
+    """
+
+    read_time_only = _read_time_only_fields(model)
+    if read_time_only & data.keys():
+        data = {key: value for key, value in data.items() if key not in read_time_only}
+    try:
+        return model(**data)
+    except ValidationError as exc:
+        raise ImportValidationError(location, str(exc)) from exc
+    except TypeError as exc:
+        raise ImportValidationError(
+            location, f"cannot be read as a {model.__name__} record. {exc}"
+        ) from exc
 
 
 def import_hands_into_session(
@@ -515,13 +884,20 @@ def _apply_completion_import_defaults(hand_data: dict[str, Any]) -> None:
     # every stripped, corrupt, pre-v5 or future-`evidence_version` payload derives
     # -- and one Acknowledge click then walked the hand to `complete`.
     declared = hand_data.get("completion_status")
+    # `isinstance` first: this runs on raw payload data, before `Hand` has had a
+    # chance to reject the field, so `declared` can be any JSON value. A hand
+    # edited to `"completion_status": []` made this membership test raise
+    # `TypeError: unhashable type: 'list'` out of the middle of the import.
     if (
-        declared in _IMPORT_COMPLETION_RESTRICTION
+        isinstance(declared, str)
+        and declared in _IMPORT_COMPLETION_RESTRICTION
         and derived in _IMPORT_COMPLETION_RESTRICTION
         and _IMPORT_COMPLETION_RESTRICTION[declared]
         > _IMPORT_COMPLETION_RESTRICTION[derived]
     ):
-        derived = declared
+        # The membership test above already restricts `declared` to the three
+        # CompletionStatus values, which mypy cannot infer through a str-keyed map.
+        derived = cast(CompletionStatus, declared)
     hand_data["completion_status"] = derived
     # Redundant in outcome, and deliberately kept as a local invariant rather than
     # advertised as the guard. `_enforce_review_status_floor` is where the
@@ -608,3 +984,28 @@ def _normalize_duplicate_action_indexes(actions: list[Action]) -> None:
             continue
         actions[index] = action.model_copy(update={"action_index": next_index[action.street]})
         next_index[action.street] += 1
+
+
+def _assign_missing_action_indexes(actions: list[Action]) -> None:
+    """Give every action its street order before the write, not during it.
+
+    ``create_action`` fills a NULL ``action_index`` with ``MAX + 1`` for the
+    street and then asserts the slot is free, so a payload mixing an explicit
+    index with a NULL one on the same street raised out of the middle of the
+    write pass rather than out of validation. Reproducing the writer's own
+    ``MAX + 1`` rule here -- rather than packing the indexes densely -- keeps the
+    stored order identical to what the writer would have chosen, and leaves it
+    nothing left to discover.
+    """
+    highest: dict[str, int] = {}
+    for action in actions:
+        if action.action_index is not None:
+            highest[action.street] = max(
+                highest.get(action.street, 0), action.action_index
+            )
+    for index, action in enumerate(actions):
+        if action.action_index is not None:
+            continue
+        assigned = highest.get(action.street, 0) + 1
+        highest[action.street] = assigned
+        actions[index] = action.model_copy(update={"action_index": assigned})

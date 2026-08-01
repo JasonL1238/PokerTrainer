@@ -1,0 +1,56 @@
+# Provider-neutral local deployment.
+#
+# This is the container definition the project supports: no hosting provider, no
+# TLS front end, no host-absolute paths. It is what restart, health and
+# persistence behaviour are validated against, and what deploy/oci builds on as
+# an optional reference for one specific provider.
+#
+#   cp deploy/.env.example .env      # then set APP_PASSWORD
+#   docker compose up -d
+#   docker compose ps                # wait for "healthy"
+#
+# Durable state lives in ./data on the host. Create it owned by the container
+# user before the first start:
+#
+#   mkdir -p data && sudo chown -R 10001:10001 data
+services:
+  app:
+    build:
+      context: .
+      args:
+        # none -> an image with no TexasSolver in it. The application degrades
+        # to "solver not configured" and every other feature is unaffected.
+        SOLVER_VARIANT: ${SOLVER_VARIANT:-bundled}
+    image: pokertrainer:local
+    restart: unless-stopped
+    # Everything configurable comes from .env so no value is pinned in a way an
+    # operator cannot override. Nothing here is a secret; APP_PASSWORD and any
+    # model-provider keys belong in .env, which is never committed.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PORT: ${PORT:-8501}
+      POKER_DB_PATH: /data/poker_tracker.db
+      POKER_DATA_DIR: /data
+      POKERTRAINER_REQUIRE_AUTH: "true"
+      # Refuse to start rather than write a study database into a container
+      # layer that the next `docker compose up --build` destroys.
+      POKERTRAINER_REQUIRE_DATA_MOUNT: "true"
+    volumes:
+      - ./data:/data
+    ports:
+      # Bound to loopback: this compose file is for a local machine, and the
+      # application's own password is not a substitute for a TLS front end.
+      - "127.0.0.1:${PORT:-8501}:${PORT:-8501}"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import os, urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('PORT', '8501') + '/_stcore/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    stop_grace_period: 30s

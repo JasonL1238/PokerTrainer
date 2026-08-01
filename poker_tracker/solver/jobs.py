@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import signal
@@ -24,6 +25,7 @@ from poker_tracker.solver.texassolver import (
 )
 
 DEFAULT_STALE_AFTER = timedelta(minutes=5)
+SOLVER_CHILD_PID_FILE = "solver_child.pid"
 
 
 class SolverJobAlreadyRunningError(RuntimeError):
@@ -41,6 +43,7 @@ def start_solver_job(
     binary = configured_binary()
     configured_resource_dir(binary)
     thread_count = _configured_thread_count()
+    memory_limit_bytes = configured_memory_limit_bytes()
     digest = input_hash(spot, range_ip, range_oop)
     combined_assumptions = list(
         dict.fromkeys(
@@ -63,6 +66,14 @@ def start_solver_job(
                     "not solved preflop GTO."
                     if range_oop.source in {"default", "builtin"}
                     else f"OOP range '{range_oop.profile_name}' was explicitly supplied by the user."
+                ),
+                *(
+                    [
+                        "Solver process memory was capped at "
+                        f"{memory_limit_bytes / 1024**3:g} GB."
+                    ]
+                    if memory_limit_bytes is not None
+                    else []
                 ),
                 *(assumptions or []),
                 *range_ip.mismatches,
@@ -199,9 +210,13 @@ def start_solver_job(
         )
     except Exception:
         _terminate_solver_group(process.pid)
+        # The worker dies before its own cleanup runs, so anything it managed to
+        # launch in the moment it was alive has to be collected from here.
+        _terminate_solver_child_process(run)
         raise
     if launched.status != "running" or launched.pid != process.pid:
         _terminate_solver_group(process.pid)
+        _terminate_solver_child_process(run)
         if launched.status == "cancelling":
             db.update_solver_run(
                 run.id,
@@ -306,9 +321,18 @@ def cancel_solver_run(db: PokerDatabase, run_id: int) -> SolverRun:
         raise ValueError("Solver run not found.")
     if run.status not in {"queued", "running", "cancelling"}:
         return run
+    # The solver runs in its own session, so a killpg aimed at the worker no
+    # longer reaches it. Stop the expensive process first: if the worker then
+    # refuses to die the run parks in 'cancelling' without a multi-gigabyte
+    # solve still burning the host behind it.
+    _terminate_solver_child_process(run)
     if run.pid and not _terminate_solver_group(run.pid):
+        current = db.fetch_solver_run(run_id)
+        if current is not None and current.status not in {"queued", "running", "cancelling"}:
+            return current
         return db.update_solver_run(
             run_id,
+            expected_statuses=("queued", "running", "cancelling"),
             status="cancelling",
             error_message="Cancellation requested; waiting for the solver worker to stop.",
         )
@@ -339,6 +363,10 @@ def reconcile_stale_solver_runs(
             continue
         if not stale and alive:
             continue
+        # Past this point the run is finished one way or another, so nothing may
+        # be left solving on its behalf. The solver has its own session and
+        # outlives a killed worker unless it is reached through its pid file.
+        _terminate_solver_child_process(run)
         if run.status == "cancelling" and not alive:
             db.update_solver_run(
                 run.id,
@@ -360,6 +388,36 @@ def reconcile_stale_solver_runs(
     return failed
 
 
+def _process_group_is_alive(pgid: int) -> bool:
+    """True while any member of the process group survives, leader or not."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return not _refusal_means_the_group_is_gone(pgid)
+    return True
+
+
+def _refusal_means_the_group_is_gone(pid: int) -> bool:
+    """Whether a refused group signal means nothing but corpses is left.
+
+    Darwin refuses killpg with EPERM once every remaining member is an unreaped
+    corpse, which reads identically to a group this user may not signal. The
+    leader tells them apart: a pid this process can still signal, or that has
+    already gone, was one of ours, so the refusal was about the dead. Reading
+    that as a live process instead used to park every cancellation of an
+    already-exited worker in 'cancelling' until the stale sweep ran.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    return True
+
+
 def _pid_is_alive(pid: int | None) -> bool:
     if pid is None:
         return False
@@ -370,6 +428,71 @@ def _pid_is_alive(pid: int | None) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def solver_child_pid_path(run_dir: Path) -> Path:
+    """Where the worker records the pid of the solver it launched.
+
+    The solver gets its own session so the worker can kill everything the solve
+    forks without signalling itself, which also puts it out of reach of a
+    killpg aimed at the worker's group. Cancellation and reconciliation follow
+    this file to it, the same way the reconstruction pipeline's sidecar pid file
+    works.
+    """
+    return run_dir / SOLVER_CHILD_PID_FILE
+
+
+def _terminate_solver_child_process(run: SolverRun) -> None:
+    """Kill the detached solver recorded beside a run's command file."""
+    if not run.command_path:
+        return
+    pid_path = solver_child_pid_path(Path(run.command_path).parent)
+    try:
+        child_pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        # No pid file means no solver was ever launched for this run, or the
+        # worker already reaped it and cleaned up. Both are the normal case.
+        return
+    _terminate_solver_group(child_pid)
+    try:
+        pid_path.unlink(missing_ok=True)
+    except OSError:
+        # A pid file we cannot remove is harmless; the run directory is
+        # per-run, so nothing else will follow it to a recycled pid.
+        pass
+
+
+def configured_memory_limit_bytes() -> int | None:
+    """Return the address-space cap for the solver child, or None when uncapped.
+
+    A cap the operator asked for and did not get is worse than no cap at all:
+    they believe the container's limit is holding while a deep river tree grows
+    until the host OOM killer fires and takes Streamlit and any concurrent
+    write with it. So every way of asking for a cap that cannot be honoured
+    raises here, before a run row exists and while the operator can still fix
+    the environment.
+    """
+    raw = os.environ.get("POKERTRAINER_SOLVER_MEMORY_GB", "").strip()
+    if not raw:
+        return None
+    try:
+        limit_gb = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "POKERTRAINER_SOLVER_MEMORY_GB must be a plain number of gigabytes "
+            f"such as 8 or 6.5, with no unit suffix; got {raw!r}."
+        ) from exc
+    if not math.isfinite(limit_gb) or limit_gb <= 0:
+        raise ValueError(
+            "POKERTRAINER_SOLVER_MEMORY_GB must be a finite number of gigabytes "
+            f"greater than zero; got {raw!r}."
+        )
+    if os.name != "posix":
+        raise ValueError(
+            "POKERTRAINER_SOLVER_MEMORY_GB cannot be enforced on this platform; "
+            "unset it rather than solve while believing a cap is in force."
+        )
+    return int(limit_gb * 1024**3)
 
 
 def _configured_thread_count() -> int:
@@ -386,12 +509,21 @@ def _configured_thread_count() -> int:
     return threads
 
 
-def _terminate_solver_group(pid: int | None) -> bool:
+def _terminate_solver_group(pid: int | None, *, grace_seconds: float = 0.5) -> bool:
+    """Send TERM then KILL to a process group; True only when the pid is gone.
+
+    ``grace_seconds`` is how long the leader is given to exit on its own. The
+    worker allows the solver longer than the UI allows the worker, because a
+    solve inside a CFR iteration answers a signal late while a Python worker
+    answers immediately.
+    """
     if pid is None:
         return True
+    signalled_group = True
     try:
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
+        signalled_group = False
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -399,10 +531,15 @@ def _terminate_solver_group(pid: int | None) -> bool:
         except PermissionError:
             return False
     except PermissionError:
-        return False
-    deadline = time.monotonic() + 0.5
+        return _refusal_means_the_group_is_gone(pid)
+    deadline = time.monotonic() + grace_seconds
     while time.monotonic() < deadline:
-        if not _pid_is_alive(pid):
+        # Waiting on the leader alone declared success while everything it
+        # forked was still solving: a group member outlives its parent and is
+        # reparented away, and that member is what still holds the memory and
+        # the threads. Escalation has to be driven by the group.
+        alive = _process_group_is_alive(pid) if signalled_group else _pid_is_alive(pid)
+        if not alive:
             return True
         time.sleep(0.05)
     try:
@@ -415,7 +552,7 @@ def _terminate_solver_group(pid: int | None) -> bool:
         except PermissionError:
             return False
     except PermissionError:
-        return False
+        return _refusal_means_the_group_is_gone(pid)
     return True
 
 
