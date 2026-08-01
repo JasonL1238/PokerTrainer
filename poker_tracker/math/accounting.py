@@ -180,6 +180,13 @@ def build_hand_ledger(
     odd_order = _validate_odd_chip_order(odd_chip_order, starting)
 
     contributions = {name: _ZERO for name in player_order}
+    # Split the same chips two ways. ``live_contributions`` buys a place in a pot
+    # layer and is what an uncalled bet is measured against; ``dead_contributions``
+    # (antes, dead blinds) is owed to the table and joins the main pot whole.
+    # Measuring refunds against the total instead hands back an unmatched ante as
+    # though it were an overbet, and removes it from the pot entirely.
+    live_contributions = {name: _ZERO for name in player_order}
+    dead_contributions = {name: _ZERO for name in player_order}
     street_contributions = {name: _ZERO for name in player_order}
     current_street: LedgerStreet | None = None
     folded: set[str] = set()
@@ -298,6 +305,13 @@ def build_hand_ledger(
             is_live_bet = action.kind in _BETTING_COMMITMENT_KINDS and not (
                 action.kind == "post_blind" and not action.is_live_post
             )
+            # Live money buys a place in a pot layer and can come back as an
+            # uncalled bet. Dead money -- antes and dead blinds -- is owed to the
+            # table: it joins the main pot whole and is never returnable.
+            if is_live_bet:
+                live_contributions[action.player] += amount
+            else:
+                dead_contributions[action.player] += amount
             if is_live_bet:
                 street_contributions[action.player] += amount
                 new_max = max(street_contributions.values(), default=_ZERO)
@@ -359,11 +373,15 @@ def build_hand_ledger(
             )
         )
 
-    refunds = _uncalled_refunds(player_order, contributions)
+    # Only live money can be uncalled. An ante nobody matched is not an overbet.
+    refunds = _uncalled_refunds(player_order, live_contributions)
     settled_contributions = {
-        name: contributions[name] - refunds[name] for name in player_order
+        name: live_contributions[name] - refunds[name] for name in player_order
     }
-    raw_pots = _build_pots(player_order, settled_contributions, folded, dead)
+    # Dead money pools into the main pot rather than forming a layer only its
+    # poster is eligible for: a lone button ante belongs to whoever wins the hand.
+    total_dead = dead + sum(dead_contributions.values(), _ZERO)
+    raw_pots = _build_pots(player_order, settled_contributions, folded, total_dead)
     _validate_winners(winner_map, raw_pots, starting, folded)
 
     gross = sum((pot["amount"] for pot in raw_pots), _ZERO)
@@ -386,7 +404,7 @@ def build_hand_ledger(
     # unit" -- is deliberately NOT passed and neither is anything computed from
     # it: it rounds the rake and nothing else, so the granularity a chopped pot
     # is divided at is the same at every declared value, at every rake rate.
-    split_unit = _split_granularity(settled_contributions.values(), dead)
+    split_unit = _split_granularity(settled_contributions.values(), total_dead)
 
     for index, pot in enumerate(raw_pots):
         pot_winners = winner_map.get(index, ())

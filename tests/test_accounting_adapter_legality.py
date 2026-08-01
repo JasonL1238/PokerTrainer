@@ -174,8 +174,14 @@ def test_dead_blind_does_not_reduce_a_later_raise_to_amount() -> None:
         [5, 2, 10, 8]
     )
     assert ledger.contributions == pytest.approx({"A": 15, "B": 10})
-    assert ledger.gross_pot == pytest.approx(20)
-    assert ledger.refunds == pytest.approx({"A": 5, "B": 0})
+    # The dead blind stays in the pot. Both players put 10 of live money in, so
+    # nothing is uncalled; A's 5 dead chips are owed to the table, not to A.
+    # This previously refunded the dead post as though it were an unmatched
+    # overbet, which took five chips off the table entirely.
+    assert ledger.refunds == pytest.approx({"A": 0, "B": 0})
+    assert ledger.gross_pot == pytest.approx(25)
+    assert ledger.net_results == pytest.approx({"A": 10, "B": -10})
+    assert sum(ledger.net_results.values()) == pytest.approx(0)
     assert ledger.is_legal is True
 
 

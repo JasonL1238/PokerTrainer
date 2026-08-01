@@ -199,9 +199,14 @@ def test_antes_are_dead_money_and_do_not_reduce_the_preflop_call_increment() -> 
             _action("SB", "call", 1),
             _action("BB", "check"),
         ],
-        winners={0: ("SB",), 1: ("SB",)},
+        winners={0: ("SB",)},
     )
 
+    # Antes are dead money, so they pool into the main pot instead of forming a
+    # layer per poster. The folded button's ante is contested by whoever wins the
+    # hand; it used to become a side pot only the button was a contributor to.
+    assert len(ledger.pots) == 1
+    assert ledger.pots[0].eligible_players == ("SB", "BB")
     assert ledger.contributions == pytest.approx({"BTN": 1, "SB": 3, "BB": 3})
     assert ledger.gross_pot == pytest.approx(7)
     assert ledger.payouts == pytest.approx({"BTN": 0, "SB": 7, "BB": 0})
@@ -451,3 +456,166 @@ def test_invalid_rake_policy_raises(policy_kwargs: dict[str, float]) -> None:
             winners={0: ("A",)},
             rake=policy,
         )
+
+
+# --- Forced posts PLAN Phase 7 names but nothing pinned ---------------------
+
+
+def test_a_live_straddle_raises_the_amount_to_call() -> None:
+    """A straddle is a live post: it sets the price, unlike an ante.
+
+    Blinds 1/2, UTG straddles to 4. The next player faces 4, not 2, and the
+    straddler's own 4 counts toward what they have already put in.
+    """
+    players = [
+        LedgerPlayer(name="sb", starting_stack=100, seat=0),
+        LedgerPlayer(name="bb", starting_stack=100, seat=1),
+        LedgerPlayer(name="straddler", starting_stack=100, seat=2),
+        LedgerPlayer(name="utg1", starting_stack=100, seat=3),
+    ]
+    actions = [
+        LedgerAction(player="sb", street="preflop", kind="post_blind", amount=1),
+        LedgerAction(player="bb", street="preflop", kind="post_blind", amount=2),
+        LedgerAction(player="straddler", street="preflop", kind="post_blind", amount=4),
+        LedgerAction(player="utg1", street="preflop", kind="call", amount=4),
+        LedgerAction(player="sb", street="preflop", kind="fold"),
+        LedgerAction(player="bb", street="preflop", kind="fold"),
+        LedgerAction(player="straddler", street="preflop", kind="check"),
+    ]
+    # Four distinct commitment levels (1, 2, 4) make three layers; the
+    # straddler is eligible for all of them.
+    layers = build_hand_ledger(players, actions).pots
+    ledger = build_hand_ledger(
+        players, actions, {pot.index: ("straddler",) for pot in layers}
+    )
+
+    # The caller faced the straddle, not the big blind.
+    call_snapshot = next(s for s in ledger.snapshots if s.player == "utg1")
+    assert call_snapshot.to_call_before == 4
+    # Checking behind a straddle you already paid for is legal.
+    assert ledger.is_legal, ledger.legality_issues
+    assert ledger.gross_pot == 11
+    assert ledger.is_balanced
+
+
+def test_a_dead_blind_reaches_the_pot_without_buying_any_of_the_call() -> None:
+    """A dead post is money owed to the table, not money toward this bet.
+
+    The returning player posts 2 dead and still owes the full big blind to see
+    a flop. Charging the dead chip against the call would let them in cheap and
+    would under-count the pot by the same amount.
+    """
+    players = [
+        LedgerPlayer(name="bb", starting_stack=100, seat=0),
+        LedgerPlayer(name="returning", starting_stack=100, seat=1),
+    ]
+    actions = [
+        LedgerAction(player="bb", street="preflop", kind="post_blind", amount=2),
+        LedgerAction(
+            player="returning",
+            street="preflop",
+            kind="post_blind",
+            amount=2,
+            is_live_post=False,
+        ),
+        LedgerAction(player="returning", street="preflop", kind="call", amount=2),
+        LedgerAction(player="bb", street="preflop", kind="check"),
+    ]
+    ledger = build_hand_ledger(players, actions, {0: ("bb",)})
+
+    # The dead post did not reduce what was owed.
+    call_snapshot = next(
+        s for s in ledger.snapshots if s.player == "returning" and s.kind == "call"
+    )
+    assert call_snapshot.to_call_before == 2
+    assert ledger.is_legal, ledger.legality_issues
+    # 2 blind + 2 dead + 2 call: every chip posted is in the pot.
+    assert ledger.contributions["returning"] == 4
+    assert ledger.gross_pot == 6
+    assert ledger.is_balanced
+
+
+def test_three_way_all_in_builds_two_side_pots_and_conserves() -> None:
+    """The layering case: three distinct stacks make a main and two sides."""
+    players = [
+        LedgerPlayer(name="short", starting_stack=10, seat=0),
+        LedgerPlayer(name="mid", starting_stack=40, seat=1),
+        LedgerPlayer(name="deep", starting_stack=100, seat=2),
+    ]
+    actions = [
+        LedgerAction(player="short", street="preflop", kind="all-in", amount=10),
+        LedgerAction(player="mid", street="preflop", kind="all-in", amount=40),
+        LedgerAction(player="deep", street="preflop", kind="all-in", amount=100),
+    ]
+    unsettled = build_hand_ledger(players, actions)
+    # 30 main (10 x 3), 60 side (30 x 2), and 60 uncalled returned to deep.
+    assert [pot.amount for pot in unsettled.pots] == [30, 60]
+    assert unsettled.refunds["deep"] == 60
+
+    ledger = build_hand_ledger(
+        players, actions, {0: ("short",), 1: ("mid",)}
+    )
+    assert ledger.payouts["short"] == 30
+    assert ledger.payouts["mid"] == 60
+    assert ledger.net_results["short"] == 20
+    assert ledger.net_results["mid"] == 20
+    assert ledger.net_results["deep"] == -40
+    assert sum(ledger.net_results.values()) == 0
+    assert ledger.is_balanced
+
+
+def test_a_lone_ante_is_not_refunded_as_an_uncalled_bet() -> None:
+    """Dead money nobody matched stays in the pot.
+
+    Refunds used to be measured against total contributions, so an ante or dead
+    blind that no opponent matched looked exactly like an unmatched overbet and
+    was handed back. A single button ante of 5 was returned in full and the pot
+    was short by the same 5 chips — money that left the table entirely.
+    """
+    players = [_player("BTN"), _player("BB")]
+    actions = [
+        _action("BTN", "ante", 5),
+        _action("BB", "post_blind", 2),
+        _action("BTN", "call", 2),
+        _action("BB", "check"),
+    ]
+    ledger = build_hand_ledger(players, actions, {0: ("BB",)})
+
+    assert ledger.refunds == pytest.approx({"BTN": 0, "BB": 0})
+    assert ledger.contributions == pytest.approx({"BTN": 7, "BB": 2})
+    assert ledger.gross_pot == pytest.approx(9)
+    assert ledger.payouts == pytest.approx({"BTN": 0, "BB": 9})
+    assert ledger.net_results == pytest.approx({"BTN": -7, "BB": 7})
+    assert sum(ledger.net_results.values()) == pytest.approx(0)
+    assert ledger.is_balanced is True
+
+
+def test_an_unmatched_live_bet_is_still_refunded() -> None:
+    """The repair must not stop real uncalled bets from coming back."""
+    players = [_player("A"), _player("B")]
+    actions = [
+        _action("A", "bet", 50, "river"),
+        _action("B", "fold", street="river"),
+    ]
+    # Every chip comes back, so there is no contestable pot to declare.
+    ledger = build_hand_ledger(players, actions)
+    assert ledger.refunds["A"] == pytest.approx(50)
+    assert ledger.gross_pot == pytest.approx(0)
+    assert ledger.net_results == pytest.approx({"A": 0, "B": 0})
+
+
+def test_dead_money_and_a_live_overbet_are_settled_independently() -> None:
+    """One player holding both an unmatched ante and an unmatched bet."""
+    players = [_player("A", stack=200), _player("B", stack=200)]
+    actions = [
+        _action("A", "ante", 3),
+        _action("A", "bet", 50, "river"),
+        _action("B", "call", 20, "river"),
+        _action("B", "fold", street="river"),
+    ]
+    ledger = build_hand_ledger(players, actions, {0: ("A",)})
+
+    # 30 of the bet was never called and comes back; the ante does not.
+    assert ledger.refunds == pytest.approx({"A": 30, "B": 0})
+    assert ledger.gross_pot == pytest.approx(43)
+    assert sum(ledger.net_results.values()) == pytest.approx(0)
