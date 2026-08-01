@@ -774,3 +774,80 @@ def test_the_caption_distinguishes_no_figure_from_a_condemned_one() -> None:
         detail="No frame before this action shows this seat's stack.",
     )
     assert _issue_rules_out_its_figure(withheld) is False
+
+
+def _post_action_context() -> ValidationFrameContext:
+    hand = _hand()
+    hand["actions"][0]["amount"] = 10.0
+    states = _states()
+    states[0]["bets"] = {"1": 10.0}
+    states[0]["stacks"] = {"1": 190.0}
+    return ValidationFrameContext(
+        job_id=1, hand_number=1, timeline_hand=hand, states=states,
+        reviews_by_image={}, cursor_key="c", pending_hand_key="p",
+        recording_start_s=0.0,
+    )
+
+
+@pytest.mark.parametrize("provenance", [FRAME_A, None])
+def test_a_retype_never_goes_silent_in_either_provenance_mode(provenance) -> None:
+    """B14 round 14 F1: the retirement notice was gated on `detached`, which
+    needs recorded provenance — so the rows the backfill legitimately refuses
+    went completely silent with the condemned value still saved. The round-13
+    test could not see it because its fixture always had provenance."""
+    context = _post_action_context()
+    before = _cv_issues_for_db_action(
+        _row(amount=10.0, stack_before=190.0, source_image=provenance), context
+    )
+    assert any(
+        issue.kind == "Stack before looks post-action" for issue in before
+    )
+    after = _cv_issues_for_db_action(
+        _row(
+            action_type="fold",
+            amount=10.0,
+            stack_before=190.0,
+            source_image=provenance,
+        ),
+        context,
+    )
+    assert after, f"the row went silent with provenance={provenance!r}"
+    assert any(issue.kind == "Check no longer applies" for issue in after)
+
+
+def test_frame_checks_notice_never_contradicts_a_live_frame_check() -> None:
+    """B14 round 14 F2: it announced that frame checks could not be applied
+    while two of them were applied directly above."""
+    issues = _cv_issues_for_db_action(
+        _row(action_type="bet", source_image=None), _no_cards_context()
+    )
+    kinds = {issue.kind for issue in issues}
+    assert "Seat not in the hand on this frame" in kinds
+    assert "Frame checks no longer apply" not in kinds
+
+    # With no frame evidence at all, the notice is the honest thing to say.
+    stranded = _cv_issues_for_db_action(
+        _row(street="turn", action_index=7, source_image=None), _context()
+    )
+    assert any(issue.kind == "Frame checks no longer apply" for issue in stranded)
+
+
+def test_every_issue_kind_has_a_badge_rank() -> None:
+    """B14 round 14: 'Check no longer applies' fell to the default rank, below
+    less severe kinds, and could be pushed off the two-slot badge."""
+    from app import _BADGE_RANK
+
+    for kind in (
+        "Action may not belong to this hand",
+        "Seat not in the hand on this frame",
+        "Stack before looks post-action",
+        "Check no longer applies",
+        "Amount unknown",
+        "Stack before unknown",
+        "Unmeasured transition",
+        "Coverage gap",
+        "Moved off its source street",
+        "Frame checks no longer apply",
+        "Edited line",
+    ):
+        assert kind in _BADGE_RANK, f"{kind} would fall to the default rank"

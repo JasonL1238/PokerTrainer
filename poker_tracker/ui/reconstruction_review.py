@@ -785,7 +785,7 @@ def cv_issues_for_timeline_action(
                 detail=(
                     f"This line was reconstructed on the {origin_street} from "
                     f"{frame_ref}, but it is now saved on the {row_street}. "
-                    "The frame-based notes below still describe the "
+                    "The frame-based notes on this row still describe the "
                     f"{origin_street} line — re-check them against the frames "
                     "for its new street."
                 ),
@@ -932,6 +932,16 @@ def cv_issues_for_timeline_action(
             # so the action's own frame reads the stack AFTER this action.
             # Every branch that CITES a frame already refuses to use this one;
             # a saved value taken from it was never checked.
+            unsized = str(
+                _starting_stack_unknown_code(hand, seat) or ""
+            ).startswith("committed_at_start")
+            caveat = (
+                " This seat also had chips in front of it before the first "
+                "frame that could not be sized, so the box total may include "
+                "more than this action."
+                if unsized
+                else ""
+            )
             issues.append(
                 ActionCvIssue(
                     kind="Stack before looks post-action",
@@ -940,7 +950,7 @@ def cv_issues_for_timeline_action(
                         f"{frame_ref} reads after this seat's chips moved, so "
                         "it is the stack AFTER this action, not before it. "
                         "Re-read that frame and add back what this action "
-                        "put in."
+                        f"put in.{caveat}"
                     ),
                     frame_index=frame_index,
                 )

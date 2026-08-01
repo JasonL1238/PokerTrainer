@@ -5946,9 +5946,13 @@ def _cv_issues_for_db_action(
         detached = not _row_still_matches_origin(action, origin)
 
     if origin is None:
-        return _issues_for_unattributable_row(
+        issues = _issues_for_unattributable_row(
             action, frame_context, fallback_frame_index
         )
+        retired = _retired_check_notice(action, frame_context, issues)
+        if retired is not None:
+            issues.append(retired)
+        return issues
 
     issues = cv_issues_for_timeline_action(
         origin,
@@ -5960,12 +5964,9 @@ def _cv_issues_for_db_action(
         db_street=action.street,
         db_action_type=action.action_type,
     )
-    if detached:
-        retired = _claims_retired_by_the_edit(
-            action, origin, frame_context, issues
-        )
-        if retired:
-            issues.append(retired)
+    retired = _claims_retired_by_the_edit(action, origin, frame_context, issues)
+    if retired is not None:
+        issues.append(retired)
     if detached and issues:
         # Never let a correction silently clear a live warning: say the
         # warnings are re-derived from the frame this row came from.
@@ -6010,11 +6011,38 @@ def _origin_is_unambiguous(
     return len(same_frame) == 1
 
 
+def _retired_check_notice(
+    action: Action,
+    frame_context: ValidationFrameContext,
+    issues: list[ActionCvIssue],
+) -> ActionCvIssue | None:
+    """Warn when a row that the frames used to object to now says nothing.
+
+    Provenance-independent on purpose: the rows the backfill legitimately
+    refuses are exactly the ones that lose their origin on an edit, and going
+    quiet reads as resolved while the objected-to value is still stored.
+    """
+
+    origin = timeline_action_by_frame_and_seat(
+        frame_context.timeline_hand,
+        _timeline_source_image_for_action(action, frame_context)
+        or _slot_source_image_ignoring_identity(action, frame_context),
+        _seat_index_for_action(action, frame_context),
+    )
+    if origin is None:
+        return None
+    return _claims_retired_by_the_edit(
+        action, origin, frame_context, issues, only_if_silent=True
+    )
+
+
 def _claims_retired_by_the_edit(
     action: Action,
     origin: dict[str, object],
     frame_context: ValidationFrameContext,
     issues: list[ActionCvIssue],
+    *,
+    only_if_silent: bool = False,
 ) -> ActionCvIssue | None:
     """Warn when an edit stopped a check that had been flagging a saved value.
 
@@ -6025,6 +6053,8 @@ def _claims_retired_by_the_edit(
     """
 
     kinds_now = {issue.kind for issue in issues}
+    if only_if_silent and kinds_now - {"Frame checks no longer apply"}:
+        return None
     before = cv_issues_for_timeline_action(
         origin,
         frame_context.timeline_hand,
@@ -6102,6 +6132,8 @@ _BADGE_RANK = {
     "Coverage gap": 6,
     "Moved off its source street": 7,
     "Frame checks no longer apply": 8,
+    "Check no longer applies": 2,
+    "Edited line": 9,
 }
 
 
@@ -6245,8 +6277,9 @@ def _issues_for_unattributable_row(
             where = "Read the amount off the frames and enter it below."
         else:
             where = (
-                f"{_frame_phrase(own_index, action).capitalize()} — open it, "
-                "read the chips this seat added, and enter that below."
+                f"{_frame_phrase(own_index, action).capitalize().rstrip(',')} "
+                "— open it, read the chips this seat added, and enter that "
+                "below."
             )
         issues.append(
             ActionCvIssue(
@@ -6259,20 +6292,25 @@ def _issues_for_unattributable_row(
                 frame_index=own_index,
             )
         )
-    issues.extend(_frame_evidence_for_row(action, frame_context, own_image))
+    frame_evidence = _frame_evidence_for_row(action, frame_context, own_image)
+    issues.extend(frame_evidence)
     needs_amount = action.action_type.replace("-", "_") in MONEY_ACTION_TYPES
-    if not action.source_image and (
-        action.stack_before is None or (needs_amount and action.amount is None)
+    if (
+        not action.source_image
+        and not frame_evidence
+        and (action.stack_before is None or (needs_amount and action.amount is None))
     ):
+        # Only when no frame-derived check actually ran: saying they cannot be
+        # applied while two of them are applied above is a contradiction.
+        fields = "Stack before" if not needs_amount else "Amount and Stack before"
         issues.append(
             ActionCvIssue(
                 kind="Frame checks no longer apply",
                 detail=(
                     "No source frame was recorded for this line and it no "
                     "longer matches any reconstructed line, so the import's "
-                    "frame-based checks — including any earlier stack warning "
-                    "— can no longer be applied. Re-check its Amount and "
-                    "Stack before against the frames yourself."
+                    f"frame-based checks cannot be applied to it. Check its "
+                    f"{fields} against the frames yourself."
                 ),
             )
         )

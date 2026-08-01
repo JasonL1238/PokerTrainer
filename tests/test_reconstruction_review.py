@@ -1979,3 +1979,55 @@ def test_a_stale_hint_never_claims_to_offer_a_value() -> None:
     )
     assert "put chips in since then" in issue.detail
     assert issue.offers_a_value is False, "a stale figure was offered as usable"
+
+
+def test_the_moved_street_hedge_does_not_point_below_itself() -> None:
+    """B14 round 14 F3: the severity re-order moved this message last, so its
+    'the notes below' referred to nothing — its referents render above it."""
+    hand, states = _cv_issue_fixture()
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            hand["actions"][1],
+            hand,
+            states,
+            db_amount=None,
+            db_stack_before=224.2,
+            db_street="river",
+        )
+        if issue.kind == "Moved off its source street"
+    )
+    assert "notes below" not in issue.detail
+    assert "notes on this row" in issue.detail
+
+
+def test_the_post_action_claim_hedges_unsized_starting_chips() -> None:
+    """B14 round 14 F4: the ladder already hedges when a seat's committed
+    chips at hand start were never sized; its saved-value twin did not, so it
+    asked for arithmetic the box total cannot support."""
+    hand, states = _cv_issue_fixture()
+    hand = dict(
+        hand,
+        players=[
+            {
+                "seat": 7, "player_name": "Seat7", "position": "BB",
+                "starting_stack": None,
+                "starting_stack_unknown": "committed_at_start_unknown",
+            }
+        ],
+    )
+    states[1]["stacks"] = {"7": 212.2}
+    states[1]["bets"] = {"7": 12.0}
+    issue = next(
+        issue
+        for issue in cv_issues_for_timeline_action(
+            dict(hand["actions"][1], stack_before=None),
+            hand,
+            states,
+            db_amount=12.0,
+            db_stack_before=212.2,
+        )
+        if issue.kind == "Stack before looks post-action"
+    )
+    assert "could not be sized" in issue.detail
+    assert "may include more than this action" in issue.detail
