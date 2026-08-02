@@ -441,8 +441,13 @@ def test_a_binary_evidence_blob_degrades_instead_of_breaking_the_hand_list() -> 
     hands = db.fetch_hands_by_session(session.id)
 
     assert len(hands) == 2
-    assert hands[-1].completion_evidence == {}
     assert parse_completion_evidence(hands[-1].completion_evidence).is_known is False
+    # Degrading is not the same as forgetting: the damaged bytes are recorded as
+    # an unreadable column, so the hand cannot pass as one that simply carries no
+    # evidence, and the undamaged hand beside it is untouched.
+    assert hands[-1].unreadable_columns == ("completion_evidence",)
+    assert hands[-1].review_status == "needs_correction"
+    assert hands[0].unreadable_columns == ()
     db.close()
 
 

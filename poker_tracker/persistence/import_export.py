@@ -8,6 +8,13 @@ picked is the separate, explicit ``import_hands_into_session``. There is no
 update path in this module, which is why silent overwrite is not merely
 unlikely but unreachable.
 
+The append is no longer SILENT. A copy whose content already exists in this
+database is named and annotated as a re-import (``_label_duplicate_import``), so
+two identical sessions can be told apart in the session list and the second one
+states that both of them are being counted in every total. It is still created:
+see that function for what refusing it would cost and why that decision is not
+made here.
+
 Every claim a payload makes about its own trustworthiness is re-derived here
 rather than believed: coaching lands stale, issues land open, ``reviewed`` lands
 demoted, and completion status is recomputed from the evidence. See the
@@ -17,6 +24,7 @@ the evidence for it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -249,7 +257,8 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
 
     Never updates or replaces an existing session, whatever ids the payload
     carries; re-importing the same file appends a second copy. See the module
-    docstring for why that is the whole of the duplicate-import contract.
+    docstring for why that is the whole of the duplicate-import contract, and
+    ``_label_duplicate_import`` for why an appended copy must say so.
     """
     validated = validate_import_payload(payload)
 
@@ -308,6 +317,10 @@ def import_session(db: PokerDatabase, payload: dict[str, Any]) -> Session:
             db.create_coaching_response(
                 review.model_copy(update={"session_id": session.id})
             )
+        # Last, and inside the same transaction: the comparison is made against
+        # the rows this import actually wrote, through the same readers, so no
+        # field mapping between payload and row can drift out of step with it.
+        session = _label_duplicate_import(db, session)
 
     return session
 
@@ -912,6 +925,138 @@ def _apply_completion_import_defaults(hand_data: dict[str, Any]) -> None:
         and hand_data.get("review_status") == "reviewed"
     ):
         hand_data["review_status"] = "needs_correction"
+
+
+# What a content fingerprint must NOT be computed over.
+#
+# The first three are this database's own bookkeeping: the auto-assigned ids, and
+# the row-creation timestamp a payload does not have to carry (a payload without
+# one gets a fresh timestamp per import, so including it would make every
+# re-import look new -- the silence this comparison exists to end).
+#
+# The rest are the fields IMPORT ITSELF re-derives, which is stated at the top of
+# this module: `reviewed` lands demoted, the completion status is recomputed from
+# the evidence, and the evidence blob is re-stamped with the import marker. They
+# are assertions ABOUT a hand rather than observations OF it, and an assertion
+# the importer rewrites cannot take part in deciding whether the payload and the
+# rows are the same poker -- comparing them made a session's own export fail to
+# match the session it came from, which is exactly the re-import an operator
+# makes. ``study_inclusion`` is the same kind of thing: a queue preference, not a
+# fact about the hand.
+_CONTENT_FINGERPRINT_IGNORED = frozenset(
+    {
+        "id",
+        "session_id",
+        "created_at",
+        "review_status",
+        "completion_status",
+        "completion_evidence",
+        "study_inclusion",
+    }
+)
+
+DUPLICATE_IMPORT_NAME_SUFFIX = "re-imported copy #{session_id}"
+
+DUPLICATE_IMPORT_NOTE = (
+    "Re-imported copy: this session's hands were already in this database as "
+    "session {other_id} when it was imported. BOTH copies are counted in every "
+    "session, hand, BB and study-theme total until one of them is deleted "
+    "(Sessions -> Delete session)."
+)
+
+
+def _content_fingerprint_fields(model: BaseModel) -> dict[str, Any]:
+    """One record's content, with this database's own bookkeeping removed."""
+    return {
+        key: value
+        for key, value in model.model_dump(mode="json").items()
+        if key not in _CONTENT_FINGERPRINT_IGNORED
+    }
+
+
+def _session_content_fingerprint(db: PokerDatabase, session: Session) -> str:
+    """A digest of what a session IS: its own fields, plus every hand it holds.
+
+    Read back out of the database on both sides of the comparison rather than
+    computed from the payload on one side and the rows on the other, so the two
+    sides cannot disagree about which fields import rewrites (``review_status``
+    is floored, ``completion_status`` re-derived, the evidence blob re-stamped).
+    A payload that produced these rows once produces byte-identical rows again.
+    """
+    if session.id is None:
+        return ""
+    hands = sorted(
+        db.fetch_hands_by_session(session.id), key=lambda hand: hand.hand_number
+    )
+    content = {
+        "session": _content_fingerprint_fields(session),
+        "hands": [_content_fingerprint_fields(hand) for hand in hands],
+    }
+    return hashlib.sha256(
+        json.dumps(content, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _duplicated_session_id(db: PokerDatabase, session: Session) -> int | None:
+    """The oldest existing session this one is a re-import of, if there is one."""
+    fingerprint = _session_content_fingerprint(db, session)
+    if not fingerprint:
+        return None
+    candidates = [
+        existing
+        for existing in db.fetch_sessions()
+        if existing.id is not None
+        and existing.id != session.id
+        # Cheap pre-filter over columns the fingerprint covers anyway, so the
+        # hand rows of unrelated sessions are never read.
+        and existing.name == session.name
+        and existing.date_played == session.date_played
+    ]
+    for existing in sorted(candidates, key=lambda item: item.id or 0):
+        if _session_content_fingerprint(db, existing) == fingerprint:
+            return existing.id
+    return None
+
+
+def _label_duplicate_import(db: PokerDatabase, session: Session) -> Session:
+    """Make an appended duplicate say that it is one.
+
+    Import is an APPEND and stays one -- see the module docstring for why no
+    payload may address, replace or edit an existing session. What was missing is
+    that the append was SILENT: re-importing an exported file (after a scare, or
+    because the operator forgot) minted a second session with the same name and
+    the same date, holding a full copy of every hand, with nothing anywhere
+    distinguishing it from the first. The session list showed two identical
+    buttons, Overview counted twice the sessions, twice the hands and twice the
+    BB as if that were the operator's poker, and every Insights denominator
+    doubled. Doubled evidence that looks like ordinary evidence is the failure
+    this product treats as serious; doubled evidence that says so is a nuisance.
+
+    The disambiguator is the new session's own id, so it is unique by
+    construction -- a third and fourth copy do not collide with the second -- and
+    it is put in the NAME because the session list is the surface the copies were
+    indistinguishable on. The note says which session it duplicates and that both
+    are being counted, which is the fact the totals do not carry.
+
+    This is deliberately the smallest correct change. It does not stop the
+    duplicate being created, and it does not un-double the Overview and Insights
+    totals: refusing a duplicate import outright would change a documented,
+    tested operator-visible contract and needs an "Import anyway" control in the
+    app to stay usable, which is not this module's to add.
+    """
+    duplicate_of = _duplicated_session_id(db, session)
+    if duplicate_of is None or session.id is None:
+        return session
+    suffix = DUPLICATE_IMPORT_NAME_SUFFIX.format(session_id=session.id)
+    note = DUPLICATE_IMPORT_NOTE.format(other_id=duplicate_of)
+    return db.update_session(
+        session.model_copy(
+            update={
+                "name": f"{session.name} ({suffix})",
+                "notes": f"{session.notes}\n\n{note}".strip(),
+            }
+        )
+    )
 
 
 def _recorded_unreadable_columns(evidence: object) -> dict[str, object]:

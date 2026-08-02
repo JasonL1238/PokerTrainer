@@ -339,7 +339,13 @@ def validate_manual_spot(spot: ManualSpotInput) -> list[str]:
     if not spot.postflop_actions:
         errors.append("Add at least one postflop action that includes Hero.")
     else:
-        errors.extend(_validate_postflop_actions(spot))
+        shape_errors = _validate_postflop_actions(spot)
+        errors.extend(shape_errors)
+        if not shape_errors:
+            # Only once the line is structurally readable: closure is a statement
+            # about amounts and actors, and there is nothing to say about either
+            # while the tokens themselves are still wrong.
+            errors.extend(_validate_line_is_settleable(spot))
     return errors
 
 
@@ -586,6 +592,105 @@ def _validate_postflop_actions(spot: ManualSpotInput) -> list[str]:
             seen_hero = True
     if not seen_hero:
         errors.append("Include at least one Hero decision in the postflop line.")
+    return errors
+
+
+def _validate_line_is_settleable(spot: ManualSpotInput) -> list[str]:
+    """Refuse a spot whose action line cannot produce the settlement it declares.
+
+    ``_validate_postflop_actions`` checks that the tokens are legal one at a
+    time -- street order, a known verb, an amount where one belongs. Nothing
+    checked that the SEQUENCE ends anywhere, and a compact-notation form invites
+    exactly that truncation: an operator recording the decision point they want
+    to study types ``x/b3.5`` (Hero checks, Villain bets 3.5, Hero has not acted)
+    and stops, because that is the spot.
+
+    Saving it was not a coverage limitation, it was a fabrication. The ledger
+    resolves Villain's unmatched 3.5 as an UNCALLED bet and refunds it -- which
+    is the arithmetic of a hand Hero folded -- while ``save_manual_spot`` pushes
+    every pot layer to the declared winner. The persisted settlement therefore
+    asserts both "Villain's last wager went unanswered" and "Hero won the pot",
+    which describes a hand that cannot happen at any table, and it asserted it
+    silently: no validation error, no save warning, no ledger warning, no
+    readiness blocker, settlement status ``reconciled``, and a Study headline
+    reading "This hand passed every trust check". Hero's real result on that line
+    is either -2.5 (he folded) or +6.5 (he called and won); the +3.0 that was
+    published is a number no completion of the hand produces.
+
+    Four impossibilities are refused here, and they are the ones the compact form
+    can express:
+
+    * a betting round nobody closed -- a player still in the hand, with chips
+      behind, left facing a wager they never answered;
+    * a declared winner who folded in the line above the declaration;
+    * a player who keeps acting after folding;
+    * a player committing more chips than their stack holds.
+
+    The last three are the ledger's own rules, and the ledger already enforces
+    them -- by raising ``LedgerError`` from inside ``save_manual_spot``, after
+    the hand, its players and its actions have been committed in that function's
+    own transaction. Enforcing them HERE is what makes this function's contract
+    ("empty means the spot is saveable") true: a form that reports no errors and
+    then throws is a form whose validation does not describe what saving will do.
+
+    Deliberately NOT refused: a hand that is closed but short. ``x/b3.5/c`` on a
+    three-card board stops before the turn, and ``x/x`` stops with nobody facing
+    anything. Those are ordinary study spots -- the operator watched the hand and
+    is recording the part worth reviewing -- and the winner they declare is an
+    observation the accounting layer already measures as an assumption. What
+    cannot be an observation is a result derived from a wager the record shows
+    was never answered.
+    """
+
+    errors: list[str] = []
+    # Both seats reach the flop having committed the same "to" amount: the
+    # builder pairs an open with a call, or a 3-bet with a call.
+    preflop_to = spot.three_bet_to if spot.pot_type == "three_bet" else spot.open_to
+    committed = {"hero": float(preflop_to), "villain": float(preflop_to)}
+    folded: dict[str, str] = {}
+
+    for street in _POSTFLOP_STREETS:
+        rows = [row for row in spot.postflop_actions if row.street == street]
+        if not rows:
+            continue
+        street_committed = {"hero": 0.0, "villain": 0.0}
+        for row in rows:
+            if row.actor in folded:
+                errors.append(
+                    f"{street}: {_label(row.actor)} already folded on the "
+                    f"{folded[row.actor]} and cannot act again."
+                )
+                continue
+            if row.action_type in {"bet", "raise", "call", "all-in"} and row.amount:
+                street_committed[row.actor] += float(row.amount)
+                committed[row.actor] += float(row.amount)
+                if committed[row.actor] - float(spot.starting_stack) > 1e-9:
+                    errors.append(
+                        f"{street}: {_label(row.actor)} commits "
+                        f"{committed[row.actor]:g} BB in total from a "
+                        f"{spot.starting_stack:g} BB stack."
+                    )
+            elif row.action_type == "fold":
+                folded.setdefault(row.actor, street)
+        wager = max(street_committed.values())
+        for actor in ("hero", "villain"):
+            if actor in folded:
+                continue
+            to_call = wager - street_committed[actor]
+            behind = float(spot.starting_stack) - committed[actor]
+            if to_call > 1e-9 and behind > 1e-9:
+                errors.append(
+                    f"{street}: {_label(actor)} is left facing {to_call:g} BB that "
+                    "the line never answers. Add the call, fold, raise, or all-in "
+                    "that closed the betting -- an unanswered wager is not a "
+                    "completed hand, and no result can be derived from one."
+                )
+
+    if spot.winner in folded:
+        errors.append(
+            f"{_label(spot.winner)} folded on the {folded[spot.winner]} and cannot "
+            "be the declared winner. Correct the winner or the postflop line."
+        )
     return errors
 
 

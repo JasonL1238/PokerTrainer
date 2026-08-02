@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 from collections.abc import Callable, Container, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date
 from html import escape
 from pathlib import Path
@@ -48,6 +49,7 @@ from poker_tracker.math.analytics import (
     Metric,
     PopulationKey,
     PopulationSnapshot,
+    ResultBasis,
     SessionStats,
     ThemeAggregate,
     aggregate_study_themes,
@@ -55,6 +57,7 @@ from poker_tracker.math.analytics import (
     classify_evidence,
     compute_population_metrics,
     compute_session_stats,
+    resolve_hero_result,
     select_population,
 )
 from poker_tracker.math.equity import get_equity_calculator
@@ -135,7 +138,6 @@ from poker_tracker.services.manual_spot_entry import (
     ManualSpotInput,
     parse_manual_spot_lines,
     parse_postflop_line,
-    save_manual_spot,
     save_manual_spots,
     validate_manual_spot,
 )
@@ -906,6 +908,35 @@ def show_source_warning_controls(
                 st.rerun()
 
 
+def _open_database_or_refuse() -> PokerDatabase | None:
+    """Open the store, or render the product's own refusal instead of a traceback.
+
+    Every startup refusal in the persistence layer is a ``RuntimeError`` raised
+    out of the constructor or ``init_db``: a stamp this build is too old to open,
+    a stamp that cannot be read, a stamp that disagrees with the physical schema.
+    They are all correct and all total -- nothing is touched or migrated -- and
+    every one of them arrived as Streamlit's red traceback panel, because nothing
+    between ``get_database()`` and ``main()`` caught them. An operator who points
+    this build at a database written by a newer one is not looking at a crash;
+    they are looking at a refusal with a remedy in it, and the presentation has to
+    say so.
+
+    Returns ``None`` when the store could not be opened, and the caller must stop:
+    every page below this needs a database.
+    """
+    try:
+        return get_database()
+    except RuntimeError as exc:
+        st.error(f"This database cannot be opened by this build.\n\n{exc}")
+        st.caption(
+            f"Store: {safe_path_label(DEFAULT_DB_PATH)}. Nothing was read, written or "
+            "migrated. Update the app to a build that understands this database, or "
+            "point POKER_DB_PATH at a different one; restoring a backup over a newer "
+            "file would lose whatever the newer build recorded."
+        )
+        return None
+
+
 def main() -> None:
     st.set_page_config(page_title="PokerTrainer", layout="wide")
     inject_theme()
@@ -914,7 +945,9 @@ def main() -> None:
         return
     show_flash()
 
-    db = get_database()
+    db = _open_database_or_refuse()
+    if db is None:
+        return
     reconciled = reconcile_stuck_jobs(db)
     if reconciled:
         st.toast(f"Recovered {len(reconciled)} interrupted processing job(s).")
@@ -990,50 +1023,130 @@ def _reconcile_cached(
     return entry
 
 
-def _hands_with_accounting_results(
+@dataclass(frozen=True)
+class ResolvedHands:
+    """Display copies of a hand list, and where each one's result came from.
+
+    The two travel together because they answer two DIFFERENT questions about the
+    same number and were previously answered by two different implementations.
+
+    * ``hands`` carry ``derived_result_substituted``, which means "the figure on
+      this copy is not the stored column". That is a WRITE guard
+      (``db._refuse_display_copy``) and nothing else: it is a statement about
+      whether the value CHANGED.
+    * ``bases`` carry ``analytics.resolve_hero_result``'s provenance, which means
+      "the ledger established this figure". That is what every provenance
+      surface must read.
+
+    Conflating them is what made the Overview report ``Reconciled results 0`` for
+    a library in which every hand was chip-proven: a ledger that CONFIRMS the
+    recorded number substitutes nothing, and a recorded/derived disagreement
+    makes the accounting non-authoritative in the first place, so the
+    value-changed flag could only ever fire on a hand whose result was NULL. The
+    KPI could not distinguish the two states it exists to distinguish.
+    """
+
+    hands: list[Hand]
+    bases: dict[int, ResultBasis]
+
+
+def _resolve_hands_for_display(
     db: PokerDatabase, hands: list[Hand], cache: AccountingCache | None = None
-) -> list[Hand]:
+) -> ResolvedHands:
     """Substitute the reconciled hero result into display copies of ``hands``.
+
+    The value and its provenance both come from ``analytics.resolve_hero_result``
+    -- the single resolver the session dashboard and Insights already share -- so
+    no surface in this app can hold a second opinion about which of a hand's two
+    possible results is being shown or where it came from.
 
     Reconciliation is skipped for any hand with no stored ``reconciled``
     settlement row. That is not an approximation: ``reconcile_persisted_hand``
-    cannot report ``is_authoritative`` without one, and only an authoritative
+    cannot report ``is_authoritative`` without one, and only an established
     reconciliation is ever substituted below, so the skipped hands take exactly
     the branch they would have taken after paying for two ledger builds. It
     matters because the callers hand this whole lists -- a library of CV drafts
     that have never been through the accounting panel used to cost one full
     reconciliation each, on every rerun, to arrive at no substitution at all.
+    ``resolve_hero_result`` is therefore called in its ``reconciled=True`` form,
+    which is what lets that skip stand instead of reconciling every hand again.
     """
     settled_hand_ids = db.fetch_reconciled_settlement_hand_ids() if hands else frozenset()
     resolved: list[Hand] = []
+    bases: dict[int, ResultBasis] = {}
     for hand in hands:
-        result = hand.hero_bb_won
-        substituted = False
+        accounting: AccountingReconciliation | None = None
         if hand.id is not None and hand.id in settled_hand_ids:
+            # Not `is_authoritative` inside the resolver either. This substitution
+            # is where a derived figure becomes the hand's result in every list,
+            # the Overview panel, the portfolio summary and the Insights KPIs, so
+            # it is exactly the place that must not publish a number an unanswered
+            # declaration produced.
             accounting, _ = _reconcile_cached(db, hand.id, cache)
-            # Not `is_authoritative`. This substitution is where a derived figure
-            # becomes the hand's result in every list, the Overview panel, the
-            # portfolio summary and the Insights KPIs, so it is exactly the place
-            # that must not publish a number an unanswered declaration produced.
-            if _accounting_is_established(hand, accounting):
-                players = db.fetch_players_by_hand(hand.id)
-                hero = next((player for player in players if player.is_hero), None)
-                if hero is not None:
-                    result = accounting.ledger.net_results.get(hero.player_key, result)
-                    substituted = result != hand.hero_bb_won
+        hero_result = resolve_hero_result(db, hand, accounting, reconciled=True)
+        if hand.id is not None:
+            bases[hand.id] = hero_result.basis
         # The copy is marked so a writer can refuse it. These objects are display
         # values -- a DERIVED hero result standing in for an observed one -- and
         # one of them reached 'Correct hand facts', where saving an unrelated
-        # field persisted the derivation into `hands.hero_bb_won`.
+        # field persisted the derivation into `hands.hero_bb_won`. The flag stays
+        # a value-inequality test on purpose: widening it to "the ledger
+        # established this" would refuse ordinary fact corrections on every
+        # chip-proven hand. Provenance is reported from ``bases``.
         resolved.append(
             hand.model_copy(
                 update={
-                    "hero_bb_won": result,
-                    "derived_result_substituted": substituted,
+                    "hero_bb_won": hero_result.value,
+                    "derived_result_substituted": hero_result.value != hand.hero_bb_won,
                 }
             )
         )
-    return resolved
+    return ResolvedHands(hands=resolved, bases=bases)
+
+
+def _hands_with_accounting_results(
+    db: PokerDatabase, hands: list[Hand], cache: AccountingCache | None = None
+) -> list[Hand]:
+    """``_resolve_hands_for_display`` for the callers that need only the hands."""
+    return _resolve_hands_for_display(db, hands, cache).hands
+
+
+def _replay_figure_label(hand: Hand, headline: str) -> str:
+    """A replay caption that carries the hand's evidence class beside its number.
+
+    The table figure is the largest element on Overview and the first one on the
+    Study replay, and it was the only thing on either page with no evidence class
+    on it. It printed ``Completed hand #3``, a hero result in result colour and a
+    pot, for a hand the pipeline had read and nobody had checked, while every
+    text figure around it was scrupulously labelled -- "Unconfirmed draft
+    result", "Evidence source: CV draft", "A draft, not a record". "Completed" is
+    a statement about ``completion_status`` and reads as "finished and recorded",
+    so the class goes into the same element as the numbers it qualifies rather
+    than into a caption in the opposite visual weight.
+    """
+    evidence = classify_evidence(hand)
+    label = f"{headline} · {EVIDENCE_CLASS_LABELS[evidence]}"
+    if evidence != "reviewed":
+        label += " · not confirmed"
+    return label
+
+
+def _result_provenance_counts(
+    hands: list[Hand], bases: Mapping[int, ResultBasis]
+) -> dict[ResultBasis, int]:
+    """Provenance of the results on screen, counted over hands that carry one.
+
+    The four counts sum to the number of displayed figures, so a surface can
+    print any one of them beside its denominator. A hand with no result is
+    counted under ``none`` and never silently folded into ``observed``.
+    """
+    counts: dict[ResultBasis, int] = {basis: 0 for basis in RESULT_BASIS_LABELS}
+    for hand in hands:
+        basis: ResultBasis = "none" if hand.hero_bb_won is None else "observed"
+        if hand.id is not None:
+            basis = bases.get(hand.id, basis)
+        counts[basis] += 1
+    return counts
 
 
 def _accounting_or_error(
@@ -1373,11 +1486,23 @@ def render_data_state_axes(
 
 def show_product_overview(db: PokerDatabase) -> None:
     sessions = db.fetch_sessions()
-    hands_by_session = {
-        session.id: _hands_with_accounting_results(db, db.fetch_hands_by_session(session.id))
+    accounting_cache = new_accounting_cache()
+    resolved_by_session = {
+        session.id: _resolve_hands_for_display(
+            db, db.fetch_hands_by_session(session.id), accounting_cache
+        )
         for session in sessions
         if session.id is not None
     }
+    hands_by_session = {
+        session_id: resolved.hands for session_id, resolved in resolved_by_session.items()
+    }
+    # Provenance for the whole library, from the one resolver. The portfolio
+    # summary's own ``derived_result_count`` counts SUBSTITUTIONS, which is a
+    # different question (see ``ResolvedHands``), so this page does not read it.
+    result_bases: dict[int, ResultBasis] = {}
+    for resolved in resolved_by_session.values():
+        result_bases.update(resolved.bases)
     all_hands = [hand for hands in hands_by_session.values() for hand in hands]
     known_hand_ids = {hand.id for hand in all_hands if hand.id is not None}
     open_issues = db.fetch_hand_issues(status="open")
@@ -1412,7 +1537,7 @@ def show_product_overview(db: PokerDatabase) -> None:
             ),
             players=featured_players,
             result_bb=featured.hero_bb_won,
-            label=f"Completed hand #{featured.hand_number}",
+            label=_replay_figure_label(featured, f"Hand #{featured.hand_number}"),
         )
         hand_label = f"HAND #{featured.hand_number}"
     else:
@@ -1511,13 +1636,27 @@ def show_product_overview(db: PokerDatabase) -> None:
                 tone="warning" if summary.unconfirmed_result_hands else "default",
             )
         with second_row[2]:
+            # Read from ``resolve_hero_result``'s basis, never from the
+            # substitution flag. A ledger that CONFIRMS a recorded result
+            # substitutes nothing, so counting substitutions made a library in
+            # which every hand was chip-proven print the same "Reconciled
+            # results 0" as one that had never been reconciled -- while the
+            # session panel and Insights, which do use the resolver, printed the
+            # opposite about the same hand.
+            provenance = _result_provenance_counts(all_hands, result_bases)
+            provenance_detail = (
+                f"Derived by the accounting ledger; "
+                f"{provenance['observed']} were recorded as observed"
+            )
+            if provenance["unattributed"]:
+                provenance_detail += (
+                    f" · {provenance['unattributed']} recorded with no hero seat "
+                    "for the ledger to attribute"
+                )
             kpi_card(
                 "Reconciled results",
-                str(summary.derived_result_count),
-                (
-                    f"Derived by the accounting ledger; "
-                    f"{summary.observed_result_count} were recorded as observed"
-                ),
+                str(provenance["reconciled"]),
+                provenance_detail,
             )
         with second_row[3]:
             kpi_card(
@@ -1762,7 +1901,7 @@ def show_hands_workspace(db: PokerDatabase) -> None:
         narrowed,
         sessions_by_id,
         key_prefix="library",
-        resolve_page=lambda page_hands: _hands_with_accounting_results(
+        resolve_page=lambda page_hands: _resolve_hands_for_display(
             db, page_hands, accounting_cache
         ),
         open_issue_counts=issue_counts,
@@ -2321,7 +2460,10 @@ def render_study_replay(
                 else None
             ),
             label=(
-                f"{session.name} · {hand.hero_position or 'Position not recorded'}"
+                _replay_figure_label(
+                    hand,
+                    f"{session.name} · {hand.hero_position or 'Position not recorded'}",
+                )
                 if selected_index is None
                 else study_action_label(actions[selected_index], selected_index)
             ),
@@ -5591,6 +5733,7 @@ def hand_evidence_badges(
     *,
     open_issue_count: int = 0,
     has_stale_analysis: bool = False,
+    result_basis: ResultBasis | None = None,
 ) -> list[tuple[str, str]]:
     """The evidence state of one hand as ``(badge status, words)`` pairs.
 
@@ -5627,8 +5770,20 @@ def hand_evidence_badges(
                 f"Reconstruction confidence · {confidence.label}",
             )
         )
-    if hand.derived_result_substituted:
+    # Provenance from ``resolve_hero_result``, falling back to the substitution
+    # flag only when the caller has no basis to give. The flag alone said
+    # "the displayed figure differs from the stored one", so a hand whose ledger
+    # CONFIRMED its recorded result -- the strongest evidence state the product
+    # can produce -- carried no provenance badge at all.
+    basis = result_basis
+    if basis is None:
+        basis = "reconciled" if hand.derived_result_substituted else None
+    if basis == "reconciled":
         badges.append(("queued", "Result derived from the reconciled ledger"))
+    elif basis == "unattributed":
+        badges.append(
+            ("needs_correction", "Result recorded, but no hero seat to attribute it to")
+        )
     return badges
 
 
@@ -5639,7 +5794,8 @@ def render_hand_results(
     *,
     key_prefix: str,
     page_size: int = 20,
-    resolve_page: Callable[[list[Hand]], list[Hand]] | None = None,
+    resolve_page: Callable[[list[Hand]], ResolvedHands] | None = None,
+    result_bases: Mapping[int, ResultBasis] | None = None,
     open_issue_counts: Mapping[int, int] | None = None,
     stale_hand_ids: Container[int] = frozenset(),
 ) -> None:
@@ -5650,6 +5806,11 @@ def render_hand_results(
     the twenty rows that will actually be drawn: the Hands library used to
     reconcile every hand in the database before this function was reached, so the
     work the pagination was there to bound was already spent by the time it ran.
+    It returns ``ResolvedHands`` rather than a bare list because the provenance of
+    each row's result is resolved by the same pass that substitutes it, and a row
+    that prints a derived figure without saying so is the defect this surface
+    exists to avoid. ``result_bases`` is the same information for a caller that
+    resolved its whole list up front.
     """
 
     page_key = f"{key_prefix}_hand_page"
@@ -5680,8 +5841,11 @@ def render_hand_results(
         st.rerun()
 
     page_items = hands[start : start + page_size]
+    page_bases: dict[int, ResultBasis] = dict(result_bases or {})
     if resolve_page is not None:
-        page_items = resolve_page(page_items)
+        resolved_page = resolve_page(page_items)
+        page_items = resolved_page.hands
+        page_bases.update(resolved_page.bases)
     for item in page_items:
         if item.id is None:
             continue
@@ -5697,6 +5861,7 @@ def render_hand_results(
                 0 if open_issue_counts is None else open_issue_counts.get(item.id, 0)
             ),
             has_stale_analysis=item.id in stale_hand_ids,
+            result_basis=page_bases.get(item.id),
         )
         with st.container(border=True, key=f"{key_prefix}_hand_{item.id}"):
             summary, action = st.columns([6, 1])
@@ -5789,7 +5954,8 @@ def render_hand_results(
 def show_session_hand_browser(db: PokerDatabase, session: Session) -> None:
     if session.id is None:
         return
-    hands = _hands_with_accounting_results(db, db.fetch_hands_by_session(session.id))
+    resolved = _resolve_hands_for_display(db, db.fetch_hands_by_session(session.id))
+    hands = resolved.hands
     if not hands:
         empty_state(
             "No hands in this session",
@@ -5837,6 +6003,7 @@ def show_session_hand_browser(db: PokerDatabase, session: Session) -> None:
                 {session.id: session},
                 key_prefix=f"session_{session.id}",
                 page_size=15,
+                result_bases=resolved.bases,
                 open_issue_counts=issue_counts,
                 stale_hand_ids=db.fetch_stale_review_hand_ids() & hand_ids,
             )
@@ -6711,7 +6878,7 @@ def _create_single_hand_form(
         return
 
     try:
-        saved_hand, accounting, warnings = save_manual_spot(db, session_id, spot)
+        results = _persist_manual_spots(db, session_id, [spot])
     except (ValidationError, ValueError, LedgerError) as exc:
         st.error(f"Could not save hand: {exc}")
         return
@@ -6720,7 +6887,7 @@ def _create_single_hand_form(
     st.session_state["manual_spot_board_cards"] = ""
     st.session_state["manual_spot_line_draft"] = ""
     st.session_state["manual_spot_notes"] = ""
-    _flash_manual_save_results([(saved_hand, accounting, warnings)])
+    _flash_manual_save_results(results)
     st.rerun()
 
 
@@ -6779,7 +6946,7 @@ def _create_multi_hand_form(
         return
 
     try:
-        results = save_manual_spots(db, session_id, parsed.spots)
+        results = _persist_manual_spots(db, session_id, list(parsed.spots))
     except (ValidationError, ValueError, LedgerError) as exc:
         st.error(f"Could not save hands: {exc}")
         return
@@ -6787,6 +6954,36 @@ def _create_multi_hand_form(
     st.session_state["manual_spot_batch_text"] = ""
     _flash_manual_save_results(results)
     st.rerun()
+
+
+def _persist_manual_spots(
+    db: PokerDatabase, session_id: int, spots: list[ManualSpotInput]
+) -> list[tuple[Hand, AccountingReconciliation, list[str]]]:
+    """Save typed spots as ONE unit, so a refusal leaves nothing behind.
+
+    ``save_manual_spot`` commits the hand, its players, its actions and its
+    settlement rows in its own transaction and reconciles afterwards. The
+    reconciliation is the first check that can reject a spot on grounds the field
+    validation does not cover -- a declared winner who folded on the typed line is
+    the reachable one, ``x/b3.5/f`` with Winner = Hero -- and by then the inner
+    transaction has already committed. The form then printed "Could not save
+    hand: Folded player 'hero' cannot win pot 0." over a hand that WAS in the
+    database: the same render's danger zone said "removes all 0 hands", the next
+    visit listed it as an ordinary unreviewed draft with no result, and retyping
+    it was refused as a duplicate hand number.
+
+    ``PokerDatabase.transaction`` is re-entrant and commits only when the
+    outermost block exits cleanly, so wrapping the whole save is what makes the
+    refusal and the message agree. It covers the batch form for the same reason:
+    a batch that reports total failure must not leave the first two lines saved.
+
+    This is a call-site boundary, not the ideal home for the rule. See the note
+    in the repair report: the atomicity belongs inside ``save_manual_spot``, and
+    the winner-is-still-in-the-hand check belongs in ``validate_manual_spot`` so
+    the refusal happens before any write rather than after a rollback.
+    """
+    with db.transaction():
+        return save_manual_spots(db, session_id, spots)
 
 
 def _flash_manual_save_results(

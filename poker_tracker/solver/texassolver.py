@@ -265,7 +265,45 @@ def parse_strategy_result(
         )
     recorded_hero: RecordedSolverAction | None = None
     hero_mapping = ActionMapping(None, "absent", "no Hero decision was reached")
+    previous: RecordedSolverAction | None = None
     for recorded in spot.recorded_line:
+        # Two invariants the walk cannot be sound without. ``prepare_solver_spot``
+        # no longer builds a line that breaks either, but a run queued before it
+        # did carries its own serialised spot in ``solver_runs.spot``, and that
+        # spot is what gets parsed -- so they are re-asserted where the reading
+        # happens rather than only where the spot is built.
+        #
+        # First: the tree is rooted at ``spot.street``, and the only thing
+        # separating one street from the next inside it is a chance node, which
+        # carries board cards where this walk looks for action branches. The walk
+        # can therefore never legitimately reach an action on a later street. That
+        # used to go through -- a missing Hero flop response let Villain's turn bet
+        # map onto Hero's flop node, and the frequencies read out and filed as
+        # Hero's turn call were the ones at the node where VILLAIN acts facing a
+        # flop bet Hero never made, carrying no warning but a bet-size
+        # approximation. Later-street actions still belong in ``recorded_line``:
+        # the loop simply never reaches them, because it stops at Hero's first
+        # decision on ``spot.street``.
+        if recorded.street != spot.street:
+            raise SolverResultUnusableError(
+                f"{recorded.player_name}'s recorded {_action_label(recorded)} is on "
+                f"the {recorded.street}, but the walk is still inside the "
+                f"{spot.street} betting round. The recorded line is missing a "
+                f"{spot.street} action, so any strategy read here describes a "
+                "different decision."
+            )
+        # Second: two players alternate. Mapping a second action by the player who
+        # just acted means an action between them is missing, and every branch
+        # descended after that belongs to the wrong seat. It is the same
+        # relocation as above with no street boundary to give it away.
+        if previous is not None and previous.player_key == recorded.player_key:
+            raise SolverResultUnusableError(
+                f"The recorded line has {recorded.player_name} acting twice in a "
+                f"row ({_action_label(previous)}, then {_action_label(recorded)}); "
+                "the other player's action between them is missing, so the node "
+                "the walk reached is not the one Hero faced."
+            )
+        previous = recorded
         mapping = map_recorded_action(
             node, recorded, pot_reference=_pot_reference(recorded, spot)
         )

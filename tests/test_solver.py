@@ -1333,15 +1333,425 @@ def test_recorded_line_uses_ledger_normalized_incremental_amount() -> None:
             "amount_semantics": "raise_to",
         }
     )
+    # Villain's answer to that raise, so the flop round still finishes. Turning
+    # Hero's call into a raise leaves a wager nobody responded to, which is a hand
+    # still in progress rather than a completed spot; this test is about the
+    # AMOUNT the line carries, so it states a line that ends.
+    actions.append(
+        Action(
+            hand_id=1,
+            player_key="villain",
+            player_name="Villain",
+            position="BTN",
+            street="flop",
+            action_index=4,
+            action_type="fold",
+        )
+    )
     snapshots = list(accounting.ledger.snapshots)
     snapshots[-1] = replace(snapshots[-1], kind="raise", amount=6.25)
+    snapshots.append(
+        _snapshot(
+            6,
+            "villain",
+            "flop",
+            "fold",
+            pot_before=18.75,
+            pot_after=18.75,
+            stack_before=93.75,
+            stack_after=93.75,
+        )
+    )
     normalized_accounting = replace(
         accounting,
         ledger=replace(accounting.ledger, snapshots=tuple(snapshots)),
     )
     prepared = prepare_solver_spot(hand, players, actions, normalized_accounting)
     assert prepared.spot is not None
-    assert prepared.spot.recorded_line[-1].amount == 6.25
+    assert prepared.spot.recorded_line[-2].amount == 6.25
+    assert prepared.spot.recorded_line[-1].action_type == "fold"
+
+
+def _postflop_variant(tail, *, board: str = "Qd 7s 2c"):
+    """The completed cash fixture with its postflop line replaced wholesale.
+
+    ``tail`` is ``(player_key, street, action_type, incremental amount)`` in
+    order. Every chip figure the solver takes from this hand is read at the FIRST
+    flop action -- pot 5 BB, 97.5 BB effective -- so the running pot and stacks
+    carried forward here exist to keep the snapshots self-consistent, not to be
+    asserted on.
+
+    Hero is BB and Villain is BTN, so Hero is out of position and acts first on
+    every postflop street; a tail that starts with Villain is stating an
+    out-of-turn line on purpose.
+    """
+
+    hand, players, actions, accounting, _ = _completed_cash_spot()
+    hand = hand.model_copy(update={"board_cards": board})
+    names = {"hero": ("Hero", "BB"), "villain": ("Villain", "BTN")}
+    new_actions = list(actions[:3])
+    new_snapshots = list(accounting.ledger.snapshots)[:3]
+    pot = 5.0
+    stacks = {"hero": 97.5, "villain": 97.5}
+    for offset, (key, street, kind, amount) in enumerate(tail):
+        name, position = names[key]
+        committed = float(amount or 0)
+        new_actions.append(
+            Action(
+                hand_id=1,
+                player_key=key,
+                player_name=name,
+                position=position,
+                street=street,
+                action_index=offset + 1,
+                action_type=kind,
+                amount=amount,
+            )
+        )
+        new_snapshots.append(
+            _snapshot(
+                3 + offset,
+                key,
+                street,
+                kind,
+                pot_before=pot,
+                pot_after=pot + committed,
+                stack_before=stacks[key],
+                stack_after=stacks[key] - committed,
+                amount=committed,
+            )
+        )
+        pot += committed
+        stacks[key] -= committed
+    prepared_accounting = replace(
+        accounting,
+        ledger=replace(accounting.ledger, snapshots=tuple(new_snapshots)),
+    )
+    return prepare_solver_spot(hand, players, new_actions, prepared_accounting)
+
+
+def test_a_postflop_line_nobody_answered_is_not_a_completed_spot() -> None:
+    """The hand is still in progress, so there is no completed decision to study.
+
+    The chip ledger settles this line by refunding the unmatched 3.75 and reports
+    it balanced, legal and reconciled with no warnings, because it sums
+    commitments and has no model of a betting round. That was the solver's only
+    gate, so a hand whose last recorded event is a wager Hero has not yet
+    answered arrived here eligible with an empty reason list.
+    """
+
+    prepared = _postflop_variant(
+        [("hero", "flop", "check", None), ("villain", "flop", "bet", 3.75)]
+    )
+    assert not prepared.eligibility.eligible
+    assert prepared.spot is None
+    assert any(
+        "never finished" in reason and "bet 3.75 BB" in reason
+        for reason in prepared.eligibility.reasons
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "tail"),
+    [
+        (
+            "only one player has acted",
+            [("hero", "flop", "check", None)],
+        ),
+        (
+            "the raise was never answered",
+            [
+                ("hero", "flop", "check", None),
+                ("villain", "flop", "bet", 3.75),
+                ("hero", "flop", "raise", 8.0),
+            ],
+        ),
+        (
+            "the flop round is missing an action before the turn begins",
+            [
+                ("hero", "flop", "check", None),
+                ("hero", "turn", "bet", 4.0),
+                ("villain", "turn", "call", 4.0),
+            ],
+        ),
+        (
+            "the turn round is missing entirely",
+            [
+                ("hero", "flop", "check", None),
+                ("villain", "flop", "check", None),
+                ("hero", "river", "check", None),
+                ("villain", "river", "check", None),
+            ],
+        ),
+        (
+            "the same player acts twice in a row",
+            [
+                ("hero", "flop", "check", None),
+                ("hero", "flop", "bet", 3.75),
+                ("villain", "flop", "call", 3.75),
+            ],
+        ),
+        (
+            "in position acts before out of position",
+            [
+                ("hero", "flop", "check", None),
+                ("villain", "flop", "check", None),
+                ("villain", "turn", "bet", 4.0),
+                ("hero", "turn", "call", 4.0),
+            ],
+        ),
+        (
+            "a check is recorded against a live bet",
+            [
+                ("hero", "flop", "check", None),
+                ("villain", "flop", "bet", 3.75),
+                ("hero", "flop", "check", None),
+            ],
+        ),
+        (
+            "a bet is recorded against a live bet",
+            [
+                ("hero", "flop", "check", None),
+                ("villain", "flop", "bet", 3.75),
+                ("hero", "flop", "bet", 8.0),
+            ],
+        ),
+        (
+            "a call is recorded with nothing to call",
+            [
+                ("hero", "flop", "check", None),
+                ("villain", "flop", "call", 3.75),
+            ],
+        ),
+        (
+            "a raise is recorded with no wager to raise",
+            [
+                ("hero", "flop", "raise", 3.75),
+                ("villain", "flop", "call", 3.75),
+            ],
+        ),
+        (
+            "the betting continues after the round closed",
+            [
+                ("hero", "flop", "check", None),
+                ("villain", "flop", "check", None),
+                ("hero", "flop", "bet", 3.75),
+                ("villain", "flop", "call", 3.75),
+            ],
+        ),
+        (
+            "the line continues after a fold ended the hand",
+            [
+                ("hero", "flop", "check", None),
+                ("villain", "flop", "bet", 3.75),
+                ("hero", "flop", "fold", None),
+                ("hero", "turn", "check", None),
+                ("villain", "turn", "check", None),
+            ],
+        ),
+        (
+            "a showdown marker is standing in for a decision",
+            [
+                ("hero", "flop", "check", None),
+                ("villain", "flop", "check", None),
+                ("hero", "turn", "show", None),
+            ],
+        ),
+    ],
+)
+def test_a_line_that_is_not_a_playable_sequence_is_refused(label, tail) -> None:
+    """Every shape here reconciles as chips and is impossible as a hand.
+
+    The ledger checks each action against the money already in front of it, one
+    action at a time; none of these breaks that, so all of them used to reach the
+    solver eligible with an empty reason list. What none of them is, is a
+    sequence two players could have played -- and the walk that reads Hero's
+    frequencies out of the solve tree assumes exactly that, descending one branch
+    per recorded action from the street's root.
+    """
+
+    prepared = _postflop_variant(tail)
+    assert not prepared.eligibility.eligible, label
+    assert prepared.spot is None, label
+    assert prepared.eligibility.reasons, label
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        [
+            ("hero", "flop", "check", None),
+            ("villain", "flop", "bet", 3.75),
+            ("hero", "flop", "call", 3.75),
+            ("hero", "turn", "check", None),
+            ("villain", "turn", "check", None),
+            ("hero", "river", "bet", 6.0),
+            ("villain", "river", "fold", None),
+        ],
+        [
+            ("hero", "flop", "check", None),
+            ("villain", "flop", "bet", 3.75),
+            ("hero", "flop", "raise", 12.0),
+            ("villain", "flop", "all-in", 93.75),
+            ("hero", "flop", "call", 81.75),
+        ],
+        [
+            ("hero", "flop", "bet", 3.75),
+            ("villain", "flop", "fold", None),
+        ],
+    ],
+)
+def test_lines_that_do_end_somewhere_a_hand_can_end_stay_eligible(tail) -> None:
+    """The refusal has to be about unfinished hands and nothing else.
+
+    A river fold, an all-in called on the flop and a flop bet folded to are three
+    different terminal shapes across three different streets; none may be caught
+    by the rule that catches the unanswered ones.
+    """
+
+    prepared = _postflop_variant(tail, board="Qd 7s 2c 8h 2d")
+    assert prepared.eligibility.eligible
+    assert prepared.spot is not None
+    assert prepared.spot.recorded_line[-1].action_type == tail[-1][2]
+
+
+def test_a_line_that_stops_before_the_saved_board_says_so() -> None:
+    """A record that simply stops is a coverage limit, so it is stated, not hidden.
+
+    Nothing is wrong with solving Hero's flop check here -- Hero really checked
+    it. What is wrong is presenting a hand whose turn and river are absent from
+    the record as a complete transcript, which is what an eligible spot with no
+    warnings claims.
+    """
+
+    prepared = _postflop_variant(
+        [("hero", "flop", "check", None), ("villain", "flop", "check", None)],
+        board="Qd 7s 2c 8h 2d",
+    )
+    assert prepared.eligibility.eligible
+    assert prepared.spot is not None
+    assert any(
+        "turn and river" in warning for warning in prepared.eligibility.warnings
+    )
+
+
+def test_a_hand_that_ended_on_the_flop_is_not_accused_of_stopping_early() -> None:
+    prepared = _postflop_variant(
+        [("hero", "flop", "bet", 3.75), ("villain", "flop", "fold", None)],
+        board="Qd 7s 2c 8h 2d",
+    )
+    assert prepared.eligibility.eligible
+    assert not any(
+        "absent from this hand's record" in warning
+        for warning in prepared.eligibility.warnings
+    )
+
+
+def test_a_stored_spot_whose_line_skips_a_street_cannot_be_read_as_hero(tmp_path) -> None:
+    """The walk may not cross a street boundary, whatever line it is handed.
+
+    ``solver_runs.spot`` holds a serialised ``SolverSpot``, so a line prepared
+    before the eligibility rule existed still reaches this walk. With Hero in
+    position and Hero's flop response missing, the walk mapped Villain's TURN bet
+    onto Hero's FLOP node, descended a bet branch Hero never made, and read the
+    node where VILLAIN acts -- filing those frequencies as Hero's turn call with
+    no warning beyond a bet-size approximation. Only a chance node separates one
+    street from the next inside the tree, and a chance node carries board cards
+    where this walk looks for action branches, so an action on a later street can
+    never be legitimately mapped here.
+    """
+
+    hero_range = _resolved_range(
+        "ip", "AhQs,KhKs,7h7s,3h3s", player_key="hero", player_name="Hero"
+    )
+    villain_range = _resolved_range(
+        "oop", "AhQs,KhKs,7h7s,3h3s", player_key="villain", player_name="Villain"
+    )
+    spot = _walk_spot(
+        [
+            RecordedSolverAction(
+                player_key="villain",
+                player_name="Villain",
+                street="flop",
+                action_type="check",
+                pot_before=5.0,
+            ),
+            RecordedSolverAction(
+                player_key="villain",
+                player_name="Villain",
+                street="turn",
+                action_type="bet",
+                amount=4.0,
+                pot_before=5.0,
+            ),
+            RecordedSolverAction(
+                player_key="hero",
+                player_name="Hero",
+                street="turn",
+                action_type="call",
+                amount=4.0,
+                pot_before=9.0,
+            ),
+        ],
+        hero_role="ip",
+    )
+    villain_facing_flop_bet = _action_node(
+        ["FOLD", "CALL", "RAISE7.5"],
+        _covering_strategy(villain_range, ["FOLD", "CALL", "RAISE7.5"]),
+    )
+    hero_flop = _action_node(
+        ["CHECK", "BET1.65", "BET3.75"],
+        _covering_strategy(hero_range, ["CHECK", "BET1.65", "BET3.75"]),
+        children={"BET3.75": villain_facing_flop_bet},
+    )
+    dump = _action_node(
+        ["CHECK", "BET1.65", "BET3.75"],
+        _covering_strategy(hero_range, ["CHECK", "BET1.65", "BET3.75"]),
+        children={"CHECK": hero_flop},
+    )
+    with pytest.raises(SolverResultUnusableError, match="still inside the flop"):
+        _parse_dump(tmp_path, dump, spot, hero_range, villain_range)
+
+
+def test_a_stored_spot_whose_line_skips_hero_on_one_street_is_refused(tmp_path) -> None:
+    """The same relocation without a street boundary to give it away.
+
+    Villain cannot bet the flop twice in a row; the missing action between them
+    is Hero's. Walking it anyway descends Villain's second bet through Hero's own
+    node and lands on the seat Villain acts from, which is then read out as
+    Hero's frequencies.
+    """
+
+    hero_range = _resolved_range(
+        "ip", "AhQs,KhKs,7h7s,3h3s", player_key="hero", player_name="Hero"
+    )
+    villain_range = _resolved_range(
+        "oop", "AhQs,KhKs,7h7s,3h3s", player_key="villain", player_name="Villain"
+    )
+    spot = _walk_spot(
+        [
+            _recorded("villain", "check"),
+            _recorded("villain", "bet", 3.75),
+            _recorded("hero", "call", 3.75, pot_before=8.75),
+        ],
+        hero_role="ip",
+    )
+    villain_facing_flop_bet = _action_node(
+        ["FOLD", "CALL", "RAISE7.5"],
+        _covering_strategy(villain_range, ["FOLD", "CALL", "RAISE7.5"]),
+    )
+    hero_flop = _action_node(
+        ["CHECK", "BET1.65", "BET3.75"],
+        _covering_strategy(hero_range, ["CHECK", "BET1.65", "BET3.75"]),
+        children={"BET3.75": villain_facing_flop_bet},
+    )
+    dump = _action_node(
+        ["CHECK", "BET1.65", "BET3.75"],
+        _covering_strategy(hero_range, ["CHECK", "BET1.65", "BET3.75"]),
+        children={"CHECK": hero_flop},
+    )
+    with pytest.raises(SolverResultUnusableError, match="acting twice in a row"):
+        _parse_dump(tmp_path, dump, spot, hero_range, villain_range)
 
 
 def test_solver_cache_key_excludes_hand_mapping_but_includes_tree_inputs() -> None:

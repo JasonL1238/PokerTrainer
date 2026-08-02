@@ -289,13 +289,20 @@ def test_a_deeply_nested_evidence_blob_degrades_instead_of_raising(
         db._commit()
         hands = db.fetch_hands_by_session(hand.session_id)
         assert [item.id for item in hands] == [hand.id]
-        # The unreadable blob degrades to all-unknown evidence, which blocks.
-        assert hands[0].completion_evidence == {}
+        # The unreadable blob degrades to all-unknown evidence, which blocks --
+        # and the loss is RECORDED rather than read back as "no evidence": the
+        # hand carries the same unreadable-column marker a damaged scalar gets,
+        # bounded so a 120 KB adversarial blob is not copied into a blocker's
+        # detail whole.
+        assert parse_completion_evidence(hands[0].completion_evidence).is_known is False
+        assert hands[0].unreadable_columns == ("completion_evidence",)
+        assert hands[0].review_status == "needs_correction"
         readiness = evaluate_study_readiness(
             hands[0], accounting=None, user_confirmed=True
         )
         assert readiness.has("COMPLETION_EVIDENCE_MISSING")
         assert readiness.has("COMPLETION_NOT_COMPLETE")
+        assert readiness.has("UNREADABLE_HAND_COLUMNS")
     finally:
         db.close()
 

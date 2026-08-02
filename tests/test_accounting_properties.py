@@ -471,12 +471,17 @@ def test_a_chopped_forced_post_pot_conserves_every_chip(hand, policy):
 
 @given(hand=forced_post_hand())
 @SETTINGS
-def test_a_forced_post_layer_is_only_called_a_side_pot_when_it_caps_somebody_out(hand):
+def test_a_forced_post_layer_is_only_emitted_when_it_caps_somebody_out(hand):
     """A side pot is a capped eligibility, not an index above zero.
 
     Forced posts are the cheapest way to make extra layers — a blind that folds
-    for less splits the pot without capping anybody — so this is the family where
-    labelling every layer after the first a "side pot" states something false.
+    for less used to split the pot without capping anybody — so this is the
+    family where labelling every layer after the first a "side pot" states
+    something false. Naming those layers "dead money" instead was the same
+    mistake pointing the other way, since their chips are ordinary live
+    wagering. A boundary that caps nobody is not a pot boundary at all, so the
+    stronger property is that no such layer is emitted: every layer after the
+    main pot must name at least one seat still in the hand that cannot win it.
     """
     ledger = build_hand_ledger(hand.players, hand.actions)
     previous: tuple[str, ...] | None = None
@@ -486,9 +491,58 @@ def test_a_forced_post_layer_is_only_called_a_side_pot_when_it_caps_somebody_out
             assert pot.label == "Main pot"
         else:
             capped_out = set(previous) - set(pot.eligible_players)
-            assert (pot.cause == "side") is bool(capped_out)
-            assert pot.label == ("Side pot" if capped_out else "Dead-money layer")
+            assert capped_out, f"layer {pot.index} was split off without capping anybody"
+            assert pot.cause == "side"
+            assert pot.label == "Side pot"
         previous = pot.eligible_players
+
+
+@given(hand=forced_post_hand())
+@SETTINGS
+def test_no_seat_is_paid_more_than_the_table_matched_of_its_own_commitment(hand):
+    """The cap a side pot exists to enforce, stated as an invariant.
+
+    A seat can win, from each opponent still in the hand, only as much as that
+    opponent matched of what the seat itself put up — plus whatever folded seats
+    abandoned and whatever dead money the others owed the table. Deriving the pot
+    layers from LIVE contributions alone broke this for the whole
+    ``live == 0 and dead > 0`` family: a seat all-in for nothing but a forced post
+    had no live level, so no layer was ever capped at its commitment and it
+    contested every chip of the first live layer. Three ante chips took twenty-three.
+
+    Nothing about that was loud — chip conservation held, so the ledger reported
+    balanced, settled and legal with no warning — which is why the guarantee has
+    to be asserted directly rather than inferred from the balance verdicts.
+    """
+    ledger = build_hand_ledger(hand.players, hand.actions)
+    put_up = {name: Decimal(str(ledger.contributions[name])) for name in hand.names}
+    in_pot = {
+        name: put_up[name] - Decimal(str(ledger.refunds[name])) for name in hand.names
+    }
+    others = {
+        name: [other for other in hand.names if other != name] for name in hand.names
+    }
+    for name in hand.names:
+        settled = build_hand_ledger(
+            hand.players, hand.actions, _winner_map(ledger.pots, (name,))
+        )
+        if not settled.is_settled:
+            continue
+        matched = in_pot[name] + _sum(
+            min(in_pot[other], put_up[name])
+            for other in others[name]
+            if other not in hand.folded
+        )
+        # A seat that folded left everything it had in the pot behind, and dead
+        # money is owed to the table rather than wagered at anybody, so neither
+        # is bounded by what this seat covered.
+        abandoned = _sum(in_pot[other] for other in others[name] if other in hand.folded)
+        owed_to_the_table = _sum(
+            hand.dead[other] for other in others[name] if other not in hand.folded
+        )
+        assert Decimal(str(settled.payouts[name])) <= (
+            matched + abandoned + owed_to_the_table
+        ), f"{name} was paid more than the table matched of its own commitment"
 
 
 # --- Splits -----------------------------------------------------------------

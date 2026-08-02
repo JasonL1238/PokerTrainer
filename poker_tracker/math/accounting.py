@@ -31,7 +31,7 @@ LedgerActionKind = Literal[
     "win",
 ]
 
-PotLayerCause = Literal["main", "side", "dead_money"]
+PotLayerCause = Literal["main", "side"]
 
 _COMMITMENT_KINDS = {"ante", "post_blind", "bet", "call", "raise", "all-in"}
 _BETTING_COMMITMENT_KINDS = _COMMITMENT_KINDS - {"ante"}
@@ -50,7 +50,6 @@ _MAX_SPLIT_QUANTUM = Decimal("1")
 _POT_LAYER_LABELS: dict[PotLayerCause, str] = {
     "main": "Main pot",
     "side": "Side pot",
-    "dead_money": "Dead-money layer",
 }
 
 
@@ -148,10 +147,17 @@ class PotLayer:
         A side pot is one specific thing: a layer that exists because a player
         still in the hand was all-in for less than the wager, so that player
         cannot win it.  Every layer above the first used to be called a side pot,
-        which is a false statement about the ordinary hands that produce layers
-        for other reasons -- a blind that folds for less, an unmatched ante --
-        and reading it teaches an operator studying their own hand the wrong
-        definition of the term.
+        which is a false statement about the ordinary hands that produce a
+        boundary for other reasons -- a blind that folds for less, an unmatched
+        ante -- and reading it teaches an operator studying their own hand the
+        wrong definition of the term.  Naming those layers "dead money" instead
+        was the same mistake pointing the other way: a layer split off by a
+        folded small blind holds nothing but live wagering between the players
+        who stayed.
+
+        ``_build_pots`` now only ever emits a boundary that caps a remaining
+        player's eligibility, so every layer after the first IS a side pot and
+        this mapping has no third case to name.
         """
 
         return _POT_LAYER_LABELS[self.cause]
@@ -189,10 +195,10 @@ def build_hand_ledger(
     """Reduce normalized completed-hand actions into pots and player results.
 
     ``winners`` maps each generated pot index to one or more ordered winners.
-    Pot 0 is the main pot; every later layer records what created it in
-    ``PotLayer.cause``, and only a layer that caps a remaining player's
-    eligibility is a side pot.  Omitting winners returns a useful but explicitly
-    unsettled ledger. ``flop_seen`` is an
+    Pot 0 is the main pot; a later layer is generated only when it caps a
+    remaining player's eligibility, which is what makes it a side pot, and
+    ``PotLayer.cause`` records that.  Omitting winners returns a useful but
+    explicitly unsettled ledger. ``flop_seen`` is an
     optional completed-hand fact for histories where a board ran out without
     any postflop action (for example, a preflop all-in). When omitted, the
     ledger preserves the historic behavior of inferring it from action streets.
@@ -406,15 +412,21 @@ def build_hand_ledger(
     settled_contributions = {
         name: live_contributions[name] - refunds[name] for name in player_order
     }
-    # Dead money pools into the main pot rather than forming a layer only its
-    # poster is eligible for: a lone button ante belongs to whoever wins the hand.
-    total_dead = dead + sum(dead_contributions.values(), _ZERO)
+    # What a seat has in the pot (live that stuck, plus every dead chip) is what
+    # sizes a layer. Dead chips used to be pooled into the main pot instead, which
+    # is why a stack all-in for nothing but its ante never capped the layer above
+    # it. ``dead`` alone -- the UNATTRIBUTED dead money -- still joins the main
+    # pot whole, because no seat wagered it and it can cap no seat.
+    committed = {
+        name: settled_contributions[name] + dead_contributions[name]
+        for name in player_order
+    }
     raw_pots = _build_pots(
         player_order,
-        settled_contributions,
+        committed,
+        contributions,
         folded,
-        total_dead,
-        dead_contributions,
+        dead,
     )
     _validate_winners(winner_map, raw_pots, starting, folded)
 
@@ -692,48 +704,83 @@ def _uncalled_refunds(
 
 def _build_pots(
     order: Sequence[str],
-    contributions: Mapping[str, Decimal],
+    committed: Mapping[str, Decimal],
+    ceilings: Mapping[str, Decimal],
     folded: set[str],
     dead_money: Decimal,
-    dead_contributions: Mapping[str, Decimal] | None = None,
 ) -> list[dict]:
-    dead_contributions = dead_contributions or {}
-    levels = sorted({amount for amount in contributions.values() if amount > 0})
+    """Cut the pot at every seat's TOTAL commitment, live chips and forced posts alike.
+
+    ``committed`` is what each seat has IN the pot: live money that stuck plus
+    every dead chip it posted.  It sizes the layers.  ``ceilings`` is what each
+    seat put in before uncalled money came back, and it decides eligibility --
+    they differ only for the one seat an uncalled bet was returned to, whose own
+    chips must not stop it contesting a pot the rest of the table built.
+
+    A player can win, from each opponent, only as much as that opponent matched
+    of what the player themselves put in.  The level a boundary is drawn at is
+    therefore each seat's whole commitment -- ``settled live + dead`` -- and not
+    its live wagering alone.
+
+    Deriving the levels from live money only had a silent, unbounded failure.  A
+    seat whose ENTIRE commitment is a forced post has no live level of its own,
+    so no boundary was ever drawn at its ceiling: it was added to the first live
+    layer wholesale and could be declared the winner of chips it never covered.
+    Three ante-sized chips against two 11-chip stacks paid 23.  Chip conservation
+    still held, so ``is_balanced``, ``is_settled`` and ``is_legal`` were all True
+    and the hand reconciled as authoritative with an 11x-wrong hero result.  The
+    trigger was never the ante specifically -- it was ``live == 0 and dead > 0``,
+    which a dead blind reaches too -- so the level set, not the eligibility list,
+    is what had to change.
+
+    Two kinds of level cannot be a real boundary, and both are folded into the
+    layer below rather than being emitted:
+
+    * A level only ONE seat reached.  Nobody matched those chips, so there is no
+      contest to hold them apart.  ``_uncalled_refunds`` has already handed back
+      unmatched LIVE money, so what remains here is dead money -- a button ante,
+      a dead blind -- and dead money belongs to whoever wins the pot it sits in
+      rather than being handed back to its poster through a layer only they could
+      win.  Emitting it would make the ordinary big-blind-ante hand unrecordable
+      truthfully.
+    * A level that caps nobody still in the hand.  If the seats that stopped
+      below it all folded, everyone who can win beneath can win here too: that is
+      one pot, not two.  Splitting it produced layers of pure live betting that
+      the previous round had to invent a name for ("Dead-money layer"), which is
+      a false statement about the chips in them.
+
+    What is left is exactly the poker definition: layer 0 is the main pot, and
+    every later layer exists because a player still in the hand was all-in for
+    less and cannot win it -- a side pot.
+    """
+
+    levels = sorted({amount for amount in committed.values() if amount > 0})
     pots: list[dict] = []
     previous = _ZERO
     for level in levels:
-        contributors = tuple(name for name in order if contributions[name] >= level)
+        contributors = tuple(name for name in order if committed[name] >= level)
+        # ``level`` came from some seat's commitment, so ``contributors`` is never
+        # empty and the slice is always worth something.
         amount = (level - previous) * len(contributors)
-        eligible = tuple(name for name in contributors if name not in folded)
-        if pots:
-            # What draws this boundary is the set of players who stopped
-            # contributing below it. If any of them is still in the hand they
-            # were all-in for less than the wager and cannot win here, and that
-            # -- capped eligibility -- is the whole definition of a side pot. If
-            # they all folded, their chips are dead money: everyone who can win
-            # the layer beneath can win this one too, so the split is
-            # bookkeeping and calling it a side pot states something untrue.
-            capped_out = [
-                name for name in pots[-1]["eligible_players"] if name not in eligible
-            ]
-            cause: PotLayerCause = "side" if capped_out else "dead_money"
-        else:
-            cause = "main"
+        previous = level
+        # Eligibility is measured against what a seat PUT UP, not against what
+        # stayed in: a seat whose live post came back uncalled -- because the only
+        # money facing it was an all-in forced post nobody could call -- still
+        # played the hand and still contests the dead money it was played for.
+        # Everything above the main pot is capped at that ceiling, which is what
+        # stops a seat winning chips no opponent matched of its own commitment.
+        threshold = level if pots else _ZERO
+        eligible = tuple(
+            name
+            for name in order
+            if name not in folded
+            and ceilings.get(name, _ZERO) > 0
+            and ceilings.get(name, _ZERO) >= threshold
+        )
+        if not pots:
+            # Unattributed dead money joins the main pot: it was never wagered by
+            # anyone, so it cannot cap anyone either.
             amount += dead_money
-            # Dead money joins this layer, so everyone still in the hand can win
-            # it -- including a player whose ENTIRE commitment was a forced post.
-            # Deriving eligibility from live contributions alone left a player
-            # all-in for their ante eligible for no pot at all, while their
-            # chips sat in one they could not be declared the winner of. That
-            # made a hand the short stack won unrecordable, which is routine
-            # once a stack is at or below the ante.
-            eligible = tuple(
-                name
-                for name in order
-                if name not in folded
-                and (name in contributors or dead_contributions.get(name, _ZERO) > 0)
-            )
-        if amount > 0:
             if not eligible:
                 raise LedgerError("A pot has no eligible player.")
             pots.append(
@@ -741,10 +788,23 @@ def _build_pots(
                     "amount": amount,
                     "contributors": contributors,
                     "eligible_players": eligible,
-                    "cause": cause,
+                    "cause": "main",
                 }
             )
-        previous = level
+            continue
+        unmatched = len(contributors) == 1
+        caps_nobody = eligible == pots[-1]["eligible_players"]
+        if unmatched or caps_nobody or not eligible:
+            pots[-1]["amount"] += amount
+            continue
+        pots.append(
+            {
+                "amount": amount,
+                "contributors": contributors,
+                "eligible_players": eligible,
+                "cause": "side",
+            }
+        )
     if not pots and dead_money > 0:
         eligible = tuple(name for name in order if name not in folded)
         if not eligible:

@@ -379,10 +379,16 @@ def persist_reconciliation(
     """Recompute summaries and persist a truthful reconciliation status."""
 
     result = reconcile_persisted_hand(db, hand_id)
-    if not any(entry.entry_type == "refund" for entry in result.entries):
-        players_by_key = {
-            player.player_key: player for player in db.fetch_players_by_hand(hand_id)
-        }
+    hand_players = db.fetch_players_by_hand(hand_id)
+    # An uncalled-bet refund derived from an action line that never closed is not
+    # a fact about the hand -- it is the arithmetic of a fold nobody made. Writing
+    # it as a durable settlement row would file that fabrication in the store, and
+    # would then have to be un-filed by hand once the missing action is recorded.
+    # The hand is blocked either way; it just does not get a manufactured row.
+    if not any(entry.entry_type == "refund" for entry in result.entries) and not (
+        _unanswered_wager_issues(hand_players, result.ledger)
+    ):
+        players_by_key = {player.player_key: player for player in hand_players}
         derived_refunds = [
             SettlementEntry(
                 hand_id=hand_id,
@@ -516,6 +522,80 @@ def _unreadable_row_issues(records: _HandRecords) -> list[str]:
     ]
 
 
+def _unanswered_wager_issues(
+    players: list[HandPlayer], ledger: HandLedger
+) -> list[str]:
+    """An uncalled wager nobody was left able to answer means the line never closed.
+
+    The ledger refunds an uncalled wager -- the excess one seat committed above
+    every other seat -- and that refund is only ever produced by one of two real
+    situations: everyone else FOLDED to it, or everyone else was ALL-IN and
+    physically could not match it. In both, the excess chips were never live to
+    anybody, so handing them back is right.
+
+    There is a third way to reach a refund, and it is not a situation at all: the
+    recorded action line simply stops while an opponent still has cards and chips.
+    A manual spot typed as ``x/b3.5`` (Hero checks, Villain bets, Hero never
+    acts), a mid-street truncation, a reconstructed hand whose closing action was
+    not observed. The ledger cannot tell that apart from a fold-win by looking at
+    contributions alone, so it refunded the bet AND paid the whole pot to the
+    declared winner: a settlement asserting simultaneously that Villain's wager
+    went unanswered and that Hero won it. Every figure derived from that hand --
+    the hero result substituted into the Hands library and the win rate, the pot
+    on the Study page, the math facts handed to the coaching provider -- is a
+    number no completion of the hand produces, and the whole stack of surfaces
+    called it "reconciled".
+
+    The distinguishing fact is available here and was never consulted: whether
+    any seat that is NOT the refunded one is still in the hand (did not fold) and
+    still has chips behind (was not all-in). If one is, the wager was live when
+    the record ended and this hand has no derivable result, whoever is declared
+    the winner of it -- including the case where the declared winner happens to be
+    the refunded seat, where the arithmetic coincides with "the opponent folded"
+    but the record does not say so.
+
+    Reported as a cross-check issue rather than raised, on the same reasoning as
+    every other issue in this module: ``persist_reconciliation`` turns it into
+    ``needs_correction``, ``is_authoritative`` goes False, and
+    ACCOUNTING_NOT_AUTHORITATIVE carries the sentence to the operator with the
+    action that clears it -- record the call, the fold, or the all-in.
+
+    Derived from the ledger and the player rows only, never from the declaration,
+    so both dependence passes see the same issue and the measurement of what the
+    declaration moves is unchanged by it.
+    """
+
+    stacks = {player.player_key: player.starting_stack for player in players}
+    names = {player.player_key: player.player_name for player in players}
+    folded = set(ledger.folded_players)
+    issues: list[str] = []
+    for identity, refund in sorted(ledger.refunds.items()):
+        if refund <= _FLOAT_TOLERANCE:
+            continue
+        live: list[str] = []
+        for other, contributed in sorted(ledger.contributions.items()):
+            if other == identity or other in folded:
+                continue
+            # A seat that put nothing in is not "still in the hand" for this
+            # purpose: the ledger already leaves it out of every pot's eligible
+            # set, and a table seat that was never dealt in or folded before the
+            # recording began must not be read as an unanswered decision.
+            if contributed <= _FLOAT_TOLERANCE:
+                continue
+            behind = stacks.get(other)
+            if behind is None or behind - contributed > _FLOAT_TOLERANCE:
+                live.append(names.get(other, other))
+        if live:
+            issues.append(
+                f"{names.get(identity, identity)} is refunded {refund:g} as an "
+                f"uncalled wager, but {', '.join(live)} neither folded nor was "
+                "all-in, so the recorded action line never closed the betting. "
+                "Record the call, fold, raise, or all-in that ended it; no result "
+                "can be derived from a hand that stops mid-wager."
+            )
+    return issues
+
+
 def _cross_check(records: _HandRecords, declaration: _Declaration) -> _CrossCheck:
     """Derive the ledger under one settlement declaration and cross-check it.
 
@@ -542,7 +622,12 @@ def _cross_check(records: _HandRecords, declaration: _Declaration) -> _CrossChec
         odd_chip_order=list(declaration.odd_chip_order),
         flop_seen=records.flop_seen,
     )
-    issues = [*ledger.warnings, *ledger.legality_issues, *_unreadable_row_issues(records)]
+    issues = [
+        *ledger.warnings,
+        *ledger.legality_issues,
+        *_unanswered_wager_issues(records.players, ledger),
+        *_unreadable_row_issues(records),
+    ]
     # One tolerance, and it is float-representation noise. Nothing here is
     # compared at anything wider, and no settlement field may widen it. Pinned by
     # round14::test_the_dependence_tolerance_is_the_float_noise_floor (the constant

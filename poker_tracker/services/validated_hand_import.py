@@ -51,13 +51,24 @@ class ImportGateResult:
 
 @dataclass(frozen=True)
 class HandImportResult:
-    """Outcome of attempting to land one timeline hand in the destination session."""
+    """Outcome of attempting to land one timeline hand in the destination session.
+
+    ``rollback_point`` is additive and names the snapshot file this import was
+    allowed to proceed against, AFTER that file was proved to survive an isolated
+    restore. It exists because the caller previously could not tell a verified
+    rollback point from an unverified one: ``ensure_preimport_snapshot`` returned
+    ``None`` both when it had just verified a snapshot and when it had merely
+    seen one in the directory listing, and nothing on this result carried the
+    difference. Every existing consumer reads ``status``/``hand_id``/``message``
+    unchanged.
+    """
 
     status: Literal["imported", "already_present", "blocked", "skipped"]
     hand_id: int | None = None
     session_id: int | None = None
     reasons: tuple[str, ...] = ()
     message: str = ""
+    rollback_point: str | None = None
 
 
 def hand_frames_validated(
@@ -338,16 +349,17 @@ def ensure_hand_imported(
         )
 
     paths = ensure_data_directories(data_dir)
-    refusal = ensure_preimport_snapshot(
+    rollback = verified_preimport_snapshot(
         db, job_id=job_id, backups=Path(paths["backups"]), data_dir=Path(paths["data"])
     )
-    if refusal is not None:
+    if rollback.refusal is not None or rollback.path is None:
         return HandImportResult(
             status="blocked",
             session_id=session_id,
             reasons=("pre-import snapshot unavailable",),
-            message=refusal,
+            message=rollback.refusal or "No verified pre-import rollback point.",
         )
+    rollback_point = rollback.path.name
     with db.transaction(immediate=True):
         existing = find_existing_imported_hand(
             db,
@@ -362,6 +374,7 @@ def ensure_hand_imported(
                 hand_id=existing.id,
                 session_id=session_id,
                 message=f"Hand already in session #{session_id}.",
+                rollback_point=rollback_point,
             )
         import_hands_into_session(db, one_hand_payload, session_id)
         saved = find_existing_imported_hand(
@@ -377,6 +390,7 @@ def ensure_hand_imported(
             session_id=session_id,
             reasons=("import did not persist the hand",),
             message="Import finished without a matching hand row.",
+            rollback_point=rollback_point,
         )
     label = "draft" if mode == "draft" else "validated hand"
     return HandImportResult(
@@ -384,7 +398,21 @@ def ensure_hand_imported(
         hand_id=saved.id,
         session_id=session_id,
         message=f"Added {label} #{timeline_hand_number} to session #{session_id}.",
+        rollback_point=rollback_point,
     )
+
+
+@dataclass(frozen=True)
+class PreimportSnapshot:
+    """The verified rollback point an import may proceed against, or the refusal.
+
+    Two states, and they are no longer spelled the same way. ``refusal`` set means
+    this import must not proceed; ``path`` set means a snapshot was proved -- in
+    this call, not in some earlier one -- to survive an isolated restore.
+    """
+
+    path: Path | None = None
+    refusal: str | None = None
 
 
 def ensure_preimport_snapshot(
@@ -394,6 +422,19 @@ def ensure_preimport_snapshot(
     backups: Path,
     data_dir: Path,
 ) -> str | None:
+    """Backwards-compatible spelling: the refusal string, or None to proceed."""
+    return verified_preimport_snapshot(
+        db, job_id=job_id, backups=backups, data_dir=data_dir
+    ).refusal
+
+
+def verified_preimport_snapshot(
+    db: PokerDatabase,
+    *,
+    job_id: int,
+    backups: Path,
+    data_dir: Path,
+) -> PreimportSnapshot:
     """Take one verified rollback point per CV job. Returns a refusal, or None.
 
     The snapshot used to be taken per imported HAND, and unpinned: importing
@@ -413,37 +454,86 @@ def ensure_preimport_snapshot(
     snapshot: an unverified rollback point is not a rollback point, and the
     moment before the write is the last moment at which refusing still helps.
 
-    Once enough other jobs have pushed this job's snapshot out of its pool, a
-    later visit to the same job takes a fresh one. That snapshot precedes the
-    hands still to land rather than all of them, which is the most any snapshot
-    taken at that moment could be.
+    EVERY call verifies, and that is the round-16 repair. Existence used to stand
+    in for verification -- ``if find_snapshots(...): return None`` short-circuited
+    before ``verify_snapshot`` was ever reached -- so exactly one hand per job
+    ever got the guarantee this docstring states. The interactive path it
+    describes adds hands one click at a time, so hands 2..N of a job proceeded
+    against a file nobody had looked at since hand 1. If the backup mount filled,
+    or a truncating copy or an interrupted rsync left the snapshot zero bytes in
+    between, the listing still contained the name, the function still returned
+    "proceed", and the remaining hands landed in the study database with no
+    usable rollback point and nothing anywhere saying so -- a snapshot the
+    product's own verifier grades ``fail``, reported as a verified one.
+
+    A retained artifact cannot be its own proof-of-check. It is a fine MARKER --
+    the filename still answers "has this job been snapshotted" from the directory
+    listing, with no marker file and no schema column -- but the question the
+    import actually depends on is "does that file still restore", and only
+    restoring it answers that. The cost is one isolated restore per hand rather
+    than one per job; a rollback point that is not checked is not cheaper than
+    one that is, it is absent.
+
+    When no retained snapshot for this job restores any more, this takes a fresh
+    one rather than dead-ending the operator on a corrupt file they would have to
+    find and delete by hand. That replacement is honest about less than the first
+    snapshot was: it postdates whatever already landed, so it is a rollback point
+    for the hands still to come. The same is true after rotation evicts this
+    job's snapshot (the preimport pool is per-CLASS, so five other jobs push this
+    one out), and it is the most any snapshot taken at that moment could be.
+
+    KNOWN AND NOT FIXED HERE: the replacement is written under the same
+    ``preimport-job<N>-<stamp>`` name as the original, and that name asserts it
+    precedes job N's imports when it does not. Correcting the assertion means
+    changing the snapshot filename grammar in ``poker_tracker.persistence.backup``
+    -- a persisted artifact shape that rotation, the health audit and the restore
+    runbook all match on -- which is not this module's to change.
     """
     scope = f"job{job_id}"
-    if find_snapshots(backups, purpose="preimport", scope=scope):
-        return None
+    live = Path(db.db_path)
+    stale: list[str] = []
+    for snapshot in find_snapshots(backups, purpose="preimport", scope=scope):
+        verification = verify_snapshot(
+            snapshot, live_database=live, data_dir=data_dir
+        )
+        if verification.status != "fail":
+            return PreimportSnapshot(path=snapshot)
+        stale.append(
+            f"{snapshot.name} ({'; '.join(verification.details) or verification.message})"
+        )
+    context = (
+        ""
+        if not stale
+        else (
+            " The retained snapshot(s) for this job no longer restore: "
+            f"{'; '.join(stale)}."
+        )
+    )
     try:
         snapshot = backup_database(
-            Path(db.db_path),
+            live,
             backups,
             purpose="preimport",
             scope=scope,
             data_dir=data_dir,
         )
     except (OSError, ValueError, sqlite3.Error) as exc:
-        return (
-            f"Could not write a pre-import snapshot to {backups}: "
-            f"{type(exc).__name__}: {exc}"
+        return PreimportSnapshot(
+            refusal=(
+                f"Could not write a pre-import snapshot to {backups}: "
+                f"{type(exc).__name__}: {exc}.{context}"
+            )
         )
-    verification = verify_snapshot(
-        snapshot, live_database=Path(db.db_path), data_dir=data_dir
-    )
+    verification = verify_snapshot(snapshot, live_database=live, data_dir=data_dir)
     if verification.status == "fail":
         detail = "; ".join(verification.details) or verification.message
-        return (
-            f"The pre-import snapshot {snapshot.name} did not survive an isolated "
-            f"restore, so this import has no rollback point: {detail}"
+        return PreimportSnapshot(
+            refusal=(
+                f"The pre-import snapshot {snapshot.name} did not survive an isolated "
+                f"restore, so this import has no rollback point: {detail}.{context}"
+            )
         )
-    return None
+    return PreimportSnapshot(path=snapshot)
 
 
 def import_all_autonomous_eligible(

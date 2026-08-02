@@ -3,6 +3,7 @@ from pydantic import ValidationError
 
 from poker_tracker.persistence.completion import (
     EVIDENCE_SCHEMA_VERSION,
+    UNREADABLE_HAND_COLUMNS_KEY,
     CompletionEvidence,
     acknowledge_codes,
     dump_completion_evidence,
@@ -605,7 +606,16 @@ def test_cv_hand_without_declared_completion_defaults_to_uncertain() -> None:
     db.close()
 
 
-def test_fetch_hand_parses_corrupt_completion_evidence_as_empty() -> None:
+def test_fetch_hand_reports_corrupt_completion_evidence_rather_than_reading_it_empty() -> None:
+    """A corrupt evidence blob never raises, and never passes as "no evidence".
+
+    It used to read back as ``{}`` with nothing recorded, which is
+    indistinguishable from a hand that legitimately carries no evidence -- so the
+    hand kept its Reviewed / Complete badges and its place in the Confirmed-result
+    KPI. It now degrades the way an unreadable SCALAR column already did: named on
+    ``unreadable_columns``, recorded with its stored text, and demoted to
+    ``needs_correction``. See tests/test_unreadable_blob_columns.py.
+    """
     db = make_db()
     session = db.create_session(Session(name="Corrupt"))
     hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
@@ -617,8 +627,13 @@ def test_fetch_hand_parses_corrupt_completion_evidence_as_empty() -> None:
 
     saved = db.fetch_hand(hand.id)
 
-    assert saved.completion_evidence == {}
+    # Still no pipeline evidence, and still no exception out of the fetch.
     assert parse_completion_evidence(saved.completion_evidence).is_known is False
+    assert saved.unreadable_columns == ("completion_evidence",)
+    assert saved.review_status == "needs_correction"
+    assert "{not valid json" in str(
+        saved.completion_evidence[UNREADABLE_HAND_COLUMNS_KEY]["completion_evidence"]
+    )
     db.close()
 
 

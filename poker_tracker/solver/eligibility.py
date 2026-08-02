@@ -6,14 +6,17 @@ from dataclasses import dataclass
 from poker_tracker.persistence.models import Action, Hand, HandPlayer
 from poker_tracker.services.hand_accounting import AccountingReconciliation
 from poker_tracker.services.study_readiness import accounting_is_established
+from poker_tracker.solver.line import (
+    STREET_ORDER,
+    recorded_line_defect,
+    unplayed_streets,
+)
 from poker_tracker.solver.models import (
     EligibilityResult,
     RecordedSolverAction,
     SolverPlayer,
     SolverSpot,
 )
-
-_STREET_ORDER = ("flop", "turn", "river")
 
 
 @dataclass(frozen=True)
@@ -98,7 +101,7 @@ def prepare_solver_spot(
 
     selected_index: int | None = None
     selected_street: str | None = None
-    for street in _STREET_ORDER:
+    for street in STREET_ORDER:
         indexes = [index for index, action in enumerate(actions) if action.street == street]
         if not indexes:
             continue
@@ -218,7 +221,7 @@ def prepare_solver_spot(
         )
 
     prior_multiway = any(
-        snapshot.street in _STREET_ORDER
+        snapshot.street in STREET_ORDER
         and snapshot.index < first_snapshot.index
         and len(snapshot.active_players) > 2
         for snapshot in snapshots
@@ -235,7 +238,7 @@ def prepare_solver_spot(
 
     recorded_line: list[RecordedSolverAction] = []
     for action, snapshot in zip(actions[selected_index:], snapshots[selected_index:], strict=True):
-        if action.street not in _STREET_ORDER or action.player_key not in active_keys:
+        if action.street not in STREET_ORDER or action.player_key not in active_keys:
             continue
         recorded_line.append(
             RecordedSolverAction(
@@ -257,6 +260,38 @@ def prepare_solver_spot(
                 warnings=warnings,
             ),
             spot=None,
+        )
+    # Everything above this point asks whether the hand's CHIPS are in order.
+    # Nothing above it asks whether the recorded actions are a sequence anybody
+    # could have played: the ledger sums commitments and checks each action in
+    # isolation, so it settles a line that stops on an unanswered bet by refunding
+    # the bet, and a line missing an action in the middle by summing what remains.
+    # Both reconcile, both report legal and balanced, and both used to arrive here
+    # eligible with an empty reason and warning list. See solver/line.py for what
+    # each one costs.
+    line_defect = recorded_line_defect(
+        recorded_line, oop_key=oop_key, ip_key=ip_key, start_street=selected_street
+    )
+    if line_defect is not None:
+        return PreparedSpot(
+            eligibility=EligibilityResult(
+                eligible=False,
+                reasons=[
+                    f"{line_defect} Correct the postflop action line before solver "
+                    "analysis."
+                ],
+                warnings=warnings,
+            ),
+            spot=None,
+        )
+    missing_streets = unplayed_streets(recorded_line, hand.board_cards)
+    if missing_streets:
+        warnings.append(
+            f"The recorded action ends on the {recorded_line[-1].street} with no "
+            f"fold or all-in, but the saved board runs to the {missing_streets[-1]}; "
+            f"the {' and '.join(missing_streets)} betting is absent from this hand's "
+            "record. The solved decision is still one Hero made, but this hand is "
+            "not a complete transcript."
         )
 
     spot = SolverSpot(

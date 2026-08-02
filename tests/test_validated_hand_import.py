@@ -542,3 +542,182 @@ def test_identity_survives_notes_edit(
     assert second.status == "already_present"
     assert len(db.fetch_hands_by_session(session_id)) == 1
     db.close()
+
+
+# ---------------------------------------------------------------------------
+# The rollback point has to prove itself on every import, not only on the first
+# ---------------------------------------------------------------------------
+
+
+def _preimport_files(backups: Path, job_id: int) -> list[Path]:
+    from poker_tracker.persistence.backup import find_snapshots
+
+    return find_snapshots(backups, purpose="preimport", scope=f"job{job_id}")
+
+
+def test_a_retained_snapshot_is_reverified_before_every_import(tmp_path: Path) -> None:
+    """Existence was standing in for verification after the first call.
+
+    ``ensure_preimport_snapshot`` short-circuited on ``find_snapshots(...)``
+    before ``verify_snapshot`` was ever reached, so exactly one hand per job got
+    the guarantee its docstring states. Truncate the retained file in between --
+    a full mount, a truncating copy, an interrupted rsync -- and the second call
+    still returned "proceed" while the only artifact backing that decision was a
+    file the product's own verifier grades ``fail``.
+
+    Written against the long-standing ``ensure_preimport_snapshot`` signature on
+    purpose: the assertion is about the decision, not about any new API.
+    """
+    from poker_tracker.maintenance.data_health import verify_snapshot
+    from poker_tracker.services.validated_hand_import import ensure_preimport_snapshot
+
+    db = _make_db(tmp_path)
+    backups = tmp_path / "backups"
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+
+    assert (
+        ensure_preimport_snapshot(db, job_id=7, backups=backups, data_dir=data_dir)
+        is None
+    )
+    retained = _preimport_files(backups, 7)
+    assert len(retained) == 1
+    retained[0].write_bytes(b"")
+    assert (
+        verify_snapshot(
+            retained[0], live_database=Path(db.db_path), data_dir=data_dir
+        ).status
+        == "fail"
+    )
+
+    refusal = ensure_preimport_snapshot(
+        db, job_id=7, backups=backups, data_dir=data_dir
+    )
+
+    if refusal is None:
+        # Proceeding is only honest if SOMETHING retained for this job restores.
+        surviving = [
+            path
+            for path in _preimport_files(backups, 7)
+            if verify_snapshot(
+                path, live_database=Path(db.db_path), data_dir=data_dir
+            ).status
+            != "fail"
+        ]
+        assert surviving, (
+            "the import was allowed to proceed against a snapshot the product's "
+            "own verifier grades 'fail'"
+        )
+    db.close()
+
+
+def test_no_verified_rollback_point_means_no_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A snapshot that stops restoring must stop the import, not just the first one.
+
+    The imported hand here is the SECOND of the job, which is precisely the call
+    the old existence short-circuit skipped verification on.
+    """
+    from poker_tracker.maintenance.data_health import CheckResult
+
+    timeline = _four_hand_timeline()
+    db = _make_db(tmp_path)
+    job_id, session_id, _ = _seed_job(db, tmp_path, timeline, monkeypatch=monkeypatch)
+    _mark_frames_correct(db, job_id, (2, "b"), (3, "c"))
+
+    first = ensure_hand_imported(db, job_id, 2, mode="auto", data_dir=tmp_path)
+    assert first.status == "imported"
+
+    # From here on nothing restores: the mount is gone, the copies are corrupt.
+    monkeypatch.setattr(
+        "poker_tracker.services.validated_hand_import.verify_snapshot",
+        lambda *args, **kwargs: CheckResult(
+            "backup_verification", "fail", "did not survive an isolated restore.", ()
+        ),
+    )
+    second = ensure_hand_imported(db, job_id, 3, mode="auto", data_dir=tmp_path)
+
+    assert second.status == "blocked", second
+    assert "pre-import snapshot unavailable" in second.reasons
+    assert len(db.fetch_hands_by_session(session_id)) == 1
+    db.close()
+
+
+def test_a_snapshot_that_still_restores_is_reused_rather_than_recopied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Re-verifying must not turn back into one full copy of the database per hand.
+
+    That regression is what the per-job snapshot exists to prevent: eight hands
+    meant eight copies, and the rollback point was evicted by the imports it was
+    taken to protect.
+    """
+    db = _make_db(tmp_path)
+    job_id, _, _ = _seed_job(
+        db, tmp_path, _four_hand_timeline(), monkeypatch=monkeypatch
+    )
+    _mark_frames_correct(db, job_id, (2, "b"), (3, "c"))
+
+    first = ensure_hand_imported(db, job_id, 2, mode="auto", data_dir=tmp_path)
+    second = ensure_hand_imported(db, job_id, 3, mode="auto", data_dir=tmp_path)
+
+    assert (first.status, second.status) == ("imported", "imported")
+    assert len(_preimport_files(tmp_path / "backups", job_id)) == 1
+    db.close()
+
+
+def test_the_result_names_the_rollback_point_it_was_allowed_to_proceed_against(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The caller could not tell "verified" from "did not look".
+
+    ``ensure_preimport_snapshot`` returned ``None`` for both, and
+    ``HandImportResult`` carried nothing about the snapshot at all, so an import
+    with no usable rollback point rendered as an ordinary success.
+    """
+    db = _make_db(tmp_path)
+    job_id, _, _ = _seed_job(
+        db, tmp_path, _four_hand_timeline(), monkeypatch=monkeypatch
+    )
+    _mark_frames_correct(db, job_id, (2, "b"))
+
+    result = ensure_hand_imported(db, job_id, 2, mode="auto", data_dir=tmp_path)
+
+    assert result.status == "imported"
+    assert result.rollback_point == _preimport_files(tmp_path / "backups", job_id)[0].name
+    db.close()
+
+
+def _four_hand_timeline() -> dict:
+    return {
+        "states": [
+            {"image": f"{letter}.jpg", "time_s": index, "hero_cards": ["As", "Kd"]}
+            for index, letter in enumerate("abcd", start=1)
+        ],
+        "hands": [
+            _spine_hand(
+                hand_number=number,
+                source_images=[f"{letter}.jpg"],
+                terminal_event="showdown",
+                t_start=float(number),
+                t_end=float(number) + 0.5,
+            )
+            for number, letter in enumerate("abcd", start=1)
+        ],
+    }
+
+
+def _mark_frames_correct(
+    db: PokerDatabase, job_id: int, *frames: tuple[int, str]
+) -> None:
+    for number, letter in frames:
+        db.upsert_reconstruction_frame_review(
+            ReconstructionFrameReview(
+                job_id=job_id,
+                hand_number=number,
+                source_image=f"{letter}.jpg",
+                timestamp_seconds=float(number),
+                status="correct",
+            )
+        )

@@ -587,6 +587,13 @@ def test_import_rejection_creates_no_partial_session() -> None:
 
 
 def test_import_still_creates_a_duplicate_session_on_reimport() -> None:
+    """Import remains an APPEND: no payload may address or replace a session.
+
+    The copy is created exactly as before. What it may no longer do is pass for
+    an original: it is named and annotated as a re-import, so the session list
+    cannot show two indistinguishable rows. See
+    tests/test_duplicate_session_import.py.
+    """
     source = make_db()
     session = create_sample_data(source)
     payload = export_session(source, session.id)
@@ -599,6 +606,9 @@ def test_import_still_creates_a_duplicate_session_on_reimport() -> None:
     assert len(target.fetch_sessions()) == 2
     assert len(target.fetch_hands_by_session(first.id)) == 5
     assert len(target.fetch_hands_by_session(second.id)) == 5
+    assert first.name == session.name
+    assert second.name != first.name
+    assert str(first.id) in second.notes
     source.close()
     target.close()
 

@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, TypeVar, get_args
+from typing import Any, TypeVar, get_args, get_origin
 
 from pydantic import ValidationError
 
@@ -5462,11 +5462,23 @@ def _session_from_row(row: sqlite3.Row) -> Session:
 
 def _hand_from_row(row: sqlite3.Row) -> Hand:
     data = _row_dict(row)
+    unreadable_blobs = _unreadable_blob_columns(Hand, data)
     data["tags"] = _parse_json_list(data.get("tags", "[]"))
     # _parse_json_object, never _parse_json_dict: the latter str()s every value and
     # would flatten nested evidence into a Python repr.
     evidence = _parse_json_object(data.get("completion_evidence", "{}"), {})
     data["completion_evidence"] = evidence if isinstance(evidence, dict) else {}
+    if unreadable_blobs:
+        # The same read-time channel a degraded SCALAR column is recorded in, so
+        # the demotion in ``_demote_degraded_hand``, the UNREADABLE_HAND_COLUMNS
+        # blocker and the export/import restore are all inherited unchanged --
+        # there is no second rule to keep in step. Written here rather than left
+        # to ``_degraded_hand``, because a damaged blob does not fail validation
+        # and so never reaches the salvage path at all.
+        data["completion_evidence"] = {
+            **data["completion_evidence"],
+            UNREADABLE_HAND_COLUMNS_KEY: dict(unreadable_blobs),
+        }
     # Symmetry with the evidence blob above. The hands table deliberately carries
     # no CHECK constraint, so a hand-edited row can hold 'COMPLETE', a trailing
     # space, or an integer. Passing those straight to the pydantic Literal made
@@ -5512,7 +5524,7 @@ def _hand_from_row(row: sqlite3.Row) -> Hand:
         hand = Hand(**{**data, "created_at": _parse_datetime(data["created_at"])})
     except (ValidationError, TypeError, ValueError):
         hand = _degraded_hand(data)
-    return _demote_degraded_hand(hand)
+    return _demote_degraded_hand(_with_unreadable_blobs(hand, unreadable_blobs))
 
 
 def _demote_degraded_hand(hand: Hand) -> Hand:
@@ -5569,7 +5581,13 @@ def _degraded_hand(data: dict[str, Any]) -> Hand:
     )
     if not unreadable:
         return hand
-    recorded = {name: repr(data.get(name)) for name in unreadable}
+    # Merged, never replaced: ``_unreadable_blob_columns`` has already recorded
+    # every JSON blob column it had to give up under this same key, and a plain
+    # assignment silently dropped that record whenever a scalar column on the
+    # same row also failed -- taking the blob's blocker with it.
+    already = hand.completion_evidence.get(UNREADABLE_HAND_COLUMNS_KEY)
+    recorded: dict[str, object] = dict(already) if isinstance(already, dict) else {}
+    recorded.update({name: repr(data.get(name)) for name in unreadable})
     return hand.model_copy(
         update={
             "review_status": "needs_correction",
@@ -5577,6 +5595,117 @@ def _degraded_hand(data: dict[str, Any]) -> Hand:
                 **hand.completion_evidence,
                 UNREADABLE_HAND_COLUMNS_KEY: recorded,
             },
+        }
+    )
+
+
+def _blob_columns(model_cls: type[PersistedModel]) -> tuple[tuple[str, type], ...]:
+    """The columns of a table stored as a JSON blob, read off the MODEL.
+
+    A field whose annotation is a ``list`` or ``dict`` container is written
+    through ``_serialize_json`` and read back through ``_parse_json_object``;
+    every other field is a scalar column that pydantic itself validates. Deriving
+    the set from ``model_fields`` rather than listing the blob columns of each
+    table is the same rule ``_salvaged_row`` follows: a blob column added to any
+    model later is covered without anyone remembering this function exists.
+    """
+    columns: list[tuple[str, type]] = []
+    for name, spec in model_cls.model_fields.items():
+        if spec.exclude:
+            continue
+        origin = get_origin(spec.annotation)
+        if origin in (list, dict):
+            columns.append((name, origin))
+    return tuple(columns)
+
+
+_BLOB_COLUMNS_BY_MODEL: dict[type[PersistedModel], tuple[tuple[str, type], ...]] = {}
+
+
+# How much of an unreadable blob's stored text a marker keeps. Generous enough
+# that every realistic value is recorded whole -- which is what makes
+# ``restore_unreadable_columns``'s ``literal_eval`` round trip exact -- and
+# bounded, because a blob column is the one place a row can hold megabytes: the
+# marker is rendered into a study blocker's detail and travels through export and
+# import, so an unbounded copy of the damaged text would be carried into both.
+_RECORDED_BLOB_TEXT_LIMIT = 4096
+
+
+def _recorded_blob_text(raw: object) -> str:
+    """What a marker stores for an unreadable blob: its ``repr``, bounded."""
+    recorded = repr(raw)
+    if len(recorded) <= _RECORDED_BLOB_TEXT_LIMIT:
+        return recorded
+    return (
+        f"{recorded[:_RECORDED_BLOB_TEXT_LIMIT]}... "
+        f"(truncated; {len(recorded)} characters stored)"
+    )
+
+
+def _unreadable_blob_columns(
+    model_cls: type[PersistedModel], data: dict[str, Any]
+) -> dict[str, str]:
+    """Name every JSON blob column of this row that could not be read back.
+
+    Detection only: what each reader STORES for a damaged blob is unchanged, so
+    no value semantics move. What changes is that the loss stops being silent.
+
+    Every scalar column this build cannot read is named on ``unreadable_columns``
+    by ``_salvaged_row``, which is what forces ``review_status='needs_correction'``
+    on a hand, ``status='open'`` on a debugging issue, ``is_stale=True`` on
+    coaching, and what the accounting cross-check refuses to build a ledger over.
+    The BLOB columns were the hole in that rule: ``_parse_json_list`` and
+    ``_parse_json_object`` degrade a damaged blob to an empty list/dict, pydantic
+    accepts an empty container as a perfectly valid value, and the row comes back
+    with ``unreadable_columns == ()`` -- indistinguishable from a row that
+    legitimately holds nothing there.
+
+    Two instances show why this had to be closed as a class rather than at a call
+    site. ``hands.completion_evidence`` is the CHANNEL the degradation markers
+    travel in, so its own damage destroyed the only record that could have
+    reported it: the hand kept its Reviewed / Complete / confidence-High badges
+    and its place in the Overview "Confirmed result ... from N reviewed hands"
+    KPI, for a status ``update_hand_status`` re-derives from that same evidence
+    and refuses to issue. ``solver_runs.spot`` is the same silence in another
+    table: a run whose spot, ranges or frequencies could not be read came back
+    ``completed`` -- the one status study evidence is granted on -- holding empty
+    dicts, so a solve was offered as evidence for a spot nobody could read.
+
+    Not every blob was exposed. ``hand_issues.issue_types`` declares
+    ``min_length=1``, so its empty degraded value fails validation, reaches
+    ``_salvaged_row`` and was already named; that is exactly the difference this
+    function removes -- whether a blob column happens to have a constraint that
+    rejects its own empty value should not decide whether its loss is reported.
+
+    An empty or absent column is untouched: a hand with no tags, an issue with no
+    evidence snapshot and a settlement with no warnings are ordinary states. Only
+    text that is PRESENT and cannot be read back as its own container is a
+    degradation.
+    """
+    blob_columns = _BLOB_COLUMNS_BY_MODEL.get(model_cls)
+    if blob_columns is None:
+        blob_columns = _blob_columns(model_cls)
+        _BLOB_COLUMNS_BY_MODEL[model_cls] = blob_columns
+    unreadable: dict[str, str] = {}
+    for column, container in blob_columns:
+        raw = data.get(column)
+        if raw is None or raw == "" or isinstance(raw, container):
+            continue
+        if isinstance(_parse_json_object(raw, None), container):
+            continue
+        unreadable[column] = _recorded_blob_text(raw)
+    return unreadable
+
+
+def _with_unreadable_blobs(model: _ModelT, unreadable: dict[str, str]) -> _ModelT:
+    """Name a degraded blob on the model, exactly where a degraded scalar is named."""
+    if not unreadable:
+        return model
+    return model.model_copy(
+        update={
+            "unreadable_columns": tuple(
+                dict.fromkeys((*model.unreadable_columns, *unreadable))
+            )
         }
     )
 
@@ -5701,18 +5830,20 @@ def _refuse_display_copy(hand: Hand, verb: str) -> None:
 
 def _hand_settlement_from_row(row: sqlite3.Row) -> HandSettlement:
     data = _row_dict(row)
+    unreadable_blobs = _unreadable_blob_columns(HandSettlement, data)
     try:
         data["no_flop_no_drop"] = bool(data["no_flop_no_drop"])
         data["is_balanced"] = bool(data["is_balanced"])
         data["warnings"] = _parse_json_list(data.get("warnings", "[]"))
         data["created_at"] = _parse_datetime(data["created_at"])
         data["updated_at"] = _parse_datetime(data["updated_at"])
-        return HandSettlement(**data)
+        settlement = HandSettlement(**data)
     except (ValidationError, ValueError, TypeError):
         # Every column this row carries, including the timestamps: the whole
         # conversion is inside the guard so no single unreadable cell can raise
         # out of a fetch. See `_degraded_hand_settlement`.
-        return _degraded_hand_settlement(data)
+        settlement = _degraded_hand_settlement(data)
+    return _with_unreadable_blobs(settlement, unreadable_blobs)
 
 
 def _degraded_hand_settlement(data: dict[str, Any]) -> HandSettlement:
@@ -5937,10 +6068,11 @@ def _review_from_row(row: sqlite3.Row) -> HandReview:
 
 def _hand_correction_from_row(row: sqlite3.Row) -> HandCorrection:
     data = _row_dict(row)
+    unreadable_blobs = _unreadable_blob_columns(HandCorrection, data)
     data["before_state"] = _parse_json_dict(data.get("before_state", "{}"))
     data["after_state"] = _parse_json_dict(data.get("after_state", "{}"))
     try:
-        return HandCorrection(
+        correction = HandCorrection(
             **{**data, "created_at": _parse_datetime(data["created_at"])}
         )
     except (ValidationError, TypeError, ValueError):
@@ -5952,7 +6084,7 @@ def _hand_correction_from_row(row: sqlite3.Row) -> HandCorrection:
                 "correction_type": "hand_facts",
             },
         )
-        return correction
+    return _with_unreadable_blobs(correction, unreadable_blobs)
 
 
 def _recognised_issue_types(stored: object) -> list[str]:
@@ -5975,18 +6107,27 @@ def _recognised_issue_types(stored: object) -> list[str]:
 
 def _hand_issue_from_row(row: sqlite3.Row) -> HandIssue:
     data = _row_dict(row)
+    # Read before the parses below turn a damaged column into an empty container.
+    # `issue_types` was already covered, but only because `min_length=1` rejects
+    # its own empty degraded value and pushes the row into `_salvaged_row`;
+    # `evidence_snapshot` has no such constraint, so the immutable snapshot an
+    # issue is filed on used to disappear with nothing recorded.
+    unreadable_blobs = _unreadable_blob_columns(HandIssue, data)
     data["issue_types"] = _parse_json_list(data.get("issue_types", "[]"))
     data["evidence_snapshot"] = _parse_json_object(
         data.get("evidence_snapshot", "{}"), {}
     )
     try:
-        return HandIssue(
-            **{
-                **data,
-                "created_at": _parse_datetime(data["created_at"]),
-                "updated_at": _parse_datetime(data["updated_at"]),
-                "resolved_at": _parse_optional_datetime(data.get("resolved_at")),
-            }
+        return _with_unreadable_blobs(
+            HandIssue(
+                **{
+                    **data,
+                    "created_at": _parse_datetime(data["created_at"]),
+                    "updated_at": _parse_datetime(data["updated_at"]),
+                    "resolved_at": _parse_optional_datetime(data.get("resolved_at")),
+                }
+            ),
+            unreadable_blobs,
         )
     except (ValidationError, TypeError, ValueError):
         issue, unreadable = _salvaged_row(
@@ -5999,7 +6140,8 @@ def _hand_issue_from_row(row: sqlite3.Row) -> HandIssue:
                 or ["other"],
             },
         )
-        if not unreadable:
+        issue = _with_unreadable_blobs(issue, unreadable_blobs)
+        if not unreadable and not unreadable_blobs:
             return issue
         # A resolution recorded in a row this build cannot fully read is not a
         # resolution anyone can verify. Open blocks study readiness
@@ -6010,11 +6152,15 @@ def _hand_issue_from_row(row: sqlite3.Row) -> HandIssue:
 
 def _coaching_response_from_row(row: sqlite3.Row) -> CoachingResponse:
     data = _row_dict(row)
+    unreadable_blobs = _unreadable_blob_columns(CoachingResponse, data)
     data["is_stale"] = bool(data.get("is_stale", 0))
     data["parsed_sections"] = _parse_json_dict(data.get("parsed_sections", "{}"))
     try:
-        return CoachingResponse(
-            **{**data, "created_at": _parse_datetime(data["created_at"])}
+        return _with_unreadable_blobs(
+            CoachingResponse(
+                **{**data, "created_at": _parse_datetime(data["created_at"])}
+            ),
+            unreadable_blobs,
         )
     except (ValidationError, TypeError, ValueError):
         response, unreadable = _salvaged_row(
@@ -6029,14 +6175,17 @@ def _coaching_response_from_row(row: sqlite3.Row) -> CoachingResponse:
             },
         )
         # Same argument as _review_from_row: degraded coaching is never current.
-        return response.model_copy(
-            update={
-                "is_stale": True,
-                "stale_reason": (
-                    "Stored coaching row could not be fully read: "
-                    f"{', '.join(unreadable)}."
-                ),
-            }
+        return _with_unreadable_blobs(
+            response.model_copy(
+                update={
+                    "is_stale": True,
+                    "stale_reason": (
+                        "Stored coaching row could not be fully read: "
+                        f"{', '.join(unreadable)}."
+                    ),
+                }
+            ),
+            unreadable_blobs,
         )
 
 
@@ -6061,6 +6210,7 @@ def _solver_range_profile_from_row(row: sqlite3.Row) -> SolverRangeProfile:
 
 def _solver_run_from_row(row: sqlite3.Row) -> SolverRun:
     data = _row_dict(row)
+    unreadable_blobs = _unreadable_blob_columns(SolverRun, data)
     # run_parameters is read back explicitly, including the empty object a
     # pre-18 row carries, so the model default never backfills an old run with
     # settings it was not solved under.
@@ -6068,7 +6218,7 @@ def _solver_run_from_row(row: sqlite3.Row) -> SolverRun:
         data[key] = _parse_json_object(data.get(key, "{}"), {})
     data["assumptions"] = _parse_json_object(data.get("assumptions", "[]"), [])
     try:
-        return SolverRun(
+        run = SolverRun(
             **{
                 **data,
                 "created_at": _parse_datetime(data["created_at"]),
@@ -6077,6 +6227,7 @@ def _solver_run_from_row(row: sqlite3.Row) -> SolverRun:
                 "heartbeat_at": _parse_optional_datetime(data.get("heartbeat_at")),
             }
         )
+        unreadable: tuple[str, ...] = ()
     except (ValidationError, TypeError, ValueError):
         run, unreadable = _salvaged_row(
             SolverRun,
@@ -6086,14 +6237,17 @@ def _solver_run_from_row(row: sqlite3.Row) -> SolverRun:
                 "input_hash": _UNREADABLE_LABEL,
             },
         )
-        # `completed` is the status study evidence is granted on, and an
-        # unreadable status is not evidence of anything; both degrade to
-        # `stale`, which blocks (STALE_SOLVER_EVIDENCE) until re-run or
-        # deleted. Queued/running are left alone so job control still sees
-        # them.
-        if "status" in unreadable or run.status == "completed":
-            run = run.model_copy(update={"status": "stale"})
-        return run
+    run = _with_unreadable_blobs(run, unreadable_blobs)
+    # `completed` is the status study evidence is granted on, and an unreadable
+    # status is not evidence of anything; both degrade to `stale`, which blocks
+    # (STALE_SOLVER_EVIDENCE) until re-run or deleted. A run whose SPOT, ranges
+    # or frequencies could not be read is the same case: `completed` would grant
+    # study evidence over a blob nobody can read. Queued/running are left alone
+    # so job control still sees them.
+    degraded = bool(unreadable) or bool(unreadable_blobs)
+    if "status" in unreadable or (degraded and run.status == "completed"):
+        run = run.model_copy(update={"status": "stale"})
+    return run
 
 
 def _video_from_row(row: sqlite3.Row) -> VideoRecord:
@@ -6168,14 +6322,18 @@ def _reconstruction_frame_review_from_row(
     row: sqlite3.Row,
 ) -> ReconstructionFrameReview:
     data = _row_dict(row)
+    unreadable_blobs = _unreadable_blob_columns(ReconstructionFrameReview, data)
     data["issue_types"] = _parse_json_list(data.get("issue_types", "[]"))
     try:
-        return ReconstructionFrameReview(
-            **{
-                **data,
-                "created_at": _parse_datetime(data["created_at"]),
-                "updated_at": _parse_datetime(data["updated_at"]),
-            }
+        return _with_unreadable_blobs(
+            ReconstructionFrameReview(
+                **{
+                    **data,
+                    "created_at": _parse_datetime(data["created_at"]),
+                    "updated_at": _parse_datetime(data["updated_at"]),
+                }
+            ),
+            unreadable_blobs,
         )
     except (ValidationError, TypeError, ValueError):
         review, unreadable = _salvaged_row(
@@ -6192,7 +6350,7 @@ def _reconstruction_frame_review_from_row(
             # The salvage default is already `unreviewed`, but state it: an
             # unreadable human verdict is no verdict.
             review = review.model_copy(update={"status": "unreviewed"})
-        return review
+        return _with_unreadable_blobs(review, unreadable_blobs)
 
 
 def _roi_profile_from_row(row: sqlite3.Row) -> ROIProfile:
