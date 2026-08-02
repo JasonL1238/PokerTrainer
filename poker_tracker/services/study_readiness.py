@@ -39,6 +39,7 @@ from poker_tracker.persistence.models import (
     Hand,
     HandIssue,
     HandReview,
+    HandSettlement,
     SolverRun,
 )
 from poker_tracker.services.hand_accounting import (
@@ -246,10 +247,18 @@ def unattested_assumption_dependence(
     )
 
 
-def accounting_verdict_predates_record(
+def stale_accounting_verdict(
     accounting: AccountingReconciliation | None,
-) -> bool:
-    """Does this hand's ledger reconcile while no stored verdict says so yet?
+) -> HandSettlement | None:
+    """The stored settlement whose verdict predates the record, if there is one.
+
+    Returns the settlement rather than a yes/no because every caller that acts on
+    this state then quotes ``settlement.status`` back to the operator, and a bare
+    predicate cannot carry the guarantee that the settlement is there: the
+    callers were re-deriving ``accounting.settlement.status`` behind a boolean,
+    which no reader -- human or type checker -- can confirm is safe without
+    re-deriving this function's body. ``accounting_verdict_predates_record``
+    below is the yes/no form for callers that only need the question answered.
 
     ``is_authoritative`` needs two things: a ledger that reconciles NOW, derived
     on every read, and a ``hand_settlements.status`` reading ``reconciled``,
@@ -277,11 +286,26 @@ def accounting_verdict_predates_record(
     than decide anything.
     """
     if accounting is None or accounting.issues:
-        return False
-    if accounting.settlement is None or accounting.settlement.status == "reconciled":
-        return False
+        return None
+    settlement = accounting.settlement
+    if settlement is None or settlement.status == "reconciled":
+        return None
     ledger = accounting.ledger
-    return ledger.is_settled and ledger.is_balanced and ledger.is_legal
+    if not (ledger.is_settled and ledger.is_balanced and ledger.is_legal):
+        return None
+    return settlement
+
+
+def accounting_verdict_predates_record(
+    accounting: AccountingReconciliation | None,
+) -> bool:
+    """Yes/no form of :func:`stale_accounting_verdict`.
+
+    Callers that go on to quote the stored status should call that instead, so
+    the settlement they quote is the one this decision was made about.
+    """
+
+    return stale_accounting_verdict(accounting) is not None
 
 
 def accounting_is_established(
@@ -808,7 +832,8 @@ def _accounting_blockers(
     if accounting is not None and accounting.is_authoritative and not accounting_error:
         return []
     detail: tuple[str, ...] = (accounting_error,) if accounting_error else ()
-    if not accounting_error and accounting_verdict_predates_record(accounting):
+    stale_verdict = None if accounting_error else stale_accounting_verdict(accounting)
+    if stale_verdict is not None:
         # Said in the blocker rather than left to the operator to infer, because
         # the alternative is what shipped: a hand blocked by an accounting
         # verdict, no issue to show, and a save that appears to do nothing.
@@ -833,7 +858,7 @@ def _accounting_blockers(
                 ),
                 detail=(
                     "Settlement status reads "
-                    f"{accounting.settlement.status!r}, not 'reconciled'.",
+                    f"{stale_verdict.status!r}, not 'reconciled'.",
                 ),
             )
         ]

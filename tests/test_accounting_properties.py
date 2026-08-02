@@ -694,3 +694,122 @@ def test_an_unsettled_ledger_is_never_balanced(hand):
     if not ledger.is_settled:
         assert ledger.is_balanced is False
         assert ledger.warnings
+
+
+# --- Adversarial round 18: dead money is not a layer boundary ----------------
+
+
+@given(hand=forced_post_hand())
+@SETTINGS
+def test_unequal_dead_money_alone_never_splits_the_pot(hand):
+    """Nobody stopped short of the live wagering, so there is one pot.
+
+    Antes and dead blinds are owed to the table, not wagered at anybody, so a
+    seat that owes more of them is not a seat anyone declined to match. Cutting
+    the pot at every distinct TOTAL commitment made a side pot out of exactly
+    that difference -- one seat's ante against another's dead blind, everybody
+    matching the same live bet, nobody all-in -- and then refused the seat that
+    won the hand the chips it had won, because it was "not eligible for pot 1".
+
+    The generator reaches this on every hand with a button ante or a dead blind
+    where the action closes, which is why it is stated over the whole family
+    rather than as one example.
+    """
+    ledger = build_hand_ledger(hand.players, hand.actions)
+    assume(ledger.pots)
+    settled_live = {
+        name: hand.live[name] - Decimal(str(ledger.refunds[name]))
+        for name in hand.names
+    }
+    contenders = [name for name in hand.names if name not in hand.folded]
+    assume(contenders)
+    line = max(settled_live[name] for name in contenders)
+    if all(settled_live[name] == line for name in contenders):
+        assert len(ledger.pots) == 1, (
+            "every seat still in the hand covered the same live wager, so there "
+            "is nothing for a second layer to hold apart"
+        )
+
+
+@given(hand=forced_post_hand())
+@SETTINGS
+def test_every_layer_boundary_is_a_clean_cut_that_drops_a_short_seat(hand):
+    """The rule stated from the other side, in the two halves it needs.
+
+    This replaces an earlier property that asserted the strictly stronger -- and
+    false -- "every seat a boundary drops is live-short". That statement is the
+    phantom-side-pot repair's own defect written down as an invariant: exempting
+    seats that covered the live line from a cut that has already been drawn left
+    two seats holding identical commitments on opposite sides of one boundary,
+    and the one on the high side could be paid past what the table matched of its
+    commitment. What is true is the pair below, and together they are what kills
+    the phantom:
+
+    * WHERE. A boundary exists only where a seat still in the hand stopped short
+      of the live wagering. Unequal dead money cannot open one, because no
+      opponent can decline a forced post. Without this the reported hand -- one
+      seat's ante against another's dead blind, nobody all-in -- derived a side
+      pot the winner of the hand was refused.
+    * HOW. Once a boundary is drawn it is a clean threshold on each seat's own
+      commitment: every seat left out of the layer above put in strictly less
+      than every seat kept in. Without this a cut applies to some seats and not
+      others, which is not a rule that can be stated to an operator.
+    """
+    ledger = build_hand_ledger(hand.players, hand.actions)
+    put_up = {name: Decimal(str(ledger.contributions[name])) for name in hand.names}
+    settled_live = {
+        name: hand.live[name] - Decimal(str(ledger.refunds[name]))
+        for name in hand.names
+    }
+    contenders = [name for name in hand.names if name not in hand.folded]
+    assume(contenders)
+    line = max(settled_live[name] for name in contenders)
+    short = {name for name in contenders if settled_live[name] < line}
+    for lower, upper in zip(ledger.pots, ledger.pots[1:], strict=False):
+        assert set(upper.eligible_players) <= set(lower.eligible_players)
+        dropped = set(lower.eligible_players) - set(upper.eligible_players)
+        assert dropped, f"layer {upper.index} exists but caps nobody out"
+        assert dropped & short, (
+            f"layer {upper.index} was opened without stopping anybody short of the "
+            f"live wager: it dropped {sorted(dropped)}, none of whom declined a chip"
+        )
+        assert max(put_up[name] for name in dropped) <= min(
+            put_up[name] for name in upper.eligible_players
+        ), (
+            f"layer {upper.index} is not a clean cut: it dropped "
+            f"{sorted(dropped)} while keeping a seat that put in no more"
+        )
+
+
+@given(hand=forced_post_hand())
+@SETTINGS
+def test_a_seat_short_of_the_live_wager_wins_no_more_than_its_own_total(hand):
+    """The cap that keeps the widening above from being an overpayment.
+
+    A seat that did not cover the live wagering -- all-in for less, or a recorded
+    line that stops before its answer -- can win, from each opponent, only as much
+    as that opponent put in up to the short seat's own total commitment. This is
+    the round-16 guarantee restated against the live line rather than against the
+    all-in flag, because a truncated line produces a seat that is short without
+    being all-in and it must be capped exactly the same way.
+    """
+    ledger = build_hand_ledger(hand.players, hand.actions)
+    put_up = {name: Decimal(str(ledger.contributions[name])) for name in hand.names}
+    in_pot = {
+        name: put_up[name] - Decimal(str(ledger.refunds[name])) for name in hand.names
+    }
+    contenders = [name for name in hand.names if name not in hand.folded]
+    assume(contenders)
+    line = max(hand.live[name] - Decimal(str(ledger.refunds[name])) for name in contenders)
+    for name in contenders:
+        if hand.live[name] - Decimal(str(ledger.refunds[name])) >= line:
+            continue
+        settled = build_hand_ledger(
+            hand.players, hand.actions, _winner_map(ledger.pots, (name,))
+        )
+        if not settled.is_settled:
+            continue
+        cap = _sum(min(in_pot[other], put_up[name]) for other in hand.names)
+        assert Decimal(str(settled.payouts[name])) <= cap, (
+            f"{name} stopped short of the live wager and was paid past its own total"
+        )

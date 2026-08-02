@@ -910,3 +910,238 @@ def test_recording_the_missing_call_closes_the_line_and_the_hand_reconciles() ->
     assert fixed.is_authoritative is True
     assert fixed.ledger.net_results["sb"] == pytest.approx(4)
     db.close()
+
+
+# --- Adversarial round 18: the phantom side pot, end to end ------------------
+
+
+def _phantom_dead_money_hand(db: PokerDatabase, session_id: int) -> Hand:
+    """Four seats, unequal dead money, one live wager everybody matched.
+
+    ``A`` posts a 5 ante and ``B`` a 3 dead blind; ``C`` and ``D`` owe nothing
+    dead. All four put in 20 live and the betting closes. Hero is ``C``, the seat
+    that owes no dead money, and ``C`` wins the hand: gross 88, hero net +68.
+    """
+    hand = db.create_hand(
+        Hand(
+            session_id=session_id,
+            hand_number=181,
+            game_type="No-limit Hold'em",
+            pot_size=88,
+            hero_bb_won=68,
+        )
+    )
+    for key, index in (("a", 0), ("b", 1), ("c", 2), ("d", 3)):
+        db.create_hand_player(
+            HandPlayer(
+                hand_id=hand.id,
+                player_key=key,
+                seat_index=index,
+                player_name=key.upper(),
+                starting_stack=100,
+                is_hero=(key == "c"),
+            )
+        )
+    rows = [
+        ("a", "ante", 5.0, None),
+        ("b", "post_blind", 3.0, False),
+        ("a", "bet", 20.0, None),
+        ("b", "call", 20.0, None),
+        ("c", "call", 20.0, None),
+        ("d", "call", 20.0, None),
+    ]
+    for key, action_type, amount, live_post in rows:
+        db.create_action(
+            Action(
+                hand_id=hand.id,
+                player_key=key,
+                player_name=key.upper(),
+                street="preflop",
+                action_type=action_type,
+                amount=amount,
+                amount_semantics="incremental",
+                is_live_post=live_post,
+            )
+        )
+    db.upsert_hand_settlement(HandSettlement(hand_id=hand.id, status="settled"))
+    return hand
+
+
+def test_unequal_dead_money_no_longer_funnels_the_operator_into_a_wrong_payout() -> None:
+    """The whole defect, measured where the operator meets it.
+
+    Cutting a layer at every distinct TOTAL commitment derived a main pot of 80
+    plus an 8-chip "side pot" only the two seats that owed dead money could win.
+    Every exit from that was worse than the last. The truthful award -- C takes
+    everything -- raised "C is not eligible for pot 1"; leaving pot 1 undeclared
+    left the hand unsettled and unbalanced; and declaring pot 1 to A or B was the
+    only thing the product accepted, reconciling as authoritative with C's net
+    short by the dead money and no issue, no warning and no correction anywhere
+    on the record.
+
+    There is one pot now, the operator declares the winner of it, and the derived
+    hero result is the one the hand actually produced.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="Phantom side pot"))
+    hand = _phantom_dead_money_hand(db, session.id)
+
+    derived = reconcile_persisted_hand(db, hand.id)
+    assert [pot.amount for pot in derived.ledger.pots] == pytest.approx([88])
+    assert set(derived.ledger.pots[0].eligible_players) == {"a", "b", "c", "d"}
+
+    db.replace_settlement_entries(
+        hand.id,
+        [
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=0,
+                player_key="c",
+                player_name="C",
+                amount=88,
+                entry_order=1,
+            )
+        ],
+    )
+    result = persist_reconciliation(db, hand.id)
+
+    assert result.issues == ()
+    assert result.is_authoritative is True
+    assert result.settlement.status == "reconciled"
+    assert result.settlement.gross_pot == pytest.approx(88)
+    assert result.ledger.net_results["c"] == pytest.approx(68)
+    assert sum(result.ledger.net_results.values()) + result.ledger.rake == pytest.approx(0)
+    db.close()
+
+
+def test_the_dead_money_cannot_be_awarded_to_a_seat_that_did_not_win_the_hand() -> None:
+    """The declaration the product used to accept is the one it now refuses.
+
+    Paying A the 8 chips of dead money as a "side pot" was the resting state the
+    operator was funnelled into. There is no pot 1 to declare it against, so the
+    award is reported as a stale claim naming a layer this hand does not have
+    rather than being reconciled into a wrong hero result.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="No layer to hide in"))
+    hand = _phantom_dead_money_hand(db, session.id)
+
+    db.replace_settlement_entries(
+        hand.id,
+        [
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=0,
+                player_key="c",
+                player_name="C",
+                amount=80,
+                entry_order=1,
+            ),
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=1,
+                player_key="a",
+                player_name="A",
+                amount=8,
+                entry_order=2,
+            ),
+        ],
+    )
+    result = persist_reconciliation(db, hand.id)
+
+    assert result.is_authoritative is False
+    assert result.settlement.status == "needs_correction"
+    assert any(issue.startswith(STALE_AWARD_PREFIX) for issue in result.issues)
+    db.close()
+
+
+def test_a_short_all_in_does_not_reopen_the_phantom_at_the_product_boundary() -> None:
+    """The reported funnel, measured with one extra seat at the table.
+
+    Removing the phantom only from hands where nobody is short leaves it in every
+    hand that has a short all-in anywhere in it, which is most hands with an
+    all-in. Here ``e`` is all-in for 20 while ``a``'s ante and ``b``'s dead blind
+    sit above it, and the seats that owe no dead money -- ``c`` and ``d``, both
+    with exactly 20 in the pot, exactly as ``e`` has -- were left eligible for
+    those 8 chips while ``e`` was refused them.
+
+    Hero is ``c``. The declaration that used to reconcile silently is ``c``
+    winning the hand outright: 108 chips on a commitment the table matched 100
+    of, reconciled and authoritative with no issue and no warning. It is refused
+    now, by name, and the hand stays needing correction.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="Phantom behind an all-in"))
+    hand = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=182,
+            game_type="No-limit Hold'em",
+            pot_size=108,
+            hero_bb_won=88,
+        )
+    )
+    for key, index, stack in (("a", 0, 100), ("b", 1, 100), ("c", 2, 100), ("d", 3, 100), ("e", 4, 20)):
+        db.create_hand_player(
+            HandPlayer(
+                hand_id=hand.id,
+                player_key=key,
+                seat_index=index,
+                player_name=key.upper(),
+                starting_stack=stack,
+                is_hero=(key == "c"),
+            )
+        )
+    rows = [
+        ("a", "ante", 5.0, None),
+        ("b", "post_blind", 3.0, False),
+        ("e", "post_blind", 4.0, False),
+        ("a", "bet", 20.0, None),
+        ("b", "call", 20.0, None),
+        ("c", "call", 20.0, None),
+        ("d", "call", 20.0, None),
+        ("e", "all-in", 16.0, None),
+    ]
+    for key, action_type, amount, live_post in rows:
+        db.create_action(
+            Action(
+                hand_id=hand.id,
+                player_key=key,
+                player_name=key.upper(),
+                street="preflop",
+                action_type=action_type,
+                amount=amount,
+                amount_semantics="incremental",
+                is_live_post=live_post,
+            )
+        )
+    db.upsert_hand_settlement(HandSettlement(hand_id=hand.id, status="settled"))
+
+    derived = reconcile_persisted_hand(db, hand.id)
+    assert [pot.amount for pot in derived.ledger.pots] == pytest.approx([100, 8])
+    assert derived.ledger.pots[1].eligible_players == ("a", "b")
+
+    db.replace_settlement_entries(
+        hand.id,
+        [
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=index,
+                player_key="c",
+                player_name="C",
+                amount=amount,
+                entry_order=index + 1,
+            )
+            for index, amount in ((0, 100.0), (1, 8.0))
+        ],
+    )
+    result = persist_reconciliation(db, hand.id)
+
+    assert result.is_authoritative is False
+    assert result.settlement.status == "needs_correction"
+    assert any("not eligible for pot 1" in issue for issue in result.issues), result.issues
+    db.close()
