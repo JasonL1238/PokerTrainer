@@ -32,6 +32,7 @@ from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 
 from poker_tracker.math.accounting import (
+    BlindStructure,
     LedgerAction,
     LedgerError,
     LedgerPlayer,
@@ -99,6 +100,62 @@ class ForcedPostHand:
     posted: dict[str, Decimal]
     wagered: dict[str, Decimal]
     folded: set[str] = field(default_factory=set)
+    # The structural forced-bet sizes the generator DEALT, as opposed to the ones
+    # the resulting action line happens to show. They differ exactly when a seat
+    # was too short to post in full, which is the family the blind structure
+    # exists for, so the generator has to record what it meant.
+    blinds: BlindStructure | None = None
+
+    @property
+    def short_live_post(self) -> bool:
+        """Did forced posting take a live poster's last chip?
+
+        The condition under which the action line cannot demonstrate the
+        structure it was dealt, and therefore the condition under which the
+        reducer must refuse rather than infer.
+
+        Asked of the seat's FINAL forced commitment, not of its running total at
+        the instant its blind row is reduced. This oracle used to ask the second
+        question, which is the same mistake the reducer was making: a seat whose
+        ante is recorded BELOW its blind is not yet out of chips at the blind,
+        so both the reducer and its oracle agreed the post was full, and the
+        property could not see the defect it exists to catch. An oracle that
+        reimplements the code under test proves only that the code is
+        self-consistent.
+        """
+        stacks = dict(zip(self.names, self.stacks, strict=True))
+        committed = {name: Decimal("0") for name in self.names}
+        voluntary: set[str] = set()
+        candidates: list[tuple[int, str]] = []
+        exhausted_at_post: set[int] = set()
+        for index, action in enumerate(self.actions):
+            if action.kind not in {
+                "ante",
+                "post_blind",
+                "bet",
+                "call",
+                "raise",
+                "all-in",
+            }:
+                continue
+            committed[action.player] += Decimal(str(action.amount))
+            if action.kind not in {"ante", "post_blind"}:
+                voluntary.add(action.player)
+            if action.kind == "post_blind" and action.is_live_post:
+                candidates.append((index, action.player))
+                if committed[action.player] == stacks[action.player]:
+                    exhausted_at_post.add(index)
+        # A seat that later CHOSE to put chips in was never short of the blind it
+        # posted, so only a stack spent entirely on forced posts counts.
+        exhausted = {
+            name
+            for name, total in committed.items()
+            if name not in voluntary and total > 0 and total == stacks[name]
+        }
+        return any(
+            index in exhausted_at_post or player in exhausted
+            for index, player in candidates
+        )
 
     @property
     def all_in_on_a_forced_post(self) -> tuple[str, ...]:
@@ -152,6 +209,7 @@ def forced_post_hand(draw):
     small_blind, big_blind = (chip * unit for unit in draw(BLINDS))
     ante = chip * draw(ANTES)
     ante_style = draw(ANTE_STYLES)
+    antes_after_blinds = draw(st.booleans())
     wants_straddle = draw(st.booleans())
     wants_dead_blind = draw(st.booleans())
     choices = draw(
@@ -201,11 +259,21 @@ def forced_post_hand(draw):
         else:
             wagered[name] += capped
 
-    if ante_style == "all":
-        for name in names:
-            commit(name, ante, "ante", forced=True)
-    elif ante_style == "button":
-        commit(names[0], ante, "ante", forced=True)
+    def post_antes():
+        if ante_style == "all":
+            for name in names:
+                commit(name, ante, "ante", forced=True)
+        elif ante_style == "button":
+            commit(names[0], ante, "ante", forced=True)
+
+    # The order two FORCED rows are listed in is not a fact about the hand: a
+    # room takes both in one motion, a reconstruction resolves them from the same
+    # chip-movement burst, and the hand editor lets an operator renumber them.
+    # The generator used to emit antes first, always, which made it structurally
+    # incapable of producing a seat whose ante follows its blind -- the shape in
+    # which the reducer's short-post refusal silently stopped firing.
+    if not antes_after_blinds:
+        post_antes()
     if wants_dead_blind and count >= 3:
         # A returning player owes a dead blind before the live one is posted.
         commit(names[1], big_blind, "post_blind", is_live_post=False, forced=True)
@@ -213,6 +281,8 @@ def forced_post_hand(draw):
     commit(names[-1], big_blind, "post_blind", forced=True)
     if wants_straddle:
         commit(names[0], big_blind * 2, "post_blind", forced=True)
+    if antes_after_blinds:
+        post_antes()
 
     for name, choice in zip(names, choices, strict=True):
         if name in folded or remaining[name] <= 0:
@@ -244,6 +314,11 @@ def forced_post_hand(draw):
         posted=posted,
         wagered=wagered,
         folded=folded,
+        blinds=BlindStructure(
+            small_blind=float(small_blind),
+            big_blind=float(big_blind),
+            straddles=(float(big_blind * 2),) if wants_straddle else (),
+        ),
     )
 
 
@@ -792,6 +867,26 @@ def test_a_seat_short_of_the_live_wager_wins_no_more_than_its_own_total(hand):
     the round-16 guarantee restated against the live line rather than against the
     all-in flag, because a truncated line produces a seat that is short without
     being all-in and it must be capped exactly the same way.
+
+    A FOLDED seat's chips are outside the cap, and that is the reducer's own
+    documented rule rather than a concession to make this pass. ``_build_pots``
+    merges a level nobody left in the hand can win DOWN -- "folded money is
+    abandoned to whoever wins: merge it down rather than strand it" -- and that
+    branch fires exactly when every seat contributing at the level has folded
+    (a non-folded contributor at level L always has a ceiling of at least L, so
+    it is always eligible there). The chips a short seat can therefore receive
+    above its own total come only from seats that gave them up.
+
+    Nothing about the guarantee against seats STILL IN THE HAND changes: their
+    contributions are still capped at the short seat's own total, which is what
+    round 16 pinned -- there, a seat all-in for one ante chip took a POSTER's
+    ante, and the poster had not folded.
+
+    This was found by running the suite at 2500 examples with
+    ``--hypothesis-seed=1``, which reaches a hand where one seat's dead blind and
+    live small blind total 6 before it folds, against two seats holding 2 each.
+    It reproduces identically on the commit before the blind-structure work, so
+    it is a gap in this cap's model of the reducer and not a regression in it.
     """
     ledger = build_hand_ledger(hand.players, hand.actions)
     put_up = {name: Decimal(str(ledger.contributions[name])) for name in hand.names}
@@ -809,7 +904,147 @@ def test_a_seat_short_of_the_live_wager_wins_no_more_than_its_own_total(hand):
         )
         if not settled.is_settled:
             continue
-        cap = _sum(min(in_pot[other], put_up[name]) for other in hand.names)
+        cap = _sum(
+            in_pot[other]
+            if other in hand.folded
+            else min(in_pot[other], put_up[name])
+            for other in hand.names
+        )
         assert Decimal(str(settled.payouts[name])) <= cap, (
             f"{name} stopped short of the live wager and was paid past its own total"
         )
+        # And the half of the old cap that is still exact: no seat that stayed in
+        # the hand may give a short seat a chip above that short seat's own total.
+        from_contenders = Decimal(str(settled.payouts[name])) - _sum(
+            in_pot[other] for other in hand.folded
+        )
+        assert from_contenders <= _sum(
+            min(in_pot[other], put_up[name]) for other in contenders
+        ), f"{name} was paid past its own total out of live seats' chips"
+
+
+# --- The blind structure ----------------------------------------------------
+#
+# The reported defect was that ``to_call`` was derived from the largest OBSERVED
+# contribution, so a big blind all-in for 4 in a 5/10 game told the rest of the
+# table it owed 5. The repair makes the structural sizes an INPUT. These
+# properties pin what that input may and may not do, over hands nobody wrote by
+# hand -- because this module has produced a critical in each of the last four
+# adversarial rounds, three of them introduced by the repair to the previous one.
+
+
+BLIND_STRUCTURES = st.one_of(
+    st.none(),
+    st.builds(
+        BlindStructure,
+        small_blind=st.sampled_from([None, 0.0, 0.5, 1.0, 2.0, 5.0]),
+        big_blind=st.sampled_from([0.5, 1.0, 2.0, 5.0, 10.0, 1000.0]),
+        straddles=st.sampled_from([(), (4000.0,), (2000.0, 4000.0)]),
+    ),
+)
+
+
+@given(hand=forced_post_hand(), structure=BLIND_STRUCTURES, policy=rake_policy())
+@SETTINGS
+def test_no_blind_structure_moves_a_single_chip(hand, structure, policy):
+    """The safety property the whole repair rests on: the floor is not money.
+
+    A declared structure changes what the reducer will CALL LEGAL. It must never
+    change what the reducer COUNTS -- not the contributions, not a refund, not a
+    pot layer, not a payout, not the rake, not the balance. Any structure at all
+    is swept here, including absurd and self-contradictory ones, because the
+    guarantee has to hold for a mis-declaration too: an operator who types the
+    wrong big blind must get a loud legality complaint, never a quietly
+    different pot.
+
+    This is also the guarantee that makes the schema 19 migration safe. Existing
+    rows declare nothing, and adding a declaration later cannot restate a single
+    figure the hand already reported.
+    """
+    try:
+        baseline = build_hand_ledger(hand.players, hand.actions, rake=policy)
+    except LedgerError:
+        assume(False)
+        return
+    try:
+        declared = build_hand_ledger(
+            hand.players, hand.actions, rake=policy, blinds=structure
+        )
+    except LedgerError:
+        # A structure no room could have is refused outright, which is a refusal
+        # to derive rather than a different derivation.
+        assume(False)
+        return
+
+    assert declared.contributions == baseline.contributions
+    assert declared.refunds == baseline.refunds
+    assert declared.payouts == baseline.payouts
+    assert declared.net_results == baseline.net_results
+    assert declared.gross_pot == baseline.gross_pot
+    assert declared.rake == baseline.rake
+    assert declared.net_pot == baseline.net_pot
+    assert declared.folded_players == baseline.folded_players
+    assert declared.is_settled == baseline.is_settled
+    assert declared.is_balanced == baseline.is_balanced
+    assert [
+        (pot.amount, pot.contributors, pot.eligible_players, pot.cause)
+        for pot in declared.pots
+    ] == [
+        (pot.amount, pot.contributors, pot.eligible_players, pot.cause)
+        for pot in baseline.pots
+    ]
+
+
+@given(hand=forced_post_hand())
+@SETTINGS
+def test_an_unreadable_forced_post_is_never_silently_accepted(hand):
+    """Loudness, stated as a property rather than as the one reported example.
+
+    Whenever a live forced post took its poster's last chip, the action line
+    cannot show the size of the bet it was paying, and an undeclared hand must
+    say so. The complaint names the seat and the clearing action, and
+    ``is_legal`` goes False so no surface can present the hand as reconciled.
+    """
+    ledger = build_hand_ledger(hand.players, hand.actions)
+    complaints = [
+        issue
+        for issue in ledger.legality_issues
+        if "Declare the blind structure" in issue
+    ]
+    if hand.short_live_post:
+        assert complaints, "a short live forced post was accepted in silence"
+        assert ledger.is_legal is False
+    else:
+        assert not complaints
+
+
+@given(hand=forced_post_hand())
+@SETTINGS
+def test_declaring_the_structure_that_was_dealt_answers_the_complaint(hand):
+    """And the complaint has a reachable clearing action, on every generated hand.
+
+    The generator knows the sizes it dealt. Declaring exactly those must remove
+    every unreadable-post complaint -- otherwise the blocker would be one an
+    honest operator could not clear, which is a worse failure than the one it
+    replaced.
+    """
+    ledger = build_hand_ledger(hand.players, hand.actions, blinds=hand.blinds)
+    assert not [
+        issue
+        for issue in ledger.legality_issues
+        if "Declare the blind structure" in issue
+    ]
+
+
+@given(hand=forced_post_hand())
+@SETTINGS
+def test_a_declared_structure_never_lowers_the_amount_to_call(hand):
+    """It is a floor. A declaration may raise what a seat owes and never reduce it.
+
+    That direction is what stops the input becoming the next free parameter: no
+    value an operator types can excuse a call the recording proves was short.
+    """
+    baseline = build_hand_ledger(hand.players, hand.actions)
+    declared = build_hand_ledger(hand.players, hand.actions, blinds=hand.blinds)
+    for before, after in zip(baseline.snapshots, declared.snapshots, strict=True):
+        assert after.to_call_before >= before.to_call_before - 1e-9

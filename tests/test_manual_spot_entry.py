@@ -360,3 +360,33 @@ def test_an_all_in_for_exactly_the_stack_is_still_accepted() -> None:
     )
     assert errors == [], errors
     assert validate_manual_spot(_srp_bb_spot(postflop_actions=actions)) == []
+
+
+def test_a_saved_spot_records_the_blind_structure_it_posted(tmp_path) -> None:
+    """This builder knows the structure exactly, so it must not leave it undeclared.
+
+    The blinds it writes come from one constant and it posts them itself, so the
+    declaration is a record of what this path did rather than a claim about a
+    room nobody saw. Leaving it blank would put every spot whose seat is short of
+    the big blind into the trap the blind structure exists to close, on a path
+    that had the answer in hand.
+    """
+    db = PokerDatabase(tmp_path / "manual_blinds.db")
+    db.init_db()
+    session = db.create_session(Session(name="Spot entry"))
+
+    hand, accounting, _ = save_manual_spot(db, session.id, _srp_bb_spot())
+    settlement = db.fetch_hand_settlement(hand.id)
+
+    assert settlement is not None
+    assert settlement.small_blind == 0.5
+    assert settlement.big_blind == 1.0
+    assert settlement.straddles == []
+    assert accounting.is_authoritative
+    # And declaring it is silent here, because every post was made in full.
+    assert [
+        item
+        for item in accounting.assumption_dependence
+        if item.input_name == "blind_structure"
+    ] == []
+    db.close()

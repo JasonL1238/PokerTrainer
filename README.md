@@ -138,13 +138,21 @@ were discarded — a killed run leaves nothing behind that could be mistaken for
 result. Only a completed job keeps its review frames, because the export and the
 validated hands point at them.
 
+Sampling is bounded by what the decoder actually has. A run never samples past
+the end of a recording and never emits one decoded frame under two timestamps, so
+a short clip cannot produce a long timeline out of repeated stills, and a
+recording whose duration cannot be determined is probed or fails rather than
+being treated as a day long.
+
 Corrections are written transactionally to SQLite. Editing hand facts, players,
 or actions changes CV imports to `corrected_cv`, records the original and
 corrected values in `hand_corrections`, invalidates settlement, and marks prior
 hand/session coaching stale without deleting it. Deleting a hand marks its
 session's coaching stale for the same reason.
 
-Everything you declare in the Accounting reconciliation panel — the **rake
+Everything you declare in the Accounting reconciliation panel — the **blind
+structure** (Small blind / Big blind / Straddles), which sets what every seat
+owed before the first voluntary action; the **rake
 policy**, which removes chips the recording never showed; **dead money**, which
 adds them; and the **pot awards**, which decide who is paid and therefore what
 the hero result is — is checked by reconciling the hand twice: once with what you
@@ -155,6 +163,22 @@ or the hero result come out different). Both halves matter: a freshly imported
 hand often records none of the figures the cross-check compares, so it reconciles
 under every policy while the declaration still moves the hero result shown in
 every list, stat and prompt.
+
+The blind structure is in that set for a different reason: it is the one
+declaration that can **block** a hand outright rather than move a figure. A
+forced post that took its poster's last chip does not show the size of the bet it
+was paying — blinds 5/10 with a big blind all-in for 4 leaves the small blind's 5
+as the largest post anybody can see — so where the recording identifies such a
+post, the ledger refuses to name an amount to call, `is_legal` goes False, and
+the hand blocks on `ACCOUNTING_NOT_AUTHORITATIVE` until you fill the fields in.
+Every chip figure is still derived and displayed while it is blocked; nothing is
+hidden and nothing is guessed. It is a floor and never a ceiling, so a declared
+structure can only ever raise what a seat owed and can never excuse an under-call
+the recording proves. Two limits are worth knowing: the refusal only reaches a
+post the recording *identifies* as forced (a reconstructed all-in that carries no
+forced-bet type is indistinguishable from an ordinary short shove and is not
+refused), and no existing hand was backfilled with a structure, because inferring
+one from the largest observed post is the defect itself.
 
 The pot awards are in that set because on a reconstructed hand nothing observed
 them. The CV pipeline emits no settlement rows at all, so the winner of every pot
@@ -221,9 +245,23 @@ room rule — a house that drops whole dollars against a 0.50 blind is ordinary 
 and it no longer decides the granularity a chopped pot is divided at. That
 granularity is derived from the hand's own amounts: the finest decimal place any
 observed contribution or declared dead-money figure is written in, capped at one
-whole chip. Indivisible chips are still real, so a 21-chip pot chopped two ways is
-still pushed 11/10 in the audited `Order` column's order, and a rake share is
-never charged to a pot beyond what that pot holds.
+whole chip. Each declared ante or dead blind counts individually, so four 0.25
+antes prove the table deals in hundredths rather than summing to a whole chip and
+destroying them. Indivisible chips are still real, so a 21-chip pot chopped two
+ways is still pushed 11/10 in the audited `Order` column's order, and a rake share
+is never charged to a pot beyond what that pot holds.
+
+**Side pots are cut only where somebody was short of live money** — where a seat
+declined or could not answer chips an opponent actually risked. Nobody can decline
+an ante or a blind, so unequal dead money never creates a side pot, and being
+all-in does not either when the all-in covered the wager. Once a cut is drawn it
+applies to every seat by that seat's own total, forced posts included, which is
+what keeps a seat all-in for nothing but its ante eligible for the layer holding
+its chips and capped at what it actually covered. If the editor shows you a pot
+you cannot explain from the action line, that is worth reporting rather than
+declaring around: the honest verdict on this part of the ledger is *not yet
+caught* rather than *correct*, and four separate adversarial rounds have found
+criticals in it.
 
 What you type in `Chip unit` **does** change derived payouts, because rounding the
 rake changes the net pot every payout is drawn from. On an 80-chip pot at a
@@ -270,9 +308,10 @@ presents it as one: readiness is re-derived on every render, and any edit to a
 hand's players, actions, or settlement returns a reviewed hand to
 `needs_correction` so a promotion cannot outlive the evidence it was granted on.
 
-JSON export version 5 carries correction, issue, coaching, and completion history
-through backup/import workflows. Import still accepts versions 1-4 and gives them
-safe conservative defaults. Importing a session lands every hand as
+JSON export version 6 carries correction, issue, coaching, completion history and
+per-action source-frame provenance through backup/import workflows. Import still
+accepts versions 1-5 and gives them safe conservative defaults. Importing a
+session lands every hand as
 `needs_correction`, whatever review status and whatever `source_type` the payload
 declares: your confirmation that a hand is correct is deliberately per-render and
 never persisted, so it cannot travel in a file, and the importing operator has not
@@ -281,7 +320,7 @@ because it is byte-identical to a forgery of one, and the label is one tick and
 one save away for the operator who now vouches for it. The v13 migration is
 different: it keeps manual review statuses, because a migrated database is your
 own data rather than somebody's JSON.) For the same reason, source-warning
-acknowledgements do not travel either: a v5 export of a hand whose warnings you
+acknowledgements do not travel either: an export of a hand whose warnings you
 accepted re-imports with those warnings unaccepted, so the importing operator
 accepts them themselves. The codes are preserved in full — only your attestation
 to them is dropped. Settlement-assumption confirmations are reset for the same
@@ -303,16 +342,25 @@ dropped, the session list keeps a row for it marked "Not counted", and Insights
 reports it under "In a session the importer labelled a re-imported copy" beside
 the denominator, the same way every other population exclusion is reported. The
 copy is still fully browsable and studiable; delete it (Sessions → Delete session)
-to remove it entirely. Schema
-version 13 is additive: v10 added correction
-history and review staleness, v11 added solver records, v12 added the debugging
-issue queue, and v13 adds explicit hand completion
+to remove it entirely.
+
+The database is at **schema version 19** and every migration is additive: v10
+added correction history and review staleness, v11 solver records, v12 the
+debugging issue queue, v13 explicit hand completion
 (`complete`/`partial`/`uncertain`/`not_applicable`) and its versioned
-reconstruction evidence. Existing manual hands become `not_applicable`; existing
-reconstructed hands migrate conservatively to `uncertain` and `needs_correction`
-and must be re-confirmed. Existing rows remain intact. Startup migrates older
+reconstruction evidence, v14 video content hashes, v15 per-hand study inclusion,
+v16 the source frame behind each reconstructed action, v17 the regression that
+proves a closed issue stays closed, and v18 the tree, accuracy target and
+iteration cap a solver run was produced under, and v19 the declared blind
+structure (`hand_settlements.small_blind`, `big_blind`, `straddles`). Existing manual hands became
+`not_applicable` at v13; existing reconstructed hands migrated conservatively to
+`uncertain` and `needs_correction` and must be re-confirmed. Existing rows remain
+intact, and the later migrations are deliberately unbackfilled: an old solver run
+reports its abstraction as unknown rather than being labelled with today's
+settings, and v19 declares no blind structure for any existing hand rather than
+guessing one from the posts it can see. Startup migrates older
 databases automatically; older application versions intentionally refuse to open
-a newer database, and a version 5 export cannot be read back by an older release,
+a newer database, and a version 6 export cannot be read back by an older release,
 so keep a copy of any pre-upgrade export you may need to restore. A database whose
 schema version stamp is missing, unreadable, behind the schema the file actually
 contains, or ahead of it is refused rather than re-migrated, and the message says to restore from a
@@ -323,9 +371,13 @@ written in one transaction, so an interrupted first start — a power loss, an O
 kill, a container restart, Ctrl-C — leaves an empty file the next start simply
 creates again.
 
-A consistent, self-contained backup is written to `data/backups` before any real
-file database is migrated, and each snapshot is left in `journal_mode=delete` so
-it can be verified and restore-drilled from a read-only or archival mount.
+A consistent, self-contained backup is written before any real file database is
+migrated, and each snapshot is left in `journal_mode=delete` so it can be
+verified and restore-drilled from a read-only or archival mount. A snapshot goes
+to the backups directory of **the database it can roll back** — `data/backups`
+for your live database, and a `backups/` directory beside the file for anything
+else — so opening a fixture, a restored copy, or a backup you are auditing can
+never evict a rollback point of your real database.
 **Migration fails closed:** if the snapshot cannot be written — a read-only
 container filesystem, an unmounted data volume, or a full disk — startup raises
 and no migration runs. The error names the backup directory it could not write
@@ -348,7 +400,10 @@ in its own five-slot pool, and the deletion does not happen if the snapshot
 cannot be written. Settings -> Storage & health lists every retained snapshot and
 states the restore procedure. Snapshots hold rows only: videos, frames, timelines
 and solver outputs are deliberately not copied, so a snapshot restored after those
-were removed will reference files that are gone.
+were removed will reference files that are gone. Each snapshot therefore carries
+an **artifact inventory** beside it, recording what the rows pointed at, so a
+restore can report which files are missing instead of leaving you to find out
+during a session.
 
 Per-import snapshots keep the rotating `poker_tracker_<timestamp>.sqlite3` name
 and the newest five are retained. Rotation matches that exact timestamped name and
@@ -408,9 +463,36 @@ remaining postflop ranges.
    range when you have a better assumption.
 7. Press **Run TexasSolver analysis**. Solver work runs in the background; use
    **Refresh** to check it or **Cancel** to stop it.
-8. Review Hero's combo frequencies, convergence, assumptions, and the mapped
-   recorded action. Optionally generate an AI explanation grounded in that
-   saved solver evidence.
+8. Review Hero's combo frequencies, convergence, assumptions, the tree the run
+   used, and the mapped recorded action. Optionally generate an AI explanation
+   grounded in that saved solver evidence.
+
+### When the solver refuses instead of answering
+
+The solve tree offers a handful of discrete sizes, so a recorded bet rarely
+equals one of them and some substitution is unavoidable. **An unbounded
+substitution is not.** The gap between your recorded action and the nearest
+branch is measured against the pot the action was made into — 2 BB of error means
+one thing into a 5 BB pot and another into a 200 BB one — and past a quarter of
+the pot the app refuses the mapping and says so, rather than answering a
+different question quietly. A 25 BB bet into a 5 BB pot, against a tree offering
+CHECK / BET 1.65 / BET 3.75, used to return Hero's frequencies for facing 3.75
+with no warning at all, while the retained evidence read "recorded_action: call
+25 BB" beside them and the coaching prompt was handed both.
+
+An action carrying no size is matched by name or not at all: a check is not a
+small bet and a raise is not a call, so when the tree does not offer your action
+there is no nearer branch, only a different one.
+
+A finished run is also checked before it counts as a result. A usable result
+needs an action node, a non-empty action list, and coverage of the range you
+submitted; an empty or partial strategy dump is rejected by name instead of being
+retained as a solve. Every retained run also records the betting abstraction,
+accuracy target and iteration cap it was produced under, on the run row itself
+rather than only in its directory — a frequency vector with no record of the tree
+it came from is a claim that cannot be checked. Runs recorded before that column
+existed say the abstraction is unknown; they are deliberately not backfilled with
+today's settings.
 
 For local use, compile or install the pinned `console` implementation and
 configure its absolute path:
@@ -425,10 +507,11 @@ export POKERTRAINER_SOLVER_THREADS=4
 streamlit run app.py
 ```
 
-The Docker image compiles commit `42313c9c` and configures the resulting binary
-automatically for both `linux/amd64` and `linux/arm64`. Hosted defaults limit
-the solver to two threads, 8 GB of address space, a 30-minute run, and one
-heavy CV/solver job at a time.
+The Dockerfile compiles commit `42313c9c` and configures the resulting binary for
+both `linux/amd64` and `linux/arm64`. Container defaults limit the solver to two
+threads, 8 GB of address space, a 30-minute run, and one heavy CV/solver job at a
+time. **That build has not been performed on either architecture** — see
+[Container](#container) — so treat the solver-in-container path as untested.
 
 Each player can use an automatic estimated range, a built-in or saved premade
 range, or validated custom weighted notation. Custom syntax accepts both eval7
@@ -486,6 +569,23 @@ offered for deletion at any age, and the audit always prints its plan before
 `--apply` acts. Source recordings need an explicit `--include-orphan-videos`,
 because a recording is the one artifact nothing can rebuild.
 
+Three things about "still references" are worth knowing, because each of them was
+once wrong in a way that deleted or offered to delete a file:
+
+- **The reference list covers every artifact column, including regression
+  fixtures.** A fixture attached to a resolved issue is frequently a frame or a
+  recording under a managed directory, and it used to be missing from the list.
+- **Files are matched by identity, not by spelling.** On a case-insensitive
+  filesystem a recording stored as `Session.MOV` and recorded as `session.mov`
+  looked like an orphan. Matching is `(st_dev, st_ino)` where the file exists and
+  a normalized case-folded key where it does not, and the textual fallback
+  deliberately over-matches: keeping an orphan costs disk, deleting a live file
+  costs the recording.
+- **The audit is not an authorization.** A job that finishes between the audit and
+  the sweep makes the database start pointing at a file the audit already
+  classified as garbage. Every reference is re-confirmed immediately before each
+  unlink, against a re-read of the database when it changed underneath.
+
 A window must be positive. A zero or negative `POKER_RETAIN_*_DAYS` is refused
 with an error naming the variable, because an unset variable expanding to empty
 would otherwise mean "expire everything immediately". When you genuinely want
@@ -523,7 +623,9 @@ python -m poker_tracker.maintenance --restore-backups
 
 The command runs SQLite structural and foreign-key checks, validates the schema
 version and core schema, verifies recorded videos and review images still exist,
-compares stored video sizes, and checks every retained backup.
+compares stored video sizes, and checks every retained backup. Its artifact check
+covers **every** path column the schema has, derived from the columns rather than
+from a hand-kept list, so a column added later is covered by having been added.
 `--restore-backups` copies each backup into an isolated temporary database for a
 safe restore drill; it never replaces the live database. The audit does not
 issue application-data writes, although SQLite may create or update its normal
@@ -532,12 +634,45 @@ automation. The command exits nonzero when a check fails, while a fresh
 installation with no backups reports a warning.
 
 The same audit runs in-product from **Settings -> Storage & health**, behind an
-explicit *Run health check* button so a page repaint never pays for it. That tab
-also builds a redacted **diagnostics bundle**: resolved configuration, dependency
-and model identity, layout support, row counts and the health report, with every
-string scrubbed before serialization. It carries no hand history, note, coaching
-text, video filename or environment value — environment variables are reported by
-name and set/unset only.
+explicit *Run health check* button so a page repaint never pays for it. Each
+check reports in words rather than by colour alone. That tab also builds a
+redacted **diagnostics bundle**: resolved configuration, dependency and model
+identity, layout support, row counts and the health report, with every string
+scrubbed through the same redaction before serialization — over the structure,
+not over the encoded JSON, because `json.dumps` escapes the quotes in every
+string field and an escaped key stops matching. It carries no hand history, note,
+coaching text, video filename or environment value: environment variables are
+reported by name and set/unset only.
+
+## Recovery drill
+
+The audit above verifies a *file*. This verifies a *recovery*: it restores a
+chosen snapshot into a throwaway location, migrates it, and answers whether your
+study history came back.
+
+```bash
+python -m poker_tracker.maintenance.recovery \
+  --backup "$POKER_DATA_DIR/backups/<snapshot>.sqlite3" \
+  --data-dir "$POKER_DATA_DIR" \
+  --target "$(mktemp -d)"
+```
+
+It checks what recovery has to mean: the schema, foreign keys, row counts against
+the snapshot's own artifact inventory, issue evidence, one completed hand read
+*through the application* rather than by raw select, and which recordings, frames,
+timelines and solver outputs are missing. Missing artifacts are reported as a
+**partial recovery** with each file named, not as a warning.
+
+Exit `0` is `RECOVERED`. Exit `1` is `PARTIAL` (something is provably gone) or
+`UNVERIFIED` (it restored cleanly but no inventory accompanied the snapshot, so
+completeness is unproven). Exit `2` means the drill did not run and **nothing was
+checked** — it refuses outright if its target overlaps `POKER_DATA_DIR`, contains
+`POKER_DB_PATH`, or already holds a database, because a drill that restored an
+old snapshot over your live file would destroy the history it was run to protect.
+
+Run it before you need it, on the machine you would actually recover onto. The
+full procedure, including what to bring to a fresh machine and what each failing
+check means, is in [docs/RUNBOOKS.md](docs/RUNBOOKS.md).
 
 ## Test
 
@@ -555,11 +690,28 @@ Streamlit product shell. It also carries dedicated readiness-bypass and
 adversarial-round regressions that try to make an unproven hand look
 study-ready.
 
-One test is skipped on purpose:
-`tests/test_ocr_readers.py::test_without_chip_template_chip_would_join_run` is a
-negative control documenting why the chip affix exists, and it skips when the
+Every skip has to name an external condition a reader can evaluate, and
+`python -m poker_tracker.suite_quality skip-policy` fails the run when one does
+not. `-ra` is on by default so the reasons print. On macOS six tests skip: four
+because Darwin refuses `setrlimit(RLIMIT_AS)`, so the memory-cap paths are
+exercised only on Linux; one because the newest schema version has no later
+migration to lack; and
+`tests/test_ocr_readers.py::test_without_chip_template_chip_would_join_run`, a
+negative control documenting why the chip affix exists, which skips when the
 synthetic chip glyph falls below the classifier confidence floor, because the
 misread it demonstrates then does not occur. Any other skip is a real problem.
+
+Two more tools live beside the suite:
+
+```bash
+python -m poker_tracker.suite_quality flake      # repeat runs, shuffled order
+python -m poker_tracker.suite_quality coverage   # which core modules run at all
+```
+
+`flake` names every test whose result was not the same in every pass; a verdict
+that cannot be reproduced is worth less than the name of the test that produced
+it. `coverage` reports and does not gate — the useful output is the name of
+important code nothing runs, not a percentage.
 
 `python -m mypy` uses the narrow file list configured in `pyproject.toml`; it is
 not whole-repository type checking.
@@ -574,7 +726,25 @@ docker run --rm -p 8501:8501 \
   pokertrainer
 ```
 
-The image runs as a non-root user and exposes a Streamlit healthcheck. Build both `linux/amd64` and `linux/arm64` before accepting a deployment architecture.
+The image runs as a non-root user and exposes a Streamlit healthcheck.
+
+**No image has been built from this repository, on either architecture.** There
+is no Docker daemon on the development machine, so the Dockerfile, the
+healthcheck, the non-root runtime, the model provisioning and the entrypoint are
+all unexecuted. Two blockers that would have stopped a build have been repaired
+and are likewise unproven: the Dockerfile used to `COPY` model weights that
+`.gitignore` excludes, so the build only ever succeeded on the machine that
+trained them, and `eval7` has no aarch64 wheel against a runtime image with no
+compiler. Build both `linux/amd64` and `linux/arm64` and run
+`deploy/verify_container.sh` before accepting any deployment architecture, and
+treat every container claim in this README as a description of the recipe rather
+than a report on an image.
+
+The image deliberately ships **without** the large CV weights; they are resolved
+at runtime from `/data/models` on the persistent mount and installed by
+`deploy/provision_models.py` against `deploy/model_manifest.json`, each file
+renamed into place only after its SHA-256 matches. Full detail is in
+[docs/CONTAINER.md](docs/CONTAINER.md).
 
 ## Deployment
 
@@ -598,10 +768,17 @@ Project guidance has one source per purpose:
   definition of done.
 - [docs/RUNBOOKS.md](docs/RUNBOOKS.md) contains the operator procedures: install,
   diagnostics, release gate, corpus vault, migration, backup and isolated
-  restore, failed-job recovery, storage audit, containers, upgrade and rollback,
-  licensing before distribution, and the issue-to-regression debugging loop.
+  restore, the fresh-machine recovery drill, failed-job recovery, storage audit,
+  containers, upgrade and rollback, licensing before distribution, and the
+  issue-to-regression debugging loop.
+- [docs/CONTAINER.md](docs/CONTAINER.md) covers what a container build needs that
+  a `git clone` does not contain, and how to verify an image.
+- [docs/PERFORMANCE.md](docs/PERFORMANCE.md) covers the measurement harness and
+  the rules it follows, chief among them that an unmeasured figure is reported as
+  `null` with a reason and never as zero.
 - [cv_lab/notes/README.md](cv_lab/notes/README.md) indexes the chronological CV
-  research record. Those findings explain decisions but are not the roadmap.
+  research and adversarial record. Those findings explain decisions, later ones
+  supersede earlier ones, and none of them is a claim about what is true today.
 - [deploy/oci/README.md](deploy/oci/README.md) is the Oracle deployment
   runbook.
 

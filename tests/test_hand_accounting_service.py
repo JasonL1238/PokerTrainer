@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from poker_tracker.math.accounting import LedgerError
 from poker_tracker.math.analytics import compute_session_stats
@@ -14,7 +15,9 @@ from poker_tracker.persistence.models import (
     SettlementEntry,
 )
 from poker_tracker.services.hand_accounting import (
+    BLIND_STRUCTURE_INPUT,
     STALE_AWARD_PREFIX,
+    attest_assumption,
     persist_reconciliation,
     reconcile_persisted_hand,
 )
@@ -1144,4 +1147,422 @@ def test_a_short_all_in_does_not_reopen_the_phantom_at_the_product_boundary() ->
     assert result.is_authoritative is False
     assert result.settlement.status == "needs_correction"
     assert any("not eligible for pot 1" in issue for issue in result.issues), result.issues
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# The blind structure, end to end through the store
+# ---------------------------------------------------------------------------
+
+
+def _create_short_blind_hand(db: PokerDatabase, session_id: int) -> Hand:
+    """Blinds 5/10, big blind all-in for 4, button calls the real 10.
+
+    The reported hand. Before the blind structure existed the reducer told the
+    button that the amount to call was 5, and a hand built around that reconciled
+    around a 14-chip pot whose truth is 24.
+    """
+    hand = db.create_hand(
+        Hand(session_id=session_id, hand_number=1, blinds_antes="5/10 NL")
+    )
+    seats = [
+        ("sb", "SB", "SB", 200.0, False),
+        ("bb", "BB", "BB", 4.0, False),
+        ("btn", "BTN", "BTN", 200.0, True),
+    ]
+    for index, (key, name, position, stack, is_hero) in enumerate(seats):
+        db.create_hand_player(
+            HandPlayer(
+                hand_id=hand.id,
+                player_key=key,
+                seat_index=index,
+                player_name=name,
+                position=position,
+                starting_stack=stack,
+                is_hero=is_hero,
+            )
+        )
+    line = [
+        ("sb", "SB", "post_blind", 5.0),
+        ("bb", "BB", "post_blind", 4.0),
+        ("btn", "BTN", "call", 10.0),
+        ("sb", "SB", "call", 5.0),
+    ]
+    for key, name, action_type, amount in line:
+        db.create_action(
+            Action(
+                hand_id=hand.id,
+                player_key=key,
+                player_name=name,
+                street="preflop",
+                action_type=action_type,
+                amount=amount,
+                amount_semantics="incremental",
+                is_live_post=True if action_type == "post_blind" else None,
+            )
+        )
+    db.upsert_hand_settlement(HandSettlement(hand_id=hand.id, status="settled"))
+    db.replace_settlement_entries(
+        hand.id,
+        [
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=index,
+                player_key="btn",
+                player_name="BTN",
+                entry_order=index + 1,
+            )
+            for index in range(2)
+        ],
+    )
+    return hand
+
+
+def test_a_hand_with_an_unreadable_forced_post_cannot_reconcile_undeclared() -> None:
+    """No declaration, no authority -- and the operator is told exactly why."""
+    db = _make_db()
+    session = db.create_session(Session(name="blinds"))
+    hand = _create_short_blind_hand(db, session.id)
+
+    result = persist_reconciliation(db, hand.id)
+
+    assert result.is_authoritative is False
+    assert result.settlement is not None
+    assert result.settlement.status == "needs_correction"
+    assert any("Declare the blind structure" in issue for issue in result.issues)
+    # Blocked, not blanked: the pot is still the truthful 24.
+    assert result.ledger.gross_pot == pytest.approx(24)
+    db.close()
+
+
+def test_declaring_the_blind_structure_clears_it_and_is_measured() -> None:
+    """The clearing action is one ordinary settlement edit, and it is disclosed.
+
+    The structure moves no chip figure, so it is measured as verdict-only -- the
+    neutral pass stops reconciling while every reported number stands still. That
+    is precisely the case ``_is_dependent``'s verdict half exists for, and it is
+    what stops "somebody typed 5/10" from being an invisible input.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="blinds"))
+    hand = _create_short_blind_hand(db, session.id)
+
+    stored = db.fetch_hand_settlement(hand.id)
+    db.upsert_hand_settlement(
+        stored.model_copy(update={"small_blind": 5.0, "big_blind": 10.0})
+    )
+    result = persist_reconciliation(db, hand.id)
+
+    assert result.is_authoritative is True
+    assert result.ledger.gross_pot == pytest.approx(24)
+    assert not any("Declare the blind structure" in issue for issue in result.issues)
+
+    named = [
+        item
+        for item in result.assumption_dependence
+        if item.input_name == BLIND_STRUCTURE_INPUT
+    ]
+    assert len(named) == 1
+    assert named[0].declared == "5/10"
+    assert named[0].neutral == "no declared blind structure"
+    assert named[0].deltas == ()
+    assert "verdict-only" in named[0].code
+
+    # The attestation door refuses a code naming no current dependence, so the
+    # measurement -- not the shape of the string -- is what a confirmation binds
+    # to. (This hand is manual, and a manual hand is exempt from attesting at
+    # all, so the honest expectation for both calls here is a refusal.)
+    assert attest_assumption(db, hand.id, "not-a-measured-code") is False
+    db.close()
+
+
+def test_re_declaring_the_blind_structure_lapses_the_attestation() -> None:
+    """A different room is a different claim, so the confirmation cannot carry."""
+    db = _make_db()
+    session = db.create_session(Session(name="blinds"))
+    hand = _create_short_blind_hand(db, session.id)
+    stored = db.fetch_hand_settlement(hand.id)
+    db.upsert_hand_settlement(
+        stored.model_copy(update={"small_blind": 5.0, "big_blind": 10.0})
+    )
+    first = persist_reconciliation(db, hand.id)
+    first_code = next(
+        item.code
+        for item in first.assumption_dependence
+        if item.input_name == BLIND_STRUCTURE_INPUT
+    )
+
+    # A different room, chosen so the hand still reconciles: the floor is the
+    # big blind either way, so nothing about the verdict or a figure moves and
+    # ONLY the declared text differs. That is the case an attestation is most
+    # likely to be inherited across, and it must not be.
+    db.upsert_hand_settlement(
+        db.fetch_hand_settlement(hand.id).model_copy(
+            update={"small_blind": 2.0, "big_blind": 10.0}
+        )
+    )
+    second = persist_reconciliation(db, hand.id)
+    second_code = next(
+        item.code
+        for item in second.assumption_dependence
+        if item.input_name == BLIND_STRUCTURE_INPUT
+    )
+    assert second_code != first_code
+    db.close()
+
+
+def test_a_hand_whose_posts_were_all_made_in_full_is_disclosed_nothing() -> None:
+    """The silent half, which matters as much as the blocking half.
+
+    Where every forced post was made in full the structure is not load-bearing:
+    the observed maximum already IS it. Naming a dependence there would train the
+    operator to click through the disclosures that do mean something.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="full posts"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+    for key, name, stack, is_hero in (
+        ("sb", "SB", 200.0, False),
+        ("bb", "BB", 200.0, True),
+    ):
+        db.create_hand_player(
+            HandPlayer(
+                hand_id=hand.id,
+                player_key=key,
+                player_name=name,
+                position=name,
+                starting_stack=stack,
+                is_hero=is_hero,
+            )
+        )
+    for key, name, action_type, amount, live in (
+        ("sb", "SB", "post_blind", 5.0, True),
+        ("bb", "BB", "post_blind", 10.0, True),
+        ("sb", "SB", "call", 5.0, None),
+        ("bb", "BB", "check", None, None),
+    ):
+        db.create_action(
+            Action(
+                hand_id=hand.id,
+                player_key=key,
+                player_name=name,
+                street="preflop",
+                action_type=action_type,
+                amount=amount,
+                amount_semantics="incremental",
+                is_live_post=live,
+            )
+        )
+    db.upsert_hand_settlement(
+        HandSettlement(
+            hand_id=hand.id, status="settled", small_blind=5.0, big_blind=10.0
+        )
+    )
+    db.replace_settlement_entries(
+        hand.id,
+        [
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=0,
+                player_key="bb",
+                player_name="BB",
+                entry_order=1,
+            )
+        ],
+    )
+
+    result = persist_reconciliation(db, hand.id)
+    assert result.is_authoritative is True
+    assert [
+        item
+        for item in result.assumption_dependence
+        if item.input_name == BLIND_STRUCTURE_INPUT
+    ] == []
+    db.close()
+
+
+def test_a_half_declared_blind_structure_cannot_be_stored() -> None:
+    """"Declared" and "usable" have to be the same state, or a saved row blocks forever."""
+    with pytest.raises(ValidationError):
+        HandSettlement(hand_id=1, small_blind=5.0)
+    with pytest.raises(ValidationError):
+        HandSettlement(hand_id=1, straddles=[20.0])
+    with pytest.raises(ValidationError):
+        HandSettlement(hand_id=1, small_blind=10.0, big_blind=5.0)
+    with pytest.raises(ValidationError):
+        HandSettlement(hand_id=1, small_blind=5.0, big_blind=10.0, straddles=[10.0])
+    # Unstated small blind is legitimate: it moves nothing and 0 would be a claim.
+    assert HandSettlement(hand_id=1, big_blind=10.0).small_blind is None
+
+
+def test_the_blind_structure_survives_a_store_round_trip() -> None:
+    db = _make_db()
+    session = db.create_session(Session(name="round trip"))
+    hand = db.create_hand(Hand(session_id=session.id, hand_number=1))
+    db.upsert_hand_settlement(
+        HandSettlement(
+            hand_id=hand.id, small_blind=2.0, big_blind=5.0, straddles=[10.0, 20.0]
+        )
+    )
+    stored = db.fetch_hand_settlement(hand.id)
+    assert stored.small_blind == pytest.approx(2.0)
+    assert stored.big_blind == pytest.approx(5.0)
+    assert stored.straddles == pytest.approx([10.0, 20.0])
+    db.close()
+
+
+def test_an_unreadable_straddles_column_blocks_instead_of_shrinking_the_floor() -> None:
+    """Degrading a declaration must not quietly make it weaker.
+
+    ``hand_settlements`` has no CHECK constraint, so a hand-edited or forged row
+    can hold junk in ``straddles``. Dropping it to an empty list -- which is what
+    the neighbouring ``warnings`` column does, correctly, because losing a note
+    only removes noise -- would LOWER the structural forced bet the amount to
+    call is floored at. So the row is reported as degraded instead: the column is
+    named, the status cannot read ``reconciled``, and the hand blocks.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="corrupt"))
+    hand = _create_short_blind_hand(db, session.id)
+    db.upsert_hand_settlement(
+        db.fetch_hand_settlement(hand.id).model_copy(
+            update={"small_blind": 5.0, "big_blind": 10.0, "straddles": [20.0]}
+        )
+    )
+    db._execute(
+        "UPDATE hand_settlements SET straddles = ? WHERE hand_id = ?",
+        ("not json at all", hand.id),
+    )
+    db._commit()
+
+    stored = db.fetch_hand_settlement(hand.id)
+    assert stored.unreadable_columns == ("straddles",)
+    assert stored.straddles == []
+    assert any("straddles" in note for note in stored.warnings)
+    assert reconcile_persisted_hand(db, hand.id).is_authoritative is False
+    db.close()
+
+
+def test_a_transposed_blind_structure_cannot_reach_the_disk() -> None:
+    """``model_copy(update=...)`` skips validators, so the WRITE has to validate.
+
+    Every editor in the app assembles the row it saves with ``model_copy``, which
+    does not run ``HandSettlement``'s model validators. A "5/10" typed into the
+    fields in the order an operator says it -- small 10, big 5 -- therefore
+    reached the disk as a structure the class itself refuses. Re-validating at
+    the write makes the class's rules true of every stored row however the caller
+    built it.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="transposed"))
+    hand = _create_short_blind_hand(db, session.id)
+    stored = db.fetch_hand_settlement(hand.id)
+
+    impossible = stored.model_copy(update={"small_blind": 10.0, "big_blind": 5.0})
+    assert impossible.small_blind == 10.0  # model_copy really did accept it
+
+    with pytest.raises(ValidationError):
+        db.upsert_hand_settlement(impossible)
+
+    # Nothing was written, so the hand is still blocked on the undeclared
+    # structure rather than reconciled around a smaller one.
+    unchanged = db.fetch_hand_settlement(hand.id)
+    assert (unchanged.small_blind, unchanged.big_blind) == (None, None)
+    assert reconcile_persisted_hand(db, hand.id).is_authoritative is False
+    db.close()
+
+
+def test_an_unreadable_blind_structure_is_dropped_whole_not_salvaged_in_half() -> None:
+    """Half a refused declaration is worse than none of it.
+
+    ``hand_settlements`` carries no CHECK constraint, so a forged or hand-edited
+    row can hold a transposed structure the writer would refuse. Probing the
+    three columns one at a time kept whichever half validated alone: from small
+    10 / big 5 the reader kept the 5 -- a perfectly valid structure, half the
+    real size, and low enough that a big blind all-in for 4 clears it. The
+    refusal the declaration exists to raise then never fired and the hand
+    reconciled around a 14-chip pot whose truth is 24. A declaration that cannot
+    be read together was not made, so all three columns go.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="forged"))
+    hand = _create_short_blind_hand(db, session.id)
+    db._execute(
+        "UPDATE hand_settlements SET small_blind = ?, big_blind = ? WHERE hand_id = ?",
+        (10.0, 5.0, hand.id),
+    )
+    db._commit()
+
+    stored = db.fetch_hand_settlement(hand.id)
+    assert (stored.small_blind, stored.big_blind, stored.straddles) == (None, None, [])
+    assert any("big_blind" in note for note in stored.warnings)
+
+    result = reconcile_persisted_hand(db, hand.id)
+    assert result.is_authoritative is False
+    assert result.ledger.is_legal is False
+    assert any(
+        "Declare the blind structure" in issue
+        for issue in result.ledger.legality_issues
+    )
+    db.close()
+
+
+def test_a_readable_blind_structure_survives_a_row_degraded_for_another_reason() -> None:
+    """Dropping the structure as a unit must not drop an intact one.
+
+    The group probe is a refusal, not a blanket. A row degraded by an unrelated
+    column keeps a declaration that reads perfectly well beside it, so an
+    operator does not lose a structure they correctly declared because the rake
+    cell was corrupted.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="partly-corrupt"))
+    hand = _create_short_blind_hand(db, session.id)
+    db.upsert_hand_settlement(
+        db.fetch_hand_settlement(hand.id).model_copy(
+            update={"small_blind": 5.0, "big_blind": 10.0}
+        )
+    )
+    db._execute(
+        "UPDATE hand_settlements SET rake_rounding_unit = ? WHERE hand_id = ?",
+        (-1.0, hand.id),
+    )
+    db._commit()
+
+    stored = db.fetch_hand_settlement(hand.id)
+    assert (stored.small_blind, stored.big_blind) == (5.0, 10.0)
+    assert any("rake_rounding_unit" in note for note in stored.warnings)
+    db.close()
+
+
+def test_a_short_blind_booked_as_an_all_in_still_blocks_the_persisted_hand() -> None:
+    """The refusal has to survive the action type a recording chose.
+
+    A blind that takes its poster's last chip is commonly written as an all-in.
+    While the recording still names the forced-bet type, the persisted hand is
+    refused exactly as the ``post_blind`` shape is -- otherwise the whole
+    declaration is one relabel away from being skipped.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="relabelled"))
+    hand = _create_short_blind_hand(db, session.id)
+    blind_row = [
+        action
+        for action in db.fetch_actions_by_hand(hand.id)
+        if action.player_key == "bb"
+    ][0]
+    db.update_action(
+        blind_row.model_copy(
+            update={"action_type": "all-in", "forced_bet_type": "big_blind"}
+        )
+    )
+
+    result = reconcile_persisted_hand(db, hand.id)
+    assert result.ledger.is_legal is False
+    assert any(
+        "Declare the blind structure" in issue
+        for issue in result.ledger.legality_issues
+    )
     db.close()

@@ -4606,6 +4606,44 @@ def show_accounting_editor(
                 "Reassign or delete those rows before saving."
             )
         with st.form(f"accounting_{hand.id}"):
+            # The blind structure is first because it is the only declaration
+            # that can BLOCK a hand outright: a forced post that took its
+            # poster's last chip does not demonstrate the size of the forced bet
+            # it was paying, so until this is filled in the ledger refuses to
+            # state an amount to call rather than reading one off the largest
+            # post it can see. Every other input here moves a figure; this one
+            # decides whether the figures may be trusted at all.
+            blind_cols = st.columns(3)
+            small_blind = blind_cols[0].number_input(
+                "Small blind",
+                min_value=0.0,
+                value=settlement.small_blind,
+                step=0.5,
+                placeholder="Not declared",
+            )
+            big_blind = blind_cols[1].number_input(
+                "Big blind",
+                min_value=0.0,
+                value=settlement.big_blind,
+                step=0.5,
+                placeholder="Not declared",
+                help=(
+                    "The room's structural big blind. A short post does not "
+                    "show what everyone else owed, and it must not be guessed "
+                    "from the posts, so a hand whose recording IDENTIFIES a "
+                    "forced post that went all-in for less is blocked until "
+                    "this is filled in. Where the recording does not identify "
+                    "one -- a reconstructed all-in carries no forced-bet type "
+                    "-- nothing blocks, and declaring the structure here is "
+                    "still what makes the amount to call correct."
+                ),
+            )
+            straddles_text = blind_cols[2].text_input(
+                "Straddles",
+                value=", ".join(f"{value:g}" for value in settlement.straddles),
+                placeholder="e.g. 4, 8",
+                help="Comma-separated, each larger than the forced bet before it.",
+            )
             assumption_cols = st.columns(4)
             dead_money = assumption_cols[0].number_input(
                 "External dead money",
@@ -4753,9 +4791,59 @@ def show_accounting_editor(
                         entry_order=int(row.get("Order") or 1),
                     )
                 )
+            declared_big_blind = _optional_float(big_blind)
+            declared_small_blind = _optional_float(small_blind)
+            declared_straddles = _parse_straddles(straddles_text)
+            if declared_big_blind == 0:
+                # Not silently read as "not declared": an empty field means the
+                # structure is unknown, and a typed 0 is a claim about a room
+                # that cannot exist. Reinterpreting one as the other is how a
+                # declaration gets quietly weaker.
+                raise ValueError(
+                    "A big blind of 0 is not a blind structure. Clear the field "
+                    "to leave the structure undeclared, or enter the real size."
+                )
+            if declared_big_blind is None and (
+                declared_small_blind is not None or declared_straddles
+            ):
+                # Refused here as well as in the model so the operator gets the
+                # sentence rather than a validation traceback: half a structure
+                # looks declared in this form and declares nothing to the ledger.
+                raise ValueError(
+                    "Enter the big blind before a small blind or a straddle. "
+                    "The big blind is what the amount to call is measured from."
+                )
+            if (
+                declared_big_blind is not None
+                and declared_small_blind is not None
+                and declared_small_blind > declared_big_blind
+            ):
+                # The transposition an operator makes by typing "5/10" into the
+                # fields in the order they say it. It is refused at the write as
+                # well, but a typed sentence here is the difference between
+                # "swap these two" and a validation dump. It matters more than a
+                # normal typo: a structure smaller than the real one LOWERS the
+                # floor, which is the direction that hides the short-post
+                # refusal instead of raising it.
+                raise ValueError(
+                    "The small blind cannot be larger than the big blind. For a "
+                    "5/10 game enter 5 as the small blind and 10 as the big blind."
+                )
+            straddle_floor = declared_big_blind
+            for position, straddle in enumerate(declared_straddles, start=1):
+                if straddle_floor is not None and straddle <= straddle_floor:
+                    raise ValueError(
+                        f"Straddle {position} of {straddle:g} must be larger than "
+                        f"the forced bet before it ({straddle_floor:g}). List "
+                        "straddles from the first outward."
+                    )
+                straddle_floor = straddle
             configured = settlement.model_copy(
                 update={
                     "status": "settled",
+                    "small_blind": declared_small_blind,
+                    "big_blind": declared_big_blind,
+                    "straddles": declared_straddles,
                     "dead_money": float(dead_money),
                     "rake_rate": float(rake_rate_pct) / 100,
                     "rake_cap": _optional_float(rake_cap),
@@ -11362,6 +11450,30 @@ def _optional_float(value: object) -> float | None:
     if value in (None, ""):
         return None
     return float(value)
+
+
+def _parse_straddles(text: str) -> list[float]:
+    """Read a comma-separated straddle list, refusing anything that is not a size.
+
+    Deliberately strict rather than lenient: a straddle that silently drops out
+    of a typo lowers the structural forced bet the reducer floors ``to_call``
+    at, which is the same silent-wrong-answer shape the blind structure exists
+    to close. The ordering and positivity rules are left to
+    ``HandSettlement.validate_blind_structure`` so there is one statement of
+    them.
+    """
+    items: list[float] = []
+    for token in (part.strip() for part in (text or "").split(",")):
+        if not token:
+            continue
+        try:
+            items.append(float(token))
+        except ValueError as exc:
+            raise ValueError(
+                f"{token!r} is not a straddle size. Enter comma-separated chip "
+                "amounts, or leave the field empty."
+            ) from exc
+    return items
 
 
 if __name__ == "__main__":

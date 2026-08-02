@@ -3,10 +3,12 @@ from __future__ import annotations
 import pytest
 
 from poker_tracker.math.accounting import (
+    BlindStructure,
     LedgerAction,
     LedgerError,
     LedgerPlayer,
     RakePolicy,
+    blind_structure,
     build_hand_ledger,
 )
 
@@ -1305,3 +1307,579 @@ def test_a_short_all_in_does_not_bring_the_phantom_side_pot_back() -> None:
     for name in ("c", "d", "e"):
         with pytest.raises(LedgerError):
             build_hand_ledger(players, actions, {0: (name,), 1: (name,)})
+
+
+# ---------------------------------------------------------------------------
+# The blind structure: what the action line cannot demonstrate
+# ---------------------------------------------------------------------------
+
+
+def _short_blind_hand(call_amount: float) -> tuple[list[LedgerPlayer], list[LedgerAction]]:
+    """Blinds 5/10 with the big blind all-in for 4, and a button that calls.
+
+    The reported hand, verbatim. The truth is a 24-chip pot: the button owes the
+    big blind of 10 and the small blind owes 5 more to see a flop.
+    """
+    players = [
+        _player("SB", stack=200, seat=0),
+        _player("BB", stack=4, seat=1),
+        _player("BTN", stack=200, seat=2),
+    ]
+    actions = [
+        _action("SB", "post_blind", 5),
+        _action("BB", "post_blind", 4),
+        _action("BTN", "call", call_amount),
+        _action("SB", "call", 5),
+    ]
+    return players, actions
+
+
+def test_a_short_all_in_blind_does_not_lower_what_everyone_else_owes() -> None:
+    """The reported defect: to_call was read off the largest OBSERVED post.
+
+    Blinds 5/10, big blind all-in for 4. The largest contribution anybody can see
+    is the small blind's 5, so the reducer told the button that calling the real
+    10 was illegal and that the amount to call was 5. An operator obeying the
+    product's own error message entered 5, and the hand reconciled -- balanced,
+    legal, settled -- around a 14-chip pot whose truth is 24.
+
+    With the structure declared, the true line is legal and the misled line is
+    the one that is refused.
+    """
+    players, truthful = _short_blind_hand(10)
+    structure = BlindStructure(small_blind=5, big_blind=10)
+
+    ledger = build_hand_ledger(players, truthful, {0: ("SB",), 1: ("SB",)}, blinds=structure)
+    assert ledger.legality_issues == ()
+    assert ledger.is_legal is True
+    assert ledger.gross_pot == pytest.approx(24)
+    assert ledger.is_balanced is True
+
+    # And the amount the operator was previously told to enter is now refused.
+    _players, misled = _short_blind_hand(5)
+    refused = build_hand_ledger(_players, misled, blinds=structure)
+    assert refused.gross_pot == pytest.approx(14)
+    assert any(
+        "call commits 5, but the amount to call is 10" in issue
+        for issue in refused.legality_issues
+    )
+
+
+def test_an_undeclared_structure_is_refused_rather_than_inferred() -> None:
+    """The absent declaration must not silently become the observed maximum.
+
+    A blind that took its poster's last chip proves the poster ran out; it says
+    nothing about what the room required. So the ledger names the seat and the
+    clearing action instead of guessing, and the hand cannot present as legal.
+    Every chip figure is still derived, because a blocked hand still has to be
+    inspectable.
+    """
+    players, actions = _short_blind_hand(10)
+    ledger = build_hand_ledger(players, actions, {0: ("SB",), 1: ("SB",)})
+
+    assert ledger.is_legal is False
+    assert any(
+        "'BB' is all-in posting a live forced bet of 4" in issue
+        and "no blind structure is declared" in issue
+        and "Declare the blind structure" in issue
+        for issue in ledger.legality_issues
+    )
+    # Still fully derived: the refusal is about judging the line, not about
+    # refusing to count the chips.
+    assert ledger.gross_pot == pytest.approx(24)
+    assert ledger.contributions == pytest.approx({"SB": 10, "BB": 4, "BTN": 10})
+
+
+def test_a_short_all_in_straddle_is_the_same_family() -> None:
+    """Cover the family, not the reported case: a straddle short of its own size."""
+    players = [
+        _player("SB", stack=200, seat=0),
+        _player("BB", stack=200, seat=1),
+        _player("STR", stack=15, seat=2),
+        _player("BTN", stack=200, seat=3),
+    ]
+    actions = [
+        _action("SB", "post_blind", 5),
+        _action("BB", "post_blind", 10),
+        _action("STR", "post_blind", 15),
+        _action("BTN", "call", 20),
+        _action("SB", "call", 15),
+        _action("BB", "call", 10),
+    ]
+
+    declared = build_hand_ledger(
+        players, actions, blinds=BlindStructure(5, 10, (20,))
+    )
+    assert declared.legality_issues == ()
+    assert declared.gross_pot == pytest.approx(75)
+
+    # The same structure with the straddle left out does not cover a 15-chip
+    # forced post, so the short post is unreadable again.
+    partial = build_hand_ledger(players, actions, blinds=BlindStructure(5, 10))
+    assert any(
+        "its largest forced bet is 10" in issue for issue in partial.legality_issues
+    )
+
+
+def test_a_short_all_in_small_blind_does_not_move_the_floor() -> None:
+    """A small blind all-in for less is the third member of the family.
+
+    It cannot lower the amount to call either -- the big blind still sets it --
+    and while nothing is declared it is still an unreadable forced post.
+    """
+    players = [
+        _player("SB", stack=2, seat=0),
+        _player("BB", stack=200, seat=1),
+        _player("BTN", stack=200, seat=2),
+    ]
+    actions = [
+        _action("SB", "post_blind", 2),
+        _action("BB", "post_blind", 10),
+        _action("BTN", "call", 10),
+    ]
+
+    declared = build_hand_ledger(players, actions, blinds=BlindStructure(5, 10))
+    assert declared.legality_issues == ()
+    assert declared.snapshots[2].to_call_before == pytest.approx(10)
+
+    undeclared = build_hand_ledger(players, actions)
+    assert any(
+        "'SB' is all-in posting a live forced bet of 2" in issue
+        for issue in undeclared.legality_issues
+    )
+
+
+def test_a_hand_whose_posts_were_all_made_in_full_is_untouched() -> None:
+    """The identity property, which is what keeps the migration honest.
+
+    Where every forced post was made in full, the observed street maximum IS the
+    structural forced bet, so declaring it changes nothing and omitting it costs
+    nothing. Every figure, every snapshot and the legality verdict must be
+    identical with and without the declaration -- that is precisely why an
+    existing database can migrate without any hand silently becoming wrong.
+    """
+    players = [_player("SB", seat=0), _player("BB", seat=1), _player("BTN", seat=2)]
+    actions = [
+        _action("SB", "post_blind", 5),
+        _action("BB", "post_blind", 10),
+        _action("BTN", "raise", 25),
+        _action("SB", "fold"),
+        _action("BB", "call", 15),
+        _action("BB", "check", street="flop"),
+        _action("BTN", "bet", 30, street="flop"),
+        _action("BB", "fold", street="flop"),
+    ]
+
+    def figures(structure):
+        ledger = build_hand_ledger(players, actions, {0: ("BTN",)}, blinds=structure)
+        return (
+            ledger.gross_pot,
+            ledger.rake,
+            ledger.net_pot,
+            tuple(sorted(ledger.payouts.items())),
+            tuple(sorted(ledger.refunds.items())),
+            tuple(sorted(ledger.net_results.items())),
+            ledger.legality_issues,
+            ledger.is_legal,
+            ledger.is_balanced,
+            tuple(snapshot.to_call_before for snapshot in ledger.snapshots),
+        )
+
+    assert figures(BlindStructure(5, 10)) == figures(None)
+
+
+def test_a_declared_structure_can_only_raise_the_amount_to_call() -> None:
+    """It is a floor, never a ceiling, so it can never excuse an under-call.
+
+    The declaration is combined with the observed street maximum by ``max``. A
+    structure declaring a big blind BELOW what the line demonstrably wagered
+    therefore changes nothing, which is what stops a declared number being used
+    to bless a call the recording proves was short.
+    """
+    players = [_player("SB", seat=0), _player("BB", seat=1), _player("BTN", seat=2)]
+    actions = [
+        _action("SB", "post_blind", 5),
+        _action("BB", "post_blind", 10),
+        _action("BTN", "call", 7),
+    ]
+
+    for structure in (None, BlindStructure(1, 2), BlindStructure(5, 10)):
+        ledger = build_hand_ledger(players, actions, blinds=structure)
+        assert any(
+            "call commits 7, but the amount to call is 10" in issue
+            for issue in ledger.legality_issues
+        ), structure
+
+
+def test_the_minimum_raise_preflop_is_the_structural_big_blind() -> None:
+    """The floor moves the minimum full raise too, for the same reason.
+
+    With the big blind all-in for 4 and 5 the largest visible post, a raise to 15
+    used to look like a full 10-chip raise over a 5-chip wager. It is a 5-chip
+    raise over the structural 10, which is below the minimum.
+    """
+    players = [
+        _player("SB", stack=200, seat=0),
+        _player("BB", stack=4, seat=1),
+        _player("BTN", stack=200, seat=2),
+    ]
+    actions = [
+        _action("SB", "post_blind", 5),
+        _action("BB", "post_blind", 4),
+        _action("BTN", "raise", 15),
+    ]
+
+    ledger = build_hand_ledger(players, actions, blinds=BlindStructure(5, 10))
+    assert any(
+        "is below the minimum full raise 10" in issue for issue in ledger.legality_issues
+    )
+
+
+def test_a_forced_post_all_in_at_exactly_the_declared_size_is_readable() -> None:
+    """A stack that is exactly one big blind posts in full; nothing is unknown."""
+    players = [
+        _player("SB", stack=200, seat=0),
+        _player("BB", stack=10, seat=1),
+        _player("BTN", stack=200, seat=2),
+    ]
+    actions = [
+        _action("SB", "post_blind", 5),
+        _action("BB", "post_blind", 10),
+        _action("BTN", "call", 10),
+        _action("SB", "call", 5),
+    ]
+
+    assert build_hand_ledger(players, actions, blinds=BlindStructure(5, 10)).legality_issues == ()
+    # Undeclared, the same post is unreadable: nothing distinguishes "posted its
+    # whole 10-chip blind" from "had 10 of a 20-chip blind".
+    assert build_hand_ledger(players, actions).legality_issues != ()
+
+
+def test_a_dead_post_is_not_a_live_forced_bet() -> None:
+    """A dead blind buys no place in the wagering, so it sets no floor and reads none."""
+    players = [
+        _player("SB", stack=200, seat=0),
+        _player("BB", stack=200, seat=1),
+        _player("LATE", stack=3, seat=2),
+    ]
+    actions = [
+        LedgerAction(
+            player="LATE", street="preflop", kind="post_blind", amount=3, is_live_post=False
+        ),
+        _action("SB", "post_blind", 5),
+        _action("BB", "post_blind", 10),
+        _action("SB", "call", 5),
+    ]
+
+    ledger = build_hand_ledger(players, actions)
+    assert ledger.legality_issues == ()
+
+
+def test_the_blind_structure_refuses_declarations_no_room_could_have() -> None:
+    players = [_player("A", seat=0)]
+    actions = [_action("A", "post_blind", 5)]
+
+    with pytest.raises(LedgerError, match="small blind must not exceed"):
+        build_hand_ledger(players, actions, blinds=BlindStructure(10, 5))
+    with pytest.raises(LedgerError, match="positive big blind"):
+        build_hand_ledger(players, actions, blinds=BlindStructure(0, 0))
+    with pytest.raises(LedgerError, match="Straddle 1 must exceed"):
+        build_hand_ledger(players, actions, blinds=BlindStructure(5, 10, (10,)))
+    with pytest.raises(LedgerError, match="Straddle 2 must exceed"):
+        build_hand_ledger(players, actions, blinds=BlindStructure(5, 10, (20, 15)))
+    with pytest.raises(LedgerError, match="must not be negative"):
+        build_hand_ledger(players, actions, blinds=BlindStructure(-1, 10))
+
+
+def test_an_unstated_small_blind_is_not_written_as_zero() -> None:
+    """``None`` is honest about not knowing; 0 would be a claim about the room."""
+    structure = blind_structure(None, 10)
+    assert structure is not None
+    assert structure.small_blind is None
+    assert blind_structure(5, None) is None
+
+    players, actions = _short_blind_hand(10)
+    assert build_hand_ledger(players, actions, blinds=structure).legality_issues == ()
+
+
+def test_no_declared_structure_but_the_true_one_lets_the_hand_reconcile() -> None:
+    """The declaration is pinned by the recording, so it is not a free parameter.
+
+    This is what keeps the new input from becoming the next dial. The floor
+    raises the amount to call, and the recorded voluntary call is compared
+    against it exactly, so a big blind declared BELOW the truth leaves the call
+    looking oversized and one declared ABOVE it leaves the call looking short.
+    Only the size the action line was actually played at clears both.
+
+    An operator cannot therefore silence the unreadable-post complaint by typing
+    a convenient number: every convenient number replaces it with a different,
+    equally blocking complaint.
+    """
+    players, actions = _short_blind_hand(10)
+
+    verdicts = {
+        big_blind: build_hand_ledger(
+            players, actions, blinds=BlindStructure(5, big_blind)
+        ).is_legal
+        for big_blind in (6, 8, 10, 11, 1000)
+    }
+    assert verdicts == {6: False, 8: False, 10: True, 11: False, 1000: False}
+
+
+def test_a_non_finite_blind_size_is_refused_at_the_boundary() -> None:
+    """``allow_inf_nan`` is a model-level rule; the reducer has its own."""
+    players, actions = _short_blind_hand(10)
+
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(LedgerError, match="must be finite"):
+            build_hand_ledger(players, actions, blinds=BlindStructure(5, bad))
+        with pytest.raises(LedgerError, match="must be finite"):
+            build_hand_ledger(players, actions, blinds=BlindStructure(5, 10, (bad,)))
+
+
+def test_an_unreadable_structure_silences_the_message_that_misled_the_operator() -> None:
+    """The reported harm was the ERROR TEXT, so the error text has to stop.
+
+    "Action 3: call commits 10, but the amount to call is 5" is the sentence the
+    operator obeyed on the way to a 14-chip pot whose truth was 24. A ledger that
+    has just reported it cannot determine the preflop wager level must not turn
+    around and name one: every wager-level complaint on the preflop street is
+    withheld while the structure is unreadable.
+
+    Nothing is lost. ``is_legal`` is already False from the blocker, so the hand
+    is blocked either way, and declaring the structure brings every one of these
+    checks back against a level the ledger can defend -- including, on a hand
+    that really was recorded short, the complaint about the call.
+    """
+    players, actions = _short_blind_hand(10)
+    undeclared = build_hand_ledger(players, actions)
+
+    assert undeclared.is_legal is False
+    assert len(undeclared.legality_issues) == 1
+    assert "Declare the blind structure" in undeclared.legality_issues[0]
+    assert not any(
+        "amount to call" in issue for issue in undeclared.legality_issues
+    )
+
+    # Declared, the same check runs again and can now name a level it can defend.
+    _players, misled = _short_blind_hand(5)
+    declared = build_hand_ledger(_players, misled, blinds=BlindStructure(5, 10))
+    assert any("the amount to call is 10" in issue for issue in declared.legality_issues)
+
+
+def test_the_silence_is_preflop_only_and_never_covers_a_stack_overrun() -> None:
+    """Withholding a claim about the wager level must not withhold anything else.
+
+    ``all-in commits X but Y remains`` reads a STACK rather than a wager, so it
+    is outside the silence even on the preflop street. And a postflop street has
+    no structural forced bet, so its wager level is fully observed and every
+    complaint about it still holds. The silence is exactly the set of claims the
+    unknown structure makes unanswerable, and nothing wider.
+    """
+    players = [
+        _player("SB", stack=200, seat=0),
+        _player("BB", stack=4, seat=1),
+        _player("BTN", stack=200, seat=2),
+    ]
+    actions = [
+        _action("SB", "post_blind", 5),
+        _action("BB", "post_blind", 4),
+        _action("BTN", "all-in", 10),
+        _action("SB", "call", 5),
+        _action("SB", "bet", 20, street="flop"),
+        _action("BTN", "call", 12, street="flop"),
+    ]
+    issues = build_hand_ledger(players, actions).legality_issues
+
+    assert any("Declare the blind structure" in issue for issue in issues)
+    # A stack fact, on the preflop street, still reported.
+    assert any(
+        "Action 3: all-in commits 10, but 200 remains" in issue for issue in issues
+    )
+    # The preflop wager-level claim about the small blind's call is withheld.
+    assert not any("Action 4" in issue for issue in issues)
+    # And the flop under-call is still reported in full.
+    assert any(
+        "Action 6: call commits 12, but the amount to call is 20" in issue
+        for issue in issues
+    )
+
+
+def _short_blind_hand_with_ante(
+    ante_after_blind: bool,
+) -> tuple[list[LedgerPlayer], list[LedgerAction]]:
+    """The reported hand with a 1-chip ante, differing only in ROW ORDER.
+
+    Blinds 5/10 with a 1-chip ante. The big blind holds 5: its ante and a big
+    blind of 4, all-in and short of the structural 10. The two rows it posts
+    under duress have no canonical order -- a room posts both in one motion, a
+    reconstruction resolves them from the same chip-movement burst, and the hand
+    editor lets an operator renumber them while fixing something else. Both
+    orders are the same hand, and both derive the same chips.
+    """
+    players = [
+        _player("SB", stack=200, seat=0),
+        _player("BB", stack=5, seat=1),
+        _player("BTN", stack=200, seat=2),
+    ]
+    forced = [_action("BB", "ante", 1), _action("BB", "post_blind", 4)]
+    if ante_after_blind:
+        forced.reverse()
+    actions = [
+        _action("SB", "ante", 1),
+        _action("BTN", "ante", 1),
+        *forced,
+        _action("SB", "post_blind", 5),
+        _action("BTN", "call", 5),
+        _action("SB", "check"),
+    ]
+    return players, actions
+
+
+def test_a_short_forced_post_is_refused_whatever_order_the_forced_rows_are_in() -> None:
+    """A verdict a row reordering can flip is not a verdict.
+
+    The all-in test used to be "is this seat out of chips at the instant this row
+    is reduced", which is a different question from "did forced posting exhaust
+    this seat". Any further forced commitment by the same seat -- its ante, its
+    dead blind -- falsified the first while leaving the second true, so moving an
+    ante row below a blind row turned a blocked hand into a legal one. Nothing
+    about the hand changed: both orders derive identical chips.
+    """
+    ante_first_players, ante_first = _short_blind_hand_with_ante(False)
+    ante_last_players, ante_last = _short_blind_hand_with_ante(True)
+
+    first = build_hand_ledger(ante_first_players, ante_first)
+    last = build_hand_ledger(ante_last_players, ante_last)
+
+    # Same hand: the reordering moves no chip.
+    assert first.contributions == last.contributions
+    assert first.gross_pot == last.gross_pot
+    assert [pot.amount for pot in first.pots] == [pot.amount for pot in last.pots]
+
+    # And therefore the same verdict, in both orders.
+    for ledger in (first, last):
+        assert ledger.is_legal is False
+        assert any(
+            "'BB' is all-in posting a live forced bet of 4" in issue
+            and "Declare the blind structure" in issue
+            for issue in ledger.legality_issues
+        )
+
+    # Declaring the structure clears it in both orders, and the misleading
+    # wager-level sentence appears against a level the ledger can defend.
+    structure = BlindStructure(small_blind=5, big_blind=10)
+    for players, actions in (
+        (ante_first_players, ante_first),
+        (ante_last_players, ante_last),
+    ):
+        declared = build_hand_ledger(players, actions, blinds=structure)
+        assert not any(
+            "Declare the blind structure" in issue
+            for issue in declared.legality_issues
+        )
+        assert any(
+            "call commits 5, but the amount to call is 10" in issue
+            for issue in declared.legality_issues
+        )
+
+
+def test_a_seat_whose_own_choice_spent_its_stack_did_not_post_short() -> None:
+    """The order repair must not start refusing hands that posted in full.
+
+    A seat that posted its full big blind and then CHOSE to put the rest in was
+    never short of it. Only a stack consumed by forced posting alone is
+    unreadable, so the wider test is still bounded by what the seat was made to
+    do.
+    """
+    players = [
+        _player("SB", stack=200, seat=0),
+        _player("BB", stack=40, seat=1),
+        _player("BTN", stack=200, seat=2),
+    ]
+    actions = [
+        _action("SB", "post_blind", 5),
+        _action("BB", "post_blind", 10),
+        _action("BTN", "raise", 30),
+        _action("SB", "fold"),
+        _action("BB", "all-in", 30),
+        _action("BTN", "call", 10),
+    ]
+    ledger = build_hand_ledger(players, actions)
+
+    assert not any(
+        "Declare the blind structure" in issue for issue in ledger.legality_issues
+    )
+    assert ledger.is_legal is True
+
+
+def test_a_short_forced_post_booked_under_another_kind_is_still_refused() -> None:
+    """Keying the refusal on the ACTION KIND alone left it one relabel away.
+
+    A blind that takes its poster's last chip is routinely booked as an all-in --
+    the CV spine does it for any seat whose stack reads zero, and the hand editor
+    lets an operator set the type by hand. Where the recording still STATES the
+    forced-bet type, that statement is what identifies the post, so the same hand
+    is refused whichever kind it was written under.
+    """
+    players = [
+        _player("SB", stack=200, seat=0),
+        _player("BB", stack=4, seat=1),
+        _player("BTN", stack=200, seat=2),
+    ]
+    actions = [
+        LedgerAction("SB", "preflop", "post_blind", 5, forced_bet_type="small_blind"),
+        LedgerAction("BB", "preflop", "all-in", 4, forced_bet_type="big_blind"),
+        LedgerAction("BTN", "preflop", "call", 5),
+        LedgerAction("SB", "preflop", "fold", 0),
+    ]
+    ledger = build_hand_ledger(players, actions)
+
+    assert ledger.is_legal is False
+    assert any(
+        "'BB' is all-in posting a live forced bet of 4" in issue
+        for issue in ledger.legality_issues
+    )
+
+    # An identical shove that the recording does NOT call a forced post stays an
+    # ordinary short all-in. Nothing here may invent a forced post from a kind.
+    plain = build_hand_ledger(
+        players,
+        [
+            LedgerAction("SB", "preflop", "post_blind", 5),
+            LedgerAction("BB", "preflop", "all-in", 4),
+            LedgerAction("BTN", "preflop", "call", 5),
+            LedgerAction("SB", "preflop", "fold", 0),
+        ],
+    )
+    assert not any(
+        "Declare the blind structure" in issue for issue in plain.legality_issues
+    )
+
+
+def test_a_short_ante_is_not_a_live_forced_bet_whatever_kind_carries_it() -> None:
+    """An ante sets no wager level, so a short one refuses nothing.
+
+    The widened identification reads ``forced_bet_type``, and that vocabulary
+    includes dead posts. Admitting them would block every hand with a seat all-in
+    for its ante -- a coverage loss dressed as a safety check.
+    """
+    players = [
+        _player("A", stack=1, seat=0),
+        _player("B", stack=200, seat=1),
+        _player("C", stack=200, seat=2),
+    ]
+    actions = [
+        LedgerAction("A", "preflop", "all-in", 1, forced_bet_type="ante"),
+        LedgerAction("B", "preflop", "ante", 1),
+        LedgerAction("C", "preflop", "ante", 1),
+        LedgerAction("B", "preflop", "post_blind", 5),
+        LedgerAction("C", "preflop", "post_blind", 10),
+        LedgerAction("B", "preflop", "call", 5),
+    ]
+    ledger = build_hand_ledger(players, actions, winners={0: ("B",), 1: ("B",)})
+
+    assert not any(
+        "Declare the blind structure" in issue for issue in ledger.legality_issues
+    )
+    assert ledger.is_legal is True

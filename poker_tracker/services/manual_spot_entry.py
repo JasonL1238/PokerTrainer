@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Literal
 
-from poker_tracker.math.accounting import build_ledger_from_records
+from poker_tracker.math.accounting import blind_structure, build_ledger_from_records
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import (
     Action,
@@ -34,6 +34,9 @@ _POSITION_ORDER = {
     "BTN": 7,
 }
 _BLIND_AMOUNTS = {"SB": 0.5, "BB": 1.0}
+# The same numbers this module posts, handed to the ledger as the structure so
+# the draft ledger and the persisted settlement cannot disagree about them.
+_SPOT_BLINDS = blind_structure(_BLIND_AMOUNTS["SB"], _BLIND_AMOUNTS["BB"])
 _POSTFLOP_ACTIONS = {"fold", "check", "call", "bet", "raise", "all-in"}
 _POSTFLOP_STREETS = ("flop", "turn", "river")
 _STREET_ALIASES = {
@@ -527,10 +530,22 @@ def save_manual_spot(
         )
         # Folded blind fillers split the pot into layers -- dead-money layers,
         # not side pots -- so award every layer to the winner.
-        draft_ledger = build_ledger_from_records(saved_players, built.actions)
+        draft_ledger = build_ledger_from_records(
+            saved_players, built.actions, blinds=_SPOT_BLINDS
+        )
         pot_indexes = [pot.index for pot in draft_ledger.pots] or [0]
         db.upsert_hand_settlement(
-            HandSettlement(hand_id=saved_hand.id, status="settled")
+            HandSettlement(
+                hand_id=saved_hand.id,
+                status="settled",
+                # This builder POSTS the blinds it is declaring, from the same
+                # constant, so the declaration is a record of what this path did
+                # rather than a claim about a room nobody observed. Recording it
+                # is what keeps a spot whose seat is short of the big blind out
+                # of the trap the ledger's blind structure exists to close.
+                small_blind=_BLIND_AMOUNTS["SB"],
+                big_blind=_BLIND_AMOUNTS["BB"],
+            )
         )
         db.replace_settlement_entries(
             saved_hand.id,

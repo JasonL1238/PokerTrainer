@@ -328,10 +328,25 @@ class Action(PersistedModel):
 
 
 class HandSettlement(PersistedModel):
-    """Persisted assumptions and reconciliation summary for a completed hand."""
+    """Persisted assumptions and reconciliation summary for a completed hand.
+
+    The blind structure sits here, beside the rake policy and the dead money,
+    because it is the same KIND of thing: a fact about the room that the action
+    line cannot demonstrate and somebody therefore has to declare. It is not
+    ``hands.blinds_antes``, which is free text for display ("1/2 NL") that no
+    derivation reads and that no writer constrains -- parsing chip sizes out of
+    it would be a guess wearing a column's clothes, and a guess is how the
+    original defect produced a wrong pot in the first place.
+    """
 
     hand_id: int
     status: SettlementStatus = "unsettled"
+    # NULL means "not declared", which is a state the reducer treats loudly
+    # rather than by falling back to the largest observed post. See
+    # ``math.accounting.BlindStructure``.
+    small_blind: float | None = Field(default=None, ge=0)
+    big_blind: float | None = Field(default=None, gt=0)
+    straddles: list[float] = Field(default_factory=list)
     dead_money: float = Field(default=0, ge=0)
     rake_rate: float = Field(default=0, ge=0, le=1)
     rake_cap: float | None = Field(default=None, ge=0)
@@ -344,6 +359,40 @@ class HandSettlement(PersistedModel):
     warnings: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
+
+    @model_validator(mode="after")
+    def validate_blind_structure(self) -> HandSettlement:
+        """A partial blind structure declares nothing and must not be storable.
+
+        The big blind is the only part the reducer's floor is built from, so a
+        row carrying a small blind or a straddle without one would look like a
+        declaration in the editor, satisfy every column constraint, and still
+        leave the ledger falling back to zero. Refusing the shape here keeps
+        "declared" and "usable" the same state everywhere downstream, so no
+        consumer needs a second definition of it.
+
+        The ordering rules match ``accounting._validate_blinds`` exactly rather
+        than being a looser echo of them: a row this model accepts and the
+        reducer then refuses would be a settlement the operator could save and
+        never clear.
+        """
+        if self.big_blind is None:
+            if self.small_blind is not None or self.straddles:
+                raise ValueError(
+                    "A blind structure needs a big blind before a small blind "
+                    "or a straddle can be declared."
+                )
+            return self
+        if self.small_blind is not None and self.small_blind > self.big_blind:
+            raise ValueError("The small blind must not exceed the big blind.")
+        floor = self.big_blind
+        for index, straddle in enumerate(self.straddles, start=1):
+            if straddle <= floor:
+                raise ValueError(
+                    f"Straddle {index} must exceed the forced bet before it."
+                )
+            floor = straddle
+        return self
 
 
 class SettlementEntry(PersistedModel):

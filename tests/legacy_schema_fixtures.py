@@ -412,6 +412,11 @@ _SCHEMA_STEPS: dict[int, str] = {
     18: """
     ALTER TABLE solver_runs ADD COLUMN run_parameters TEXT NOT NULL DEFAULT '{}';
     """,
+    19: """
+    ALTER TABLE hand_settlements ADD COLUMN small_blind REAL;
+    ALTER TABLE hand_settlements ADD COLUMN big_blind REAL;
+    ALTER TABLE hand_settlements ADD COLUMN straddles TEXT NOT NULL DEFAULT '[]';
+    """,
 }
 
 # The versions that physically changed the file. Versions 1-4 are absent because

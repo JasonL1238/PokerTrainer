@@ -36,6 +36,22 @@ PotLayerCause = Literal["main", "side"]
 _COMMITMENT_KINDS = {"ante", "post_blind", "bet", "call", "raise", "all-in"}
 _BETTING_COMMITMENT_KINDS = _COMMITMENT_KINDS - {"ante"}
 _NON_COMMITMENT_KINDS = {"fold", "check", "show", "win"}
+# Forced-bet names that identify a STRUCTURAL LIVE forced bet: one whose size is
+# set by the room and which therefore sets what every other seat owes. Antes,
+# big-blind antes and dead blinds are excluded on purpose -- they are owed to the
+# table and establish no wager level, so a short one says nothing about
+# ``to_call`` and must not raise the blind-structure blocker.
+#
+# This set exists because the action KIND is not a reliable name for "this was a
+# forced post". A recording that books a blind which took its poster's last chip
+# as ``all-in`` describes the same event, and keying only on ``post_blind`` let
+# exactly that recording escape the refusal below -- the reported defect, one
+# relabel away. Where a recording states the forced-bet type, that statement is
+# what is read.
+_LIVE_STRUCTURAL_FORCED_BETS = frozenset(
+    {"small_blind", "big_blind", "straddle", "bring_in"}
+)
+_FORCED_POST_KINDS = {"ante", "post_blind"}
 _FLOP_STREETS = {"flop", "turn", "river", "showdown"}
 _ZERO = Decimal("0")
 # The coarsest denomination a chopped pot may be divided at. A whole chip is the
@@ -72,6 +88,7 @@ class ActionRecord(Protocol):
     amount: float | None
     amount_semantics: str
     is_live_post: bool | None
+    forced_bet_type: str | None
     pot_before: float | None
 
 
@@ -90,6 +107,59 @@ class LedgerAction:
     kind: LedgerActionKind
     amount: float = 0
     is_live_post: bool = True
+    # What the recording says this commitment WAS, when it says anything: one of
+    # ``models.ForcedBetType`` or None. It is not a second copy of ``kind`` --
+    # a recording is free to book a forced post that took its poster's last chip
+    # under ``all-in``, and the CV spine and the hand editor both can. The blind
+    # structure refusal reads this so a forced post stays identifiable when the
+    # kind stops naming it. Defaults to None, which means "the recording said
+    # nothing", so every existing construction keeps its exact behaviour.
+    forced_bet_type: str | None = None
+
+
+@dataclass(frozen=True)
+class BlindStructure:
+    """The room's structural forced-bet sizes, in the same chip unit as the actions.
+
+    A fact about the TABLE, not about the line -- the same category as
+    ``RakePolicy`` and ``dead_money``, and supplied the same way, because the
+    action line cannot demonstrate it.
+
+    Why it has to be an input at all.  ``to_call`` used to be derived purely
+    from the largest observed contribution on the street.  That is exact
+    whenever every forced post was made in full, and silently wrong the moment
+    one was not: blinds 5/10 with a big blind all-in for 4 leaves 5 (the small
+    blind) as the largest observed post, so the reducer told the button that
+    calling 10 was illegal and that the amount to call was 5.  An operator who
+    obeyed the product's own error message entered 5, and the hand reconciled --
+    balanced, legal, authoritative, warning-free -- around a 14-chip pot whose
+    truth is 24.  A short all-in blind does not lower what anybody else owes.
+
+    Why it cannot be inferred.  A small blind of 5 is equally consistent with
+    5/10 and with 5/5; real structures include 1/3, 2/2, 2/5 and 5/10, and a
+    straddle is whatever the room permits.  Guessing produces a different wrong
+    answer rather than no answer, so nothing here guesses.
+
+    ``small_blind`` is deliberately carried even though only the largest forced
+    bet moves ``to_call``: it is half of what an operator means by "5/10", it is
+    what makes the stored declaration checkable by a human, and validating it
+    against the big blind catches a transposed entry that would otherwise pass
+    silently. ``None`` means it was not stated, which is honest and costs
+    nothing -- it is not written as 0, because 0 is a claim.
+
+    ``straddles`` is ordered from the first straddle outward, each strictly
+    larger than the forced bet before it, so a re-straddle is expressible and
+    the largest live forced bet is simply the last of them.
+
+    Field order is ``small_blind`` then ``big_blind`` so that a positional
+    ``BlindStructure(5, 10)`` reads as the "5/10" an operator would say. The
+    validator refuses a transposition, so the ordering trap cannot fail
+    silently either way.
+    """
+
+    small_blind: float | None
+    big_blind: float
+    straddles: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -196,6 +266,7 @@ def build_hand_ledger(
     odd_chip_order: Sequence[str] = (),
     dead_money: float = 0,
     flop_seen: bool | None = None,
+    blinds: BlindStructure | None = None,
 ) -> HandLedger:
     """Reduce normalized completed-hand actions into pots and player results.
 
@@ -209,6 +280,37 @@ def build_hand_ledger(
     optional completed-hand fact for histories where a board ran out without
     any postflop action (for example, a preflop all-in). When omitted, the
     ledger preserves the historic behavior of inferring it from action streets.
+
+    ``blinds`` is the room's structural forced-bet sizes (see ``BlindStructure``).
+    Preflop, the live wagering starts at the largest structural forced bet
+    whether or not anybody posted it in full, so a blind or straddle that is
+    all-in for less never lowers what the rest of the table owes.  It is a
+    FLOOR and never a ceiling: it is combined with the observed street maximum
+    by ``max``, so a declared structure can only ever raise the amount to call
+    and can never excuse an under-call the recording demonstrates.
+
+    Omitting ``blinds`` is not a silent fall back to the observed maximum.  A
+    live forced post that leaves its poster all-in above the declared floor --
+    which is every such post when nothing is declared, since the floor is then
+    zero -- does not demonstrate the size of the forced bet it was paying, so it
+    is reported as a legality issue naming the seat and the clearing action.
+    The hand stays fully inspectable and every chip figure is still derived; it
+    simply may not present as legal, reconciled, or study-ready until the
+    structure is declared.  A hand whose forced posts were all made in full says
+    nothing about a structure it does not need, so it is untouched.
+
+    THE SCOPE OF THAT REFUSAL, STATED HONESTLY.  It reaches a forced post the
+    RECORDING IDENTIFIES as one -- by ``kind == "post_blind"``, or by a
+    ``forced_bet_type`` naming a live structural bet on a row booked under
+    another kind (see ``_is_live_structural_post``).  A recording that books a
+    short blind as a plain ``all-in`` and states no forced-bet type has said
+    nothing that distinguishes it from an ordinary short shove, and nothing here
+    can tell them apart; such a hand still derives ``to_call`` from the observed
+    maximum and is NOT refused.  The CV reconstruction spine emits exactly that
+    shape for a seat whose stack reads zero, so this refusal does not cover
+    every reconstructed hand.  Declaring the structure covers those hands
+    correctly -- the floor is applied whatever the kinds are -- but the operator
+    is not prompted to.
     """
 
     player_order, starting = _validate_players(players)
@@ -217,6 +319,10 @@ def build_hand_ledger(
         raise LedgerError("dead_money must not be negative.")
     policy = rake or RakePolicy()
     rate, cap, unit = _validate_rake(policy)
+    # The largest structural live forced bet, or zero when nothing is declared.
+    # Zero is not "the observed maximum": it is what makes every all-in forced
+    # post uninterpretable below, which is the loud half of the contract.
+    preflop_floor = _validate_blinds(blinds)
     winner_map = {index: tuple(names) for index, names in (winners or {}).items()}
     odd_order = _validate_odd_chip_order(odd_chip_order, starting)
 
@@ -239,6 +345,14 @@ def build_hand_ledger(
     last_street_rank = -1
     last_full_raise = _ZERO
     last_wager_faced: dict[str, Decimal] = {}
+    # Decided over the WHOLE recording before a single row is reduced, so the
+    # verdict cannot depend on the order two forced rows happen to be listed in,
+    # and so every preflop complaint that names a wager level is silenced --
+    # including any that precede the post. See ``_unreadable_forced_posts``.
+    unreadable_posts = _unreadable_forced_posts(actions, starting, preflop_floor)
+    # True once this ledger has stated it cannot determine the preflop wager
+    # level, from which point it must stop making claims that depend on one.
+    structure_unreadable = bool(unreadable_posts)
 
     for index, action in enumerate(actions):
         if action.player not in starting:
@@ -270,7 +384,12 @@ def build_hand_ledger(
             last_street_rank = max(last_street_rank, rank)
             current_street = action.street
             street_contributions = {name: _ZERO for name in player_order}
-            last_full_raise = _ZERO
+            # Preflop the minimum full raise starts at the structural forced bet,
+            # for the same reason the amount to call does: a big blind all-in for
+            # 4 in a 5/10 game does not make 5 a legal raise size.
+            last_full_raise = (
+                preflop_floor if action.street == "preflop" else _ZERO
+            )
             last_wager_faced = {}
 
         committed_before = contributions[action.player]
@@ -295,7 +414,27 @@ def build_hand_ledger(
         else:
             effective_low = effective_high = stack_before
         effective_before = effective_low
-        betting_max = max(street_contributions.values(), default=_ZERO)
+        # The floor answers "what does this seat owe to keep playing", which is a
+        # question only a VOLUNTARY action faces. A forced post is not answering
+        # a wager -- its size is set by the room and no legality check here reads
+        # ``to_call`` for one -- so applying the floor to it would move nothing
+        # except the ``to_call_before`` a post's own snapshot reports. Leaving
+        # posts out is what makes a hand whose blinds were all made in full
+        # derive BYTE-IDENTICALLY with and without a declared structure, right
+        # down to every snapshot, which is the property the migration rests on.
+        wager_floor = (
+            preflop_floor
+            if action.street == "preflop" and not _is_forced_post(action)
+            else _ZERO
+        )
+        # The live wagering in force: what the street has demonstrably seen, or
+        # the structural forced bet, whichever is larger. Taking the observed
+        # maximum ALONE is the defect this floor exists for; taking the declared
+        # floor alone would let a declaration excuse an under-call the recording
+        # proves. Only ``max`` has neither failure.
+        betting_max = max(
+            max(street_contributions.values(), default=_ZERO), wager_floor
+        )
         player_street_before = street_contributions[action.player]
         to_call = max(_ZERO, betting_max - player_street_before)
         pot_before = dead + sum(contributions.values(), _ZERO)
@@ -307,35 +446,60 @@ def build_hand_ledger(
         )
 
         action_label = f"Action {index + 1}"
-        if action.kind == "check" and to_call > 0:
-            legality_issues.append(f"{action_label}: check while facing {to_call}.")
-        if action.kind == "call":
-            if to_call <= 0:
-                legality_issues.append(f"{action_label}: call with nothing to call.")
-            elif amount != to_call and not (amount == stack_before and amount < to_call):
+        # Every complaint in this block is a claim about the wager level in
+        # force. Once an unreadable forced post has been seen, the preflop wager
+        # level is exactly what this ledger has just said it cannot determine, so
+        # stating one would contradict the blocker it raised -- and that
+        # contradiction is not academic: the reported defect is an operator who
+        # obeyed "the amount to call is 5" and entered a 14-chip pot whose truth
+        # was 24. Nothing is lost by staying quiet. ``is_legal`` is already False
+        # from the blocker, so the hand is blocked either way, and declaring the
+        # structure brings every one of these checks back with a level it can
+        # defend. The stack-based ``all-in`` check below is deliberately outside
+        # the guard: it reads no wager level.
+        #
+        # ``structure_unreadable`` is set later in this same loop, when the post
+        # is reached. Forced posts precede voluntary action on every recording a
+        # room can produce, so the flag is always set before the actions it
+        # silences; a malformed line that posts a blind after a call would report
+        # that call against the pre-post level, which is no worse than today.
+        if not (structure_unreadable and action.street == "preflop"):
+            if action.kind == "check" and to_call > 0:
+                legality_issues.append(f"{action_label}: check while facing {to_call}.")
+            if action.kind == "call":
+                if to_call <= 0:
+                    legality_issues.append(f"{action_label}: call with nothing to call.")
+                elif amount != to_call and not (
+                    amount == stack_before and amount < to_call
+                ):
+                    legality_issues.append(
+                        f"{action_label}: call commits {amount}, but the amount to "
+                        f"call is {to_call}."
+                    )
+            if action.kind == "bet" and betting_max > 0:
                 legality_issues.append(
-                    f"{action_label}: call commits {amount}, but the amount to call is {to_call}."
+                    f"{action_label}: bet used while facing an existing wager."
                 )
-        if action.kind == "bet" and betting_max > 0:
-            legality_issues.append(f"{action_label}: bet used while facing an existing wager.")
-        if action.kind == "raise":
-            raise_size = new_total - betting_max
-            if to_call <= 0 or raise_size <= 0:
-                legality_issues.append(f"{action_label}: raise does not increase the wager.")
-            elif last_full_raise > 0 and raise_size < last_full_raise:
+            if action.kind == "raise":
+                raise_size = new_total - betting_max
+                if to_call <= 0 or raise_size <= 0:
+                    legality_issues.append(
+                        f"{action_label}: raise does not increase the wager."
+                    )
+                elif last_full_raise > 0 and raise_size < last_full_raise:
+                    legality_issues.append(
+                        f"{action_label}: raise size {raise_size} is below the minimum "
+                        f"full raise {last_full_raise}."
+                    )
+            if (
+                aggressive_increment > 0
+                and action.player in last_wager_faced
+                and last_full_raise > 0
+                and betting_max - last_wager_faced[action.player] < last_full_raise
+            ):
                 legality_issues.append(
-                    f"{action_label}: raise size {raise_size} is below the minimum "
-                    f"full raise {last_full_raise}."
+                    f"{action_label}: betting was not reopened after a short all-in raise."
                 )
-        if (
-            aggressive_increment > 0
-            and action.player in last_wager_faced
-            and last_full_raise > 0
-            and betting_max - last_wager_faced[action.player] < last_full_raise
-        ):
-            legality_issues.append(
-                f"{action_label}: betting was not reopened after a short all-in raise."
-            )
         if action.kind == "all-in" and amount != stack_before:
             legality_issues.append(
                 f"{action_label}: all-in commits {amount}, but {stack_before} remains."
@@ -370,12 +534,29 @@ def build_hand_ledger(
                         last_full_raise = raise_size
         if action.kind not in {"ante", "post_blind", "show", "win"}:
             last_wager_faced[action.player] = max(
-                street_contributions.values(), default=_ZERO
+                max(street_contributions.values(), default=_ZERO), wager_floor
             )
         if action.kind == "fold":
             folded.add(action.player)
         if contributions[action.player] == starting[action.player]:
             all_in.add(action.player)
+        if index in unreadable_posts:
+            # A forced post that took the poster's last chip proves only that the
+            # poster ran out; it does not say what the room required. Above the
+            # declared floor there is nothing left to read it against -- with no
+            # declaration the floor is zero, so EVERY such post lands here, which
+            # is the intended loud default. The ledger refuses to name an amount
+            # to call rather than inventing one from the largest post it happens
+            # to see. See ``BlindStructure`` and ``_unreadable_forced_posts``.
+            legality_issues.append(
+                f"{action_label}: {action.player!r} is all-in posting a live "
+                f"forced bet of {amount}, which the declared blind structure "
+                f"does not cover ({_blind_floor_text(preflop_floor)}). A short "
+                "forced post does not demonstrate the structural size it was "
+                "paying, so the amount every other seat owes cannot be read off "
+                "this hand. Declare the blind structure (small blind, big blind, "
+                "any straddle) for this hand."
+            )
 
         pot_after = dead + sum(contributions.values(), _ZERO)
         call_increment = min(amount, to_call) if action.kind in {"call", "all-in"} else _ZERO
@@ -530,6 +711,7 @@ def build_ledger_from_records(
     rake: RakePolicy | None = None,
     odd_chip_order: Sequence[str] = (),
     flop_seen: bool | None = None,
+    blinds: BlindStructure | None = None,
 ) -> HandLedger:
     """Adapt persisted application records to the normalized ledger contract.
 
@@ -629,6 +811,12 @@ def build_ledger_from_records(
                     if getattr(action, "is_live_post", None) is None
                     else bool(action.is_live_post)
                 ),
+                # Carried verbatim, including from a row whose ``action_type``
+                # is not ``post_blind``. That row is the whole reason the field
+                # exists here: a blind which took its poster's last chip is
+                # routinely booked as an all-in, and reading only the kind let
+                # it past the blind-structure refusal.
+                forced_bet_type=getattr(action, "forced_bet_type", None),
             )
         )
 
@@ -640,7 +828,186 @@ def build_ledger_from_records(
         odd_chip_order=odd_chip_order,
         dead_money=dead_money,
         flop_seen=flop_seen,
+        blinds=blinds,
     )
+
+
+def blind_structure(
+    small_blind: float | None,
+    big_blind: float | None,
+    straddles: Sequence[float] = (),
+) -> BlindStructure | None:
+    """The one definition of "a blind structure was declared", for every caller.
+
+    The big blind is what the reducer's floor is built from, so its absence IS
+    the absence of a declaration -- and every surface that stores, reads,
+    neutralises, or displays the structure has to agree about that or they will
+    disagree about whether a hand is study-ready. Persisted callers pass the
+    three ``hand_settlements`` columns straight in.
+    """
+
+    if big_blind is None:
+        return None
+    return BlindStructure(
+        small_blind=small_blind,
+        big_blind=big_blind,
+        straddles=tuple(straddles),
+    )
+
+
+def _is_forced_post(action: LedgerAction) -> bool:
+    """Whether this commitment was posted under duress rather than chosen.
+
+    Forced posts are the rows a seat has no say in, so they carry no information
+    about what the seat would have done -- and, for the ordering question below,
+    they are the rows a recording may legitimately list in any order relative to
+    one another.
+    """
+
+    return action.kind in _FORCED_POST_KINDS or action.forced_bet_type is not None
+
+
+def _is_live_structural_post(action: LedgerAction) -> bool:
+    """Whether this commitment is a live forced bet that sets the wager level.
+
+    Two ways a recording can say so, because only one of them is always
+    available: the action KIND (``post_blind``, the shape the hand editor and the
+    manual writer produce), or the recorded FORCED-BET TYPE (the shape that
+    survives when a post which took its poster's last chip was booked as
+    ``all-in``). Requiring the kind alone is what let the second shape past.
+    """
+
+    if action.kind == "post_blind":
+        return bool(action.is_live_post)
+    if action.kind in {"all-in", "bet", "call", "raise"}:
+        return (
+            action.forced_bet_type in _LIVE_STRUCTURAL_FORCED_BETS
+            and bool(action.is_live_post)
+        )
+    return False
+
+
+def _unreadable_forced_posts(
+    actions: Sequence[LedgerAction],
+    starting: Mapping[str, Decimal],
+    preflop_floor: Decimal,
+) -> frozenset[int]:
+    """Indexes of live forced posts the declared structure cannot account for.
+
+    A live forced post whose poster ended all-in proves only that the poster ran
+    out; above the declared floor there is nothing left to read the structural
+    size against, so the wager level cannot be named. That verdict is decided
+    HERE, in one pass over the whole recording, for two reasons.
+
+    ORDER. Asking "is this seat all-in yet" at the instant the post's own row is
+    reduced is not the same question as "did forced posting exhaust this seat",
+    and the two disagree whenever the seat has another forced row after its live
+    blind -- its ante, or its dead blind. Those rows have no canonical order: the
+    same hand, same seats, same stacks, same chips, is a legal recording either
+    way, and both orders derive byte-identical contributions, pots, refunds,
+    payouts and results. Deciding at the instant made the REFUSAL depend on that
+    order, so moving an ante row below a blind row silently turned a blocked hand
+    into a reconciled one around a pot that was 10 chips short. A verdict that a
+    row reordering can flip is not a verdict. The seat's FINAL commitment answers
+    it, and only forced rows may make up that total -- a seat that later chose to
+    put chips in was never short of the blind it posted.
+
+    TIMING. The flag this returns silences preflop complaints that name a wager
+    level, and a flag raised part-way through the pass silences nothing before
+    it. A recording whose live post lands after a voluntary action -- malformed,
+    but reachable from a reconstruction with a misordered street -- would
+    otherwise still print the sentence that misled the operator, once. Knowing
+    every unreadable post before the loop starts closes that.
+
+    Returns an empty set for a recording the main pass will reject outright, so
+    a malformed hand raises its structural error rather than a verdict about it.
+    """
+
+    committed = {name: _ZERO for name in starting}
+    voluntary: set[str] = set()
+    candidates: list[tuple[int, str]] = []
+    exhausted_at_post: set[int] = set()
+    for index, action in enumerate(actions):
+        if action.player not in committed or action.kind not in _COMMITMENT_KINDS:
+            continue
+        try:
+            amount = _decimal(action.amount, f"action {index + 1} amount")
+        except LedgerError:
+            return frozenset()
+        if amount <= 0 or amount > starting[action.player] - committed[action.player]:
+            return frozenset()
+        committed[action.player] += amount
+        if not _is_forced_post(action):
+            voluntary.add(action.player)
+        if (
+            action.street == "preflop"
+            and _is_live_structural_post(action)
+            # ``preflop_floor``, deliberately, and not the ``wager_floor`` the
+            # main pass withholds from forced posts: this asks whether the
+            # DECLARATION covers the post, not what the poster owed.
+            and amount > preflop_floor
+        ):
+            candidates.append((index, action.player))
+            if committed[action.player] == starting[action.player]:
+                exhausted_at_post.add(index)
+    exhausted = {
+        name
+        for name, total in committed.items()
+        if name not in voluntary and total > 0 and total == starting[name]
+    }
+    return frozenset(
+        index
+        for index, player in candidates
+        if index in exhausted_at_post or player in exhausted
+    )
+
+
+def _validate_blinds(blinds: BlindStructure | None) -> Decimal:
+    """The largest structural live forced bet a declared structure establishes.
+
+    Returns zero for an absent declaration, which is deliberately NOT the same
+    thing as "use the observed maximum": zero makes every all-in forced post
+    uninterpretable in ``build_hand_ledger``, so the missing declaration is
+    reported instead of guessed at.
+
+    The refusals are the ones that catch a declaration nobody could have meant.
+    A transposed "5/10" entered as big blind 5 and small blind 10 would
+    otherwise be accepted and would silently lower the floor by half; a
+    non-positive big blind declares no structure at all while still clearing the
+    unobservable-post check; and a straddle that does not exceed the forced bet
+    before it is not a straddle. Refusing here rather than warning is right
+    because these are impossible rooms, not unusual ones.
+    """
+
+    if blinds is None:
+        return _ZERO
+    small = (
+        None
+        if blinds.small_blind is None
+        else _decimal(blinds.small_blind, "small blind")
+    )
+    big = _decimal(blinds.big_blind, "big blind")
+    if small is not None and small < 0:
+        raise LedgerError("Blind sizes must not be negative.")
+    if big <= 0:
+        raise LedgerError("A declared blind structure needs a positive big blind.")
+    if small is not None and small > big:
+        raise LedgerError("The small blind must not exceed the big blind.")
+    floor = big
+    for index, value in enumerate(blinds.straddles, start=1):
+        straddle = _decimal(value, f"straddle {index}")
+        if straddle <= floor:
+            raise LedgerError(
+                f"Straddle {index} must exceed the forced bet before it."
+            )
+        floor = straddle
+    return floor
+
+
+def _blind_floor_text(floor: Decimal) -> str:
+    if floor <= 0:
+        return "no blind structure is declared"
+    return f"its largest forced bet is {floor}"
 
 
 def _validate_players(

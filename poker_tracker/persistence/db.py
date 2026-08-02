@@ -19,6 +19,7 @@ from pydantic import ValidationError
 from poker_tracker.math.accounting import (
     LedgerError,
     RakePolicy,
+    blind_structure,
     build_ledger_from_records,
 )
 from poker_tracker.math.cards import CardParseError, parse_visible_cards
@@ -77,7 +78,7 @@ DEFAULT_DB_PATH = os.environ.get(
     "POKER_DB_PATH",
     str(Path(__file__).resolve().parent.parent.parent / "poker_tracker.db"),
 )
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 _PROCESSING_JOB_PID_UNSET = object()
 # A migration on a real database can outlast SQLite's 5s default, and a second
 # opener must wait for it rather than failing startup with "database is locked".
@@ -1094,6 +1095,9 @@ class PokerDatabase:
             CREATE TABLE IF NOT EXISTS hand_settlements (
                 hand_id INTEGER PRIMARY KEY,
                 status TEXT NOT NULL DEFAULT 'unsettled',
+                small_blind REAL,
+                big_blind REAL,
+                straddles TEXT NOT NULL DEFAULT '[]',
                 dead_money REAL NOT NULL DEFAULT 0,
                 rake_rate REAL NOT NULL DEFAULT 0,
                 rake_cap REAL,
@@ -3079,6 +3083,11 @@ class PokerDatabase:
                 self.fetch_players_by_hand(settlement.hand_id),
                 actions,
                 dead_money=settlement.dead_money,
+                blinds=blind_structure(
+                    settlement.small_blind,
+                    settlement.big_blind,
+                    settlement.straddles,
+                ),
                 rake=RakePolicy(
                     rate=settlement.rake_rate,
                     cap=settlement.rake_cap,
@@ -3469,6 +3478,16 @@ class PokerDatabase:
         return [_hand_player_from_row(row) for row in rows]
 
     def upsert_hand_settlement(self, settlement: HandSettlement) -> HandSettlement:
+        # Re-validated at the WRITE, not trusted because the argument is typed.
+        # ``model_copy(update=...)`` -- how every editor in the app builds the row
+        # it saves -- does not run model validators, so a ``HandSettlement``
+        # arriving here can hold a shape its own class refuses. A transposed
+        # "5/10" entered as small 10 / big 5 reached the disk that way, and the
+        # reader then salvaged half of it into a smaller, valid, wrong structure.
+        # Validating here makes the class's rules true of every row on disk
+        # regardless of how the caller assembled it, which is the only place that
+        # can be guaranteed once.
+        HandSettlement.model_validate(settlement.model_dump())
         payload = settlement.model_dump()
         # Read before the write, so the invalidation below can ask whether this
         # save changed anything rather than assuming a save is a change.
@@ -3489,13 +3508,17 @@ class PokerDatabase:
         self._execute(
             """
             INSERT INTO hand_settlements (
-                hand_id, status, dead_money, rake_rate, rake_cap,
+                hand_id, status, small_blind, big_blind, straddles,
+                dead_money, rake_rate, rake_cap,
                 rake_rounding_unit, no_flop_no_drop, gross_pot, rake_amount,
                 net_pot, is_balanced, warnings, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(hand_id) DO UPDATE SET
                 status = excluded.status,
+                small_blind = excluded.small_blind,
+                big_blind = excluded.big_blind,
+                straddles = excluded.straddles,
                 dead_money = excluded.dead_money,
                 rake_rate = excluded.rake_rate,
                 rake_cap = excluded.rake_cap,
@@ -3511,6 +3534,9 @@ class PokerDatabase:
             (
                 payload["hand_id"],
                 payload["status"],
+                payload["small_blind"],
+                payload["big_blind"],
+                _serialize_json(payload["straddles"]),
                 payload["dead_money"],
                 payload["rake_rate"],
                 payload["rake_cap"],
@@ -5274,6 +5300,76 @@ def _migrate_to_v18(db: PokerDatabase) -> None:
     db._ensure_column("solver_runs", "run_parameters", "TEXT NOT NULL DEFAULT '{}'")
 
 
+def _migrate_to_v19(db: PokerDatabase) -> None:
+    """Record the room's blind structure, because the action line cannot show it.
+
+    MIGRATION IMPACT (schema 18 -> 19)
+
+    Added:
+      - hand_settlements.small_blind REAL NULL
+      - hand_settlements.big_blind REAL NULL
+      - hand_settlements.straddles TEXT NOT NULL DEFAULT '[]'
+
+    Forward-only and purely additive. No existing column changes type, no
+    existing row is rewritten, deleted, or re-keyed, and no file on disk is
+    touched. A hand with no ``hand_settlements`` row at all is not given one.
+
+    DELIBERATELY UNBACKFILLED, and this is the whole point of the column.
+    Backfilling a big blind -- from ``hands.blinds_antes``, from the largest
+    observed blind post, from the session stakes -- would assert a fact about a
+    room nobody recorded, and asserting exactly that fact from the largest
+    observed post is the defect this migration exists to end. A small blind of 5
+    is equally consistent with 5/10 and 5/5.
+
+    WHAT HAPPENS TO EXISTING HANDS, precisely, so that "they silently become
+    wrong" is not one of the answers:
+
+      * A hand whose forced posts were all made in full -- effectively every
+        ordinary hand -- reads ``big_blind IS NULL``, declares no structure, and
+        derives byte-identically to schema 18. The reducer's preflop floor is
+        combined with the observed street maximum by ``max``, and a floor of
+        zero is the identity. Nothing about its pot, rake, payouts, hero result,
+        settlement status, or study readiness moves.
+
+      * A hand whose recording IDENTIFIES a live forced post that left its
+        poster all-in -- by an action type of ``post_blind``, or by a
+        ``forced_bet_type`` naming a live structural bet on a row booked under
+        another type -- gains one legality issue naming that seat, so
+        ``is_legal`` goes False, the
+        reconciliation stops being authoritative, and study readiness blocks on
+        ACCOUNTING_NOT_AUTHORITATIVE. That is a deliberate, visible demotion of
+        hands that were previously reconciled around an amount-to-call the
+        product had inferred from a short post -- the reported case reconciled a
+        14-chip pot whose truth was 24, silently and with an empty blocker
+        tuple. The clearing action is an ordinary settlement edit: declare the
+        blind structure in Edit settlement and save. It is not a data repair and
+        it destroys nothing; the previous figures are still derived and still
+        displayed while the hand is blocked.
+
+      * A hand whose recording does NOT identify the short post as a forced one
+        -- a reconstruction that books a blind which took its poster's last chip
+        as a plain ``all-in`` with no forced-bet type -- is NOT demoted, because
+        nothing distinguishes it from an ordinary short shove. Its amount to
+        call still comes from the observed maximum. Declaring the structure
+        fixes such a hand, but the product does not ask for it.
+
+      * ``hands.blinds_antes`` is untouched and is still free display text. It
+        is not parsed, and nothing reads a chip size out of it.
+
+    DOWNGRADE: an older build does not read a v19 database at all.
+    ``_assert_supported_schema_version`` refuses any stamp above the build's own
+    ``SCHEMA_VERSION`` with "Update the app before opening it", so the file is
+    not opened, not read, and not written. That is safer than the partial read
+    it replaces, but it means a downgrade is an app rollback, not a file
+    operation: keep the pre-migration backup ``init_db`` took. ``_ensure_column``
+    is idempotent, so re-running the chain forward is a no-op.
+    """
+
+    db._ensure_column("hand_settlements", "small_blind", "REAL")
+    db._ensure_column("hand_settlements", "big_blind", "REAL")
+    db._ensure_column("hand_settlements", "straddles", "TEXT NOT NULL DEFAULT '[]'")
+
+
 # Versioned migrations run in order and refuse databases written by newer apps.
 _MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {
     6: _migrate_to_v6,
@@ -5289,6 +5385,7 @@ _MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {
     16: _migrate_to_v16,
     17: _migrate_to_v17,
     18: _migrate_to_v18,
+    19: _migrate_to_v19,
 }
 
 
@@ -5863,6 +5960,21 @@ def _hand_settlement_from_row(row: sqlite3.Row) -> HandSettlement:
         data["no_flop_no_drop"] = bool(data["no_flop_no_drop"])
         data["is_balanced"] = bool(data["is_balanced"])
         data["warnings"] = _parse_json_list(data.get("warnings", "[]"))
+        # Deliberately NOT ``_parse_json_list``, which degrades an unreadable
+        # column to an empty list. That contract is right for ``warnings``, where
+        # losing a note only ever removes noise, and wrong here: dropping a
+        # straddle LOWERS the structural forced bet the amount to call is floored
+        # at, which is a declaration quietly getting weaker. Raising sends the row
+        # through ``_degraded_hand_settlement``, which names the column, forces
+        # the status off ``reconciled`` and blocks the hand instead.
+        raw_straddles = data.get("straddles", "[]")
+        if isinstance(raw_straddles, str):
+            parsed_straddles = json.loads(raw_straddles or "[]")
+            if not isinstance(parsed_straddles, list):
+                raise ValueError("straddles must hold a JSON list of chip amounts.")
+            data["straddles"] = parsed_straddles
+        elif raw_straddles is None:
+            data["straddles"] = []
         data["created_at"] = _parse_datetime(data["created_at"])
         data["updated_at"] = _parse_datetime(data["updated_at"])
         settlement = HandSettlement(**data)
@@ -5908,6 +6020,35 @@ def _degraded_hand_settlement(data: dict[str, Any]) -> HandSettlement:
         "updated_at": data.get("updated_at"),
     }
     unreadable: list[str] = []
+    # The three blind-structure columns are probed TOGETHER, as one declaration,
+    # and stand or fall together.
+    #
+    # Probing them one at a time cannot work, in either order. Probed
+    # small-blind-first, a perfectly readable small blind is refused against a
+    # ``safe`` mapping that does not yet carry its big blind, and an intact
+    # declaration is dropped from a row degraded for an unrelated reason. Probed
+    # big-blind-first -- which is what this did -- a TRANSPOSED "5/10" stored as
+    # small 10 / big 5 keeps the 5 and drops the 10, converting a declaration
+    # nobody could have meant into a smaller one that is perfectly valid. That is
+    # strictly worse than dropping it: a floor of 5 covers a big blind that went
+    # all-in for 4, so the refusal the declaration was made to answer never
+    # fires, and the hand reconciles around a 14-chip pot whose truth is 24.
+    #
+    # A row whose three columns cannot be read together is a row that did not
+    # declare a structure. Dropping all three leaves the floor at zero, which
+    # blocks the hand and names the columns -- the conservative direction this
+    # whole function exists to take.
+    structure_columns = [
+        name for name in ("small_blind", "big_blind", "straddles") if name in data
+    ]
+    if structure_columns:
+        declared = {name: data[name] for name in structure_columns}
+        try:
+            HandSettlement(**{**safe, **declared})
+        except ValidationError:
+            unreadable.extend(structure_columns)
+        else:
+            safe.update(declared)
     for name in (
         "status",
         "dead_money",
@@ -6010,9 +6151,18 @@ def _declared_settlement_inputs(
 ) -> dict[str, object] | None:
     """Everything one settlement row DECLARES, and nothing it derives.
 
-    The declared half is the rake policy and the dead money: figures nothing
-    observed, which move the net pot and the hero result the coaching prompt and
-    the solver input were built from. Changing either invalidates them.
+    The declared half is the blind structure, the rake policy and the dead
+    money: figures nothing observed, which move the net pot and the hero result
+    the coaching prompt and the solver input were built from. Changing any of
+    them invalidates those.
+
+    The blind structure is in even though it moves no chip figure on its own.
+    It decides whether the preflop wagering can be judged at all, so it decides
+    whether the hand is authoritative -- and an authoritative hand is exactly
+    the one whose DERIVED hero result is substituted into every list view, the
+    coaching prompt and the solver spot. A hand that became study-ready because
+    a structure was declared, and stops being study-ready when it is withdrawn,
+    is a hand whose retained analysis rested on it.
 
     The rest of the row is derived and is deliberately out. ``gross_pot``,
     ``rake_amount`` and ``net_pot`` are functions of the players, the actions,
@@ -6032,6 +6182,9 @@ def _declared_settlement_inputs(
         return None
     return settlement.model_dump(
         include={
+            "small_blind",
+            "big_blind",
+            "straddles",
             "dead_money",
             "rake_rate",
             "rake_cap",

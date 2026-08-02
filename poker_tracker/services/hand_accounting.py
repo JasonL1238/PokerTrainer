@@ -8,9 +8,11 @@ from hashlib import blake2s
 from math import isclose
 
 from poker_tracker.math.accounting import (
+    BlindStructure,
     HandLedger,
     LedgerError,
     RakePolicy,
+    blind_structure,
     build_ledger_from_records,
 )
 from poker_tracker.persistence.completion import ASSUMPTION_DEPENDENCE_PREFIX
@@ -193,6 +195,13 @@ class _Declaration:
     rake: RakePolicy
     dead_money: float
     awards: tuple[tuple[SettlementEntry, str], ...]
+    # The room's forced-bet sizes. A declaration in the same sense as the rake
+    # policy -- nothing observed it -- and neutralised the same way, even though
+    # it is the one declared input that moves no chip figure by itself. What it
+    # moves is the VERDICT: withdrawing it puts back the refusal to read an
+    # amount to call off a short all-in forced post, so a hand that reconciles
+    # only because somebody typed "5/10" is named and measured like any other.
+    blinds: BlindStructure | None = None
     # The winners the RECORDING leaves no choice about, used in place of the
     # declared award rows when this declaration is the withdrawn one. See
     # ``_forced_winners``: withdrawing the awards to "nobody won anything" is not
@@ -230,17 +239,35 @@ class _Declaration:
         self, forced: tuple[tuple[int, str], ...] | None = None
     ) -> _Declaration:
         return _Declaration(
-            rake=self.rake, dead_money=self.dead_money, awards=(), forced_winners=forced
+            rake=self.rake,
+            dead_money=self.dead_money,
+            awards=(),
+            blinds=self.blinds,
+            forced_winners=forced,
         )
 
     def with_neutral_rake(self) -> _Declaration:
         return _Declaration(
-            rake=_NEUTRAL_RAKE, dead_money=self.dead_money, awards=self.awards
+            rake=_NEUTRAL_RAKE,
+            dead_money=self.dead_money,
+            awards=self.awards,
+            blinds=self.blinds,
         )
 
     def with_neutral_dead_money(self) -> _Declaration:
         return _Declaration(
-            rake=self.rake, dead_money=_NEUTRAL_DEAD_MONEY, awards=self.awards
+            rake=self.rake,
+            dead_money=_NEUTRAL_DEAD_MONEY,
+            awards=self.awards,
+            blinds=self.blinds,
+        )
+
+    def with_neutral_blinds(self) -> _Declaration:
+        return _Declaration(
+            rake=self.rake,
+            dead_money=self.dead_money,
+            awards=self.awards,
+            blinds=_NEUTRAL_BLINDS,
         )
 
     @classmethod
@@ -249,6 +276,7 @@ class _Declaration:
             rake=_NEUTRAL_RAKE,
             dead_money=_NEUTRAL_DEAD_MONEY,
             awards=(),
+            blinds=_NEUTRAL_BLINDS,
             forced_winners=forced,
         )
 
@@ -257,6 +285,7 @@ class _Declaration:
         return (
             self.rake == _NEUTRAL_RAKE
             and self.dead_money == _NEUTRAL_DEAD_MONEY
+            and self.blinds == _NEUTRAL_BLINDS
             and not self.awards
         )
 
@@ -296,11 +325,22 @@ class _HandRecords:
         return 0.0 if self.settlement is None else self.settlement.dead_money
 
     @property
+    def declared_blinds(self) -> BlindStructure | None:
+        if self.settlement is None:
+            return None
+        return blind_structure(
+            self.settlement.small_blind,
+            self.settlement.big_blind,
+            self.settlement.straddles,
+        )
+
+    @property
     def declaration(self) -> _Declaration:
         return _Declaration(
             rake=self.declared_rake,
             dead_money=self.declared_dead_money,
             awards=self.awards,
+            blinds=self.declared_blinds,
         )
 
 
@@ -651,6 +691,7 @@ def _ledger_under_declaration(
             rake=declared.rake,
             odd_chip_order=list(declared.odd_chip_order),
             flop_seen=records.flop_seen,
+            blinds=declared.blinds,
         )
 
     try:
@@ -936,12 +977,18 @@ def _cross_check(records: _HandRecords, declaration: _Declaration) -> _CrossChec
 RAKE_POLICY_INPUT = "rake_policy"
 DEAD_MONEY_INPUT = "dead_money"
 POT_AWARD_INPUT = "declared_pot_awards"
+BLIND_STRUCTURE_INPUT = "blind_structure"
 # No single input alone breaks the reconciliation but the declaration as a whole
 # does -- so no half can be attested to on its own, and the set is named as one.
 JOINT_INPUT = "settlement_assumptions"
 
 _NEUTRAL_RAKE = RakePolicy()
 _NEUTRAL_DEAD_MONEY = 0.0
+# Withdrawing the blind structure means the room's forced-bet sizes are not
+# known, which is a state a recording really can be in -- unlike "nobody won
+# anything", which is why the awards need ``_forced_winners``. So the neutral
+# value is simply the absence of the declaration.
+_NEUTRAL_BLINDS: BlindStructure | None = None
 
 
 def _derive_assumption_dependence(
@@ -967,6 +1014,25 @@ def _derive_assumption_dependence(
        load-bearing but the declaration as a whole is, it is reported as one
        joint dependence, because attesting to any half would be attesting to
        something that on its own proves nothing.
+
+    The BLIND STRUCTURE is input 5 of that set and is the one that moves no
+    chip figure at all. It cannot: the reducer combines it with the observed
+    street maximum by ``max``, so it can only raise the amount to call, and the
+    amount to call is a legality question rather than a pot size. What it moves
+    is the VERDICT, which is exactly why step 3 asks about both. Withdrawing it
+    puts back the reducer's refusal to read an amount to call off a forced post
+    that took its poster's last chip, so a hand that is authoritative only
+    because somebody typed "5/10" -- a fact no camera and no action line can
+    show -- is named, measured as verdict-only, and blocked until attested. A
+    hand whose forced posts were all made in full does not need the declaration
+    and is disclosed nothing, exactly like a rake policy that provably takes no
+    chips.
+
+    Not bound into ``_declaration_fingerprint``, deliberately. Editing the
+    structure changes the blind-structure dependence's own declared text and so
+    its own code, which blocks the hand on its own; binding it into every OTHER
+    input's code as well would lapse every stored attestation in the database
+    the day this column shipped, for no reachable gain.
 
     The declared POT AWARDS are inputs 3 and 4 of that set, and leaving them out
     was a two-entry field list wearing a different hat. On a reconstructed hand
@@ -1012,9 +1078,13 @@ def _derive_assumption_dependence(
     _one``): zero on a hand that declared nothing -- no settlement row, no awards,
     which is every freshly reconstructed hand before anyone opens the Accounting
     reconciliation panel -- one on a SHOWDOWN hand whose only declaration is its
-    awards, four on a showdown hand declaring all three, and one more in each case
+    awards, four on a showdown hand declaring rake, dead money and awards, and one
+    more in each case
     on a FOLD WIN, where ``_forced_winners`` fires and a second neutral pass is
-    built against the forced winners: two, and five.
+    built against the forced winners: two, and five. A declared blind structure
+    costs one further pass, and only when it is declared: an undeclared input
+    neutralises to the baseline declaration and is skipped without a build, which
+    is why every count above is unchanged by adding a fifth input.
 
     The ceiling used to be stated as "up to four", which understated the commonest
     hand shape there is. It is now derived from a counter in the test rather than
@@ -1060,6 +1130,12 @@ def _derive_assumption_dependence(
             _awards_text(declared.awards),
             _forced_awards_text(forced),
         ),
+        (
+            BLIND_STRUCTURE_INPUT,
+            declared.with_neutral_blinds(),
+            _blinds_text(declared.blinds),
+            _blinds_text(_NEUTRAL_BLINDS),
+        ),
     ):
         if without == declared:
             # This input was never declared, so neutralising it is the baseline
@@ -1103,12 +1179,14 @@ def _derive_assumption_dependence(
                 declared=(
                     f"rake {_rake_text(settlement)}; dead money "
                     f"{_chips_text(declared.dead_money)}; awards "
-                    f"{_awards_text(declared.awards)}"
+                    f"{_awards_text(declared.awards)}; blinds "
+                    f"{_blinds_text(declared.blinds)}"
                 ),
                 neutral=(
                     f"rake {_rake_text(None)}; dead money "
                     f"{_chips_text(_NEUTRAL_DEAD_MONEY)}; awards "
-                    f"{_forced_awards_text(forced)}"
+                    f"{_forced_awards_text(forced)}; blinds "
+                    f"{_blinds_text(_NEUTRAL_BLINDS)}"
                 ),
             )
         )
@@ -1352,6 +1430,22 @@ def _forced_awards_text(forced: tuple[tuple[int, str], ...] | None) -> str:
     return "the only seat the action line leaves eligible: " + "; ".join(
         f"pot {index} -> {identity}" for index, identity in forced
     )
+
+
+def _blinds_text(blinds: BlindStructure | None) -> str:
+    """The declared blind structure as the operator would say it.
+
+    Rendered from the structure rather than from ``hands.blinds_antes``: that
+    column is free display text nothing validates, and an attestation must name
+    the numbers the derivation actually used.
+    """
+    if blinds is None:
+        return "no declared blind structure"
+    small = "unstated" if blinds.small_blind is None else f"{blinds.small_blind:g}"
+    text = f"{small}/{blinds.big_blind:g}"
+    if blinds.straddles:
+        text += " straddled to " + "/".join(f"{value:g}" for value in blinds.straddles)
+    return text
 
 
 def _chips_text(value: float) -> str:
