@@ -58,11 +58,32 @@ def validate_video_extension(filename: str) -> str:
     return extension
 
 
+# Every common filesystem (ext4, APFS, HFS+, XFS, NTFS) caps a single path
+# COMPONENT at 255 bytes, and unique_stored_video_path prepends a uuid4 hex plus
+# an underscore to whatever this function returns. Sanitization leaves only
+# [a-z0-9._-], so byte length equals character length and one budget covers both.
+_MAX_STORED_NAME_BYTES = 255
+_STORED_NAME_PREFIX_BYTES = 33  # len(uuid4().hex) + the "_" separator
+
+
 def safe_filename(filename: str) -> str:
-    """Return a filesystem-safe filename preserving the extension."""
+    """Return a filesystem-safe filename preserving the extension.
+
+    The stem is bounded so the name this returns still fits inside a path
+    component once ``unique_stored_video_path`` has prefixed it. Without the
+    bound an operator whose upload carried a long name got ENAMETOOLONG out of
+    ``os.replace`` at the END of ``save_video_file`` -- after the whole video had
+    been streamed to a temp file -- as a bare OSError with the 10k-character path
+    in its message, rather than a stored video. Truncation cannot collide,
+    because uniqueness comes from the uuid prefix and not from the stem.
+    """
     extension = validate_video_extension(filename)
     stem = Path(filename).stem.strip().lower()
     stem = re.sub(r"[^a-z0-9._-]+", "_", stem).strip("._-")
+    budget = _MAX_STORED_NAME_BYTES - _STORED_NAME_PREFIX_BYTES - len(extension)
+    # Re-strip after the cut: a truncation landing mid-run can expose trailing
+    # "._-" that the first strip had buried, and ".mp4" must not follow a dot.
+    stem = stem[:budget].strip("._-")
     stem = stem or "video"
     return f"{stem}{extension}"
 

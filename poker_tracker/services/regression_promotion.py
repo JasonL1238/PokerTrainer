@@ -217,14 +217,27 @@ def resolution_blocker(db: PokerDatabase, issue_id: int) -> str | None:
     does not admit a wrong hand into study, and requiring a permanent regression
     for one would push operators to file everything as "other" — which would
     cost the gate its meaning on the categories that matter.
+
+    An issue whose stored categories could not be read is gated regardless: the
+    reader's fallback is ``other``, which is outside the set, so believing it
+    would let row damage clear the gate. This mirrors ``_regression_blocker``,
+    the writer that enforces it — an explanation that disagreed with the refusal
+    would be worse than none.
     """
     issue = db.fetch_hand_issue(issue_id)
     if issue is None:
         raise ValueError(f"Issue {issue_id} was not found.")
-    if not is_release_blocking(list(issue.issue_types)):
+    categories_unreadable = "issue_types" in issue.unreadable_columns
+    if not categories_unreadable and not is_release_blocking(list(issue.issue_types)):
         return None
     cases = regressions_for_issue(db, issue_id)
     if not cases:
+        if categories_unreadable:
+            return (
+                "This issue's stored categories could not be read, so it is "
+                "treated as release-blocking and closing it needs a permanent "
+                f"regression. Suggested fixture: {suggested_kind(list(issue.issue_types))}."
+            )
         return (
             "This issue is release-blocking, so closing it needs a permanent "
             f"regression. Suggested fixture: {suggested_kind(list(issue.issue_types))}."
@@ -252,7 +265,12 @@ def regression_summary(db: PokerDatabase, issue_id: int) -> dict[str, Any]:
     return {
         "issue_id": issue_id,
         "issue_types": list(issue.issue_types),
-        "release_blocking": is_release_blocking(list(issue.issue_types)),
+        # Reports what the gate does, not what the salvaged categories say: a row
+        # whose categories are unreadable is gated, and a summary claiming
+        # otherwise while `blocker` refuses the close would be read as a bug in
+        # the gate rather than as damage in the row.
+        "release_blocking": is_release_blocking(list(issue.issue_types))
+        or "issue_types" in issue.unreadable_columns,
         "suggested_kind": suggested_kind(list(issue.issue_types)),
         "blocker": resolution_blocker(db, issue_id),
         "cases": [

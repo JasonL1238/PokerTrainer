@@ -111,17 +111,61 @@ def _detect_regions(model, img, *, conf: float, imgsz: int, iou: float, device: 
     return _dedupe_face_cards(rows, dedupe_iou)
 
 
-def _sample_times(container, stream, start: float, end: float, interval: float):
-    """Yield (t_seconds, bgr_image) sampled every `interval`s via seek."""
+def _sample_times(container, stream, start: float, end: float, interval: float,
+                  stats: dict | None = None):
+    """Yield (t_seconds, bgr_image) sampled every `interval`s via seek.
+
+    Sampling stops at the end of the decodable stream, not at ``end``. Past the
+    last frame the decoder has nothing left to return, and the loop below used
+    to keep re-emitting the final image under every later timestamp: a 3-second
+    clip asked for ``--end 10 --interval 1`` produced 11 timestamped states from
+    4 distinct pictures. Those extra states are not a coverage limitation the
+    spine can see -- they carry a plausible table, so a timeline assembled from
+    them is wrong in a way nothing downstream rejects.
+
+    A sample time that resolves to a frame already emitted is dropped for the
+    same reason. The test is decoder identity (same presentation timestamp), not
+    pixel identity: a table that genuinely does not change between two seconds
+    is two real observations, while one decoded frame answering two sample times
+    is one observation reported twice. Variable-rate screen recordings emit no
+    frame at all while the screen is static, so on those the gap between
+    consecutive frames can exceed the sampling interval. The skipped times leave
+    a gap in the emitted series, which is the honest record -- nothing was
+    observed at those times -- and the spine already reads gaps as unobserved
+    stretches rather than as continuity.
+
+    ``stats`` collects what the sampler did: how many times were requested, how
+    many frames were emitted, how many requested times were answered by an
+    already-emitted frame, and the time at which the stream ran out (``None``
+    when sampling reached ``end`` with frames still available).
+    """
+    counts = {"requested": 0, "emitted": 0, "duplicate_times": 0, "ended_at": None}
+    if stats is not None:
+        stats.clear()
+        stats.update(counts)
+        counts = stats
     t = start
+    last_pts = None
     while t <= end:
+        counts["requested"] += 1
         container.seek(int(t / stream.time_base), stream=stream)
         frame = None
+        reached_t = False
         for frame in container.decode(stream):
             if float(frame.pts * stream.time_base) >= t:
+                reached_t = True
                 break
-        if frame is not None:
-            yield t, frame.to_ndarray(format="bgr24")
+        if frame is None or not reached_t:
+            # No frame at or after t: the stream ends before this sample time.
+            counts["ended_at"] = t
+            return
+        if frame.pts == last_pts:
+            counts["duplicate_times"] += 1
+            t += interval
+            continue
+        last_pts = frame.pts
+        counts["emitted"] += 1
+        yield t, frame.to_ndarray(format="bgr24")
         t += interval
 
 
@@ -220,9 +264,11 @@ def main() -> None:
     )
     frames: list[rd.Frame] = []
     raw_dump: list[dict] = []
+    sampling: dict = {}
     n_cards = 0
     n_nontable = 0
-    for i, (t, img) in enumerate(_sample_times(container, stream, args.start, args.end, args.interval)):
+    for i, (t, img) in enumerate(_sample_times(container, stream, args.start, args.end,
+                                               args.interval, stats=sampling)):
         screen_label, _anchor = classify_screen(img)
         image_name = f"t{t:09.2f}"
         h, w = int(img.shape[0]), int(img.shape[1])
@@ -286,6 +332,20 @@ def main() -> None:
         f"\nsampled {len(frames)} frames "
         f"({n_nontable} nontable skipped), {n_cards} named cards total"
     )
+    # State plainly what the requested window did and did not cover, so a run
+    # that asked for more video than exists reads as a shorter run rather than
+    # as a full one.
+    if sampling.get("ended_at") is not None:
+        print(
+            f"sampling stopped at t={sampling['ended_at']:.2f}s: the stream ends "
+            f"before that time (requested up to {args.end}s)"
+        )
+    if sampling.get("duplicate_times"):
+        print(
+            f"{sampling['duplicate_times']} requested sample time(s) resolved to an "
+            "already-sampled frame and were not emitted; the recording has no "
+            "distinct frame there"
+        )
     print("building hand timeline via reconstruction spine...")
     _write_progress(
         progress_path,

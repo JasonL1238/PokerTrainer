@@ -7,7 +7,11 @@
     "Raw recordings stay under POKER_VALIDATION_ROOT and are never committed.",
     "This checked-in manifest is intentionally incomplete for release counts;",
     "python -m poker_tracker.validation must fail closed until Phase 2 minimums are met.",
-    "fixture_synthetic_hu_01 is schema plumbing only, not a scored ClubWPT case."
+    "fixture_synthetic_hu_01 is schema plumbing only, not a scored ClubWPT case.",
+    "A release-scored case must declare recording.duration_s. Full mode resolves",
+    "it from the recording when the manifest omits it and fails the case as",
+    "unmeasurable when neither answers; it never assumes a sampling window.",
+    "The nulls below are the absence of a recording, not an omitted measurement."
   ],
   "minimums": {
     "sessions": 10,

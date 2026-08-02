@@ -37,9 +37,14 @@ RANGES = {
     ),
     "loose": RangeDescription(
         label="loose",
-        description="Wider range with more suited hands, broadways, and speculative calls.",
-        examples=["55+", "Axs", "KTs+", "QTs+", "JTs", "T9s"],
-        notation="55+,A2s+,KTs+,QTs+,JTs,T9s,ATo+,KJo+",
+        description="Wider range with more suited hands, broadways, and speculative calls (~27%).",
+        examples=["22+", "A2s+", "K5s+", "suited connectors", "A9o+", "KTo+", "QTo+"],
+        # The labels form a ladder: each one must contain everything the label
+        # below it does. The previous notation ("55+,A2s+,KTs+,QTs+,JTs,T9s,
+        # ATo+,KJo+") was 15.7% of hands against `standard`'s 21.6% and dropped
+        # small pairs, suited connectors and every suited king below KTs, so
+        # calling a villain looser handed the equity engine a *tighter* range.
+        notation="22+,A2s+,K5s+,Q8s+,J8s+,T8s+,97s+,86s+,76s,65s,54s,A9o+,KTo+,QTo+,JTo",
     ),
     "very_loose": RangeDescription(
         label="very_loose",

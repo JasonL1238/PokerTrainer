@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -12,7 +13,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from poker_tracker.release_gate.environment import collect_environment, ffmpeg_version
+from poker_tracker.release_gate.environment import (
+    collect_environment,
+    ffmpeg_version,
+    video_duration_seconds,
+)
 from poker_tracker.release_gate.evaluate import evaluate_answer_key_against_timeline
 from poker_tracker.release_gate.models import (
     allowlist_violations,
@@ -651,14 +656,30 @@ def _run_full_reconstruction(
             setup_invalid = True
             continue
 
+        duration_s, duration_source = _resolve_case_duration(recording, video_path)
+        if duration_s is None:
+            case_reports.append(
+                {
+                    "case_id": case_id,
+                    "ok": False,
+                    "fail_closed": (
+                        "recording duration is unknown: the manifest declares no "
+                        f"duration_s and {logical_name} could not be probed"
+                    ),
+                    "recording": logical_name,
+                    "duration_source": duration_source,
+                }
+            )
+            failed += 1
+            setup_invalid = True
+            continue
+
         timeline_path = artifact_dir / f"{case_id}.timeline.json"
         started = time.perf_counter()
         run = _run_pipeline_for_case(
             video_path=video_path,
             timeline_path=timeline_path,
-            duration_s=(
-                recording.get("duration_s") if isinstance(recording, dict) else None
-            ),
+            duration_s=duration_s,
             detector=resolved_models["region_detector"]["path"],
             classifier=resolved_models["card_classifier"]["path"],
         )
@@ -670,6 +691,8 @@ def _run_full_reconstruction(
                     "ok": False,
                     "fail_closed": run["error"],
                     "recording": logical_name,
+                    "duration_s": duration_s,
+                    "duration_source": duration_source,
                     "elapsed_s": elapsed,
                 }
             )
@@ -678,6 +701,11 @@ def _run_full_reconstruction(
         artifacts.append(str(timeline_path))
         report = _score_case(manifest_path, case, timeline_path)
         report["recording"] = logical_name
+        # The window that was actually reconstructed, and where its bound came
+        # from. A score covers the stretch of recording that was sampled, and a
+        # reader cannot tell that from the hand counts alone.
+        report["duration_s"] = duration_s
+        report["duration_source"] = duration_source
         report["elapsed_s"] = elapsed
         if str(report.get("fail_closed") or "").startswith("unreadable_artifacts"):
             failed += 1
@@ -699,6 +727,33 @@ def _run_full_reconstruction(
     }
 
 
+def _resolve_case_duration(
+    recording: Any, video_path: Path
+) -> tuple[float | None, str]:
+    """How long the recording is, and where that number came from.
+
+    A missing ``duration_s`` is missing information, and the gate used to turn it
+    into 86 400 seconds. That is the same failure shape as reporting an unmeasured
+    run as zero errors: the number is not a measurement, and everything computed
+    from it inherits that. Sampling a day out of a short recording ends either as
+    a timeout reported as a reconstruction failure, or as a timeline built from
+    repeats of the final frame -- a wrong result that nothing rejects.
+
+    The manifest's own figure wins, because that is the corpus's pinned
+    description of the recording. Otherwise the file itself is probed. When
+    neither answers, the case is unmeasurable and the caller fails it rather than
+    choosing a bound nothing supports.
+    """
+    declared = recording.get("duration_s") if isinstance(recording, dict) else None
+    if isinstance(declared, (int, float)) and not isinstance(declared, bool):
+        if declared > 0 and math.isfinite(declared):
+            return float(declared), "manifest"
+    probed = video_duration_seconds(video_path)
+    if probed is not None and probed > 0 and math.isfinite(probed):
+        return float(probed), "probed_from_recording"
+    return None, "unmeasurable"
+
+
 def _run_pipeline_for_case(
     *,
     video_path: Path,
@@ -708,7 +763,19 @@ def _run_pipeline_for_case(
     classifier: str | None,
 ) -> dict[str, Any]:
     repo_root = _repo_root()
-    end = float(duration_s) if isinstance(duration_s, (int, float)) else 86_400.0
+    if (
+        not isinstance(duration_s, (int, float))
+        or isinstance(duration_s, bool)
+        or not math.isfinite(duration_s)
+        or duration_s <= 0
+    ):
+        # The caller owns resolving this; a fallback here would reintroduce the
+        # unbounded window one layer down, where no case report can describe it.
+        return {
+            "ok": False,
+            "error": "recording duration is unknown; refusing to sample an unbounded window",
+        }
+    end = float(duration_s)
     command = [
         sys.executable,
         str(PIPELINE_SCRIPT),

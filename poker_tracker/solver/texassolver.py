@@ -461,6 +461,23 @@ def _require_usable_strategy(
         raise SolverResultUnusableError(
             "The mapped solver node lists no actions to choose between."
         )
+    repeated = sorted({item for item in strategy.actions if strategy.actions.count(item) > 1})
+    if repeated:
+        # A node names each branch once, so a repeated label means the vector
+        # position an action's frequency sits at is not recoverable. The read is
+        # not merely unusable, it is quietly WRONG: a two-branch node listing
+        # ["CHECK", "CHECK"] retains "CHECK 50%" twice for a node that checks
+        # 100% of the time, and that halved figure is what reaches the prompt and
+        # the operator's evidence card. Nothing downstream can tell it from a
+        # real split -- the grounding validator sees two CHECK candidates and
+        # refuses whatever the coach says about checking, so the failure surfaces
+        # as an unexplainable result rather than as the malformed dump it is.
+        raise SolverResultUnusableError(
+            "The mapped solver node lists "
+            + ", ".join(repeated)
+            + " more than once, so which frequency belongs to which branch "
+            "cannot be read."
+        )
     if not strategy.strategy_combos:
         raise SolverResultUnusableError(
             "The mapped solver node carries no per-combination strategy."

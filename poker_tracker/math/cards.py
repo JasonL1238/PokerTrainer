@@ -20,9 +20,12 @@ class Card:
     def __post_init__(self) -> None:
         rank = self.rank.upper()
         suit = self.suit.lower()
-        if rank not in RANKS:
+        # `in` on a string is a substring test, so the length check is what makes
+        # this a membership test: without it `""` and `"TJ"` are both "in" RANKS
+        # and `""` and `"hd"` are both "in" SUITS, and the card is built anyway.
+        if len(rank) != 1 or rank not in RANKS:
             raise CardParseError(f"Invalid card rank: {self.rank}")
-        if suit not in SUITS:
+        if len(suit) != 1 or suit not in SUITS:
             raise CardParseError(f"Invalid card suit: {self.suit}")
         object.__setattr__(self, "rank", rank)
         object.__setattr__(self, "suit", suit)

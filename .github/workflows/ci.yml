@@ -43,6 +43,15 @@ jobs:
       - name: Test
         run: python -m pytest
 
+      # The exit gate forbids "unexplained skips". The rule is enforced inside
+      # the suite by tests/test_suite_quality.py, so this step cannot be the
+      # only thing standing between a silent skip and a green build; it runs
+      # anyway because its output is the inventory a reviewer reads -- every
+      # skip in the tree, its form, and the condition it claims -- and because
+      # a reviewer should not have to reconstruct that from a stack trace.
+      - name: Skip inventory
+        run: python -m poker_tracker.suite_quality skips tests deploy/tests
+
       # Schema and hash validation for every corpus artifact that is safe to
       # commit. Private recordings are never available here, so this checks the
       # manifest and answer keys only.
@@ -86,4 +95,110 @@ jobs:
         with:
           name: release-gate-report
           path: ${{ runner.temp }}/release_reports/
+          if-no-files-found: warn
+
+  # The other half of the exit gate: "without flaky reruns" cannot be judged by
+  # a suite that runs once. This job runs it three times -- once in collection
+  # order, twice under shuffled order with fixed seeds -- and fails if any test
+  # did not produce the same result every time. It is a separate job so a flake
+  # is reported as a flake rather than as a lint or type failure, and so the
+  # ordered run in `quality` stays the authoritative pass/fail.
+  #
+  # Reruns are not automatic anywhere in this repository. Rerunning until green
+  # is how a flake becomes permanent.
+  flake:
+    name: Repeat determinism (3 passes, 2 shuffled)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
+
+      # The seeds are fixed rather than random so a red build is reproducible
+      # from the log alone. Change them deliberately, not to make a run pass.
+      #
+      # The order dependency this harness found is now repaired, so this job is
+      # expected to be green. It was reducible to two tests:
+      #
+      #   pytest "tests/test_phase1_adversarial_round13.py::test_the_session_hand_list_performs_the_deletion_the_blockers_name" \
+      #          "tests/test_app_shell.py::test_product_shell_navigation_smoke"
+      #
+      # The first test clears st.cache_resource before its AppTest run and not
+      # after, so app.py's cached PokerDatabase -- opened on a tmp_path file
+      # that no longer exists -- survived into every later AppTest in the
+      # process. The second then found a session in that leaked database, so
+      # the Hands page rendered the manual-entry form, and its positional
+      # `app.radio[0]` picked up the form's "Pot type" radio instead of the
+      # navigation control. tests/conftest.py now clears the resource cache
+      # after every test, which makes it the per-test resource every test
+      # already assumed it was; tests/test_suite_quality.py pins the repro.
+      - name: Hunt for flakes
+        run: |
+          python -m poker_tracker.suite_quality flake \
+            --passes 3 --seeds 20260801,20260802 \
+            --report-dir "$RUNNER_TEMP/suite_quality"
+
+      - name: Retain flake report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flake-report
+          path: ${{ runner.temp }}/suite_quality/
+          if-no-files-found: warn
+
+  # Measurement, not a gate. There is no fail_under and no ratchet: the useful
+  # output is the name of a core module the suite never executes, and a floor
+  # would turn that into a number somebody lowers. The report is an artifact so
+  # a reviewer can see which module a change left untested.
+  coverage:
+    name: Core-module coverage (report only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
+
+      # `coverage run`, not `pytest --cov`: pytest-cov would register itself as
+      # a plugin in every run on every machine that installs the dev
+      # requirements, coverage only measures when it is asked to.
+      - name: Measure
+        run: |
+          python -m coverage run -m pytest -q
+          python -m coverage json -o "$RUNNER_TEMP/coverage.json"
+
+      - name: Report per core module
+        run: python -m poker_tracker.suite_quality coverage "$RUNNER_TEMP/coverage.json"
+
+      - name: Retain coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-json
+          path: ${{ runner.temp }}/coverage.json
           if-no-files-found: warn

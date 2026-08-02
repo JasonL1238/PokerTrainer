@@ -7,12 +7,18 @@ which on this product means Streamlit and whatever was mid-write. So a value
 that cannot be parsed, or a cap that cannot be installed, raises with the
 variable named instead of being swallowed and the work started anyway.
 
-The idiom was established on the solver side --
+The idiom was established on the solver side, as
 ``poker_tracker.solver.jobs.configured_memory_limit_bytes`` and
-``poker_tracker.solver.run_job._memory_limiter`` -- and is the same code with
-``POKERTRAINER_SOLVER_MEMORY_GB`` hardcoded into its messages. This module is
-that code with the variable name as a parameter so the CV side does not become
-a second dialect of it; the solver pair should be migrated onto it.
+``poker_tracker.solver.run_job._memory_limiter`` with
+``POKERTRAINER_SOLVER_MEMORY_GB`` hardcoded into their messages. This module is
+that code with the variable name as a parameter, and both the CV path and the
+solver path now read their bounds through it. Two copies that agree today are
+the dangerous case, not the harmless one: the second copy drifts first, and the
+symptom of the drift is a cap that silently does not apply.
+
+``tests/test_runtime_limits_single_implementation.py`` fails if a third copy
+appears, so this stays the only implementation without anyone remembering to
+check.
 """
 
 from __future__ import annotations
@@ -48,7 +54,7 @@ def bounded_int_from_env(
         value = int(raw)
     except ValueError as exc:
         raise ValueError(
-            f"{variable} must be a whole number from {minimum} to {maximum}, "
+            f"{variable} must be an integer from {minimum} to {maximum}, "
             f"with no unit suffix; got {raw!r}."
         ) from exc
     if not minimum <= value <= maximum:

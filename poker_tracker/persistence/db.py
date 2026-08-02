@@ -49,6 +49,7 @@ from poker_tracker.persistence.models import (
     Hand,
     HandCorrection,
     HandIssue,
+    HandIssueType,
     HandPlayer,
     HandReview,
     HandSettlement,
@@ -2228,9 +2229,19 @@ class PokerDatabase:
         A regression must have been observed BOTH failing for the original
         defect and passing after the fix. One without the other proves nothing:
         a test that only ever passed may not exercise the defect at all.
+
+        Which issues the gate covers is read from ``issue_types``, so a row whose
+        categories could not be read is gated too. The salvage falls back to
+        ``other`` -- the one category outside the set -- and it cannot show that
+        the operator did not file this under ``pot_or_result``. A degraded row
+        may only ever ADD a requirement, never clear one, which is the same rule
+        that forces its status to ``open``.
         """
         issue = _hand_issue_from_row(issue_row)
-        if not RELEASE_BLOCKING_ISSUE_TYPES.intersection(issue.issue_types):
+        categories_unreadable = "issue_types" in issue.unreadable_columns
+        if not categories_unreadable and not RELEASE_BLOCKING_ISSUE_TYPES.intersection(
+            issue.issue_types
+        ):
             return None
         rows = self._execute(
             """
@@ -2240,6 +2251,12 @@ class PokerDatabase:
             (issue_row["id"],),
         ).fetchall()
         if not rows:
+            if categories_unreadable:
+                return (
+                    "This issue's stored categories could not be read, so it is "
+                    "treated as release-blocking and closing it needs a permanent "
+                    "regression. Promote it to a regression case first."
+                )
             return (
                 "This issue is release-blocking, so closing it needs a permanent "
                 "regression. Promote it to a regression case first."
@@ -3453,6 +3470,11 @@ class PokerDatabase:
 
     def upsert_hand_settlement(self, settlement: HandSettlement) -> HandSettlement:
         payload = settlement.model_dump()
+        # Read before the write, so the invalidation below can ask whether this
+        # save changed anything rather than assuming a save is a change.
+        before = _declared_settlement_inputs(
+            self.fetch_hand_settlement(settlement.hand_id)
+        )
         # `UNREADABLE_SETTLEMENT_PREFIX` describes the row a reader could not
         # validate, so it is a derivation and no writer may persist it -- exactly
         # as `strip_derived_evidence_markers` treats the unreadable-card marker.
@@ -3540,12 +3562,27 @@ class PokerDatabase:
             self._record_declared_chip_adjustment(
                 settlement.hand_id, code=code, declared=taken[key] != 0
             )
-        self._stale_retained_analysis(settlement.hand_id)
-        self._demote_reviewed_hand(settlement.hand_id)
-        self._commit()
         saved = self.fetch_hand_settlement(settlement.hand_id)
         if saved is None:
             raise RuntimeError("Settlement upsert did not persist a row.")
+        # Only a save that moved a DECLARED input invalidates what was derived
+        # from it. `persist_reconciliation` re-saves this row on every call, and
+        # the settlement editor nulls the derived summaries before re-deriving
+        # them, so an unconditional invalidation meant that reconciling a hand
+        # nothing had happened to staled its coaching, staled its saved hand
+        # review, flipped its completed solver run to `stale`, cancelled a solve
+        # still in flight, and demoted the hand out of `reviewed`.
+        #
+        # After a correction it was an ordering trap with no signal: clearing the
+        # blockers needs coaching re-run AND the accounting reconciled, doing them
+        # in that order silently discarded the coaching just paid for, the other
+        # order worked, and nothing said so. See `_declared_settlement_inputs` for
+        # why the derived columns and the cross-check's verdict are not evidence
+        # changes.
+        if before != _declared_settlement_inputs(saved):
+            self._stale_retained_analysis(settlement.hand_id)
+            self._demote_reviewed_hand(settlement.hand_id)
+        self._commit()
         return saved
 
     def fetch_hand_settlement(self, hand_id: int) -> HandSettlement | None:
@@ -3600,7 +3637,9 @@ class PokerDatabase:
             self._record_redeclared_awards(entry.hand_id, before=before, after=after)
         return saved
 
-    def _insert_settlement_entry(self, entry: SettlementEntry) -> SettlementEntry:
+    def _insert_settlement_entry(
+        self, entry: SettlementEntry, *, stale_retained_analysis: bool = True
+    ) -> SettlementEntry:
         payload = entry.model_dump()
         self._resolve_settlement_entry_player(payload)
         cursor = self._execute(
@@ -3623,9 +3662,13 @@ class PokerDatabase:
         )
         # An award row changes the winner, so `reviewed` cannot outlive it and
         # the coaching and solver output derived from the old award is stale.
-        # Both writers run this; only the public one discloses the re-declaration.
-        self._stale_retained_analysis(payload["hand_id"])
-        self._demote_reviewed_hand(payload["hand_id"])
+        # `create_settlement_entry` adds a row to whatever was there, which is
+        # always a change; `replace_settlement_entries` rebuilds the whole set and
+        # asks its own before/after question, so it opts out here and invalidates
+        # once, only when the rebuilt set differs.
+        if stale_retained_analysis:
+            self._stale_retained_analysis(payload["hand_id"])
+            self._demote_reviewed_hand(payload["hand_id"])
         self._commit()
         return entry.model_copy(
             update={"id": cursor.lastrowid, "player_key": payload["player_key"]}
@@ -3637,17 +3680,33 @@ class PokerDatabase:
         if any(entry.hand_id != hand_id for entry in entries):
             raise ValueError("All settlement entries must belong to the requested hand.")
         with self.transaction():
-            before = _declared_award_state(self.fetch_settlement_entries(hand_id))
+            stored_before = self.fetch_settlement_entries(hand_id)
+            before = _declared_award_state(stored_before)
             self._execute("DELETE FROM settlement_entries WHERE hand_id = ?", (hand_id,))
             # The private insert: this method took its own before/after snapshot
             # above, and the public writer's per-row snapshot would compare each
             # half-rebuilt row set against the last and record a correction per
             # entry for an unchanged declaration.
-            saved = [self._insert_settlement_entry(entry) for entry in entries]
+            saved = [
+                self._insert_settlement_entry(entry, stale_retained_analysis=False)
+                for entry in entries
+            ]
             after = _declared_award_state(saved)
-            # Also runs when `entries` is empty, which clears every award.
-            self._stale_retained_analysis(hand_id)
-            self._demote_reviewed_hand(hand_id)
+            # Read back rather than compared against `entries`, because the writer
+            # resolves each row's player identity: the two sides have to come from
+            # the same reader or an unchanged declaration compares unequal.
+            #
+            # Wider than the award snapshot above, which exists to describe a
+            # re-declared WINNER for the audit trail. Refund rows are derived
+            # rather than declared, so they record no correction, but they move
+            # the net results the coaching and the solver input were built from
+            # and so they still invalidate. Also fires when `entries` is empty and
+            # there were awards, which clears every declared winner.
+            if _settlement_entry_state(stored_before) != _settlement_entry_state(
+                self.fetch_settlement_entries(hand_id)
+            ):
+                self._stale_retained_analysis(hand_id)
+                self._demote_reviewed_hand(hand_id)
             self._record_redeclared_awards(hand_id, before=before, after=after)
         return saved
 
@@ -5787,6 +5846,64 @@ def _declared_award_state(entries: list[SettlementEntry]) -> dict[str, str]:
     }
 
 
+def _declared_settlement_inputs(
+    settlement: HandSettlement | None,
+) -> dict[str, object] | None:
+    """Everything one settlement row DECLARES, and nothing it derives.
+
+    The declared half is the rake policy and the dead money: figures nothing
+    observed, which move the net pot and the hero result the coaching prompt and
+    the solver input were built from. Changing either invalidates them.
+
+    The rest of the row is derived and is deliberately out. ``gross_pot``,
+    ``rake_amount`` and ``net_pot`` are functions of the players, the actions,
+    the declared awards and the policy above, and every writer of those already
+    invalidates on its own -- so a derived figure cannot move without the
+    invalidation having happened at its source. ``status``, ``is_balanced`` and
+    ``warnings`` are the cross-check's VERDICT on those same figures; a hand
+    re-blessed after a correction moves from ``needs_correction`` back to
+    ``reconciled`` without a chip moving, and treating that as an evidence change
+    would stale the coaching the operator had just re-run in order to get there.
+    ``updated_at`` moves on every write by construction.
+
+    ``None`` means the hand had no settlement row at all, which is not equal to
+    any declaration and therefore always counts as a change.
+    """
+    if settlement is None:
+        return None
+    return settlement.model_dump(
+        include={
+            "dead_money",
+            "rake_rate",
+            "rake_cap",
+            "rake_rounding_unit",
+            "no_flop_no_drop",
+        }
+    )
+
+
+def _settlement_entry_state(entries: list[SettlementEntry]) -> tuple[tuple, ...]:
+    """The declared awards and refunds as an order-insensitive comparable set.
+
+    Row ids are out for the same reason ``_declared_award_state`` leaves them
+    out: rebuilding an unchanged declaration renumbers them. ``entry_order`` is
+    in, because it decides who takes the odd chip on a chopped pot.
+    """
+    return tuple(
+        sorted(
+            (
+                entry.entry_type,
+                -1 if entry.pot_index is None else int(entry.pot_index),
+                entry.player_key or "",
+                entry.player_name,
+                "" if entry.amount is None else f"{entry.amount:.6f}",
+                entry.entry_order,
+            )
+            for entry in entries
+        )
+    )
+
+
 def _review_from_row(row: sqlite3.Row) -> HandReview:
     data = _row_dict(row)
     data["is_stale"] = bool(data.get("is_stale", 0))
@@ -5838,6 +5955,24 @@ def _hand_correction_from_row(row: sqlite3.Row) -> HandCorrection:
         return correction
 
 
+def _recognised_issue_types(stored: object) -> list[str]:
+    """The categories a damaged ``issue_types`` column still names, in order.
+
+    Salvaging the whole column to ``["other"]`` discarded the readable half of a
+    partly-damaged list, and ``other`` is the one category deliberately outside
+    ``RELEASE_BLOCKING_ISSUE_TYPES``. ``["cards", "solver_output"]`` -- what a
+    database written by a build with one more category looks like to this one --
+    therefore read back as an ordinary ``other`` issue that
+    ``resolve_hand_issue`` closed with no regression at all, and exported as one
+    too, so the downgrade outlived the damaged row.
+    """
+    if not isinstance(stored, list):
+        return []
+    return list(
+        dict.fromkeys(value for value in stored if value in get_args(HandIssueType))
+    )
+
+
 def _hand_issue_from_row(row: sqlite3.Row) -> HandIssue:
     data = _row_dict(row)
     data["issue_types"] = _parse_json_list(data.get("issue_types", "[]"))
@@ -5860,7 +5995,8 @@ def _hand_issue_from_row(row: sqlite3.Row) -> HandIssue:
             {
                 "hand_id": _coerced_int(data.get("hand_id"), 0),
                 "description": _UNREADABLE_LABEL,
-                "issue_types": ["other"],
+                "issue_types": _recognised_issue_types(data.get("issue_types"))
+                or ["other"],
             },
         )
         if not unreadable:

@@ -55,6 +55,12 @@ CV_MEMORY_ENV_VAR = "POKERTRAINER_CV_MEMORY_GB"
 MIN_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 24 * 60 * 60
 
+# The statuses a row can be in and still receive this run's outcome. The terminal
+# write below carries an optimistic status guard and update_processing_job answers
+# a refused guard by returning the unchanged row rather than raising, so a worker
+# started on a row outside this set does an hour of CV that nothing can record.
+RUNNABLE_JOB_STATUSES = frozenset({"queued", "running"})
+
 # backup_database now lives in the persistence package so db.py can snapshot
 # before a migration; re-exported here because callers and tests import it from
 # this module.
@@ -152,6 +158,22 @@ def run_job(
         job = db.fetch_processing_job(job_id)
         if job is None:
             raise ValueError(f"Processing job #{job_id} was not found.")
+        # Refused here, before the recording is opened and before any artifact is
+        # touched. Re-running a finished job's id -- easy to do, because the worker
+        # is a documented recovery entrypoint and the id is right there in the job
+        # panel -- rebuilt the timeline, took another backup, overwrote the
+        # finished row's progress and message with this run's heartbeats, and then
+        # lost its own completion to the status guard, leaving the row reading
+        # "Preparing session for validation" at 96% with no record of how many
+        # hands were exported or whether the backup verified. It returned 0 while
+        # doing it. A finished job is not resumable; the recording gets a new one.
+        if job.status not in RUNNABLE_JOB_STATUSES:
+            raise ValueError(
+                f"Processing job #{job_id} is already {job.status!r}, so this "
+                "worker could not record an outcome on it and nothing was read "
+                "from the recording. Start a new reconstruction for this video "
+                "instead of re-running a finished job."
+            )
         _assert_no_foreign_heavy_job(db, job_id)
         video = db.fetch_video(job.video_id)
         if video is None:
@@ -242,7 +264,7 @@ def run_job(
             if current is not None and current.status in {"cancelling", "cancelled"}:
                 message = f"{message} (cancel arrived after export)."
             video_id = current.video_id if current is not None else job.video_id
-            db.update_processing_job(
+            recorded = db.update_processing_job(
                 job_id,
                 expected_statuses=("running", "cancelling", "cancelled"),
                 status="completed",
@@ -253,6 +275,22 @@ def run_job(
             )
             db.update_video_session(video_id, destination.id)
         reconstruction_completed = True
+        if recorded.status != "completed":
+            # The status guard was refused -- reconcile_stuck_jobs failed this row
+            # while the export and the backup were running, and it answers a
+            # refused guard by returning the row unchanged rather than raising.
+            # The work is real and its artifacts are kept, but the row now belongs
+            # to the reconciler and there is nowhere left to record the outcome:
+            # mark_failed carries the same kind of guard and would be refused too.
+            # The log is the last surface that can say so, and a zero exit code
+            # here would report a success no operator could ever see.
+            print(
+                f"Reconstruction job #{job_id} finished but its row is "
+                f"{recorded.status!r} and would not accept a completion, so the "
+                f"outcome was recorded nowhere: {message}",
+                file=sys.stderr,
+            )
+            return 1
         return 0
     except JobCancelled as exc:
         try:

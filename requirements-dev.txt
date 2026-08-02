@@ -4,3 +4,7 @@ ruff>=0.9,<1
 # Property and fuzz testing (PLAN Phase 7 chip conservation, Phase 14 property
 # suites). Pinned below 7 so generated cases stay reproducible across machines.
 hypothesis>=6.100,<7
+# Coverage measurement for the Phase 14 exit gate. The library, not pytest-cov:
+# pytest-cov registers a pytest plugin on install and so changes every run on
+# the machine, while `coverage run -m pytest` only measures when asked.
+coverage>=7,<8

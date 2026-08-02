@@ -1,10 +1,62 @@
 [tool.pytest.ini_options]
 pythonpath = ["."]
+# -ra prints the reason for every skip at the end of a run. The Phase 14 exit
+# gate forbids unexplained skips, and a run that does not print the reasons
+# makes that a judgement nobody is in a position to make. The rule itself is
+# enforced by tests/test_suite_quality.py; this only puts the evidence on
+# screen. Collection order is untouched -- the shuffling plugin
+# (poker_tracker/suite_quality/random_order.py) is opt-in via -p so an ordinary
+# run stays the run it was.
+addopts = "-ra"
 # deploy/tests holds the container build contract -- that every Dockerfile COPY
 # source exists in a clean checkout, that the stage running pip has a compiler.
 # It lives outside tests/ because it needs no application imports, but leaving it
 # out of testpaths meant a bare `pytest`, and therefore CI, never ran it.
 testpaths = ["tests", "deploy/tests"]
+
+# Coverage is measured with `coverage run -m pytest`, not `pytest --cov`.
+# pytest-cov installs itself as a pytest plugin, which changes every run on the
+# machine whether or not anybody asked for coverage; the coverage library only
+# does something when it is invoked. `python -m poker_tracker.suite_quality
+# coverage` turns the JSON below into a per-module report. There is
+# deliberately no fail_under: a floor rewards executing lines instead of
+# asserting on them, and the finding worth acting on is the name of the module
+# nothing runs, not a percentage.
+[tool.coverage.run]
+# The repository root rather than the package: app.py is 9500 lines of product
+# and sits beside poker_tracker/, and coverage's `source` takes directories and
+# package names, not single files -- naming "app.py" here silently drops files
+# from the report instead of adding one. Everything unwanted is omitted below.
+# Measuring from a directory (rather than `include`) is what makes coverage
+# report a module nothing imported at all, which is the finding worth having.
+source = ["."]
+branch = false
+# cv_lab is research tooling with its own notes trail rather than product code;
+# a suite that measures itself reports its own size; deploy/ holds container
+# contract checks with no application code behind them.
+omit = [
+    "tests/*",
+    "cv_lab/*",
+    "deploy/*",
+    "data/*",
+    "artifacts/*",
+    "*/__pycache__/*",
+    "*/site-packages/*",
+]
+
+[tool.coverage.report]
+show_missing = false
+skip_empty = true
+# The suite writes and removes scratch modules in the working directory, so a
+# file coverage traced can be gone by the time the report is written. That is a
+# missing file, not a missing measurement, and it must not abort the report.
+ignore_errors = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
 
 [tool.ruff]
 line-length = 100
@@ -23,6 +75,9 @@ files = [
     "poker_tracker/services/hand_accounting.py",
     "poker_tracker/services/study_readiness.py",
     "poker_tracker/solver/eligibility.py",
+    "poker_tracker/suite_quality/coverage_report.py",
+    "poker_tracker/suite_quality/flake.py",
+    "poker_tracker/suite_quality/skip_policy.py",
     "poker_tracker/ui/auth.py",
     "poker_tracker/ui/components.py",
     "poker_tracker/ui/navigation.py",

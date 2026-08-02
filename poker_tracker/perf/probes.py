@@ -41,6 +41,7 @@ from poker_tracker.perf.measurement import (
     measured,
     not_taken,
 )
+from poker_tracker.release_gate.environment import video_duration_seconds
 from poker_tracker.release_gate.models import resolve_models
 from poker_tracker.safety.redaction import redact_text
 
@@ -1030,29 +1031,6 @@ def representative_case(ctx: ProbeContext) -> tuple[Path, dict[str, Any]] | None
     return None
 
 
-def video_duration_seconds(path: Path) -> float | None:
-    """Container duration in seconds, or None when it cannot be read.
-
-    The pipeline samples up to ``--end``, so an unknown duration must not become
-    a large default: it would seek past the end of the file thousands of times
-    and report a throughput figure describing seeks rather than reconstruction.
-    """
-    try:
-        import av
-    except ImportError:
-        return None
-    try:
-        with av.open(str(path)) as container:
-            if container.duration:
-                return float(container.duration) / 1_000_000.0
-            stream = container.streams.video[0]
-            if stream.duration and stream.time_base:
-                return float(stream.duration * stream.time_base)
-    except Exception:
-        return None
-    return None
-
-
 _RECONSTRUCTION_BODY = """
 import runpy
 import sys
@@ -1254,7 +1232,7 @@ def probe_solver(ctx: ProbeContext) -> list[Measurement]:
     db_path = ctx.db_path
     conditions = {
         "database": str(db_path),
-        "source": "solver_runs rows with status='succeeded' and a recorded runtime",
+        "source": "solver_runs rows with status='completed' and a recorded runtime",
         "access": "sqlite mode=ro",
     }
     if not db_path.is_file():
@@ -1266,9 +1244,13 @@ def probe_solver(ctx: ProbeContext) -> list[Measurement]:
     try:
         connection = open_readonly(db_path)
         try:
+            # 'completed' is the only status this product ever writes for a run
+            # that produced a result; SolverRunStatus has never contained
+            # 'succeeded', so the predicate this used to carry matched nothing
+            # and every installation reported zero recorded solver runs.
             rows = connection.execute(
                 "SELECT runtime_seconds FROM solver_runs "
-                "WHERE status = 'succeeded' AND runtime_seconds IS NOT NULL"
+                "WHERE status = 'completed' AND runtime_seconds IS NOT NULL"
             ).fetchall()
         finally:
             connection.close()

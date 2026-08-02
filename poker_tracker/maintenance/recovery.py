@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from poker_tracker.maintenance import data_health
+from poker_tracker.math.accounting import LedgerError
 from poker_tracker.persistence import backup as backup_module
 from poker_tracker.persistence import backup_inventory
 from poker_tracker.persistence.backup import resolve_artifact_path
@@ -238,6 +239,10 @@ def run_recovery_drill(
     ]
 
     inventory, inventory_error = _load_inventory(backup, inventory_path)
+    # Measured here and nowhere later: opening the restored copy below migrates
+    # it, and once it carries this build's schema an older snapshot's genuine
+    # absences are indistinguishable from an inventory that failed to run.
+    shape = _snapshot_shape(restored)
 
     with _snapshots_redirected_to(target / "backups"):
         db = PokerDatabase(restored)
@@ -269,7 +274,7 @@ def run_recovery_drill(
                     expected_schema_version=expected_schema_version,
                 )
             )
-            checks.append(_inventory_check(inventory, inventory_error))
+            checks.append(_inventory_check(inventory, inventory_error, shape))
             counts, count_checks = _history_checks(db, inventory)
             checks.extend(count_checks)
             checks.append(_issue_evidence_check(db))
@@ -460,7 +465,9 @@ def _history_checks(
 
 
 def _inventory_check(
-    inventory: BackupInventory | None, inventory_error: str | None
+    inventory: BackupInventory | None,
+    inventory_error: str | None,
+    shape: frozenset[str] | None = None,
 ) -> RecoveryCheck:
     """Is there an independent record of what this snapshot was supposed to hold?
 
@@ -468,6 +475,14 @@ def _inventory_check(
     is only establishable when the snapshot carries a record written beside it.
     Its absence is reported as a failure rather than a warning: the gate asks
     whether the COMPLETE history came back, and "unknown" is not a yes.
+
+    ``shape`` is the snapshot's own physical schema, and it is what separates an
+    inventory that failed from one that ran against an older database. Every
+    pre-migration snapshot is older than this build by construction, so its
+    inventory necessarily records the ``ARTIFACT_PATH_COLUMNS`` sources that
+    version did not have -- and reading those as an incomplete inventory failed
+    the drill on the one artifact that can undo an irreversible migration, which
+    the runbook then reads as "do not put this backup in place".
     """
     if inventory_error is not None:
         return RecoveryCheck(
@@ -495,8 +510,17 @@ def _inventory_check(
     if inventory.payload.get("error"):
         incomplete.append(f"inventory failed: {inventory.payload['error']}")
     unreadable = inventory.payload.get("unreadable_sources") or []
+    notes: list[str] = []
     if isinstance(unreadable, list):
-        incomplete.extend(f"inventory could not read {source}" for source in unreadable)
+        absent, unexplained = _classify_unreadable_sources(unreadable, shape)
+        notes.extend(
+            f"{source}: absent from this snapshot's schema, so the inventory "
+            "records no reference from it"
+            for source in absent
+        )
+        incomplete.extend(
+            f"inventory could not read {source}" for source in unexplained
+        )
     if incomplete:
         return RecoveryCheck(
             "backup_inventory",
@@ -510,9 +534,12 @@ def _inventory_check(
             "warning",
             "The inventory records artifacts but no session or hand counts, so "
             "the restored totals could not be compared with the source.",
-            (
-                str(inventory.inventory_path),
-                "artifact references are verified; totals are self-reported",
+            _limited(
+                [
+                    str(inventory.inventory_path),
+                    "artifact references are verified; totals are self-reported",
+                    *notes,
+                ]
             ),
         )
     stated = ", ".join(
@@ -522,7 +549,78 @@ def _inventory_check(
         "backup_inventory",
         "pass",
         f"The backup carries an inventory recording {stated}.",
+        _limited(notes),
     )
+
+
+# Every inventory source label this product writes, mapped to the schema object
+# it needs in order to have been readable at all. `ARTIFACT_PATH_COLUMNS` labels
+# ARE `table.column`, so a label is its own requirement; the timeline source
+# names no column, because a job's timeline is found by convention over
+# `processing_jobs` rather than stored in one.
+_INVENTORY_SOURCE_REQUIREMENTS: dict[str, str] = {
+    **{label: label for label, _ in PokerDatabase.ARTIFACT_PATH_COLUMNS},
+    backup_inventory.TIMELINE_SOURCE: "processing_jobs",
+}
+
+
+def _classify_unreadable_sources(
+    unreadable: Sequence[Any], shape: frozenset[str] | None
+) -> tuple[list[str], list[str]]:
+    """Split "this schema never had it" from "this could not be read".
+
+    Only the two are separated; nothing is discarded. A source whose table or
+    column is genuinely absent from the snapshot is reported as a note, because
+    the inventory covering fewer sources than this build has is a fact the
+    operator should see. Everything else -- a source the snapshot DOES declare, a
+    label this build does not recognise, or any label at all when the snapshot's
+    schema could not be read -- stays a failure, because none of those is
+    explained by the snapshot's age and the completeness it claims is unfounded.
+    """
+    absent: list[str] = []
+    unexplained: list[str] = []
+    for item in unreadable:
+        source = str(item)
+        requirement = _INVENTORY_SOURCE_REQUIREMENTS.get(source)
+        if shape is not None and requirement is not None and requirement not in shape:
+            absent.append(source)
+        else:
+            unexplained.append(source)
+    return absent, unexplained
+
+
+def _snapshot_shape(restored: Path) -> frozenset[str] | None:
+    """The tables and ``table.column`` pairs the snapshot physically carried.
+
+    Returns None when the shape could not be read, which is deliberately not the
+    same as an empty set: an unreadable schema explains nothing, and the caller
+    treats every unreadable inventory source as a failure in that case.
+    """
+    try:
+        with closing(
+            sqlite3.connect(
+                f"{restored.resolve().as_uri()}?mode=ro", uri=True, timeout=5
+            )
+        ) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            tables = [
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                ).fetchall()
+            ]
+            objects = set(tables)
+            for table in tables:
+                objects.update(
+                    f"{table}.{column[1]}"
+                    for column in connection.execute(
+                        f"PRAGMA table_info({table})"
+                    ).fetchall()
+                )
+            return frozenset(objects)
+    except (OSError, sqlite3.Error):
+        return None
 
 
 def _issue_evidence_check(db: PokerDatabase) -> RecoveryCheck:
@@ -594,7 +692,7 @@ def _completed_hand_readback_check(db: PokerDatabase) -> RecoveryCheck:
             "The restored hand has no identifier and cannot be read back.",
         )
     try:
-        details = _read_hand_end_to_end(db, subject)
+        details, ledger_error = _read_hand_end_to_end(db, subject)
     except Exception as exc:  # noqa: BLE001 - any failure to read is the finding
         return RecoveryCheck(
             "completed_hand_readback",
@@ -602,12 +700,30 @@ def _completed_hand_readback_check(db: PokerDatabase) -> RecoveryCheck:
             f"Hand {subject.id} could not be read back through the application.",
             (f"{type(exc).__name__}: {exc}",),
         )
+    if ledger_error is not None and completed:
+        # A hand the history records as COMPLETE is one whose reconciliation
+        # succeeded when it was written. If the ledger now refuses to build from
+        # the same rows, something in them changed, and that is damage even
+        # though the product would still render the hand.
+        return RecoveryCheck(
+            "completed_hand_readback",
+            "fail",
+            f"Hand {subject.id} could not be read back through the application.",
+            _limited([f"LedgerError: {ledger_error}", *details]),
+        )
     if not completed:
+        # The fallback subject is whatever hand is there, and on a history with
+        # no completed hand that is routinely an incomplete legacy or CV draft.
+        # `poker_visuals` renders one without a derived ledger and
+        # `resolve_hand_evidence` carries the refusal into `accounting_error`, so
+        # a refusal here is the product working, not a history that failed to
+        # come back.
+        refusal = "" if ledger_error is None else ", and its ledger refuses to build"
         return RecoveryCheck(
             "completed_hand_readback",
             "warning",
             f"No completed hand was restored; hand {subject.id} "
-            f"({subject.completion_status}) reads back end to end instead.",
+            f"({subject.completion_status}) reads back{refusal} instead.",
             details,
         )
     return RecoveryCheck(
@@ -618,8 +734,18 @@ def _completed_hand_readback_check(db: PokerDatabase) -> RecoveryCheck:
     )
 
 
-def _read_hand_end_to_end(db: PokerDatabase, hand: Hand) -> tuple[str, ...]:
-    """Compose one hand from durable records exactly as a study surface does."""
+def _read_hand_end_to_end(
+    db: PokerDatabase, hand: Hand
+) -> tuple[tuple[str, ...], str | None]:
+    """Compose one hand from durable records exactly as a study surface does.
+
+    The ``LedgerError`` branch is the product's own, from
+    ``analytics.resolve_hand_evidence``: a refusal to build the ledger is carried
+    into readiness as ``accounting_error`` rather than raised, because a hand
+    whose seats were never recorded is a hand the product shows with a blocker.
+    Returning the refusal instead of swallowing it lets the caller decide what it
+    means for the hand it actually picked.
+    """
     hand_id = int(hand.id or 0)
     stored = db.fetch_hand(hand_id)
     if stored is None:
@@ -632,24 +758,36 @@ def _read_hand_end_to_end(db: PokerDatabase, hand: Hand) -> tuple[str, ...]:
     actions = db.fetch_actions_by_hand(hand_id)
     settlement = db.fetch_hand_settlement(hand_id)
     entries = db.fetch_settlement_entries(hand_id)
-    accounting = reconcile_persisted_hand(db, hand_id)
+    accounting = None
+    ledger_error: str | None = None
+    try:
+        accounting = reconcile_persisted_hand(db, hand_id)
+    except LedgerError as exc:
+        ledger_error = str(exc)
     readiness = evaluate_study_readiness(
         stored,
         accounting=accounting,
+        accounting_error=ledger_error,
         hand_issues=db.fetch_hand_issues(hand_id=hand_id),
         coaching_reviews=db.fetch_coaching_reviews_by_hand(hand_id),
         hand_reviews=db.fetch_reviews_by_hand(hand_id),
         solver_runs=db.fetch_solver_runs_by_hand(hand_id),
     )
     blockers = ", ".join(blocker.code for blocker in readiness.blockers) or "none"
+    authoritative = (
+        f"refused: {ledger_error}" if accounting is None else accounting.is_authoritative
+    )
     return (
-        f"session: {session.name}",
-        f"players: {len(players)}",
-        f"actions: {len(actions)}",
-        f"settlement: {'absent' if settlement is None else settlement.status}",
-        f"settlement entries: {len(entries)}",
-        f"accounting authoritative: {accounting.is_authoritative}",
-        f"study ready: {readiness.is_ready} (blockers: {blockers})",
+        (
+            f"session: {session.name}",
+            f"players: {len(players)}",
+            f"actions: {len(actions)}",
+            f"settlement: {'absent' if settlement is None else settlement.status}",
+            f"settlement entries: {len(entries)}",
+            f"accounting authoritative: {authoritative}",
+            f"study ready: {readiness.is_ready} (blockers: {blockers})",
+        ),
+        ledger_error,
     )
 
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import os
 import shutil
 import signal
@@ -12,6 +11,11 @@ from pathlib import Path
 
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import SolverRun
+from poker_tracker.runtime.limits import (
+    bounded_int_from_env,
+    format_gb,
+    memory_limit_bytes_from_env,
+)
 from poker_tracker.solver.models import ResolvedRange, SolverSpot
 from poker_tracker.solver.storage import solver_run_directory
 from poker_tracker.solver.texassolver import (
@@ -26,6 +30,13 @@ from poker_tracker.solver.texassolver import (
 
 DEFAULT_STALE_AFTER = timedelta(minutes=5)
 SOLVER_CHILD_PID_FILE = "solver_child.pid"
+# Named once here because the worker restates both of them to the operator, and
+# a message that names a variable the reader cannot find is worse than no
+# message. The CV path holds its own pair the same way in ui/run_cv_job.py.
+SOLVER_MEMORY_ENV_VAR = "POKERTRAINER_SOLVER_MEMORY_GB"
+SOLVER_THREADS_ENV_VAR = "POKERTRAINER_SOLVER_THREADS"
+MIN_SOLVER_THREADS = 1
+MAX_SOLVER_THREADS = 4
 
 
 class SolverJobAlreadyRunningError(RuntimeError):
@@ -68,10 +79,7 @@ def start_solver_job(
                     else f"OOP range '{range_oop.profile_name}' was explicitly supplied by the user."
                 ),
                 *(
-                    [
-                        "Solver process memory was capped at "
-                        f"{memory_limit_bytes / 1024**3:g} GB."
-                    ]
+                    [f"Solver process memory was capped at {format_gb(memory_limit_bytes)}."]
                     if memory_limit_bytes is not None
                     else []
                 ),
@@ -469,44 +477,31 @@ def configured_memory_limit_bytes() -> int | None:
     they believe the container's limit is holding while a deep river tree grows
     until the host OOM killer fires and takes Streamlit and any concurrent
     write with it. So every way of asking for a cap that cannot be honoured
-    raises here, before a run row exists and while the operator can still fix
-    the environment.
+    raises, before a run row exists and while the operator can still fix the
+    environment.
+
+    The rule itself lives in ``poker_tracker.runtime.limits`` because the CV
+    reconstruction path needs exactly the same one. This kept its name: callers
+    and tests import it, and the solver's variable belongs to the solver.
     """
-    raw = os.environ.get("POKERTRAINER_SOLVER_MEMORY_GB", "").strip()
-    if not raw:
-        return None
-    try:
-        limit_gb = float(raw)
-    except ValueError as exc:
-        raise ValueError(
-            "POKERTRAINER_SOLVER_MEMORY_GB must be a plain number of gigabytes "
-            f"such as 8 or 6.5, with no unit suffix; got {raw!r}."
-        ) from exc
-    if not math.isfinite(limit_gb) or limit_gb <= 0:
-        raise ValueError(
-            "POKERTRAINER_SOLVER_MEMORY_GB must be a finite number of gigabytes "
-            f"greater than zero; got {raw!r}."
-        )
-    if os.name != "posix":
-        raise ValueError(
-            "POKERTRAINER_SOLVER_MEMORY_GB cannot be enforced on this platform; "
-            "unset it rather than solve while believing a cap is in force."
-        )
-    return int(limit_gb * 1024**3)
+    return memory_limit_bytes_from_env(SOLVER_MEMORY_ENV_VAR)
 
 
 def _configured_thread_count() -> int:
-    raw = os.environ.get(
-        "POKERTRAINER_SOLVER_THREADS",
-        str(min(4, max(1, os.cpu_count() or 1))),
+    """The solver's thread ceiling, or raise naming the variable that is wrong.
+
+    The default tracks the host rather than the ceiling, so a two-core machine
+    is not asked for four threads. A value outside the range is refused instead
+    of clamped: TexasSolver takes the count from the command file, so a silent
+    clamp would put a number in the run's own input that the operator never
+    chose.
+    """
+    return bounded_int_from_env(
+        SOLVER_THREADS_ENV_VAR,
+        default=min(MAX_SOLVER_THREADS, max(MIN_SOLVER_THREADS, os.cpu_count() or 1)),
+        minimum=MIN_SOLVER_THREADS,
+        maximum=MAX_SOLVER_THREADS,
     )
-    try:
-        threads = int(raw)
-    except ValueError as exc:
-        raise ValueError("POKERTRAINER_SOLVER_THREADS must be an integer from 1 to 4.") from exc
-    if not 1 <= threads <= 4:
-        raise ValueError("POKERTRAINER_SOLVER_THREADS must be from 1 to 4.")
-    return threads
 
 
 def _terminate_solver_group(pid: int | None, *, grace_seconds: float = 0.5) -> bool:

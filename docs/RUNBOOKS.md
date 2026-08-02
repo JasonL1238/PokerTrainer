@@ -90,6 +90,12 @@ Two things in the report are easy to misread and worth checking explicitly:
   retained timelines without decoding video or loading models, and cannot tell a
   pipeline's timeline from one written by hand. A passing fixture report is a
   regression check, not a release.
+- **`duration_source` on a full-mode case.** `manifest` means the case declared
+  `recording.duration_s`; `probed_from_recording` means the manifest did not and
+  the file was measured. A case whose length can be established neither way
+  fails as setup invalid: the sampling window is unknown, and the gate does not
+  choose one. Declare `duration_s` in the manifest to keep the window pinned
+  rather than re-derived on every run.
 
 Today the committed corpus exits `2` because Phase 2 has produced no answer
 keys. CI asserts that it does.
@@ -529,7 +535,79 @@ db.resolve_hand_issue(ISSUE_ID, resolution_notes="...")
 
 ---
 
-## 13. What this application must never become
+## 13. Suite quality: skips, flakes, and coverage
+
+Three commands behind the Phase 14 exit gate — "all mandatory suites pass
+without unexplained skips or flaky reruns". They live in
+`poker_tracker/suite_quality/`.
+
+**Skips.** Every skip must be conditional and must say what the environment is
+missing. The rule is enforced inside the suite by
+`tests/test_suite_quality.py`; this prints the inventory a reviewer reads.
+
+```bash
+python -m poker_tracker.suite_quality skips tests deploy/tests
+```
+
+Exit 2 means a skip is unexplained. If a legitimate skip states a precondition
+no vocabulary would recognise, register its reason in
+`skip_policy.REVIEWED_SKIPS` with the review a reader would otherwise have to
+perform — that registration *is* the explanation, and the audit reports any
+registration whose skip has since gone away.
+
+**Flakes.** The suite runs once, in order, everywhere else. This runs it
+repeatedly, shuffling module order and within-module order between passes, and
+names every test whose result was not the same each time.
+
+```bash
+python -m poker_tracker.suite_quality flake --passes 4 --seeds 20260801,20260802
+```
+
+Exit 2 means a test disagreed with itself. The report separates *unstable*
+(passed once, failed once — the flake), *consistently failing* (broken, not
+flaky), and *order dependent* (ran or skipped differently under a shuffle).
+There is no rerun-until-green anywhere in this repository: rerunning until
+green is how a flake becomes permanent.
+
+To shuffle a single ordinary run — the plugin does nothing without a seed:
+
+```bash
+python -m pytest -p sq_random_order --sq-seed 20260801
+```
+
+Load `sq_random_order` (the top-level shim), never
+`poker_tracker.suite_quality.random_order`. pytest imports a `-p` plugin before
+any conftest, so naming a module inside the package pulls in
+`poker_tracker/__init__.py` — and with it the modules that resolve the
+operator's database and data directory — before `tests/conftest.py` redirects
+them. A run that does that reads and migrates `<repo>/poker_tracker.db`.
+`tests/conftest.py` now refuses such a run outright rather than letting it
+proceed.
+
+**Coverage.** Measured with the `coverage` library, not `pytest-cov`:
+`pytest-cov` registers a plugin on install and so changes every run on the
+machine.
+
+```bash
+python -m coverage run -m pytest -q
+python -m coverage json -o coverage.json
+python -m poker_tracker.suite_quality coverage coverage.json
+```
+
+There is no floor and no ratchet, deliberately. The output worth acting on is
+the *name* of a core module the suite never executes, not a percentage; a
+`fail_under` rewards executing lines instead of asserting on them.
+
+Read the last section of that report carefully. `poker_tracker/coaching`,
+`math`, `persistence` and `ui` have no `__init__.py`, and coverage's walk of
+the source tree descends only into directories that have one — so a module in
+them that no test imports is missing from the payload rather than sitting in it
+at 0%. The report reconstructs that list from the filesystem and prints it
+under "Never imported by the suite".
+
+---
+
+## 14. What this application must never become
 
 Non-negotiable, and worth restating because it constrains every fix:
 

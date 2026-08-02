@@ -8,8 +8,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from poker_tracker.persistence.db import PokerDatabase
+from poker_tracker.runtime.limits import format_gb, memory_limiter
 from poker_tracker.safety.redaction import safe_error_message
 from poker_tracker.solver.jobs import (
+    SOLVER_MEMORY_ENV_VAR,
     _terminate_solver_group,
     configured_memory_limit_bytes,
     solver_child_pid_path,
@@ -22,11 +24,6 @@ from poker_tracker.solver.texassolver import (
     parse_final_exploitability,
     parse_strategy_result,
 )
-
-try:
-    import resource
-except ImportError:  # Windows: RLIMIT_AS does not exist there.
-    resource = None  # type: ignore[assignment]
 
 # A solver inside a CFR iteration answers a signal late, so it is given longer
 # to exit than the UI gives the worker before escalating.
@@ -100,7 +97,7 @@ def run_solver_job(
                     # record why the run ended.
                     start_new_session=os.name == "posix",
                     preexec_fn=(
-                        _memory_limiter(memory_limit_bytes)
+                        memory_limiter(memory_limit_bytes, variable=SOLVER_MEMORY_ENV_VAR)
                         if os.name == "posix" and memory_limit_bytes is not None
                         else None
                     ),
@@ -114,8 +111,8 @@ def run_solver_job(
                 # asked for and not applied is how a river tree reaches the host
                 # OOM killer while the operator believes it is bounded.
                 raise RuntimeError(
-                    f"The {memory_limit_bytes / 1024**3:g} GB solver memory cap from "
-                    "POKERTRAINER_SOLVER_MEMORY_GB could not be applied, so the solve "
+                    f"The {format_gb(memory_limit_bytes)} solver memory cap from "
+                    f"{SOLVER_MEMORY_ENV_VAR} could not be applied, so the solve "
                     "was not started. macOS rejects RLIMIT_AS outright; unset the "
                     "variable to solve without a cap, or run the solver in the Linux "
                     "container where the cap holds."
@@ -243,25 +240,6 @@ def run_solver_job(
         if pid_path is not None:
             pid_path.unlink(missing_ok=True)
         db.close()
-
-
-def _memory_limiter(limit_bytes: int):
-    """Build the between-fork-and-exec hook that caps the solver's address space.
-
-    subprocess re-raises whatever this hook raises in the parent, which is the
-    point: a cap that could not be applied fails the run instead of leaving the
-    operator believing a cap is in force.
-    """
-
-    def apply_limit() -> None:
-        if resource is None:
-            raise RuntimeError(
-                "POKERTRAINER_SOLVER_MEMORY_GB was set but this platform has no "
-                "RLIMIT_AS support."
-            )
-        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
-
-    return apply_limit
 
 
 def _terminate_solver_child(

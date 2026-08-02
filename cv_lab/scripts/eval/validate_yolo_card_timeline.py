@@ -216,11 +216,50 @@ def _hand_from_all_states(states: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _time_ordered(states: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    """The hand's states in the order the recording produced them, and whether the
+    input disagreed with that.
+
+    Every sequence rule below -- board append-only, street order, the terminal
+    sweep -- walks its argument in LIST order, and nothing anywhere read
+    ``time_s``. So the verdict was a function of how the producer happened to
+    emit the list rather than of what the recording shows, and the same three
+    observations could be assessed two ways: a board of four cards at t=5
+    followed by three at t=10 is a board_regression at confidence 0.1, but the
+    identical states listed 0, 10, 5 walk 0 -> 3 -> 4 cards and score a clean
+    1.0. The export gate reads this report and nothing else, so that is a
+    destroyed hand promoted to study-ready by list order alone.
+
+    Ordering is applied only when every state carries a numeric time, because
+    there is no order to restore otherwise; the sort is stable, so states
+    sharing a timestamp keep the order they arrived in and the report stays
+    deterministic. Out-of-order input is also reported in its own right: it is
+    evidence about the PRODUCER, and the spine that built this timeline
+    (build_states, the debounces, fold detection, action attribution) walks the
+    same list in the same way, so its output rests on the same wrong order.
+    """
+    times = [state.get("time_s") for state in states]
+    if not all(isinstance(t, (int, float)) and not isinstance(t, bool) for t in times):
+        return list(states), False
+    ordered = sorted(states, key=lambda state: state["time_s"])
+    return ordered, any(a is not b for a, b in zip(ordered, states, strict=True))
+
+
 def _hand_sequence_warnings(hand: dict[str, Any], hand_states: list[dict[str, Any]]) -> list[dict[str, Any]]:
     warnings: list[dict[str, Any]] = []
     previous_count: int | None = None
     previous_order: int | None = None
     previous_board: list[str] = []
+
+    hand_states, out_of_order = _time_ordered(hand_states)
+    if out_of_order:
+        warnings.append(_warn(
+            "state_time_order",
+            "hand states are not listed in the order their timestamps record",
+            hand_number=hand.get("hand_number"),
+            time_s=hand.get("t_start"),
+            image=None,
+        ))
 
     # The pot sweep at the end of every hand clears the board: an empty board
     # that never comes back within the hand is settlement, not a regression.
@@ -671,6 +710,15 @@ WARNING_SEVERITY: dict[str, float] = {
     # The hand's own action list contradicts itself, so every derived number
     # (pot, contributions, hero net) rests on a sequence that never happened.
     "action_sequence_illegal": 0.50,
+    # The states this hand was reconstructed from are not listed in the order
+    # their own timestamps record. This report re-orders them before judging the
+    # board and the streets, so the verdict beside this code is sound -- but the
+    # SPINE that produced the hand walked the list as given (build_states, the
+    # run-length debounces, fold detection, action attribution all consume it in
+    # list order), so its players, actions, pot and winner describe a sequence
+    # the recording did not have. That is the "wrong rather than merely
+    # incomplete" band, so it routes into rejection_codes.
+    "state_time_order": 0.50,
     "stack_ledger_incoherent": 0.50,
     "anchor_unavailable": 0.40,
     "reconciliation_failed": 0.35,

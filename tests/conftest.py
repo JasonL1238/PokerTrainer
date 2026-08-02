@@ -26,9 +26,31 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+
+# The redirect only works if nothing has already imported the application, and
+# this file is not the earliest code pytest runs. A plugin loaded with `-p` is
+# imported during argument preparsing, before any conftest, so `-p
+# poker_tracker.<anything>` executes `poker_tracker/__init__.py` -- which
+# imports `persistence.db` and `ui.video_storage` -- with the variables below
+# still unset. Every operator root then freezes on the real one, and the suite
+# migrates `<repo>/poker_tracker.db` exactly as it did in round 12. Refusing
+# here costs a run; discovering it afterwards costs the rollback point, because
+# the pre-migration snapshot is written wherever POKER_DATA_DIR pointed at
+# import time.
+if "poker_tracker" in sys.modules:
+    raise RuntimeError(
+        "poker_tracker was imported before tests/conftest.py could redirect the "
+        "operator's state, so the suite would read and migrate the real database "
+        "and data directory. This is what loading a plugin from inside the "
+        "poker_tracker package with -p does. Load the shuffle plugin as "
+        "`-p sq_random_order` (the top-level shim, which imports nothing), or set "
+        "POKER_DB_PATH and POKER_DATA_DIR outside the repository before invoking "
+        "pytest."
+    )
 
 # Claimed before the first poker_tracker import below, and never after: these
 # constants are read once per process, at module import.
@@ -102,3 +124,30 @@ def isolated_backup_dir(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Pa
         yield directory
     finally:
         patcher.undo()
+
+
+@pytest.fixture(autouse=True)
+def _clear_streamlit_resource_cache() -> Iterator[None]:
+    """Stop one AppTest's cached database from being handed to the next one.
+
+    ``st.cache_resource`` is process-global, and ``app.py`` caches its
+    ``PokerDatabase`` there. A UI test that clears the cache on the way IN but
+    not on the way out leaves its own sandbox database cached for every later
+    AppTest in the process -- still readable through the open SQLite handle long
+    after pytest has deleted the tmp_path file behind it. The next AppTest then
+    renders against the previous test's sessions: with a session present,
+    ``create_hand_form`` stops returning early and the Hands page grows a second
+    radio, so ``test_product_shell_navigation_smoke``'s positional lookup finds
+    the manual-entry form's control instead of the navigation one.
+
+    That is order-dependent rather than constant, which is what made it a flake:
+    running ``test_the_session_hand_list_performs_the_deletion_the_blockers_name``
+    immediately before ``test_product_shell_navigation_smoke`` reproduces it in
+    about a second, and a shuffled full run reproduces it whenever the two land
+    in that order. Clearing after every test makes the cache a per-test resource,
+    which is what every test already assumes it is.
+    """
+    yield
+    streamlit = sys.modules.get("streamlit")
+    if streamlit is not None:
+        streamlit.cache_resource.clear()

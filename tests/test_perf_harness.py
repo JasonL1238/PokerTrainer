@@ -310,9 +310,14 @@ def test_the_solver_probe_summarizes_recorded_runtimes(tmp_path) -> None:
     db_path = tmp_path / "library.db"
     connection = sqlite3.connect(db_path)
     connection.execute("CREATE TABLE solver_runs (status TEXT, runtime_seconds REAL)")
+    # 'completed' is the status a finished run actually carries. This seed used
+    # to say 'succeeded', which SolverRunStatus has never contained, so the
+    # fixture agreed with the probe's predicate and neither agreed with the
+    # product; see tests/test_chain_solver_grounding.py for the same assertion
+    # taken against a real schema and a real retained run.
     connection.executemany(
         "INSERT INTO solver_runs VALUES (?, ?)",
-        [("succeeded", 10.0), ("succeeded", 30.0), ("succeeded", 20.0), ("failed", 999.0)],
+        [("completed", 10.0), ("completed", 30.0), ("completed", 20.0), ("failed", 999.0)],
     )
     connection.commit()
     connection.close()

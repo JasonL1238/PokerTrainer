@@ -112,6 +112,33 @@ def ffmpeg_version() -> str | None:
     return first[0] if first else None
 
 
+def video_duration_seconds(path: Path) -> float | None:
+    """Container duration in seconds, or None when it cannot be read.
+
+    The pipeline samples up to ``--end``, so an unknown duration must not become
+    a large default: it would seek past the end of the file thousands of times
+    and report a throughput figure describing seeks rather than reconstruction.
+
+    Lives here rather than in the perf harness because the release gate needs the
+    same answer for the same reason, and two probes could disagree about the same
+    recording.
+    """
+    try:
+        import av
+    except ImportError:
+        return None
+    try:
+        with av.open(str(path)) as container:
+            if container.duration:
+                return float(container.duration) / 1_000_000.0
+            stream = container.streams.video[0]
+            if stream.duration and stream.time_base:
+                return float(stream.duration * stream.time_base)
+    except Exception:
+        return None
+    return None
+
+
 def _memory_bytes() -> int | None:
     try:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")

@@ -27,6 +27,7 @@ source asset shipped in the repository, is a hole in it.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +38,7 @@ from poker_tracker.maintenance import data_health
 from poker_tracker.persistence import backup as backup_module
 from poker_tracker.persistence import db as db_module
 from poker_tracker.solver import storage as solver_storage
+from poker_tracker.suite_quality import flake
 from poker_tracker.ui import video_storage
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -215,3 +217,54 @@ def test_running_the_app_shell_leaves_the_operator_database_untouched() -> None:
     after = operator_db.stat()
     assert (before.st_mtime_ns, before.st_size) == (after.st_mtime_ns, after.st_size)
     assert sorted(p.name for p in REPO_ROOT.glob("poker_tracker.db-*")) == sidecars_before
+
+
+def _collect_only(plugin: str | None, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    """Collect one cheap module in a child pytest, optionally loading a plugin."""
+    command = [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--collect-only", "-q"]
+    if plugin is not None:
+        command += ["-p", plugin]
+    command.append(str(REPO_ROOT / "tests" / "test_icm.py"))
+    return subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTEST_ADDOPTS": "", "TMPDIR": str(tmp_path)},
+    )
+
+
+def test_a_plugin_loaded_from_inside_the_package_cannot_reach_the_real_database(
+    tmp_path: Path,
+) -> None:
+    """The redirect assumes conftest runs first, and ``-p`` breaks that assumption.
+
+    pytest imports a ``-p`` plugin during argument preparsing, before any
+    conftest. Naming a module inside ``poker_tracker`` therefore executes
+    ``poker_tracker/__init__.py`` -- which imports ``persistence.db`` and
+    ``ui.video_storage`` -- while ``POKER_DB_PATH`` and ``POKER_DATA_DIR`` are
+    still unset, so every operator root freezes on the real one and the suite
+    migrates ``<repo>/poker_tracker.db``. Observed: a shuffled full run took the
+    operator's database from schema 15 to 18, and the pre-migration snapshot the
+    migration writes went to wherever the unredirected data directory pointed.
+
+    The run must be refused rather than allowed to proceed, because by the time
+    a test opens the path the damage is a completed migration.
+    """
+    result = _collect_only("poker_tracker.suite_quality.random_order", tmp_path)
+    assert result.returncode != 0, (
+        "A plugin that imports the application before conftest was allowed to run:\n"
+        + result.stdout
+    )
+    combined = result.stdout + result.stderr
+    assert "before tests/conftest.py could redirect" in combined, combined
+
+
+def test_the_supported_shuffle_plugin_leaves_the_redirect_intact(tmp_path: Path) -> None:
+    """The shim exists so the flake hunt is still runnable, not merely refused."""
+    result = _collect_only(flake.PLUGIN, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert flake.PLUGIN == "sq_random_order", (
+        "The flake harness must load the top-level shim, not a module inside the "
+        f"package: {flake.PLUGIN}"
+    )

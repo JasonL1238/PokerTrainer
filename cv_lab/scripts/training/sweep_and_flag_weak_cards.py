@@ -38,6 +38,7 @@ from cv_lab.scripts.pipeline.evaluate_yolo_cards import (  # noqa: E402
 from cv_lab.scripts.pipeline.run_two_model_pipeline import (  # noqa: E402
     DEFAULT_DETECTOR,
     _detect_regions,
+    _sample_times,
 )
 
 DEFAULT_IMAGES_DIR = REPO_ROOT / "cv_lab" / "datasets" / "yolo_cards_autolabel_v1" / "images"
@@ -73,19 +74,6 @@ def _slug(video: Path, idx: int) -> str:
 
 def _val_split(file_id: str, val_fraction: float = 0.2) -> str:
     return "val" if (hash(file_id) % 100) < int(val_fraction * 100) else "train"
-
-
-def _sample_times(container, stream, start: float, end: float, interval: float):
-    t = start
-    while t <= end:
-        container.seek(int(t / stream.time_base), stream=stream)
-        frame = None
-        for frame in container.decode(stream):
-            if float(frame.pts * stream.time_base) >= t:
-                break
-        if frame is not None:
-            yield t, frame.to_ndarray(format="bgr24")
-        t += interval
 
 
 def _rank_of(label: str) -> str:
