@@ -75,6 +75,27 @@ def all_in_hand(draw):
     return players, actions, names, stacks
 
 
+# The forced-bet names that set what the rest of the table owes. Antes,
+# big-blind antes and dead blinds are owed to the table and name no wager level.
+# Written here from the specification sentence "forced posts are not live", so
+# this suite identifies a forced post without importing the reducer's opinion.
+_LIVE_STRUCTURAL_TYPES = frozenset({"small_blind", "big_blind", "straddle", "bring_in"})
+
+
+def _is_forced_row(action: LedgerAction) -> bool:
+    return action.kind in {"ante", "post_blind"} or action.forced_bet_type is not None
+
+
+def _is_live_structural_row(action: LedgerAction) -> bool:
+    if action.kind == "ante":
+        return False
+    if action.forced_bet_type is not None:
+        return action.forced_bet_type in _LIVE_STRUCTURAL_TYPES and bool(
+            action.is_live_post
+        )
+    return action.kind == "post_blind" and bool(action.is_live_post)
+
+
 @dataclass(frozen=True)
 class ForcedPostHand:
     """A generated hand that starts with forced posts, plus the facts to check it.
@@ -100,6 +121,12 @@ class ForcedPostHand:
     posted: dict[str, Decimal]
     wagered: dict[str, Decimal]
     folded: set[str] = field(default_factory=set)
+    # Dead money declared for the table with no contributing seat: a rake-back
+    # promotion chip, a bad-beat drop returned to the pot. It is owed to the
+    # table exactly as an ante is, so the model puts it in the lowest layer and
+    # lets it confer eligibility on nobody. Carried on the generated hand so the
+    # payout-cap properties sweep it rather than only ever seeing zero.
+    external_dead: Decimal = _ZERO
     # The structural forced-bet sizes the generator DEALT, as opposed to the ones
     # the resulting action line happens to show. They differ exactly when a seat
     # was too short to post in full, which is the family the blind structure
@@ -122,6 +149,11 @@ class ForcedPostHand:
         property could not see the defect it exists to catch. An oracle that
         reimplements the code under test proves only that the code is
         self-consistent.
+
+        Asked of what the row IS, not of the kind that carries it. A forced post
+        which took its poster's last chip is routinely booked as ``all-in`` with
+        the forced-bet type recorded alongside; keying on ``post_blind`` alone
+        made this oracle blind to exactly the row the refusal exists for.
         """
         stacks = dict(zip(self.names, self.stacks, strict=True))
         committed = {name: Decimal("0") for name in self.names}
@@ -139,9 +171,9 @@ class ForcedPostHand:
             }:
                 continue
             committed[action.player] += Decimal(str(action.amount))
-            if action.kind not in {"ante", "post_blind"}:
+            if not _is_forced_row(action):
                 voluntary.add(action.player)
-            if action.kind == "post_blind" and action.is_live_post:
+            if _is_live_structural_row(action):
                 candidates.append((index, action.player))
                 if committed[action.player] == stacks[action.player]:
                     exhausted_at_post.add(index)
@@ -212,6 +244,11 @@ def forced_post_hand(draw):
     antes_after_blinds = draw(st.booleans())
     wants_straddle = draw(st.booleans())
     wants_dead_blind = draw(st.booleans())
+    external_dead = chip * draw(st.sampled_from([0, 0, 0, 1, 4]))
+    # Whether this recording books a forced post that took its poster's last
+    # chip as ``all-in`` carrying its forced-bet type, or as the plain kind.
+    # Both spell the same event and must derive byte-identical chips.
+    relabel_exhausting_posts = draw(st.booleans())
     choices = draw(
         st.lists(
             st.sampled_from(["call", "fold", "shove"]),
@@ -233,23 +270,49 @@ def forced_post_hand(draw):
     street_live = {name: _ZERO for name in names}
     folded: set[str] = set()
 
-    def commit(name, amount, kind, *, is_live_post=True, forced):
-        """Put in as much of ``amount`` as the seat still has, or nothing."""
+    def commit(name, amount, kind, *, is_live_post=True, forced, forced_type=None):
+        """Put in as much of ``amount`` as the seat still has, or nothing.
+
+        ``forced_type`` is what the room CALLS this post. When it is given and
+        the post takes the seat's last chip, the row may be booked as ``all-in``
+        carrying that name -- the shape a real recording produces when a forced
+        post exhausts its poster, and the shape the CV spine and the hand editor
+        both write into ``actions.forced_bet_type`` / ``actions.is_live_post``.
+
+        The generator classified its OWN live/dead bookkeeping from ``kind``, and
+        emitted no ``forced_bet_type`` at all, so it was structurally incapable of
+        producing that row -- which is how a money classifier that also keyed on
+        ``kind`` alone survived every property below while counting a dead ante as
+        chosen live money. Liveness is decided here from the spec sentence
+        instead: a forced post is live only when it is one of the STRUCTURAL bets
+        that set the wager level, whatever kind carries it.
+        """
 
         capped = min(amount, remaining[name])
         if capped <= 0:
             return
+        exhausts = capped == remaining[name]
+        booked = kind
+        carried = forced_type
+        if forced_type is not None and exhausts and relabel_exhausting_posts:
+            booked = "all-in"
+        elif forced_type is not None and not relabel_exhausting_posts:
+            carried = None
         actions.append(
             LedgerAction(
                 player=name,
                 street="preflop",
-                kind=kind,
+                kind=booked,
                 amount=float(capped),
                 is_live_post=is_live_post,
+                forced_bet_type=carried,
             )
         )
         remaining[name] -= capped
-        if kind != "ante" and is_live_post:
+        is_live_money = not forced or (
+            forced_type in {"small_blind", "big_blind", "straddle"} and is_live_post
+        )
+        if is_live_money:
             live[name] += capped
             street_live[name] += capped
         else:
@@ -262,9 +325,9 @@ def forced_post_hand(draw):
     def post_antes():
         if ante_style == "all":
             for name in names:
-                commit(name, ante, "ante", forced=True)
+                commit(name, ante, "ante", forced=True, forced_type="ante")
         elif ante_style == "button":
-            commit(names[0], ante, "ante", forced=True)
+            commit(names[0], ante, "ante", forced=True, forced_type="ante")
 
     # The order two FORCED rows are listed in is not a fact about the hand: a
     # room takes both in one motion, a reconstruction resolves them from the same
@@ -276,11 +339,20 @@ def forced_post_hand(draw):
         post_antes()
     if wants_dead_blind and count >= 3:
         # A returning player owes a dead blind before the live one is posted.
-        commit(names[1], big_blind, "post_blind", is_live_post=False, forced=True)
-    commit(names[-2], small_blind, "post_blind", forced=True)
-    commit(names[-1], big_blind, "post_blind", forced=True)
+        commit(
+            names[1],
+            big_blind,
+            "post_blind",
+            is_live_post=False,
+            forced=True,
+            forced_type="dead_blind",
+        )
+    commit(names[-2], small_blind, "post_blind", forced=True, forced_type="small_blind")
+    commit(names[-1], big_blind, "post_blind", forced=True, forced_type="big_blind")
     if wants_straddle:
-        commit(names[0], big_blind * 2, "post_blind", forced=True)
+        commit(
+            names[0], big_blind * 2, "post_blind", forced=True, forced_type="straddle"
+        )
     if antes_after_blinds:
         post_antes()
 
@@ -314,6 +386,7 @@ def forced_post_hand(draw):
         posted=posted,
         wagered=wagered,
         folded=folded,
+        external_dead=external_dead,
         blinds=BlindStructure(
             small_blind=float(small_blind),
             big_blind=float(big_blind),
@@ -348,6 +421,97 @@ def _winner_map(pots, preferred=()):
 
 def _sum(values) -> Decimal:
     return sum((Decimal(str(v)) for v in values), Decimal("0"))
+
+
+# --- The model, restated here and nowhere else ------------------------------
+#
+# Three helpers derived from the four rules of the pot-layering specification,
+# NOT from ``accounting._build_pots``. Every payout property below is stated
+# through them, so there is exactly one place in this suite where the model is
+# written down and it can be read against the specification by eye:
+#
+#   1. Boundaries are cut at distinct LIVE contribution levels, after refunds.
+#   2. ALL dead money goes into the lowest layer and opens no boundary.
+#   3. A seat is eligible for a layer if its own LIVE contribution reaches that
+#      layer's level; every unfolded seat that put ANY chip up contests the main
+#      pot.
+#   4. A folded seat's chips stay where they landed and it is eligible for none.
+
+
+def _model_figures(hand, ledger) -> tuple[dict[str, Decimal], Decimal]:
+    """Each seat's LIVE money after refunds, and the whole dead pool.
+
+    The two quantities rule 1 and rule 2 are stated over. ``hand.live`` is what
+    the generator wagered before any uncalled money came back; the refund is read
+    off the ledger because it is not in dispute -- it is measured against live
+    money only, and ``test_a_forced_post_is_never_returned_as_an_uncalled_bet``
+    is the guarantee on that.
+    """
+
+    live = {
+        name: hand.live[name] - Decimal(str(ledger.refunds[name]))
+        for name in hand.names
+    }
+    pool = _sum(hand.dead.values()) + hand.external_dead
+    return live, pool
+
+
+def _model_main_pot_eligibility(hand) -> set[str]:
+    """Who contests the main pot, from rule 3's second sentence and rule 4.
+
+    "Every unfolded seat that put ANY chip up -- live or dead -- is eligible for
+    the main pot", read PRE-refund: a seat whose only live post came back still
+    played the hand, and the return is what the table did about it afterwards.
+
+    This exists because every payout property below used to take the main pot's
+    eligible set straight off ``ledger.pots[0].eligible_players`` and then assert
+    the cap FOR THAT SET. Whatever set the reducer named, the property agreed with
+    it -- so widening the main pot to a seat that put nothing up, or to the
+    declarer of external dead money, passed all thirty properties while paying
+    that seat the whole dead pool. The cap arithmetic was independent of the
+    reducer; the eligibility it was applied to was not, and eligibility is half
+    the model.
+    """
+
+    return {
+        name
+        for name in hand.names
+        if name not in hand.folded and hand.live[name] + hand.dead[name] > _ZERO
+    }
+
+
+def _model_payout_cap(
+    seat: str, live: dict[str, Decimal], pool: Decimal, contests_main: bool
+) -> Decimal:
+    """The most chips ``seat`` can collect, read straight off the spec sentence.
+
+    You get your own live money back, you win from each opponent only the LIVE
+    chips that opponent matched OF YOURS, and you win the dead money only if you
+    win the layer it sits in -- which rule 2 makes always the main pot.
+
+    Three things this deliberately does NOT do, each of which is how the property
+    it replaces got it wrong:
+
+    * the seat's OWN dead posts never appear inside the ``min()``. An opponent
+      does not match your ante. Your ante is owed to the table and is already
+      counted once, in ``pool``.
+    * the OPPONENT's dead posts never appear inside the ``min()`` either, for the
+      same reason.
+    * a folded opponent gets no free pass to contribute its whole stack. It is
+      capped at ``min(live[other], live[seat])`` exactly like anybody else,
+      because rule 4 leaves a folded seat's chips in the layers its LIVE money
+      reached and no higher, and a seat short of that cannot reach them.
+    """
+
+    own = live[seat]
+    matched = _sum(min(live[other], own) for other in live if other != seat)
+    return own + matched + (pool if contests_main else _ZERO)
+
+
+def _eligibility_threshold(eligible, live, contenders) -> Decimal:
+    """The live level a layer's eligible set behaves as a threshold on."""
+
+    return min((live[name] for name in eligible), default=_ZERO)
 
 
 # --- Conservation -----------------------------------------------------------
@@ -602,50 +766,121 @@ def test_a_forced_post_layer_is_only_emitted_when_it_caps_somebody_out(hand):
 
 @given(hand=forced_post_hand())
 @SETTINGS
-def test_no_seat_is_paid_more_than_the_table_matched_of_its_own_commitment(hand):
-    """The cap a side pot exists to enforce, stated as an invariant.
+def test_a_seat_that_wins_every_layer_it_can_is_paid_exactly_the_model_cap(hand):
+    """THE payout property. It replaces two that agreed with the reducer's own error.
 
-    A seat can win, from each opponent still in the hand, only as much as that
-    opponent matched of what the seat itself put up — plus whatever folded seats
-    abandoned and whatever dead money the others owed the table. Deriving the pot
-    layers from LIVE contributions alone broke this for the whole
-    ``live == 0 and dead > 0`` family: a seat all-in for nothing but a forced post
-    had no live level, so no layer was ever capped at its commitment and it
-    contested every chip of the first live layer. Three ante chips took twenty-three.
+    Award every layer to one seat wherever that seat is eligible. The chips it
+    collects must be, to the chip:
 
-    Nothing about that was loud — chip conservation held, so the ledger reported
-    balanced, settled and legal with no warning — which is why the guarantee has
-    to be asserted directly rather than inferred from the balance verdicts.
+        its own live money back
+        + the LIVE chips each opponent matched of it
+        + the whole dead pool, if it contests the main pot
+
+    and a seat that contests no layer must be paid nothing. Stated as EQUALITY
+    rather than as an upper bound on purpose: an inequality catches only
+    overpayment, and half the disagreements this model resolved were the pot
+    layers holding dead money ABOVE the main pot, which UNDERPAYS the short seat
+    the antes it is owed. One assertion catches both directions and, swept over
+    every seat of a hand, pins every layer amount in the ladder.
+
+    WHAT THIS REPLACES, AND WHY THE OLD ONE COULD NOT CATCH WHAT IT WAS FOR.
+    The property here used to cap a seat at
+
+        in_pot[name] + sum(min(in_pot[other], put_up[name]) for unfolded others)
+        + sum(in_pot[other] for folded others)
+        + sum(dead[other] for unfolded others)
+
+    with ``put_up`` = the seat's contribution INCLUDING ITS OWN DEAD POSTS and
+    ``in_pot`` = the opponent's contribution including THAT OPPONENT'S dead posts.
+    That is not an independent check of the reducer; it is the reducer's own
+    modelling error written down a second time. ``_build_pots`` cut its first
+    boundary at a short seat's live-plus-dead TOTAL, and this expression measured
+    against exactly the same total, so the two agreed by construction and their
+    agreement carried no information. On the reported hand -- big-blind ante of
+    10, stacks 26/500/500 -- it evaluates to min(26,26) + min(20,26) + min(20,26)
+    = 66, which is to the chip the number the reducer produced and 8 chips more
+    than the 58 the model owes: the big blind was paid 4 live chips by each of two
+    opponents that neither had wagered against it, and the hand reported settled,
+    balanced and legal with no warning. 3110 passing tests did not see it because
+    the invariant encoded the same error as the code.
+
+    The replacement takes its cap from the specification instead
+    (``_model_payout_cap``), so the two sides can disagree. On the same hand it
+    gives 16 + min(20,16) + min(20,16) + 10 = 58.
     """
-    ledger = build_hand_ledger(hand.players, hand.actions)
-    put_up = {name: Decimal(str(ledger.contributions[name])) for name in hand.names}
-    in_pot = {
-        name: put_up[name] - Decimal(str(ledger.refunds[name])) for name in hand.names
-    }
-    others = {
-        name: [other for other in hand.names if other != name] for name in hand.names
-    }
+    dead_money = float(hand.external_dead)
+    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money)
+    assume(ledger.pots)
+    live, pool = _model_figures(hand, ledger)
+    contests_main = set(ledger.pots[0].eligible_players)
+    # Rule 3 is checked, not borrowed. Taking the eligible set off the ledger and
+    # then asserting the cap FOR THAT SET is agreement by construction: widen the
+    # main pot to a seat that put nothing up and the cap widens with it.
+    assert contests_main == _model_main_pot_eligibility(hand), (
+        "the main pot's eligible set is not the unfolded seats that put a chip up"
+    )
+
     for name in hand.names:
         settled = build_hand_ledger(
-            hand.players, hand.actions, _winner_map(ledger.pots, (name,))
+            hand.players,
+            hand.actions,
+            _winner_map(ledger.pots, (name,)),
+            dead_money=dead_money,
         )
         if not settled.is_settled:
             continue
-        matched = in_pot[name] + _sum(
-            min(in_pot[other], put_up[name])
-            for other in others[name]
-            if other not in hand.folded
+        paid = Decimal(str(settled.payouts[name]))
+        if name in contests_main:
+            assert paid == _model_payout_cap(name, live, pool, True), (
+                f"{name} wins every layer it is eligible for and is not paid the "
+                "chips the model says it is owed"
+            )
+        else:
+            # Folded, or in the hand having put nothing up. Eligibility is nested,
+            # so a seat out of the main pot is out of every layer.
+            assert paid == _ZERO, f"{name} contests no layer and was paid {paid}"
+
+
+@given(hand=forced_post_hand(), policy=rake_policy())
+@SETTINGS
+def test_no_declared_settlement_can_pay_a_seat_past_the_model_cap(hand, policy):
+    """The same cap as an upper bound, under rake and after a chop.
+
+    The equality above is stated over one specific award map. This one sweeps
+    arbitrary ones -- every layer chopped between every seat eligible for it,
+    with a raked policy on top -- because the bound has to hold of a seat's actual
+    share AFTER the split and after the drop, not of the layer it came out of.
+    A rake allocator that moved a chip from one layer to another, or a split that
+    handed an odd chip across a boundary, would break this while leaving the
+    ladder itself correct.
+    """
+    dead_money = float(hand.external_dead)
+    ledger = build_hand_ledger(
+        hand.players, hand.actions, dead_money=dead_money, rake=policy
+    )
+    assume(ledger.pots)
+    live, pool = _model_figures(hand, ledger)
+    contests_main = set(ledger.pots[0].eligible_players)
+    awards = {
+        pot.index: tuple(pot.eligible_players)
+        for pot in ledger.pots
+        if pot.eligible_players
+    }
+    assume(len(awards) == len(ledger.pots))
+    settled = build_hand_ledger(
+        hand.players,
+        hand.actions,
+        awards,
+        dead_money=dead_money,
+        rake=policy,
+        odd_chip_order=tuple(hand.names),
+    )
+    for name in hand.names:
+        paid = Decimal(str(settled.payouts[name]))
+        assert paid >= _ZERO
+        assert paid <= _model_payout_cap(name, live, pool, name in contests_main), (
+            f"{name} was paid past the live chips its opponents matched of it"
         )
-        # A seat that folded left everything it had in the pot behind, and dead
-        # money is owed to the table rather than wagered at anybody, so neither
-        # is bounded by what this seat covered.
-        abandoned = _sum(in_pot[other] for other in others[name] if other in hand.folded)
-        owed_to_the_table = _sum(
-            hand.dead[other] for other in others[name] if other not in hand.folded
-        )
-        assert Decimal(str(settled.payouts[name])) <= (
-            matched + abandoned + owed_to_the_table
-        ), f"{name} was paid more than the table matched of its own commitment"
 
 
 # --- Splits -----------------------------------------------------------------
@@ -789,18 +1024,25 @@ def test_unequal_dead_money_alone_never_splits_the_pot(hand):
     The generator reaches this on every hand with a button ante or a dead blind
     where the action closes, which is why it is stated over the whole family
     rather than as one example.
+
+    Counted over CONTESTABLE layers rather than over all of them. A line in which
+    every seat that wagered above the line folded leaves chips in a band no
+    remaining seat is eligible for; the model strands that band rather than
+    merging it down into a pot a short seat could win. Such a band is not a pot
+    boundary in the sense this property is about -- nobody is being held apart
+    from anybody -- and counting it would make the property assert the merge-down
+    that the payout cap exists to forbid.
     """
-    ledger = build_hand_ledger(hand.players, hand.actions)
+    dead_money = float(hand.external_dead)
+    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money)
     assume(ledger.pots)
-    settled_live = {
-        name: hand.live[name] - Decimal(str(ledger.refunds[name]))
-        for name in hand.names
-    }
+    settled_live, _pool = _model_figures(hand, ledger)
     contenders = [name for name in hand.names if name not in hand.folded]
     assume(contenders)
     line = max(settled_live[name] for name in contenders)
     if all(settled_live[name] == line for name in contenders):
-        assert len(ledger.pots) == 1, (
+        contestable = [pot for pot in ledger.pots if pot.eligible_players]
+        assert len(contestable) == 1, (
             "every seat still in the hand covered the same live wager, so there "
             "is nothing for a second layer to hold apart"
         )
@@ -808,119 +1050,179 @@ def test_unequal_dead_money_alone_never_splits_the_pot(hand):
 
 @given(hand=forced_post_hand())
 @SETTINGS
-def test_every_layer_boundary_is_a_clean_cut_that_drops_a_short_seat(hand):
-    """The rule stated from the other side, in the two halves it needs.
+def test_every_layer_boundary_is_a_clean_cut_at_a_live_contribution_level(hand):
+    """The ladder half of the model: WHERE a boundary may be drawn, and on WHAT.
 
-    This replaces an earlier property that asserted the strictly stronger -- and
-    false -- "every seat a boundary drops is live-short". That statement is the
-    phantom-side-pot repair's own defect written down as an invariant: exempting
-    seats that covered the live line from a cut that has already been drawn left
-    two seats holding identical commitments on opposite sides of one boundary,
-    and the one on the high side could be paid past what the table matched of its
-    commitment. What is true is the pair below, and together they are what kills
-    the phantom:
+    This is the property that forbids the phantom side pot, and its currency is
+    the whole point. It used to assert the clean cut over each seat's TOTAL
+    commitment --
+
+        max(put_up[dropped]) <= min(put_up[kept])
+
+    -- which is the reducer's modelling error stated as an invariant: it is
+    satisfied by a boundary cut at a seat's live-plus-ante total, and satisfied by
+    nothing else. On the big-blind ante hand the big blind's total of 26 exceeds
+    the 20 of the two seats kept in the layer above it, so the CORRECT ladder
+    fails that assertion outright. A folded seat's ante can put it on the wrong
+    side of a cut it has nothing to do with.
+
+    The cut is on LIVE money, and on live money the statement is not merely true
+    but strict:
 
     * WHERE. A boundary exists only where a seat still in the hand stopped short
       of the live wagering. Unequal dead money cannot open one, because no
-      opponent can decline a forced post. Without this the reported hand -- one
-      seat's ante against another's dead blind, nobody all-in -- derived a side
-      pot the winner of the hand was refused.
-    * HOW. Once a boundary is drawn it is a clean threshold on each seat's own
-      commitment: every seat left out of the layer above put in strictly less
-      than every seat kept in. Without this a cut applies to some seats and not
-      others, which is not a rule that can be stated to an operator.
+      opponent can decline a forced post, and a seat's own dead posts cannot
+      raise the level its opponents are charged into the layer below at.
+    * HOW. Every seat dropped by a boundary wagered strictly less live money than
+      every seat kept, so the cut is a threshold on live contribution and nothing
+      else. Eligibility is therefore recoverable from the live figures alone,
+      which is asserted directly below.
     """
-    ledger = build_hand_ledger(hand.players, hand.actions)
-    put_up = {name: Decimal(str(ledger.contributions[name])) for name in hand.names}
-    settled_live = {
-        name: hand.live[name] - Decimal(str(ledger.refunds[name]))
-        for name in hand.names
-    }
+    dead_money = float(hand.external_dead)
+    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money)
+    live, _pool = _model_figures(hand, ledger)
     contenders = [name for name in hand.names if name not in hand.folded]
     assume(contenders)
-    line = max(settled_live[name] for name in contenders)
-    short = {name for name in contenders if settled_live[name] < line}
+    line = max(live[name] for name in contenders)
+    short = {name for name in contenders if live[name] < line}
     for lower, upper in zip(ledger.pots, ledger.pots[1:], strict=False):
-        assert set(upper.eligible_players) <= set(lower.eligible_players)
+        assert set(upper.eligible_players) < set(lower.eligible_players), (
+            f"layer {upper.index} does not strictly narrow the layer below it"
+        )
         dropped = set(lower.eligible_players) - set(upper.eligible_players)
-        assert dropped, f"layer {upper.index} exists but caps nobody out"
         assert dropped & short, (
             f"layer {upper.index} was opened without stopping anybody short of the "
             f"live wager: it dropped {sorted(dropped)}, none of whom declined a chip"
         )
-        assert max(put_up[name] for name in dropped) <= min(
-            put_up[name] for name in upper.eligible_players
+        if not upper.eligible_players:
+            continue
+        assert max(live[name] for name in dropped) < min(
+            live[name] for name in upper.eligible_players
         ), (
-            f"layer {upper.index} is not a clean cut: it dropped "
-            f"{sorted(dropped)} while keeping a seat that put in no more"
+            f"layer {upper.index} is not a clean cut on live money: it dropped "
+            f"{sorted(dropped)} while keeping a seat that wagered no more"
         )
+        # And the threshold is exact in both directions: every unfolded seat that
+        # reached the level is IN, every seat that did not is OUT. A boundary at a
+        # total-contribution level fails this -- it separates seats holding equal
+        # live money, which is the phantom in its purest form.
+        threshold = _eligibility_threshold(upper.eligible_players, live, contenders)
+        assert set(upper.eligible_players) == {
+            name for name in contenders if live[name] >= threshold
+        }, f"layer {upper.index} is not a threshold on live contribution"
 
 
 @given(hand=forced_post_hand())
 @SETTINGS
-def test_a_seat_short_of_the_live_wager_wins_no_more_than_its_own_total(hand):
-    """The cap that keeps the widening above from being an overpayment.
+def test_every_dead_chip_is_in_the_main_pot_and_no_layer_above_it_holds_one(hand):
+    """Rule 2, stated so that a leak in either direction is caught.
 
-    A seat that did not cover the live wagering -- all-in for less, or a recorded
-    line that stops before its answer -- can win, from each opponent, only as much
-    as that opponent put in up to the short seat's own total commitment. This is
-    the round-16 guarantee restated against the live line rather than against the
-    all-in flag, because a truncated line produces a seat that is short without
-    being all-in and it must be capped exactly the same way.
+    All dead money -- antes, big-blind antes, dead blinds, and dead money declared
+    for the table -- goes into the LOWEST layer whole. Two consequences, and the
+    reason both are asserted rather than one:
 
-    A FOLDED seat's chips are outside the cap, and that is the reducer's own
-    documented rule rather than a concession to make this pass. ``_build_pots``
-    merges a level nobody left in the hand can win DOWN -- "folded money is
-    abandoned to whoever wins: merge it down rather than strand it" -- and that
-    branch fires exactly when every seat contributing at the level has folded
-    (a non-folded contributor at level L always has a ceiling of at least L, so
-    it is always eligible there). The chips a short seat can therefore receive
-    above its own total come only from seats that gave them up.
+    * the main pot is never smaller than the dead pool. When the reducer carried
+      part of the antes UP into a side pot the short seat could not win, the short
+      seat was underpaid the antes it was owed, and that was 58.6% of the
+      disagreements the model resolved -- more than the overpayment shape, and
+      completely silent, because chip conservation still held.
+    * everything above the main pot is purely live, so the layers above it total
+      exactly the live money wagered above the main pot's ceiling.
 
-    Nothing about the guarantee against seats STILL IN THE HAND changes: their
-    contributions are still capped at the short seat's own total, which is what
-    round 16 pinned -- there, a seat all-in for one ante chip took a POSTER's
-    ante, and the poster had not folded.
-
-    This was found by running the suite at 2500 examples with
-    ``--hypothesis-seed=1``, which reaches a hand where one seat's dead blind and
-    live small blind total 6 before it folds, against two seats holding 2 each.
-    It reproduces identically on the commit before the blind-structure work, so
-    it is a gap in this cap's model of the reducer and not a regression in it.
+    The second is stated through the main pot's own live ceiling, recovered from
+    the ladder rather than from the reducer: it is the highest live level whose
+    threshold set is still the main pot's eligible set. A hand whose main pot is
+    nothing but dead money has a ceiling of zero, and every live chip is above it.
     """
-    ledger = build_hand_ledger(hand.players, hand.actions)
-    put_up = {name: Decimal(str(ledger.contributions[name])) for name in hand.names}
-    in_pot = {
-        name: put_up[name] - Decimal(str(ledger.refunds[name])) for name in hand.names
-    }
+    dead_money = float(hand.external_dead)
+    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money)
+    assume(ledger.pots)
+    live, pool = _model_figures(hand, ledger)
     contenders = [name for name in hand.names if name not in hand.folded]
     assume(contenders)
-    line = max(hand.live[name] - Decimal(str(ledger.refunds[name])) for name in contenders)
+
+    assert Decimal(str(ledger.pots[0].amount)) >= pool, (
+        "the main pot holds less than the dead money owed to the table, so part "
+        "of it leaked into a layer the seats that owed it may not be able to win"
+    )
+    if len(ledger.pots) == 1:
+        return
+    contests_main = set(ledger.pots[0].eligible_players)
+    ceiling = max(
+        [_ZERO]
+        + [
+            level
+            for level in {live[name] for name in hand.names if live[name] > 0}
+            if {name for name in contenders if live[name] >= level} == contests_main
+        ]
+    )
+    above = _sum(pot.amount for pot in ledger.pots[1:])
+    assert above == _sum(
+        max(_ZERO, live[name] - ceiling) for name in hand.names
+    ), "the layers above the main pot do not hold exactly the live money above it"
+
+
+@given(hand=forced_post_hand())
+@SETTINGS
+def test_a_seat_short_of_the_live_wager_is_paid_only_the_live_chips_it_was_matched(hand):
+    """The short seat's cap, with no free pass for a folded opponent.
+
+    This replaces a property whose cap was
+
+        sum(in_pot[other] if other in folded else min(in_pot[other], put_up[name]))
+
+    with ``put_up`` and ``in_pot`` both including their own seat's DEAD posts. Two
+    separate errors sat in that one line, and both of them pointed the same way as
+    the reducer, which is why 3110 tests agreed with a layering that pays a
+    live-short seat chips no opponent matched:
+
+    * ``put_up[name]`` conflated the seat's live wager with its own antes. A seat
+      live-short by 5 with a 5 ante was allowed to be paid as though it had
+      wagered 5 more than it did, from every opponent. On the reported big-blind
+      ante hand the expression came out at 66 -- exactly the number the reducer
+      produced, and 8 more than the 58 the model owes.
+    * the folded-seat free pass let a folded opponent contribute its ENTIRE
+      commitment to the cap. That was a concession to the reducer's old
+      "merge an unwinnable layer DOWN rather than strand it" branch, which is
+      itself the sixth critical waiting to happen: merging folded chips down past
+      a short seat's live level pays that seat money nobody wagered at it. The
+      model strands such a layer instead, so a folded opponent is capped at
+      ``min(live[other], live[name])`` like everybody else and the free pass is
+      not needed.
+
+    THE SEED-1 WEAKENING, REVISITED. That docstring recorded the free pass being
+    added after ``--hypothesis-seed=1`` at 2500 examples reached "a hand where one
+    seat's dead blind and live small blind total 6 before it folds, against two
+    seats holding 2 each", and nobody acted on the signal. Under the correct model
+    that hand is fully explicable and needs no weakening: the folded seat's live
+    money above 2 sits in a band whose eligible set is empty, and an empty band is
+    stranded, not merged down, so no seat holding 2 can be paid out of it. The
+    tight cap below is asserted with no exception for folded seats, and the suite
+    is run at that seed and example count to prove the hand no longer escapes it.
+    """
+    dead_money = float(hand.external_dead)
+    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money)
+    assume(ledger.pots)
+    live, pool = _model_figures(hand, ledger)
+    contenders = [name for name in hand.names if name not in hand.folded]
+    assume(contenders)
+    line = max(live[name] for name in contenders)
+    contests_main = set(ledger.pots[0].eligible_players)
+
     for name in contenders:
-        if hand.live[name] - Decimal(str(ledger.refunds[name])) >= line:
+        if live[name] >= line:
             continue
         settled = build_hand_ledger(
-            hand.players, hand.actions, _winner_map(ledger.pots, (name,))
+            hand.players,
+            hand.actions,
+            _winner_map(ledger.pots, (name,)),
+            dead_money=dead_money,
         )
         if not settled.is_settled:
             continue
-        cap = _sum(
-            in_pot[other]
-            if other in hand.folded
-            else min(in_pot[other], put_up[name])
-            for other in hand.names
-        )
-        assert Decimal(str(settled.payouts[name])) <= cap, (
-            f"{name} stopped short of the live wager and was paid past its own total"
-        )
-        # And the half of the old cap that is still exact: no seat that stayed in
-        # the hand may give a short seat a chip above that short seat's own total.
-        from_contenders = Decimal(str(settled.payouts[name])) - _sum(
-            in_pot[other] for other in hand.folded
-        )
-        assert from_contenders <= _sum(
-            min(in_pot[other], put_up[name]) for other in contenders
-        ), f"{name} was paid past its own total out of live seats' chips"
+        assert Decimal(str(settled.payouts[name])) <= _model_payout_cap(
+            name, live, pool, name in contests_main
+        ), f"{name} stopped short of the live wager and was paid past what it was matched"
 
 
 # --- The blind structure ----------------------------------------------------

@@ -647,14 +647,49 @@ The other standing rules in this area:
 - **No pot may be raked past its own size.** Each share is capped at its own pot
   and the rounding leftover is offered to the layers in order, each taking only
   what it still has room for.
-- **A pot layer is cut only where somebody was short of live money**, and once
-  cut it applies to every seat by that seat's own total, forced posts included.
-  Nobody can decline a forced post, so unequal dead money never opens a layer;
-  being all-in does not either, if the all-in covered the wager. This rests on a
-  modelling choice no rulebook settles cleanly and the honest verdict on the
-  module is not-yet-caught rather than correct; the argument is written down in
-  `poker_tracker/math/accounting.py` and the history is in
-  `cv_lab/notes/17_release_adversarial_rounds.md`.
+- **A pot layer is cut at a LIVE contribution level and nowhere else**, and once
+  cut it applies to every seat by that seat's own live contribution. All dead
+  money — antes, dead blinds, declared dead money — goes whole into the lowest
+  layer: nobody can decline a forced post, so unequal dead money never opens a
+  layer, and a short seat's own forced posts never raise the level its opponents
+  are charged into the main pot at. Being all-in does not open a layer either, if
+  the all-in covered the wager. Cutting at a seat's TOTAL commitment instead was
+  the round-19 critical: a seat live-short behind an ante was paid live chips no
+  opponent had wagered against it, and the hand reported settled, balanced and
+  legal with no warning. The model is written down in
+  `poker_tracker/math/accounting.py::_build_pots`, its acceptance criteria are
+  `tests/test_accounting_pot_layering_model.py`, and the history is in
+  `cv_lab/notes/17_release_adversarial_rounds.md`. The honest verdict on the
+  module is still not-yet-caught rather than correct.
+- **What is dead is decided by what the row IS, not by the kind that carries it.**
+  A forced post which took its poster's last chip is routinely booked as `all-in`
+  with `actions.forced_bet_type` / `actions.is_live_post` carrying the truth, and
+  both columns are operator-editable on every action row. The money classifier
+  read `action_type` alone, so that row was counted as chosen live money — and
+  under the live-level model live money is the only thing that opens a boundary,
+  so a dead ante became a live level and the seat was paid live chips no opponent
+  had wagered against it. `_is_live_money` now decides it through the same
+  `_is_forced_post` / `_is_live_structural_post` pair the blind-structure refusal
+  already used, so every spelling of one event derives byte-identical chips.
+- **OPEN, and refused rather than answered: an unmatched forced post larger than
+  a main-pot seat's whole commitment.** Rule 2 is unconditional and worked
+  examples (a) and (d) both require it — in (a) the big blind's unmatched 10 ante
+  sits in a main pot the two deep seats may win. But in all four worked examples
+  every forced post is within reach of every seat that may win it, so none of them
+  decides the case where it is not: antes of 100 with a 40-chip stack short of its
+  own ante pays that stack all five opponents' full antes (540, where each covered
+  40), and a button ante of 200 against a one-chip all-in pays that seat 204.
+  Capping a forced post at the shortest main-pot seat's total commitment
+  reproduces all four worked examples AND both of those hands, so the reading is
+  genuinely open and only the operator can close it. Until then the ledger changes
+  no chip and emits a named warning; `_cross_check` folds ledger warnings into its
+  issues, so such a hand is `needs_correction` and never authoritative. Pinned by
+  `tests/test_accounting_pot_layering_model.py::test_a_forced_post_no_main_pot_seat_could_cover_is_not_study_ready`
+  and
+  `tests/test_hand_accounting_service.py::test_a_forced_post_no_seat_could_cover_is_refused_as_study_ready`.
+  Note that `_model_payout_cap` in the property suite encodes rule 2 as written,
+  so the suite will actively reject the capped alternative; it is evidence that
+  the code matches the model, never that the model is right.
 - **Dead money and a declared rake are mirror images and both are measured.** Dead
   money creates chips the observed action line never saw; a rake policy destroys
   them. Neither widens a tolerance — both move the derived side of the
@@ -2482,7 +2517,7 @@ Spawn a second fresh agent with instructions to:
 
 ## Where the adversarial gate stands
 
-**Four whole-product rounds have run. Every one of them found criticals. The
+**Five whole-product rounds have run. Every one of them found criticals. The
 clean-round counter is 0 of the required 2.**
 
 | Round | Repairs carried by | What it found |
@@ -2491,6 +2526,7 @@ clean-round counter is 0 of the required 2.**
 | 2 | `e8c0e49`, `ed0f403` | Two criticals in pot accounting, both introduced by this program's own repair to the previous defect. Plus retention deleting regression fixtures, and redaction that made a quoted secret strictly *more* exposed than an unquoted one. |
 | 3 | `3c3144e`, `5e1cec8`, `ba3cb2d` | Three more criticals in the same module: a forced-post-only seat contesting a whole live layer, a stale award raising out of the reconciler, and unequal dead money manufacturing a side pot nobody was all-in for. |
 | 4 | uncommitted (blind structure) | Two criticals in the blind-structure repair itself: the short-post refusal was decided at the instant the blind row was reduced, so moving a seat's ante below its blind silently turned a blocked hand into a reconciled one; and a transposed structure written through `model_copy` (which skips validators) was salvaged by the reader into a smaller *valid* structure, whose floor then covered the very post it was declared to expose. A third finding — the refusal never reaches a forced post the recording does not identify as one, which is every short blind the CV spine emits — is real, is only partly repaired, and is now stated as a limit rather than a guarantee. |
+| 5 | uncommitted (live-level pot model) | One critical in the same module, again in the repair to the previous defect: the live/dead money classifier still keyed on `action_type` alone, so a forced post booked as `all-in` with its `forced_bet_type` recorded — the shape the hand editor and the CV spine both produce — was counted as chosen live money. Under the new live-level model that opened a boundary and paid a seat live chips no opponent had wagered against it, settled, balanced, legal and warning-free. Two further findings are real, reproduced, and **not** repaired: they are consequences of rule 2 of the operator's pot model, not deviations from it, and they need an operator ruling rather than a fifth in-session model rewrite. They are refused as study-ready in the meantime. |
 
 The findings themselves are recorded in
 `cv_lab/notes/17_release_adversarial_rounds.md`.
@@ -2502,8 +2538,8 @@ and neither has ever reached 1.
 
 Two things about this record matter more than the count:
 
-1. **The accounting module has now produced a critical in four consecutive
-   rounds, and three times the critical was introduced by the repair to the one
+1. **The accounting module has now produced a critical in five consecutive
+   rounds, and four times the critical was introduced by the repair to the one
    before.** Round 2's eligibility override was added to stop a short-stacked hand
    being unrecordable, and it turned a loud refusal into a quiet elevenfold
    overpayment — the worse of the two failures. A repair in this module is not
@@ -2516,7 +2552,7 @@ Two things about this record matter more than the count:
    checking, and that is why the stopping rule is two consecutive clean rounds
    with fresh agents rather than a green suite.
 
-Round 5 is the first round eligible to count, once no further change lands.
+Round 6 is the first round eligible to count, once no further change lands.
 Repairs land *before* the next round starts, and any code, schema, dependency or
 release-configuration change between two rounds resets the counter.
 # Final local/private-beta acceptance sequence

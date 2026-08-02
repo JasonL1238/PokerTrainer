@@ -255,12 +255,28 @@ is never charged to a pot beyond what that pot holds.
 declined or could not answer chips an opponent actually risked. Nobody can decline
 an ante or a blind, so unequal dead money never creates a side pot, and being
 all-in does not either when the all-in covered the wager. Once a cut is drawn it
-applies to every seat by that seat's own total, forced posts included, which is
-what keeps a seat all-in for nothing but its ante eligible for the layer holding
-its chips and capped at what it actually covered. If the editor shows you a pot
+applies to every seat by that seat's own **live** contribution: an opponent never
+matches your ante, so your own forced posts cannot raise the level the rest of the
+table is charged into the pot below at. Every dead chip — antes, dead blinds and
+any dead money you declare — goes whole into the main pot, which is what keeps a
+seat all-in for nothing but its ante eligible for the layer holding its chips.
+Which chips are dead is decided by **what the row is, not by how it was spelled**:
+a forced post that took its poster's last chip is often recorded as an all-in, and
+the `Forced post` and `Post status` fields on an action row are what the ledger
+reads, so relabelling one row cannot move a chip.
+
+**One case is deliberately refused rather than answered.** When a seat is all-in
+for less than *another* seat's forced post — a stack short of its own ante, or a
+one-chip all-in against a button ante — the main pot hands that seat the whole
+forced post, more than any opponent covered of it. Whether an unmatched forced
+post should be capped at what the winner covered is a question about the pot model
+itself, and the ledger does not answer it: the chips are still derived and the
+hand is still legal and balanced, but it is reported as **not study-ready** with
+the seat, the poster and both numbers named, so it can never be published as
+authoritative while the question is open. If the editor shows you a pot
 you cannot explain from the action line, that is worth reporting rather than
 declaring around: the honest verdict on this part of the ledger is *not yet
-caught* rather than *correct*, and four separate adversarial rounds have found
+caught* rather than *correct*, and five separate adversarial rounds have found
 criticals in it.
 
 What you type in `Chip unit` **does** change derived payouts, because rounding the

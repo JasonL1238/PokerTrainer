@@ -275,3 +275,99 @@ whole family of hands.
 
 The counter is 0 of the required 2 and every round to date has found a critical.
 `PLAN.md` carries that status; this note carries only what was found.
+
+---
+
+## Round 5 — the live-level pot model
+
+The operator replaced the layering rule outright: boundaries are cut at distinct
+LIVE contribution levels after refunds; all dead money goes whole into the lowest
+layer; a seat is eligible for a layer if its own live contribution reaches that
+layer's level, and every unfolded seat that put any chip up contests the main
+pot. Four worked examples were handed down as acceptance criteria. All four are
+reproduced exactly by the shipped reducer and by an independently written
+harness: (a) big-blind ante 58/8 with the poster net +32, (b) ante-only seat 7/14
+net 0, (c) 3/20 net +2, (d) one pot of 88 any of the four may win.
+
+### The critical: the money classifier was still keyed on the action kind
+
+`_build_pots` was faithful. What it was HANDED was not. Liveness was decided by
+
+    action.kind in _BETTING_COMMITMENT_KINDS and not (
+        action.kind == "post_blind" and not action.is_live_post
+    )
+
+so a forced post booked as `all-in` carrying `forced_bet_type="ante"` — the shape
+the hand editor writes from its two selectboxes and the shape a post which took
+its poster's last chip normally has — was counted as chosen live money. The
+module had already ruled on this exact row twice, 370 lines further down, for the
+blind-structure refusal; the money classifier was the one place not widened.
+
+Under the OLD total-commitment layering the misclassification was nearly
+harmless, because moving a chip between the live and dead columns left the
+boundary where it was. Under the live-level model live money is the only thing
+that opens a boundary and the only thing that decides eligibility above the main
+pot, so the same relabel moved chips between layers: worked example (c) paid its
+ante-only seat +4 instead of +2, and a 10-ante hand paid a 10-chip stack 30 chips
+its three opponents never wagered against it — settled, balanced, legal,
+warning-free, `is_authoritative=True`, `status="reconciled"`.
+
+Repaired by `_is_live_money`, which asks `_is_forced_post` / `_is_live_structural_post`
+rather than the kind, plus the mirror of the same test in `build_ledger_from_records`
+(the raise-to baseline, where a relabelled ante made "raise to 40" mean two
+different chip amounts). A row the recording NAMES as a dead forced bet is dead
+even when the separate post-status field was left at its live default.
+
+The property suite could not see any of this: its generator emitted no
+`forced_bet_type` at all and classified its own live/dead bookkeeping from the
+kind, so the input family was unreachable. With the generator widened, four
+independent properties fail against the pre-repair reducer.
+
+### Two findings NOT repaired, and why
+
+Two adversaries independently reproduced the same thing: a seat all-in for less
+than *another* seat's forced post is paid that post in full. Antes of 100 with a
+40-chip stack short of its own ante pays it 540 where five opponents covered 40
+apiece; a button ante of 200 against a one-chip all-in pays that seat 204. Both
+reproduce end to end as authoritative and both are regressions against the old
+total-commitment layering, which got them right.
+
+Neither is a deviation from the specification. They are rule 2 — "ALL dead money
+goes entirely into the LOWEST layer" — doing exactly what it says, in a
+configuration none of the four worked examples reaches: in (a) and (b) the
+unmatched post is the short seat's OWN, in (c) each opponent's ante exactly equals
+the short seat's whole commitment, in (d) nobody is short. Rules 2 and 4 as
+written also make (a) and (d) impossible any other way: (a) requires the big
+blind's unmatched 10 ante to sit in a main pot the two DEEP seats may win, so
+unmatched dead money demonstrably is shared.
+
+A model does exist that satisfies all four worked examples and both hands: cap
+each contributor's dead chips, for placement in the lowest layer, at the smallest
+TOTAL commitment among that layer's eligible seats, and push the excess up. It
+opens no new boundary, so it is compatible with rule 1 and with (d)'s single pot.
+It is not implemented here. Four of the five criticals in this module were
+introduced by an in-session repair that argued its way past the previous model,
+and this is the fifth invitation to do it again. It needs an operator ruling.
+
+In the meantime the hand is not published. No chip figure changes; a warning
+names the seat, the poster and both numbers, and `_cross_check` folds ledger
+warnings into its issues, so the hand is `needs_correction` and never
+authoritative. A wrong prediction that is visibly rejected is a coverage
+limitation.
+
+### What the replacement invariant is and is not
+
+`_model_payout_cap` states the payout in the spec's own terms and is genuinely
+independent of `_build_pots` for AMOUNTS: eight mutations of the reducer were
+tried and the six that are not semantic no-ops were all caught, including a
+revert to the round-4 total-commitment cut. It was NOT independent for
+ELIGIBILITY — it read the main pot's eligible set off the ledger and then asserted
+the cap for that set, so widening the main pot widened the cap with it. Rule 3 is
+now derived in the suite and asserted, not borrowed.
+
+Two limits remain. The generator still cannot produce an unfolded seat that put
+no chip up, so the eligibility assertion is not exercised by fuzzing (one
+hand-written test covers it). And `_model_payout_cap` encodes rule 2 as written,
+so it actively REJECTS the capped alternative above — it is evidence that the
+code matches the model, never that the model is right. That distinction is the
+whole reason this module has produced five consecutive criticals.

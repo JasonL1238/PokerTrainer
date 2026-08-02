@@ -640,8 +640,19 @@ def test_a_player_all_in_for_their_ante_can_still_win_the_pot() -> None:
 
     Widening the first layer's eligible set to fix that overshot: the layer was
     still sized by the LIVE wagering, so the short stack contested 35 chips
-    having covered 5. It must be eligible for a layer capped at what it covered
-    — 5 from each of the three seats — and for nothing above it.
+    having covered 5.
+
+    Cutting the layer at the short stack's TOTAL instead -- what this test
+    asserted for three rounds, as ``[15, 20]`` with the short stack paid 15 --
+    overshot the other way. ``short`` wagered NO live money: its whole commitment
+    is an ante, which ``B`` and ``C`` never matched and never could, because an
+    ante is owed to the table rather than wagered at anybody. Charging them 5 live
+    chips each into a layer ``short`` can win paid it 10 chips nobody had put up
+    against it, and reported the hand settled, balanced and legal with no warning.
+
+    What ``short`` is owed is the dead money -- here its own ante and nothing
+    else, since neither opponent posted one -- so it wins 5 and comes out at
+    exactly zero, and the 30 of live betting it never covered is a layer above it.
     """
     players = [
         _player("short", stack=5),
@@ -655,12 +666,12 @@ def test_a_player_all_in_for_their_ante_can_still_win_the_pot() -> None:
     ]
     unsettled = build_hand_ledger(players, actions)
     assert "short" in unsettled.pots[0].eligible_players
-    assert [pot.amount for pot in unsettled.pots] == pytest.approx([15, 20])
+    assert [pot.amount for pot in unsettled.pots] == pytest.approx([5, 30])
     assert "short" not in unsettled.pots[1].eligible_players
 
     ledger = build_hand_ledger(players, actions, {0: ("short",), 1: ("B",)})
-    assert ledger.payouts["short"] == pytest.approx(15)
-    assert ledger.net_results["short"] == pytest.approx(10)
+    assert ledger.payouts["short"] == pytest.approx(5)
+    assert ledger.net_results["short"] == pytest.approx(0)
     assert sum(ledger.net_results.values()) == pytest.approx(0)
     assert ledger.is_balanced is True
 
@@ -737,11 +748,12 @@ def test_only_a_layer_that_caps_eligibility_is_called_a_side_pot() -> None:
 def test_a_seat_all_in_for_only_an_ante_caps_the_layer_above_it() -> None:
     """A forced post can be the whole stack, and that still makes a side pot.
 
-    The short stack's chips are dead, but they are still what it covered, so the
-    level set has to be drawn from total commitments. Pooling them into the main
-    pot and widening that pot's eligible set instead left the layer sized by the
-    live wagering the short stack never matched -- and this test asserted that as
-    correct while its own name states the opposite.
+    The cap is real; where it sits is what changed. The level set is drawn from
+    LIVE contributions, and ``short`` has none, so the boundary is at live level
+    zero: the main pot is the dead money alone and every live chip is above it.
+    Drawing the level set from TOTAL commitments instead put the boundary at 5 and
+    charged both opponents 5 live chips into a layer ``short`` could win, which is
+    money neither of them wagered against it.
     """
     players = [_player("short", stack=5), _player("B"), _player("C")]
     actions = [
@@ -752,7 +764,7 @@ def test_a_seat_all_in_for_only_an_ante_caps_the_layer_above_it() -> None:
     layers = build_hand_ledger(players, actions).pots
 
     assert [pot.cause for pot in layers] == ["main", "side"]
-    assert [pot.amount for pot in layers] == pytest.approx([15, 20])
+    assert [pot.amount for pot in layers] == pytest.approx([5, 30])
     assert layers[0].eligible_players == ("short", "B", "C")
     assert layers[1].eligible_players == ("B", "C")
 
@@ -803,7 +815,17 @@ def test_a_seat_all_in_for_its_ante_cannot_win_the_live_betting_it_never_covered
 
 
 def test_a_seat_all_in_for_a_dead_blind_is_capped_the_same_way() -> None:
-    """The trigger is a forced post with no live level, not the ante specifically."""
+    """The trigger is a forced post with no live level, not the ante specifically.
+
+    ``C`` is the only seat that owed dead money, so the dead pool is its own chip
+    and the main pot is that chip alone: ``C`` gets it back and ends the hand at
+    zero. This used to derive ``[3, 18]``, paying ``C`` a live chip from each of
+    ``A`` and ``B`` because the boundary was cut at ``C``'s total rather than at
+    its live contribution of nothing. Compare
+    ``test_a_seat_all_in_for_its_ante_cannot_win_the_live_betting_it_never_covered``,
+    where every seat posts an ante: there the dead pool is 3 and ``C`` genuinely
+    is owed the other two antes, and that hand is unchanged.
+    """
     players = [_player("A", stack=100), _player("B", stack=100), _player("C", stack=1)]
     actions = [
         LedgerAction(
@@ -814,12 +836,12 @@ def test_a_seat_all_in_for_a_dead_blind_is_capped_the_same_way() -> None:
     ]
     layers = build_hand_ledger(players, actions).pots
 
-    assert [pot.amount for pot in layers] == pytest.approx([3, 18])
+    assert [pot.amount for pot in layers] == pytest.approx([1, 20])
     assert [pot.cause for pot in layers] == ["main", "side"]
     assert "C" not in layers[1].eligible_players
 
     ledger = build_hand_ledger(players, actions, {0: ("C",), 1: ("A",)})
-    assert ledger.net_results == pytest.approx({"A": 8, "B": -10, "C": 2})
+    assert ledger.net_results == pytest.approx({"A": 10, "B": -10, "C": 0})
 
 
 def test_a_forced_post_all_in_caps_a_layer_next_to_a_genuine_side_pot() -> None:
@@ -960,10 +982,20 @@ def test_a_refunded_seat_still_contests_a_layer_above_what_stayed_in() -> None:
     at 35.
 
     R matched every live chip its opponents wagered; the 5 they are ahead by is
-    dead money owed to the table, not a wager R declined. Measuring eligibility
-    against what STAYED IN would cap R below that cut and refuse the only
-    truthful declaration on a hand R won, which is the unrecordable-hand failure
-    that started this whole chain. Measuring against what R put up keeps R in.
+    dead money owed to the table, not a wager R declined. Under the live-level
+    model R needs no special case at all: the refund puts R's live figure at
+    exactly 30, which IS the boundary, so R is eligible by the plain rule. That is
+    the point -- the old ladder had to cut at 35 and then exempt R from its own
+    cut, and a rule with an exemption in it is a rule that will be applied
+    inconsistently.
+
+    The amounts moved with the model. This used to derive ``[4, 97]``: the first
+    boundary sat at ``S``'s total of 1, so each of the other three was charged a
+    live chip into the layer ``S`` can win, and 10 of the 11 dead chips were
+    carried up into a layer ``S`` cannot -- an overpayment and an underpayment of
+    the same seat in the same hand, netting out to 4 where the model says 11.
+    ``S`` is owed the whole dead pool, which is its own ante plus the two dead
+    blinds, and nothing else; nobody wagered a live chip at it.
     """
     players = [
         _player("S", stack=1, seat=0),
@@ -985,15 +1017,15 @@ def test_a_refunded_seat_still_contests_a_layer_above_what_stayed_in() -> None:
     ]
     layers = build_hand_ledger(players, actions).pots
 
-    assert [pot.amount for pot in layers] == pytest.approx([4, 97])
+    assert [pot.amount for pot in layers] == pytest.approx([11, 90])
     assert layers[0].eligible_players == ("S", "R", "Z", "W")
-    # R has 30 in the pot and the layer is cut at 35, and R is still eligible.
+    # R has 30 of live money in the pot and the layer is cut at 30, so R is in it.
     assert layers[1].eligible_players == ("R", "Z", "W")
 
     ledger = build_hand_ledger(players, actions, {0: ("S",), 1: ("R",)})
     assert ledger.refunds["R"] == pytest.approx(70)
-    assert ledger.payouts["R"] == pytest.approx(97)
-    assert ledger.net_results == pytest.approx({"S": 3, "R": 67, "Z": -35, "W": -35})
+    assert ledger.payouts["R"] == pytest.approx(90)
+    assert ledger.net_results == pytest.approx({"S": 10, "R": 60, "Z": -35, "W": -35})
     assert ledger.is_balanced is True
     assert ledger.legality_issues == ()
 
@@ -1132,13 +1164,20 @@ def test_an_all_in_that_covered_the_wager_caps_nobody() -> None:
     assert ledger.is_balanced is True
 
 
-def test_a_seat_short_of_the_live_wager_is_still_capped_at_its_own_total() -> None:
-    """The guarantee the round-16 repair exists for, restated against round 18.
+def test_a_seat_short_of_the_live_wager_is_still_capped_at_its_own_live_wager() -> None:
+    """The guarantee the round-16 repair exists for, in the currency it belongs in.
 
     The same hand as above with ``B`` all-in for less than the wager instead of
     exactly it. Now ``B`` genuinely declined live chips, so the layer above its
-    total is a side pot ``B`` cannot win -- and ``B`` is refused it rather than
-    being handed the whole pot because the dead money is uneven.
+    LIVE contribution is a side pot ``B`` cannot win -- and ``B`` is refused it
+    rather than being handed the whole pot because the dead money is uneven.
+
+    ``B`` wagered 10 live behind a 3-chip dead blind. What the table matched of it
+    is 10 from ``A`` and 10 from ``C``, plus the whole 8-chip dead pool, which is
+    38. This used to derive ``[39, 19]``: the boundary sat at ``B``'s total of 13,
+    so ``A`` and ``C`` were each charged 13 live chips into the main pot when
+    neither had wagered more than 10 against ``B``'s live money. One chip, silently,
+    on an entirely ordinary hand.
     """
     players = [
         _player("A", stack=100, seat=0),
@@ -1156,12 +1195,14 @@ def test_a_seat_short_of_the_live_wager_is_still_capped_at_its_own_total() -> No
     ]
     layers = build_hand_ledger(players, actions).pots
 
-    # B covered 13 of every seat's commitment -- 39 -- and the 19 above that,
-    # A's remaining live chips and its ante with them, is a side pot B is out of.
-    assert [pot.amount for pot in layers] == pytest.approx([39, 19])
+    assert [pot.amount for pot in layers] == pytest.approx([38, 20])
     assert [pot.cause for pot in layers] == ["main", "side"]
     assert layers[0].eligible_players == ("A", "B", "C")
     assert layers[1].eligible_players == ("A", "C")
+
+    settled = build_hand_ledger(players, actions, {0: ("B",), 1: ("A",)})
+    assert settled.payouts["B"] == pytest.approx(38)
+    assert settled.net_results == pytest.approx({"A": -5, "B": 25, "C": -20})
 
     with pytest.raises(LedgerError):
         build_hand_ledger(players, actions, {0: ("B",), 1: ("B",)})
@@ -1195,27 +1236,26 @@ def test_a_line_that_stops_mid_wager_still_caps_the_seat_that_never_answered() -
         build_hand_ledger(players, actions, {0: ("A",), 1: ("A",)})
 
 
-def test_a_lone_top_level_is_not_merged_down_into_a_capped_seat_s_reach() -> None:
-    """The "only one seat reached this level" merge was itself an overpayment.
+def test_an_ante_never_separates_two_seats_that_wagered_the_same_live_money() -> None:
+    """The antes are the main pot; the blinds are the layer above it.
 
-    ``bob`` is all-in for a single ante chip and put no live money up at all, so
-    it is short of the live wagering and capped at its own total of 1: the most
-    the table matched of that is three chips. ``alice`` is the only seat that
-    reached level 2, and folding that level down into the layer below -- on the
-    reasoning that nobody matched those chips -- put ``alice``'s ante inside the
-    pot ``bob`` could win, paying ``bob`` four.
+    ``alice`` and ``carol`` each posted a live blind of 1. ``bob`` is all-in for a
+    single ante chip and wagered nothing live. So the dead money -- ``alice``'s
+    ante and ``bob``'s -- is the main pot, all three contest it, and the two live
+    blinds are a layer above that only the two seats who wagered them can win.
 
-    The lone level stays its own layer whenever the level below it caps somebody
-    out. Where the old merge was right, on the ordinary hand where nobody is
-    capped, the level drops no short seat and is merged anyway --
-    ``test_unmatched_dead_money_is_still_won_by_whoever_takes_the_pot`` is that
-    hand, and it is unaffected.
+    Two separate errors used to live in this four-chip hand, and they pointed in
+    opposite directions:
 
-    ``carol`` is out of the top layer too, on exactly the same grounds as
-    ``bob``: its own total is 1 and the layer sits above 1. A cut applies to
-    every seat by its own commitment once it is drawn, which is what keeps
-    ``bob`` and ``carol`` -- identical totals -- from landing on opposite sides
-    of one boundary.
+    * ``[3, 1]`` put ``alice``'s live blind inside the pot ``bob`` could win,
+      paying ``bob`` 3 on a chip nobody wagered at it. The most ``bob`` can be
+      owed is the dead pool, which is 2.
+    * it left ``carol`` out of the top layer while keeping ``alice`` in, though
+      the two wagered exactly the same live money. The only thing separating them
+      was ``alice``'s ante -- dead money, which rule 2 forbids from opening a
+      boundary. So ``carol`` was refused a hand it may legitimately win outright,
+      and ``carol`` taking all four chips is now recordable, as it must be:
+      ``carol`` matched every live chip anybody wagered.
     """
     players = [
         _player("alice", stack=2, seat=0),
@@ -1230,19 +1270,23 @@ def test_a_lone_top_level_is_not_merged_down_into_a_capped_seat_s_reach() -> Non
     ]
     layers = build_hand_ledger(players, actions).pots
 
-    assert [pot.amount for pot in layers] == pytest.approx([3, 1])
+    assert [pot.amount for pot in layers] == pytest.approx([2, 2])
     assert layers[0].eligible_players == ("alice", "bob", "carol")
-    assert layers[1].eligible_players == ("alice",)
+    assert layers[1].eligible_players == ("alice", "carol")
 
+    # bob wagered nothing live, so the live blinds stay out of its reach.
     with pytest.raises(LedgerError):
         build_hand_ledger(players, actions, {0: ("bob",), 1: ("bob",)})
-    with pytest.raises(LedgerError):
-        build_hand_ledger(players, actions, {0: ("carol",), 1: ("carol",)})
 
     ledger = build_hand_ledger(players, actions, {0: ("bob",), 1: ("alice",)})
-    assert ledger.payouts["bob"] == pytest.approx(3)
-    assert ledger.net_results == pytest.approx({"alice": -1, "bob": 2, "carol": -1})
+    assert ledger.payouts["bob"] == pytest.approx(2)
+    assert ledger.net_results == pytest.approx({"alice": 0, "bob": 1, "carol": -1})
     assert ledger.is_balanced is True
+
+    whole = build_hand_ledger(players, actions, {0: ("carol",), 1: ("carol",)})
+    assert whole.payouts["carol"] == pytest.approx(4)
+    assert whole.net_results == pytest.approx({"alice": -2, "bob": -1, "carol": 3})
+    assert whole.is_balanced is True
 
 
 def test_a_short_all_in_does_not_bring_the_phantom_side_pot_back() -> None:
@@ -1260,10 +1304,14 @@ def test_a_short_all_in_does_not_bring_the_phantom_side_pot_back() -> None:
     could be declared the winner of 108 having covered 100 -- the round-16
     overpayment, reached from the other direction and silently accepted.
 
-    A cut is drawn only where a short seat is stopped, and once drawn it applies
-    to every seat by that seat's own commitment. So this hand has exactly one
-    boundary -- at ``e``'s 20 -- and everyone whose total stops at 20 is out of
-    the layer above it.
+    Cutting at ``e``'s TOTAL of 20 -- what this test asserted, as ``[100, 8]`` --
+    was the last of those escapes and the fifth critical. ``e`` wagered 16 live
+    behind a 4-chip dead blind, so charging the other four seats 20 live chips
+    each into the main pot paid ``e`` 8 chips that nobody had wagered against it,
+    and it refused ``c`` and ``d`` the layer above though they had wagered exactly
+    what ``a`` and ``b`` had. The one boundary this hand has is at ``e``'s LIVE 16,
+    the main pot is 92, and the 16 above it is contested by the four seats who
+    wagered 20 -- not by the two who owed dead money.
     """
     players = [
         _player("a", stack=100, seat=0),
@@ -1288,25 +1336,28 @@ def test_a_short_all_in_does_not_bring_the_phantom_side_pot_back() -> None:
     ]
     layers = build_hand_ledger(players, actions).pots
 
-    assert [pot.amount for pot in layers] == pytest.approx([100, 8])
+    assert [pot.amount for pot in layers] == pytest.approx([92, 16])
     assert [pot.cause for pot in layers] == ["main", "side"]
     assert layers[0].eligible_players == ("a", "b", "c", "d", "e")
-    # One boundary, at e's total. c and d stop at 20 exactly as e does, so the
-    # three of them are on the same side of it.
-    assert layers[1].eligible_players == ("a", "b")
+    # One boundary, at e's LIVE 16. c and d wagered the full 20 exactly as a and b
+    # did, so the four of them are on the same side of it.
+    assert layers[1].eligible_players == ("a", "b", "c", "d")
 
     # e wins the hand: it takes everything it covered and nothing above it.
     ledger = build_hand_ledger(players, actions, {0: ("e",), 1: ("a",)})
-    assert ledger.payouts["e"] == pytest.approx(100)
-    assert ledger.net_results["e"] == pytest.approx(80)
+    assert ledger.payouts["e"] == pytest.approx(92)
+    assert ledger.net_results["e"] == pytest.approx(72)
     assert ledger.is_balanced is True
     assert ledger.legality_issues == ()
 
-    # And no seat that stopped at 20 may be paid past what the table matched of
-    # its own 20, whether it stopped by going all-in or by having chips behind.
-    for name in ("c", "d", "e"):
-        with pytest.raises(LedgerError):
-            build_hand_ledger(players, actions, {0: (name,), 1: (name,)})
+    # e wagered 16 and may not be paid out of the layer above it, whatever its
+    # dead blind brought its total to. c and d wagered the full 20 and may.
+    with pytest.raises(LedgerError):
+        build_hand_ledger(players, actions, {0: ("e",), 1: ("e",)})
+    for name in ("c", "d"):
+        whole = build_hand_ledger(players, actions, {0: (name,), 1: (name,)})
+        assert whole.payouts[name] == pytest.approx(108)
+        assert whole.is_balanced is True
 
 
 # ---------------------------------------------------------------------------

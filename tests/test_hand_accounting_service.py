@@ -1066,15 +1066,20 @@ def test_a_short_all_in_does_not_reopen_the_phantom_at_the_product_boundary() ->
 
     Removing the phantom only from hands where nobody is short leaves it in every
     hand that has a short all-in anywhere in it, which is most hands with an
-    all-in. Here ``e`` is all-in for 20 while ``a``'s ante and ``b``'s dead blind
-    sit above it, and the seats that owe no dead money -- ``c`` and ``d``, both
-    with exactly 20 in the pot, exactly as ``e`` has -- were left eligible for
-    those 8 chips while ``e`` was refused them.
+    all-in. Here ``e`` is all-in having wagered 16 live behind a 4-chip dead
+    blind, while ``a``'s ante and ``b``'s dead blind sit above it in the ladder.
 
-    Hero is ``c``. The declaration that used to reconcile silently is ``c``
-    winning the hand outright: 108 chips on a commitment the table matched 100
-    of, reconciled and authoritative with no issue and no warning. It is refused
-    now, by name, and the hand stays needing correction.
+    Under the live-level model the seat that must be refused is ``e`` and only
+    ``e``. ``c`` and ``d`` wagered the full 20 exactly as ``a`` and ``b`` did, so
+    nothing separates the four of them and any of them may be declared the winner
+    of all 108; only dead money made them look different, and dead money opens no
+    boundary. ``e`` wagered 16, the table matched 16 of it, and the layer above
+    that is 16 chips ``e`` cannot reach -- so the declaration this refuses at the
+    product boundary is ``e`` taking the hand outright, which is 16 chips more
+    than anybody wagered against it.
+
+    Both halves are asserted, because a repair that satisfies one by discarding
+    the other is exactly how this module produced five consecutive criticals.
     """
     db = _make_db()
     session = db.create_session(Session(name="Phantom behind an all-in"))
@@ -1124,8 +1129,10 @@ def test_a_short_all_in_does_not_reopen_the_phantom_at_the_product_boundary() ->
     db.upsert_hand_settlement(HandSettlement(hand_id=hand.id, status="settled"))
 
     derived = reconcile_persisted_hand(db, hand.id)
-    assert [pot.amount for pot in derived.ledger.pots] == pytest.approx([100, 8])
-    assert derived.ledger.pots[1].eligible_players == ("a", "b")
+    assert [pot.amount for pot in derived.ledger.pots] == pytest.approx([92, 16])
+    # The service orders seats hero-first, so compare membership.
+    assert set(derived.ledger.pots[0].eligible_players) == {"a", "b", "c", "d", "e"}
+    assert set(derived.ledger.pots[1].eligible_players) == {"a", "b", "c", "d"}
 
     db.replace_settlement_entries(
         hand.id,
@@ -1134,12 +1141,12 @@ def test_a_short_all_in_does_not_reopen_the_phantom_at_the_product_boundary() ->
                 hand_id=hand.id,
                 entry_type="award",
                 pot_index=index,
-                player_key="c",
-                player_name="C",
+                player_key="e",
+                player_name="E",
                 amount=amount,
                 entry_order=index + 1,
             )
-            for index, amount in ((0, 100.0), (1, 8.0))
+            for index, amount in ((0, 92.0), (1, 16.0))
         ],
     )
     result = persist_reconciliation(db, hand.id)
@@ -1565,4 +1572,220 @@ def test_a_short_blind_booked_as_an_all_in_still_blocks_the_persisted_hand() -> 
         "Declare the blind structure" in issue
         for issue in result.ledger.legality_issues
     )
+    db.close()
+
+
+def _short_ante_hand(db: PokerDatabase, session_id: int, c_row: tuple) -> Hand:
+    """Worked example (c) at 10x, with the short seat's ante row spelled by caller.
+
+    A 10-chip ante and 5/10 blinds, four seats, ``c`` holding exactly the ante.
+    Truth: main 40 [a, b, c, d], side 300 [a, b, d]; ``c`` wins the main pot for
+    net +30 and ``a`` takes the side pot.
+    """
+    hand = db.create_hand(
+        Hand(
+            session_id=session_id,
+            hand_number=182,
+            game_type="No-limit Hold'em",
+            pot_size=340,
+            hero_bb_won=-110,
+        )
+    )
+    for key, index, stack in (("a", 0, 200), ("b", 1, 200), ("c", 2, 10), ("d", 3, 200)):
+        db.create_hand_player(
+            HandPlayer(
+                hand_id=hand.id,
+                player_key=key,
+                seat_index=index,
+                player_name=key.upper(),
+                starting_stack=stack,
+                is_hero=(key == "d"),
+            )
+        )
+    rows = [
+        ("a", "ante", 10.0, None, None, "preflop"),
+        ("b", "ante", 10.0, None, None, "preflop"),
+        c_row,
+        ("d", "ante", 10.0, None, None, "preflop"),
+        ("a", "post_blind", 5.0, None, None, "preflop"),
+        ("b", "post_blind", 10.0, None, None, "preflop"),
+        ("d", "raise", 100.0, None, None, "preflop"),
+        ("a", "call", 95.0, None, None, "preflop"),
+        ("b", "call", 90.0, None, None, "preflop"),
+        ("d", "check", None, None, None, "flop"),
+        ("a", "check", None, None, None, "flop"),
+        ("b", "check", None, None, None, "flop"),
+    ]
+    for key, action_type, amount, live_post, forced, street in rows:
+        db.create_action(
+            Action(
+                hand_id=hand.id,
+                player_key=key,
+                player_name=key.upper(),
+                street=street,
+                action_type=action_type,
+                amount=amount,
+                amount_semantics="incremental" if amount is not None else "unknown",
+                is_live_post=live_post,
+                forced_bet_type=forced,
+            )
+        )
+    db.upsert_hand_settlement(
+        HandSettlement(
+            hand_id=hand.id, status="settled", small_blind=5, big_blind=10
+        )
+    )
+    return hand
+
+
+def test_relabelling_an_ante_row_cannot_move_a_chip_at_the_product_boundary() -> None:
+    """The two durable columns the hand editor writes must not change the chips.
+
+    ``actions.forced_bet_type`` and ``actions.is_live_post`` are set from two
+    selectboxes on EVERY action row, including all-in, and a forced post that
+    took its poster's last chip is routinely booked as an all-in. The money
+    classifier read only ``action_type``, so the same event spelled the second way
+    was counted as chosen live money -- and under the live-level model that moved
+    30 chips into the main pot and paid them to a seat whose live commitment is
+    zero. It reconciled as authoritative with no issue and no warning.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="Ante spelling"))
+    plain = _short_ante_hand(
+        db, session.id, ("c", "ante", 10.0, None, None, "preflop")
+    )
+    relabelled = _short_ante_hand(
+        db, session.id, ("c", "all_in", 10.0, False, "ante", "preflop")
+    )
+
+    for hand in (plain, relabelled):
+        db.replace_settlement_entries(
+            hand.id,
+            [
+                SettlementEntry(
+                    hand_id=hand.id,
+                    entry_type="award",
+                    pot_index=0,
+                    player_key="c",
+                    player_name="C",
+                    amount=40,
+                    entry_order=1,
+                ),
+                SettlementEntry(
+                    hand_id=hand.id,
+                    entry_type="award",
+                    pot_index=1,
+                    player_key="a",
+                    player_name="A",
+                    amount=300,
+                    entry_order=2,
+                ),
+            ],
+        )
+
+    truth = persist_reconciliation(db, plain.id)
+    other = persist_reconciliation(db, relabelled.id)
+
+    assert [pot.amount for pot in truth.ledger.pots] == pytest.approx([40, 300])
+    assert truth.ledger.net_results["c"] == pytest.approx(30)
+    assert truth.is_authoritative is True
+    # Same hand, other spelling: same chips, same verdict.
+    assert [pot.amount for pot in other.ledger.pots] == pytest.approx([40, 300])
+    assert other.ledger.contributions == pytest.approx(truth.ledger.contributions)
+    assert other.ledger.net_results == pytest.approx(truth.ledger.net_results)
+    assert other.is_authoritative is True
+    assert other.issues == ()
+    db.close()
+
+
+def test_a_forced_post_no_seat_could_cover_is_refused_as_study_ready() -> None:
+    """Rule 2's undecided case reaches the operator instead of the study queue.
+
+    Antes of 100 with a 40-chip stack short of its own ante: the model pays that
+    stack all five opponents' full antes, 300 chips more than any of them covered
+    of it, and the four worked examples do not decide whether that is right.
+    Nothing here changes a chip. What it changes is that the hand can no longer be
+    published as authoritative while the question is open.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="Short of the ante"))
+    hand = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=183,
+            game_type="No-limit Hold'em",
+            pot_size=740,
+        )
+    )
+    seats = (("btn", 0, 40, True), ("sb", 1, 5000, False), ("bb", 2, 5000, False))
+    for key, index, stack, hero in seats:
+        db.create_hand_player(
+            HandPlayer(
+                hand_id=hand.id,
+                player_key=key,
+                seat_index=index,
+                player_name=key.upper(),
+                starting_stack=stack,
+                is_hero=hero,
+            )
+        )
+    rows = [
+        ("btn", "ante", 40.0),
+        ("sb", "ante", 100.0),
+        ("bb", "ante", 100.0),
+        ("sb", "post_blind", 100.0),
+        ("bb", "post_blind", 200.0),
+        ("sb", "fold", None),
+    ]
+    for key, action_type, amount in rows:
+        db.create_action(
+            Action(
+                hand_id=hand.id,
+                player_key=key,
+                player_name=key.upper(),
+                street="preflop",
+                action_type=action_type,
+                amount=amount,
+                amount_semantics="incremental" if amount is not None else "unknown",
+            )
+        )
+    db.upsert_hand_settlement(
+        HandSettlement(hand_id=hand.id, status="settled", small_blind=100, big_blind=200)
+    )
+    db.replace_settlement_entries(
+        hand.id,
+        [
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=0,
+                player_key="btn",
+                player_name="BTN",
+                amount=240,
+                entry_order=1,
+            ),
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=1,
+                player_key="bb",
+                player_name="BB",
+                amount=200,
+                entry_order=2,
+            ),
+        ],
+    )
+
+    result = persist_reconciliation(db, hand.id)
+
+    # The awards declared above ARE the derived ladder, to the chip, so the only
+    # thing standing between this hand and "reconciled" is the open question.
+    assert [pot.amount for pot in result.ledger.pots] == pytest.approx([240, 200])
+    assert result.ledger.is_legal is True
+    assert result.ledger.is_settled is True
+    assert result.ledger.is_balanced is True
+    assert result.is_authoritative is False
+    assert result.settlement.status == "needs_correction"
+    assert any("forced post" in issue for issue in result.issues)
+    assert result.ledger.net_results["btn"] == pytest.approx(200)
     db.close()
