@@ -11,9 +11,8 @@ unlikely but unreachable.
 The append is no longer SILENT. A copy whose content already exists in this
 database is named and annotated as a re-import (``_label_duplicate_import``), so
 two identical sessions can be told apart in the session list and the second one
-states that both of them are being counted in every total. It is still created:
-see that function for what refusing it would cost and why that decision is not
-made here.
+states that it is the copy the totals leave out. It is still created: see that
+function for what refusing it would cost and why that decision is not made here.
 
 Every claim a payload makes about its own trustworthiness is re-derived here
 rather than believed: coaching lands stale, issues land open, ``reviewed`` lands
@@ -959,9 +958,10 @@ DUPLICATE_IMPORT_NAME_SUFFIX = "re-imported copy #{session_id}"
 
 DUPLICATE_IMPORT_NOTE = (
     "Re-imported copy: this session's hands were already in this database as "
-    "session {other_id} when it was imported. BOTH copies are counted in every "
-    "session, hand, BB and study-theme total until one of them is deleted "
-    "(Sessions -> Delete session)."
+    "session {other_id} when it was imported. THIS copy is left out of every "
+    "session, hand, BB and study-theme total, and each surface that leaves it "
+    "out says so; session {other_id} is the one still counted. Delete this copy "
+    "(Sessions -> Delete session) to remove it entirely."
 )
 
 
@@ -1038,11 +1038,14 @@ def _label_duplicate_import(db: PokerDatabase, session: Session) -> Session:
     indistinguishable on. The note says which session it duplicates and that both
     are being counted, which is the fact the totals do not carry.
 
-    This is deliberately the smallest correct change. It does not stop the
-    duplicate being created, and it does not un-double the Overview and Insights
-    totals: refusing a duplicate import outright would change a documented,
-    tested operator-visible contract and needs an "Import anyway" control in the
-    app to stay usable, which is not this module's to add.
+    This is deliberately the smallest correct change: it does not stop the
+    duplicate being created, because refusing a duplicate import outright would
+    change a documented, tested operator-visible contract and needs an "Import
+    anyway" control in the app to stay usable, which is not this module's to add.
+    Un-doubling the totals is not done here either -- the note is the record that
+    these rows are a second copy, and ``analytics.duplicate_import_sessions``
+    reads it so the portfolio and population layers can drop them and say they
+    did.
     """
     duplicate_of = _duplicated_session_id(db, session)
     if duplicate_of is None or session.id is None:

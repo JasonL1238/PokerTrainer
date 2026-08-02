@@ -12,6 +12,12 @@ from poker_tracker.solver.models import ResolvedRange, SolverPlayer, SolverSpot
 from poker_tracker.solver.texassolver import TEXASSOLVER_MIN_WEIGHT
 
 TOTAL_COMBOS = 1326
+# TexasSolver reads six decimals of weight out of the command file, so that is
+# the precision a combo is actually submitted at whatever the operator wrote.
+SOLVER_WEIGHT_DECIMALS = 6
+# At or above this the combo is written bare instead of with an explicit weight:
+# the remaining gap to 1.0 is finer than the emitted precision can express.
+_FULL_WEIGHT = 0.999999
 _COLON_WEIGHT = re.compile(
     r"^(?P<token>[^:]+):(?P<weight>(?:0(?:\.\d+)?|1(?:\.0+)?))$"
 )
@@ -40,6 +46,38 @@ class ParsedRange:
     combo_keys: frozenset[str]
 
 
+def _submitted_weight(weight: float) -> float:
+    """The weight the solver actually receives for a combo written as ``weight``.
+
+    This is a numeric step, not a formatting one, and that distinction is the
+    whole point. The unsupported-weight guard used to be spelled
+    ``float(f"{weight:.6f}")``, which made it a test of the printed form: a
+    weight under 5e-7 printed as ``0.000000``, compared equal to zero, and so
+    read as "this combo carries no weight" rather than as "the solver would drop
+    this combo". It went on to be emitted as an ``AdAc:0`` token -- the silent
+    drop the guard exists to prevent. Quantizing here and validating the result
+    keeps the guard and the emitted token talking about the same number, and
+    survives any later change to how that number is spelled.
+    """
+
+    return round(weight, SOLVER_WEIGHT_DECIMALS)
+
+
+def _unsupported_weight_error() -> ValueError:
+    return ValueError(
+        "TexasSolver silently drops weights at or below "
+        f"{TEXASSOLVER_MIN_WEIGHT:g}; increase or remove those weights."
+    )
+
+
+def _weight_token(combo: str, weight: float) -> str:
+    """Render one already-validated submitted weight for the command file."""
+
+    if weight >= _FULL_WEIGHT:
+        return combo
+    return f"{combo}:{weight:.{SOLVER_WEIGHT_DECIMALS}f}".rstrip("0").rstrip(".")
+
+
 def normalize_weighted_notation(notation: str) -> str:
     """Accept TexasSolver ``HAND:weight`` tokens and return eval7 notation."""
 
@@ -50,8 +88,17 @@ def normalize_weighted_notation(notation: str) -> str:
             continue
         match = _COLON_WEIGHT.match(token)
         if match:
-            percent = float(match.group("weight")) * 100
-            percent_text = f"{percent:.6f}".rstrip("0").rstrip(".")
+            weight = float(match.group("weight"))
+            # Judged on the number the operator wrote, before it becomes the
+            # percent string eval7 takes. A weight small enough to render as
+            # ``0%`` reaches eval7 as a token it rejects as ungrammatical, which
+            # blames the operator's spelling for a value this function threw
+            # away; one merely small reaches eval7 intact and is dropped later
+            # by the solver instead. Both are the same fact, so both are said
+            # here in the same words.
+            if _submitted_weight(weight) <= TEXASSOLVER_MIN_WEIGHT:
+                raise _unsupported_weight_error()
+            percent_text = f"{weight * 100:.6f}".rstrip("0").rstrip(".")
             converted.append(f"{percent_text}%({match.group('token').strip()})")
         else:
             converted.append(token)
@@ -78,28 +125,22 @@ def parse_range(notation: str, *, dead_cards: str = "") -> ParsedRange:
         prior = combos.get(key)
         if prior is None or float(weight) > prior[1]:
             combos[key] = (combo, float(weight))
+    # Quantized once, here, so that everything below -- the guard, the emitted
+    # tokens and the reported width -- is talking about the weight the solver
+    # will receive rather than three separate readings of it.
+    submitted = [
+        (combo, _submitted_weight(weight)) for combo, weight in combos.values()
+    ]
     unsupported = [
-        combo
-        for combo, weight in combos.values()
-        if 0 < float(f"{weight:.6f}") <= TEXASSOLVER_MIN_WEIGHT
+        combo for combo, weight in submitted if weight <= TEXASSOLVER_MIN_WEIGHT
     ]
     if unsupported:
-        raise ValueError(
-            "TexasSolver silently drops weights at or below "
-            f"{TEXASSOLVER_MIN_WEIGHT:g}; increase or remove those weights."
-        )
+        raise _unsupported_weight_error()
     overweight = [combo for combo, weight in combos.values() if weight > 1.0000001]
     if overweight:
         raise ValueError("Range weights cannot exceed 1.0 (100%).")
-    solver_tokens: list[str] = []
-    weighted_combo_total = 0.0
-    for combo, raw_weight in combos.values():
-        weight = float(f"{raw_weight:.6f}")
-        weighted_combo_total += weight
-        if weight >= 0.999999:
-            solver_tokens.append(combo)
-        else:
-            solver_tokens.append(f"{combo}:{weight:.6f}".rstrip("0").rstrip("."))
+    solver_tokens = [_weight_token(combo, weight) for combo, weight in submitted]
+    weighted_combo_total = sum(weight for _, weight in submitted)
     if not solver_tokens:
         raise ValueError("Range has no available combinations after removing visible cards.")
     return ParsedRange(
@@ -182,6 +223,34 @@ def builtin_range_profiles(table_sizes: range = range(5, 9)) -> list[SolverRange
 BUILTIN_RANGE_PROFILES = builtin_range_profiles()
 
 
+# The two sides of the attribution a run makes about a range. "default" and
+# "builtin" both mean the product's own study estimate; "user" and "custom" mean
+# the operator supplied it. start_solver_job writes a different assumption onto
+# the run for each side, so which side a resolution falls on is a claim about
+# whose range was solved.
+_ESTIMATE_SOURCES = frozenset({"default", "builtin"})
+
+
+def _check_profile_source(profile: SolverRangeProfile, source: str) -> None:
+    """Refuse to present a profile as something its own record contradicts.
+
+    A run built from a built-in profile carries "estimated study input, not
+    solved preflop GTO"; one built from a saved profile carries "explicitly
+    supplied by the user". Which of the two a profile is, the profile already
+    records, so a caller asking for the other one is asking the run either to
+    attribute the product's estimate to the operator or to file the operator's
+    own range as a study default. Both are wrong attributions presented as fact,
+    and neither is visible once the run is written.
+    """
+
+    if (profile.source in _ESTIMATE_SOURCES) == (source in _ESTIMATE_SOURCES):
+        return
+    raise ValueError(
+        f"Range profile '{profile.name}' is recorded as {profile.source}, so it "
+        f"cannot be resolved as {source}."
+    )
+
+
 def default_scenario(spot: SolverSpot, player: SolverPlayer) -> str:
     aggressor = _last_aggressor_key(spot)
     if spot.pot_type == "single_raised":
@@ -221,6 +290,7 @@ def resolve_profile(
         return position_penalty, table_penalty, stack_penalty, profile.name
 
     chosen = min(compatible, key=score)
+    _check_profile_source(chosen, source)
     mismatches: list[str] = []
     if chosen.position and chosen.position != player.position:
         mismatches.append(
@@ -299,6 +369,7 @@ def resolve_selected_profile(
     source: str,
 ) -> ResolvedRange:
     scenario = default_scenario(spot, player)
+    _check_profile_source(profile, source)
     if profile.pot_type and profile.pot_type != spot.pot_type:
         raise ValueError(
             f"Premade range '{profile.name}' is for "

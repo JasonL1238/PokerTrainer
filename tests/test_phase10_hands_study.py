@@ -341,7 +341,7 @@ def test_hand_row_view_model_carries_the_retired_reading_too() -> None:
         confidence_score=0.95,
     )
 
-    row = build_hand_rows([session], [corrected])[0]
+    row = build_hand_rows([session], [corrected], {})[0]
 
     assert row.confidence_label == "Superseded by your corrections"
     assert row.confidence_is_current is False

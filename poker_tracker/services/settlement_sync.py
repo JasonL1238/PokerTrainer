@@ -54,6 +54,7 @@ from poker_tracker.services.hand_accounting import (
 )
 from poker_tracker.services.study_readiness import (
     accounting_is_established,
+    accounting_verdict_predates_record,
     unattested_assumption_dependence,
 )
 
@@ -93,6 +94,20 @@ def sync_recorded_figures_from_ledger(
                 f"{REFUSED_UNESTABLISHED} It reconciles only under settlement "
                 f"inputs you declared ({names}). Press 'Confirm this assumption' "
                 "beside each one, or correct the declaration, and save again."
+            )
+        if accounting_verdict_predates_record(reconciled):
+            # "Reconcile a legal, balanced ledger first" is false here and sends
+            # the operator to look for a defect in a ledger that has none. The
+            # save above repaired the recorded summary figures and recorded the
+            # verdict it reached before that repair, so this hand needs the same
+            # save once more -- which is a thing to say, not a thing to leave the
+            # operator to discover by pressing the button again.
+            raise SettlementSyncRefused(
+                f"{REFUSED_UNESTABLISHED} The ledger itself balances and is "
+                "legal; what is missing is a saved settlement recording that "
+                f"verdict (status reads {reconciled.settlement.status!r}). Press "
+                "'Save and reconcile' once more and the replacement will go "
+                "through."
             )
         raise SettlementSyncRefused(
             f"{REFUSED_UNESTABLISHED} Reconcile a legal, balanced ledger first."

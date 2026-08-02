@@ -352,35 +352,100 @@ def test_a_weight_texassolver_would_drop_is_refused(weight: float) -> None:
         parse_range(f"AA:{weight:.10f}".rstrip("0"))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Defect in poker_tracker/solver/ranges.py (outside this suite's write scope). "
-        "The unsupported-weight guard tests float(f'{weight:.6f}') > 0, so a weight "
-        "below 5e-7 rounds to exactly 0.0, slips past the guard, and is emitted as a "
-        "'AdAc:0' token -- the silent drop the guard exists to prevent."
-    ),
-)
 def test_a_weight_below_the_printing_precision_is_also_refused() -> None:
+    """The instance the guard used to miss, kept as its own named case.
+
+    The guard was spelled ``float(f"{weight:.6f}") > 0``, which asked whether the
+    weight PRINTED as something other than zero rather than whether it WAS
+    something the solver would keep. A weight of 1e-7 printed as `0.000000`,
+    tested equal to zero, and was accepted as six live combos and serialized into
+    an `AdAc:0` token -- notation the parser itself then rejects, which is how the
+    round-trip property found it.
+    """
     with pytest.raises(ValueError, match="silently drops weights"):
         parse_range("AA:0.0000001")
 
 
-def test_a_weight_below_the_printing_precision_currently_escapes_as_zero() -> None:
-    """Pins the shape of the defect above so a partial repair cannot look complete.
+@st.composite
+def _weight_text(draw: st.DrawFn) -> str:
+    """A weight spelled as ``0.<digits>``, drawn across every magnitude.
 
-    A weight of 1e-7 is accepted, reported as six live combos, and serialized
-    into a `:0` weight -- notation the parser itself then rejects, which is how
-    the round-trip property found it. Both this test and the strict xfail above
-    go away with the repair; failing here is the signal that the repair landed.
+    The count of leading zeros is drawn rather than the value, so the band below
+    the printing precision -- which a uniform float would land in about once in
+    two million draws -- is sampled as often as the ordinary one.
     """
-    parsed = parse_range("AA:0.0000001")
+    leading_zeros = draw(st.integers(min_value=0, max_value=13))
+    digits = draw(st.integers(min_value=1, max_value=999999))
+    return f"0.{'0' * leading_zeros}{digits}"
 
-    assert parsed.combo_count == 6
-    assert parsed.range_percent == 0.0
-    assert all(token.endswith(":0") for token in parsed.solver_notation.split(","))
-    with pytest.raises(ValueError):
-        parse_range(parsed.solver_notation)
+
+# One step of the six-decimal precision a weight is submitted at. A value within
+# a step of the cutoff may fall on either side of it once it has been through
+# eval7, and which side is not the point of the assertions below.
+_WEIGHT_STEP = 10**-6
+
+
+@SETTINGS
+@given(_weight_text())
+def test_a_weight_is_judged_on_its_value_not_on_how_it_prints(text: str) -> None:
+    """The family invariant, stated over numbers rather than over their spelling.
+
+    Every weight is either refused for being one TexasSolver would drop, or it
+    reaches the solver as a weight above that cutoff. Nothing in between: no
+    weight may be accepted and then emitted as something the solver discards,
+    which is what a guard that reads the printed form permits whenever the
+    printed form loses the value.
+    """
+    weight = float(text)
+    try:
+        parsed = parse_range(f"AA:{text}")
+    except ValueError as exc:
+        assert "silently drops weights" in str(exc), (text, str(exc))
+        assert weight <= TEXASSOLVER_MIN_WEIGHT + _WEIGHT_STEP, text
+        return
+
+    assert weight > TEXASSOLVER_MIN_WEIGHT - _WEIGHT_STEP, text
+    for emitted in _weights_of(parsed).values():
+        assert emitted > TEXASSOLVER_MIN_WEIGHT, (text, parsed.solver_notation)
+    assert parsed.range_percent > 0, text
+    # The emitted notation is the only carrier of these weights, so it has to
+    # survive being read back as the same range.
+    assert _weights_of(parse_range(parsed.solver_notation)) == pytest.approx(
+        _weights_of(parsed), abs=1e-9
+    ), text
+
+
+@SETTINGS
+@given(notation())
+def test_no_emitted_token_ever_carries_a_droppable_weight(
+    generated: tuple[str, dict[str, float]],
+) -> None:
+    """Said over whole generated ranges as well, not just single-token ones."""
+    text, _ = generated
+    parsed = parse_range(text)
+
+    for token in parsed.solver_notation.split(","):
+        _, separator, weight_text = token.partition(":")
+        assert weight_text != "0", (text, token)
+        if separator:
+            assert float(weight_text) > TEXASSOLVER_MIN_WEIGHT, (text, token)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["AA:0.0000001", "AA:0.00000000001", "0.00001%(AA)", "AA:0.5,KK:0.0000001", "AA:0"],
+)
+def test_a_sub_precision_weight_never_reaches_the_solver_as_zero(text: str) -> None:
+    """Both spellings of a weight, and both places the value could be lost.
+
+    The colon form is rejected while it is still a number the operator wrote; the
+    eval7 percent form survives normalization and is rejected on the weight that
+    would actually be submitted. Either way the refusal names the same cause,
+    rather than blaming the operator's spelling for a value the parser rounded
+    away on its way to eval7.
+    """
+    with pytest.raises(ValueError, match="silently drops weights"):
+        parse_range(text)
 
 
 # --- the study-label ladder -----------------------------------------------------------

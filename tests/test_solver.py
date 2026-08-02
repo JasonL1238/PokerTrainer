@@ -42,6 +42,7 @@ from poker_tracker.solver.models import (
 from poker_tracker.solver.profile_io import export_range_profiles, import_range_profiles
 from poker_tracker.solver.ranges import (
     BUILTIN_RANGE_PROFILES,
+    TOTAL_COMBOS,
     normalize_weighted_notation,
     parse_range,
     resolve_custom_range,
@@ -53,7 +54,9 @@ from poker_tracker.solver.texassolver import (
     ACTION_MAPPING_MAX_POT_FRACTION,
     MIN_STRATEGY_RANGE_COVERAGE,
     PINNED_CONSOLE_COMMIT,
+    TEXASSOLVER_MIN_WEIGHT,
     SolverResultUnusableError,
+    _exact_combo_weights,
     build_command_file,
     configured_resource_dir,
     input_hash,
@@ -416,6 +419,40 @@ def test_custom_hero_range_must_contain_recorded_combo() -> None:
     assert all("Ah" not in combo and "Qs" not in combo for combo in exact_combos)
 
 
+def test_the_weights_the_adapter_reads_back_are_the_weights_the_parser_meant() -> None:
+    """`solver_notation` is the only carrier of a range's weights out of the parser.
+
+    The adapter re-reads that string to work out what share of the submitted range
+    a dump describes, and refuses a result that covers too little of it. So the
+    string has to carry the parser's own numbers back intact. A weight below the
+    printing precision used to be accepted and written as an `AdAc:0` token, which
+    came back here as no weight at all: the coverage denominator quietly lost those
+    combos, and the range the solver was actually given was smaller than the one
+    the operator wrote.
+    """
+    for notation in ("AA:0.25,KK:0.5,QQ", "AA:0.006", "AA:0.0000001", "AA:0.5,KK:0.000001"):
+        try:
+            parsed = parse_range(notation)
+        except ValueError as exc:
+            assert "silently drops weights" in str(exc), notation
+            continue
+        read_back = _exact_combo_weights(parsed.solver_notation)
+        assert len(read_back) == parsed.combo_count, notation
+        assert all(
+            weight > TEXASSOLVER_MIN_WEIGHT for weight in read_back.values()
+        ), (notation, parsed.solver_notation)
+        assert sum(read_back.values()) == pytest.approx(
+            parsed.range_percent * TOTAL_COMBOS
+        ), notation
+
+    fully_weighted = parse_range("AA:0.25,KK:0.5,QQ")
+    assert set(_exact_combo_weights(fully_weighted.solver_notation).values()) == {
+        0.25,
+        0.5,
+        1.0,
+    }
+
+
 def test_premade_range_cannot_cross_pot_structures() -> None:
     _, _, _, _, spot = _completed_cash_spot()
     three_bet_spot = spot.model_copy(update={"pot_type": "three_bet"})
@@ -431,6 +468,126 @@ def test_premade_range_cannot_cross_pot_structures() -> None:
             single_raised,
             source="builtin",
         )
+
+
+def _saved_villain_profile(db) -> SolverRangeProfile:
+    """Save a range the way the Custom tab's 'Save as premade range' button does."""
+
+    db.create_solver_range_profile(
+        SolverRangeProfile(
+            name="6-max BTN open, my own study range",
+            notation="22+,A2s+,AQo+",
+            table_size=6,
+            position="BTN",
+            scenario="rfi",
+            pot_type="single_raised",
+            stack_bb=100,
+            description="User-saved post-session solver range.",
+        )
+    )
+    saved = db.fetch_solver_range_profiles()[0]
+    # Saved and built-in profiles are told apart by whether the row exists, and
+    # the row's own column has to agree with that or the label is a coin toss.
+    assert saved.id is not None
+    assert saved.source == "user"
+    return saved
+
+
+def test_a_saved_profile_reaches_the_stored_run_as_the_operators_own_range(
+    tmp_path, monkeypatch
+) -> None:
+    """The saved-profile path end to end, down to what the persisted row says.
+
+    Which side of the estimate/supplied line a range falls on is the entire point
+    of recording its source: a built-in study estimate filed as the operator's own
+    range is a wrong attribution, and once the run is written nothing downstream
+    can tell the two apart. The in-memory assumptions are asserted at the job
+    boundary elsewhere; what is checked here is the run READ BACK OUT OF THE
+    DATABASE through a second connection, because that row is what the evidence
+    card, the coaching prompt and any later export actually read.
+    """
+    _configure_fake_solver_install(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "poker_tracker.solver.jobs.solver_run_directory",
+        lambda run_id: _run_directory(tmp_path, run_id),
+    )
+
+    class DummyProcess:
+        pid = 44100
+
+    monkeypatch.setattr(
+        "poker_tracker.solver.jobs.subprocess.Popen",
+        lambda *args, **kwargs: DummyProcess(),
+    )
+    db_path = tmp_path / "saved-range.db"
+    db = PokerDatabase(db_path)
+    db.init_db()
+    session = db.create_session(Session(name="Saved range"))
+    hand = db.create_hand(
+        Hand(session_id=session.id, hand_number=1, game_type="NLHE cash", table_size=6)
+    )
+    _, _, _, _, original = _completed_cash_spot()
+    spot = original.model_copy(update={"hand_id": hand.id})
+    saved = _saved_villain_profile(db)
+
+    # The classification the Premade selector performs, over a profile that has
+    # actually been through SQLite rather than one built in the test.
+    villain = resolve_selected_profile(
+        spot, spot.ip, saved, source="user" if saved.id is not None else "builtin"
+    )
+    hero = resolve_profile(spot, spot.oop, BUILTIN_RANGE_PROFILES, source="default")
+    run = start_solver_job(db, spot, villain, hero)
+    db.close()
+
+    reader = PokerDatabase(db_path)
+    stored = reader.fetch_solver_run(run.id)
+    assert stored is not None
+    assert stored.range_ip["source"] == "user"
+    assert stored.range_ip["profile_name"] == saved.name
+    assert stored.range_oop["source"] == "default"
+    retained = "\n".join(stored.assumptions)
+    assert f"IP range '{saved.name}' was explicitly supplied by the user." in retained
+    assert f"IP range '{saved.name}' is an estimated study input" not in retained
+    # The negative half: the same run's built-in range keeps the estimate label,
+    # so the two are distinguishable rather than uniformly one or the other.
+    assert (
+        f"OOP range '{hero.profile_name}' is an estimated study input, "
+        "not solved preflop GTO." in retained
+    )
+    assert retained.count("estimated study input, not solved preflop GTO") == 1
+    reader.close()
+
+
+def test_a_range_cannot_be_resolved_as_a_source_its_profile_contradicts() -> None:
+    """Neither direction of the attribution may be supplied by the caller.
+
+    The source decides which sentence the run carries about the range, so a
+    caller that can name it freely can file a built-in estimate as the operator's
+    own read, or the operator's own read as a product default. The profile
+    already records which it is.
+    """
+    _, _, _, _, spot = _completed_cash_spot()
+    builtin = next(
+        profile
+        for profile in BUILTIN_RANGE_PROFILES
+        if profile.pot_type == "single_raised" and profile.scenario == "rfi"
+    )
+    user_profile = builtin.model_copy(update={"id": 7, "source": "user"})
+
+    with pytest.raises(ValueError, match="recorded as builtin"):
+        resolve_selected_profile(spot, spot.ip, builtin, source="user")
+    with pytest.raises(ValueError, match="recorded as user"):
+        resolve_selected_profile(spot, spot.ip, user_profile, source="builtin")
+    with pytest.raises(ValueError, match="recorded as user"):
+        resolve_profile(spot, spot.ip, [user_profile], source="default")
+
+    # The honest pairings still resolve, so the guard is not simply refusing.
+    assert resolve_selected_profile(spot, spot.ip, builtin, source="builtin").source == (
+        "builtin"
+    )
+    assert resolve_selected_profile(spot, spot.ip, user_profile, source="user").source == (
+        "user"
+    )
 
 
 def test_command_file_and_parser_preserve_combo_frequencies(tmp_path) -> None:

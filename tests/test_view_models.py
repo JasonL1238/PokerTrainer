@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 from poker_tracker.persistence.models import Hand, ProcessingJob, Session, VideoRecord
+from poker_tracker.ui import view_models
 from poker_tracker.ui.view_models import (
     build_hand_rows,
     build_job_rows,
@@ -8,7 +9,6 @@ from poker_tracker.ui.view_models import (
     build_session_rows,
     confidence_label,
     format_age,
-    result_basis_label,
 )
 
 
@@ -20,9 +20,10 @@ def test_portfolio_and_session_rows_preserve_sample_counts() -> None:
         Hand(id=3, session_id=4, hand_number=3),
     ]
 
-    summary = build_portfolio_summary(hands, 1)
+    summary = build_portfolio_summary(hands, [session], result_bases={})
     rows = build_session_rows([session], {4: hands})
 
+    assert summary.session_count == 1
     assert summary.hand_count == 3
     assert summary.reviewed_count == 1
     assert summary.review_percent == 100 / 3
@@ -44,7 +45,7 @@ def test_hand_rows_label_source_confidence_and_unknown_cards() -> None:
         )
     ]
 
-    row = build_hand_rows([session], hands)[0]
+    row = build_hand_rows([session], hands, {})[0]
 
     assert row.session_name == "CV import"
     assert row.hero_cards == "Unknown"
@@ -76,7 +77,7 @@ def test_hand_rows_carry_the_evidence_class_the_metric_denominator_counts() -> N
         ),
     ]
 
-    rows = build_hand_rows([session], hands)
+    rows = build_hand_rows([session], hands, {})
 
     assert [row.evidence_class for row in rows] == [
         "manual",
@@ -89,24 +90,79 @@ def test_hand_rows_carry_the_evidence_class_the_metric_denominator_counts() -> N
 
 
 def test_a_derived_result_is_never_rendered_as_an_observed_one() -> None:
-    """``derived_result_substituted`` had no display consumer at all.
+    """A row's provenance label comes from the resolver's basis, not from a flag.
 
     A hand whose ``hero_bb_won`` column is NULL but whose reconciliation derives
     -18 BB showed -18 BB in the Hands library indistinguishable from a figure the
-    operator recorded.
+    operator recorded. The flag that used to answer this -- ``derived_result_
+    substituted`` -- records only that the displayed value differs from the
+    stored column, so the CHIP-PROVEN hand below (id 3: the ledger established
+    the figure and agreed with the recorded one, the strongest evidence the
+    product can produce) was labelled "Recorded on the hand" while carrying the
+    substitution flag ``False``. The four cases here are the four bases.
     """
     session = Session(id=1, name="Mixed")
     observed = Hand(id=1, session_id=1, hand_number=1, hero_bb_won=-18)
-    derived = observed.model_copy(update={"derived_result_substituted": True})
-    blank = Hand(id=2, session_id=1, hand_number=2)
+    ledger_only = Hand(id=2, session_id=1, hand_number=2, hero_bb_won=-18)
+    chip_proven = Hand(id=3, session_id=1, hand_number=3, hero_bb_won=-18)
+    unattributed = Hand(id=4, session_id=1, hand_number=4, hero_bb_won=-18)
+    blank = Hand(id=5, session_id=1, hand_number=5)
 
-    rows = build_hand_rows([session], [observed, derived, blank])
+    rows = build_hand_rows(
+        [session],
+        [observed, ledger_only, chip_proven, unattributed, blank],
+        {
+            1: "observed",
+            2: "reconciled",
+            3: "reconciled",
+            4: "unattributed",
+            5: "none",
+        },
+    )
 
-    assert rows[0].result_bb == rows[1].result_bb == -18
+    assert [row.result_bb for row in rows[:4]] == [-18, -18, -18, -18]
+    assert [row.result_basis for row in rows] == [
+        "observed",
+        "reconciled",
+        "reconciled",
+        "unattributed",
+        "none",
+    ]
     assert rows[0].result_basis_label == "Recorded on the hand"
     assert rows[1].result_basis_label == "Derived from the reconciled ledger"
-    assert rows[2].result_basis_label == "No result recorded"
-    assert result_basis_label(derived) == "Derived from the reconciled ledger"
+    # The case the substitution flag could never catch: nothing was substituted
+    # and the ledger still established the number.
+    assert chip_proven.derived_result_substituted is False
+    assert rows[2].result_basis_label == "Derived from the reconciled ledger"
+    assert (
+        rows[3].result_basis_label
+        == "Recorded, ledger could not attribute it to a hero seat"
+    )
+    assert rows[4].result_basis_label == "No result recorded"
+
+
+def test_the_substitution_flag_cannot_relabel_a_row_it_does_not_own() -> None:
+    """The old wrong path is gone, not merely unused.
+
+    A flag saying "this display copy's value differs from the stored column" is
+    not provenance, and while a helper existed that answered the provenance
+    question from it, the next consumer would have reached for it -- it had the
+    right name. So the row takes its label from the basis it was given even when
+    the flag says the opposite in both directions.
+    """
+    session = Session(id=1, name="Mixed")
+    flagged = Hand(
+        id=1, session_id=1, hand_number=1, hero_bb_won=-18
+    ).model_copy(update={"derived_result_substituted": True})
+    unflagged = Hand(id=2, session_id=1, hand_number=2, hero_bb_won=-18)
+
+    rows = build_hand_rows(
+        [session], [flagged, unflagged], {1: "observed", 2: "reconciled"}
+    )
+
+    assert rows[0].result_basis_label == "Recorded on the hand"
+    assert rows[1].result_basis_label == "Derived from the reconciled ledger"
+    assert not hasattr(view_models, "result_basis_label")
 
 
 def test_job_rows_include_video_and_relative_age() -> None:

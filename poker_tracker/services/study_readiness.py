@@ -246,6 +246,44 @@ def unattested_assumption_dependence(
     )
 
 
+def accounting_verdict_predates_record(
+    accounting: AccountingReconciliation | None,
+) -> bool:
+    """Does this hand's ledger reconcile while no stored verdict says so yet?
+
+    ``is_authoritative`` needs two things: a ledger that reconciles NOW, derived
+    on every read, and a ``hand_settlements.status`` reading ``reconciled``,
+    which is a label written by a past save. They come apart whenever the record
+    moves after the label was written -- correct an action amount, an award, a
+    starting stack or the board -- and on a hand that has simply never been
+    reconciled, where the ledger has always been fine and nobody has saved yet.
+
+    Both are the same state and it needs its own name, because the blocker built
+    for it said "The chip ledger does not reconcile", which is the one thing that
+    is not true here, and carried no detail: ``persist_reconciliation`` had
+    already rewritten the recorded figures the cross-check compares, so the
+    issue list an operator would be shown was EMPTY. A hand blocked with a false
+    reason and no evidence is indistinguishable from a hand with a real
+    accounting defect, and the two want opposite actions -- one wants the ledger
+    investigated, the other wants the settlement saved once.
+
+    Deliberately not part of ``accounting_is_established``: a stale verdict is
+    still not a verdict, and no derived figure may be published on one. This only
+    decides how the refusal is worded.
+
+    ``is_authoritative`` is deliberately not read, and not because of the
+    allowlist that guards it: a stored status other than ``reconciled`` already
+    forces that flag False, so consulting it would restate a term below rather
+    than decide anything.
+    """
+    if accounting is None or accounting.issues:
+        return False
+    if accounting.settlement is None or accounting.settlement.status == "reconciled":
+        return False
+    ledger = accounting.ledger
+    return ledger.is_settled and ledger.is_balanced and ledger.is_legal
+
+
 def accounting_is_established(
     hand: Hand, accounting: AccountingReconciliation | None
 ) -> bool:
@@ -770,6 +808,35 @@ def _accounting_blockers(
     if accounting is not None and accounting.is_authoritative and not accounting_error:
         return []
     detail: tuple[str, ...] = (accounting_error,) if accounting_error else ()
+    if not accounting_error and accounting_verdict_predates_record(accounting):
+        # Said in the blocker rather than left to the operator to infer, because
+        # the alternative is what shipped: a hand blocked by an accounting
+        # verdict, no issue to show, and a save that appears to do nothing.
+        # `persist_reconciliation` repairs the recorded figures and records the
+        # verdict it reached BEFORE that repair, so the pass that fixes the
+        # record and the pass that blesses it are two passes, and only one of
+        # them is announced.
+        return [
+            StudyBlocker(
+                code="ACCOUNTING_NOT_AUTHORITATIVE",
+                category="accounting",
+                reason=(
+                    "This hand's chip ledger reconciles, but no saved settlement "
+                    "records that verdict, so the pot and result are not yet "
+                    "proven by anything durable."
+                ),
+                clearing_action=(
+                    "Open Import validation → Edit this hand → Other fixes → "
+                    "Chip stacks / accounting and press Save and reconcile once. "
+                    "The ledger already balances; the stored settlement status is "
+                    "what is out of date."
+                ),
+                detail=(
+                    "Settlement status reads "
+                    f"{accounting.settlement.status!r}, not 'reconciled'.",
+                ),
+            )
+        ]
     if not detail and accounting is not None:
         detail = tuple(accounting.issues[:4])
     # A LedgerError means the ledger REFUSED to build -- a player commits more

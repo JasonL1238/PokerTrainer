@@ -21,7 +21,8 @@ from typing import Literal
 from poker_tracker.math.accounting import LedgerError
 from poker_tracker.math.study_math import mean_confidence_interval
 from poker_tracker.persistence.db import PokerDatabase
-from poker_tracker.persistence.models import CoachingResponse, Hand, HandReview
+from poker_tracker.persistence.import_export import DUPLICATE_IMPORT_NOTE
+from poker_tracker.persistence.models import CoachingResponse, Hand, HandReview, Session
 from poker_tracker.services.hand_accounting import (
     AccountingReconciliation,
     reconcile_persisted_hand,
@@ -30,6 +31,54 @@ from poker_tracker.services.study_readiness import accounting_is_established
 
 AGGRESSIVE_ACTIONS = {"bet", "raise", "all-in"}
 PASSIVE_ACTIONS = {"check", "call"}
+
+
+# ---------------------------------------------------------------------------
+# Re-imported copies
+# ---------------------------------------------------------------------------
+
+# Built from the note the importer writes rather than respelled, so the reader
+# and the writer cannot drift into disagreeing about what a re-imported copy
+# looks like. If ``DUPLICATE_IMPORT_NOTE`` is reworded, this pattern is reworded
+# with it and a copy labelled by an older build stops matching -- which is the
+# safe direction, because a session that fails to match is counted, exactly as it
+# was before this existed, rather than silently vanishing from the totals.
+_DUPLICATE_NOTE_PATTERN = re.compile(
+    re.escape(DUPLICATE_IMPORT_NOTE.split("{other_id}")[0]) + r"(\d+)"
+)
+
+
+def duplicate_import_source(session: Session) -> int | None:
+    """The session id this one was recorded as a re-imported copy of, if any.
+
+    The marker is the note ``import_export._label_duplicate_import`` writes, and
+    it is the product's own statement that these hands are already in this
+    database under another session. Nothing else in the schema records it: import
+    is an append and the copy is an ordinary session in every other respect.
+    """
+    match = _DUPLICATE_NOTE_PATTERN.search(session.notes or "")
+    if match is None:
+        return None
+    duplicate_of = int(match.group(1))
+    return None if duplicate_of == session.id else duplicate_of
+
+
+def duplicate_import_sessions(sessions: Iterable[Session]) -> Mapping[int, int]:
+    """``{copy session id: the session id it duplicates}`` over a session list.
+
+    The copy is the one dropped from a total and the named session is the one
+    kept, which is well defined however many copies exist: the importer always
+    names the OLDEST matching session, so a third and fourth re-import both point
+    at the original rather than at each other.
+    """
+    found: dict[int, int] = {}
+    for session in sessions:
+        if session.id is None:
+            continue
+        duplicate_of = duplicate_import_source(session)
+        if duplicate_of is not None:
+            found[session.id] = duplicate_of
+    return found
 
 
 @dataclass(frozen=True)
@@ -277,6 +326,7 @@ def resolve_hero_result(
 PopulationKey = Literal["confirmed", "reconciled", "all_saved"]
 
 ExclusionReason = Literal[
+    "duplicate_session",
     "operator_excluded",
     "not_reviewed",
     "incomplete",
@@ -284,6 +334,7 @@ ExclusionReason = Literal[
 ]
 
 EXCLUSION_REASON_LABELS: Mapping[ExclusionReason, str] = {
+    "duplicate_session": "In a session the importer labelled a re-imported copy",
     "operator_excluded": "Marked non-study",
     "not_reviewed": "Not marked reviewed",
     "incomplete": "Reconstruction is partial or uncertain",
@@ -357,12 +408,16 @@ POPULATIONS: Mapping[PopulationKey, PopulationSpec] = {
     "all_saved": PopulationSpec(
         key="all_saved",
         label="All saved hands",
-        rule="every row in the hands table",
+        rule=(
+            "every row in the hands table, except rows belonging to a session the "
+            "importer recorded as a re-imported copy"
+        ),
         admits="Everything the database holds, whatever state it is in.",
         excludes=(
-            "Nothing. This population mixes confirmed records with unconfirmed "
-            "CV drafts, so a rate computed over it is a description of the "
-            "database rather than of your play."
+            "Only re-imported copies, which are a second stored copy of hands "
+            "already counted under another session. This population still mixes "
+            "confirmed records with unconfirmed CV drafts, so a rate computed "
+            "over it is a description of the database rather than of your play."
         ),
     ),
 }
@@ -389,6 +444,10 @@ class HandEvidence:
     accounting_established: bool
     accounting_error: str | None
     result: HeroResult
+    # The session id this hand's session was recorded as a re-imported copy of.
+    # Set means the same poker is already in the database under another session,
+    # so counting this row adds it to the operator's totals a second time.
+    duplicate_of_session_id: int | None
     tags: tuple[str, ...]
     current_coaching_themes: tuple[str, ...]
     stale_coaching_themes: tuple[str, ...]
@@ -413,7 +472,17 @@ def population_exclusion(
     report a single actionable reason per hand. The order is by what the
     operator would do about it: a deliberate exclusion first, then the workflow
     step, then the evidence problems.
+
+    The duplicate check precedes the ``all_saved`` shortcut deliberately. A
+    re-imported copy is not a weaker grade of evidence that a wider population
+    can admit -- it is the same poker stored twice -- so no population may count
+    it, and ``all_saved`` says so in its rule rather than quietly doubling. That
+    also removes the second, weaker answer to the question: with the check above
+    the shortcut there is no population left that a caller could reach for to get
+    the doubled figure back.
     """
+    if evidence.duplicate_of_session_id is not None:
+        return "duplicate_session"
     if population == "all_saved":
         return None
     if evidence.study_inclusion == "skip":
@@ -488,6 +557,7 @@ def build_hand_evidence(
     coaching_by_hand: Mapping[int, Sequence[CoachingResponse | HandReview]]
     | None = None,
     load_coaching: bool = True,
+    sessions: Iterable[Session] | None = None,
 ) -> tuple[HandEvidence, ...]:
     """Resolve every hand's epistemic state once, for any number of populations.
 
@@ -499,8 +569,17 @@ def build_hand_evidence(
     cache pass it in; without one this reconciles each hand itself, which is two
     ledger builds per hand. ``coaching_by_hand`` does the same for retained
     coaching: supplied, it costs nothing; omitted with ``load_coaching`` set, it
-    is two queries per hand.
+    is two queries per hand. ``sessions`` is the same optimisation for a caller
+    that already holds the session list.
+
+    The re-import lookup is done HERE, from the database, rather than taken as a
+    required argument, because a caller that forgets it would get doubled totals
+    back and nothing would say so. One query for the whole corpus is the price of
+    making that unforgettable.
     """
+    duplicates = duplicate_import_sessions(
+        db.fetch_sessions() if sessions is None else sessions
+    )
     resolved: list[HandEvidence] = []
     for hand in hands:
         accounting: AccountingReconciliation | None = None
@@ -551,6 +630,7 @@ def build_hand_evidence(
                 accounting_established=established,
                 accounting_error=error,
                 result=resolve_hero_result(db, hand, accounting, reconciled=True),
+                duplicate_of_session_id=duplicates.get(hand.session_id),
                 tags=tuple(hand.tags),
                 current_coaching_themes=tuple(dict.fromkeys(current)),
                 stale_coaching_themes=tuple(dict.fromkeys(stale)),
@@ -595,6 +675,7 @@ def build_population(
     coaching_by_hand: Mapping[int, Sequence[CoachingResponse | HandReview]]
     | None = None,
     load_coaching: bool = True,
+    sessions: Iterable[Session] | None = None,
 ) -> PopulationSnapshot:
     """Convenience for a caller that needs exactly one population."""
     return select_population(
@@ -604,6 +685,7 @@ def build_population(
             reconcile=reconcile,
             coaching_by_hand=coaching_by_hand,
             load_coaching=load_coaching,
+            sessions=sessions,
         ),
         population,
     )

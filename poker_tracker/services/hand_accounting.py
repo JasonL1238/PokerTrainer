@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import blake2s
 from math import isclose
 
@@ -376,7 +376,38 @@ def persist_reconciliation(
     *,
     status_when_valid: str = "reconciled",
 ) -> AccountingReconciliation:
-    """Recompute summaries and persist a truthful reconciliation status."""
+    """Recompute summaries and persist a truthful reconciliation status.
+
+    The VERDICT is taken over the record as found, and deliberately so: rounds
+    4-6 pin a settlement whose recorded rake disagrees with the policy stored
+    beside it to ``needs_correction`` on the save that repairs it, and round 10
+    pins a settlement row the reader had to degrade to being rewritten by that
+    same save. Both exist because a recorded figure disagreeing with the ledger
+    is EVIDENCE -- an import payload forged one -- and the operator gets one
+    visible refusal before the product replaces it.
+
+    The WARNINGS are about the row this stores, which is a different row, and
+    that difference is the whole defect. The save that repairs a stale figure
+    used to file the mismatch it had just eliminated: correct a bet from 10 to 20
+    and reconcile, and the row read ``needs_correction`` because "Recorded gross
+    pot does not match the derived ledger" while holding the corrected 40 the
+    complaint denied. Every consumer then disagreed with it -- the returned
+    reconciliation, re-derived from the repaired row, carried an EMPTY issue
+    tuple, and ``app.py`` renders THAT, so the hand was blocked and no surface in
+    the product would say why. Pressing the same button again, changing nothing,
+    cleared it.
+
+    So the warnings now describe the stored row, and the state they leave is
+    named rather than merely survived: see
+    ``study_readiness.accounting_verdict_predates_record``, which is what tells
+    the operator another pass is required instead of blocking them in silence.
+    One save is still not a fixed point when it repaired something -- that is
+    the pinned contract above, and closing it means changing what rounds 4-6 and
+    10 assert, which is a decision for whoever owns that contract rather than a
+    side effect of this repair. When a save repairs NOTHING it is now a genuine
+    no-op: the write is skipped outright, so ``updated_at`` does not move either,
+    and a repeat save changes nothing at all.
+    """
 
     result = reconcile_persisted_hand(db, hand_id)
     hand_players = db.fetch_players_by_hand(hand_id)
@@ -414,26 +445,54 @@ def persist_reconciliation(
             )
             result = reconcile_persisted_hand(db, hand_id)
     existing = result.settlement or HandSettlement(hand_id=hand_id)
+    ledger = result.ledger
     valid = (
-        result.ledger.is_settled
-        and result.ledger.is_balanced
-        and result.ledger.is_legal
+        ledger.is_settled
+        and ledger.is_balanced
+        and ledger.is_legal
         and not result.issues
     )
-    status = status_when_valid if valid else "needs_correction"
-    updated = existing.model_copy(
+    summarised = existing.model_copy(
         update={
-            "status": status,
-            "gross_pot": result.ledger.gross_pot,
-            "rake_amount": result.ledger.rake,
-            "net_pot": result.ledger.net_pot,
-            "is_balanced": result.ledger.is_balanced,
-            "warnings": list(result.issues),
-            "updated_at": utc_now(),
+            "status": status_when_valid if valid else "needs_correction",
+            "gross_pot": ledger.gross_pot,
+            "rake_amount": ledger.rake,
+            "net_pot": ledger.net_pot,
+            "is_balanced": ledger.is_balanced,
         }
     )
-    db.upsert_hand_settlement(updated)
+    # The issues that hold on the row about to be stored, not the ones that held
+    # on the row it replaces. Five comparisons read fields overwritten just above
+    # -- the three recorded summary figures against the ledger, `is_balanced`
+    # against chip conservation, and `status` against whether every pot has a
+    # winner -- and filing those against the repaired row stated a defect the same
+    # save had removed. None of them can fire here: the figures ARE the ledger's,
+    # `is_balanced` IS the ledger's, and `reconciled` is written only where
+    # `valid` held, which requires a settled ledger. Nothing else the cross-check
+    # reads is written by this function, so this is one ledger build and no second
+    # verdict.
+    records = replace(_load_hand_records(db, hand_id), settlement=summarised)
+    updated = summarised.model_copy(
+        update={"warnings": list(_cross_check(records, records.declaration).issues)}
+    )
+    if _settlement_state(result.settlement) != _settlement_state(updated):
+        db.upsert_hand_settlement(updated.model_copy(update={"updated_at": utc_now()}))
     return reconcile_persisted_hand(db, hand_id)
+
+
+def _settlement_state(settlement: HandSettlement | None) -> tuple | None:
+    """Everything this writer stores, with the timestamps left out.
+
+    ``updated_at`` moves on every write by construction, so comparing whole rows
+    would make every save look like a change and the skip would never fire.
+    ``created_at`` is not this writer's to move. Everything else is compared,
+    including the declared inputs copied through untouched, because a save that
+    agrees about the verdict and disagrees about the declaration is not a no-op.
+    """
+    if settlement is None:
+        return None
+    dumped = settlement.model_dump(exclude={"created_at", "updated_at"})
+    return tuple(sorted((key, repr(value)) for key, value in dumped.items()))
 
 
 # ---------------------------------------------------------------------------
@@ -522,37 +581,142 @@ def _unreadable_row_issues(records: _HandRecords) -> list[str]:
     ]
 
 
+STALE_AWARD_PREFIX = "Stored pot awards do not fit this hand's pot layers"
+
+
+def _ledger_under_declaration(
+    records: _HandRecords, declaration: _Declaration
+) -> tuple[HandLedger, list[str]]:
+    """Build the ledger under one declaration; a stale award index is not a crash.
+
+    ``settlement_entries.pot_index`` is a durable ordinal into a structure this
+    product DERIVES, and the derivation is not frozen. Commit 3c3144e began
+    cutting pot levels at dead contributions as well as live ones, which moves
+    both the count and the numbering of the layers of any hand that contains a
+    forced post -- in both directions. An award row written under the earlier
+    layering can therefore name a pot index this build does not produce, or name
+    a seat that is no longer eligible for the index it does produce, and
+    ``_validate_winners`` raises ``LedgerError`` for either. Nothing between here
+    and the caller caught it, so a hand that reconciled a release ago became an
+    unhandled traceback for every caller that is not app.py.
+
+    Three answers were available and this is the third.
+
+    A forward-only migration that recomputes ``pot_index`` was rejected: to
+    renumber an award it would have to decide WHICH derived layer an old ordinal
+    meant, and the old layering is not recoverable from the stored rows -- the
+    ordinal survives, the levels it indexed do not. Every renumbering rule is
+    therefore a guess, and a guess written into a durable column is a wrong award
+    silently accepted as study-ready, which is the failure this module has
+    already shipped twice.
+
+    Re-keying awards off something stable rather than an ordinal is the better
+    long-term shape and does not help here. ``pot_index`` IS the durable column,
+    the settlement editor's "Pot" field is the operator's own ordinal, and rows
+    already exist under it; changing the key is a schema change that would still
+    have to answer the same unanswerable renumbering question for every row
+    already stored.
+
+    So the mismatch is SURFACED. The hand is rebuilt with the unusable awards
+    withdrawn -- an unsettled but fully inspectable ledger, with every
+    contribution, refund, snapshot and layer still derived -- and the refusal is
+    reported as a cross-check issue naming the claim and the layer count.
+    ``persist_reconciliation`` turns that into ``needs_correction``,
+    ``is_authoritative`` goes False, and the operator re-declares the winner
+    against the layers this hand actually has. Nothing is renumbered on their
+    behalf and nothing is accepted.
+
+    The rebuild is also what tells the two cases apart. A ``LedgerError`` raised
+    with awards present may equally be a structurally impossible record -- an
+    action referencing an unknown player, a commitment past a stack -- which the
+    awards did not cause and withdrawing them does not cure. When the award-free
+    build raises too, that error propagates unchanged, so a genuinely broken
+    record still fails loudly instead of being reported as a settlement problem.
+
+    NO SCHEMA CHANGE, and therefore no migration. ``settlement_entries`` keeps
+    its columns, its index and its meaning; existing rows are read exactly as
+    they were written; a store that never meets the mismatch behaves identically.
+    The only durable effect is on hands that DO meet it, and it is a status of
+    ``needs_correction`` the operator clears by re-declaring the awards -- an
+    ordinary settlement edit, not a data repair. Downgrading is safe for the same
+    reason: an older build reading the same rows raises where this one reports.
+    """
+
+    def build(declared: _Declaration) -> HandLedger:
+        return build_ledger_from_records(
+            records.players,
+            records.actions,
+            dead_money=declared.dead_money,
+            winners=declared.winners,
+            rake=declared.rake,
+            odd_chip_order=list(declared.odd_chip_order),
+            flop_seen=records.flop_seen,
+        )
+
+    try:
+        return build(declaration), []
+    except LedgerError as error:
+        # Only the operator's own stored awards can be stale. A forced-winner
+        # pass numbers its pots off the award-less ledger it was just handed, so
+        # it cannot name a layer this build does not have, and letting it take
+        # this branch would turn an unbuildable neutral pass -- which
+        # ``_try_cross_check`` reads as the strongest form of dependence -- into
+        # a buildable one.
+        if not declaration.awards or declaration.forced_winners is not None:
+            raise
+        # Withdrawing the awards is the whole difference between the two builds,
+        # so if this one refuses as well, the awards were never the problem.
+        withdrawn = build(declaration.without_awards())
+        return withdrawn, [
+            f"{STALE_AWARD_PREFIX}: {error} This hand derives "
+            f"{len(withdrawn.pots)} pot layer(s); re-declare the winner of each "
+            "one in Edit settlement. Stored awards are numbered against the pot "
+            "layering in force when they were saved, and this hand no longer "
+            "produces that layering."
+        ]
+
+
 def _unanswered_wager_issues(
     players: list[HandPlayer], ledger: HandLedger
 ) -> list[str]:
-    """An uncalled wager nobody was left able to answer means the line never closed.
+    """A recorded line that stops while a seat still owes chips has no result.
 
-    The ledger refunds an uncalled wager -- the excess one seat committed above
-    every other seat -- and that refund is only ever produced by one of two real
-    situations: everyone else FOLDED to it, or everyone else was ALL-IN and
-    physically could not match it. In both, the excess chips were never live to
-    anybody, so handing them back is right.
+    A completed street ends with every seat that is still in the hand having
+    either matched the largest live wager on it or run out of chips. When the
+    record stops short of that, the reducer has no way to know it: it reads the
+    remaining seat's silence as a fold nobody made, refunds whatever went
+    unmatched, and pays the declared winner the rest. A manual spot typed as
+    ``x/b3.5`` (Hero checks, Villain bets, Hero never acts), a mid-street
+    truncation, a reconstructed hand whose closing action was not observed --
+    every figure derived from one of those is a number no completion of the hand
+    produces, and the whole stack of surfaces called it "reconciled".
 
-    There is a third way to reach a refund, and it is not a situation at all: the
-    recorded action line simply stops while an opponent still has cards and chips.
-    A manual spot typed as ``x/b3.5`` (Hero checks, Villain bets, Hero never
-    acts), a mid-street truncation, a reconstructed hand whose closing action was
-    not observed. The ledger cannot tell that apart from a fold-win by looking at
-    contributions alone, so it refunded the bet AND paid the whole pot to the
-    declared winner: a settlement asserting simultaneously that Villain's wager
-    went unanswered and that Hero won it. Every figure derived from that hand --
-    the hero result substituted into the Hands library and the win rate, the pot
-    on the Study page, the math facts handed to the coaching provider -- is a
-    number no completion of the hand produces, and the whole stack of surfaces
-    called it "reconciled".
+    This used to be measured through the REFUND: find a seat handed uncalled
+    money back, then ask whether anybody who could have called it was still
+    there. That reads the symptom rather than the fact, and it only appears when
+    ONE seat is uniquely ahead. Three seats -- small blind 1, big blind 2, button
+    calls 2 -- and the small blind never acts again: two seats tie at the top, so
+    nothing is uncalled, no refund is produced, and the guard never ran. The hand
+    reconciled as authoritative, balanced, legal and warning-free, with the small
+    blind recorded as winning two big blinds it never paid to see. The trigger was
+    never the refund; it was the unmatched wager, and every refund-bearing case is
+    one instance of that.
 
-    The distinguishing fact is available here and was never consulted: whether
-    any seat that is NOT the refunded one is still in the hand (did not fold) and
-    still has chips behind (was not all-in). If one is, the wager was live when
-    the record ended and this hand has no derivable result, whoever is declared
-    the winner of it -- including the case where the declared winner happens to be
-    the refunded seat, where the arithmetic coincides with "the opponent folded"
-    but the record does not say so.
+    So the fact is measured directly, street by street, off the ledger's own
+    snapshots: on any street where live money went in, a seat that did not fold,
+    put chips up, still has chips behind, and did not reach that street's largest
+    live contribution is a seat whose decision was never recorded. The
+    refund-shaped case is a strict subset -- the refunded seat is by construction
+    the one at the top, so every other live seat is below it -- so nothing that
+    was caught before stops being caught.
+
+    A seat that put NOTHING in is not read as owing a decision: the ledger already
+    leaves it out of every pot's eligible set, and a table seat that was never
+    dealt in, or folded before the recording began, is not an unanswered wager. A
+    seat that folded later is excused for earlier streets too, which is the one
+    deliberate gap: reaching the fold means it answered, and unpicking which
+    street it answered on would need action-level history the reducer does not
+    keep per seat.
 
     Reported as a cross-check issue rather than raised, on the same reasoning as
     every other issue in this module: ``persist_reconciliation`` turns it into
@@ -568,31 +732,59 @@ def _unanswered_wager_issues(
     stacks = {player.player_key: player.starting_stack for player in players}
     names = {player.player_key: player.player_name for player in players}
     folded = set(ledger.folded_players)
+
+    def owes_a_decision(identity: str) -> bool:
+        """Did this seat still have a choice to make when the record ended?"""
+
+        if identity in folded:
+            return False
+        contributed = ledger.contributions.get(identity, 0.0)
+        if contributed <= _FLOAT_TOLERANCE:
+            return False
+        behind = stacks.get(identity)
+        # An unknown stack is treated as chips behind. A seat this product cannot
+        # prove was all-in must not be assumed to have been.
+        return behind is None or behind - contributed > _FLOAT_TOLERANCE
+
+    # The largest live contribution each seat reached on each street, read off the
+    # snapshots so this agrees with the reducer by construction rather than by a
+    # second walk of the actions. A seat with no snapshot on a street reached zero
+    # there, which is the whole point on the street it went silent.
+    reached: dict[tuple[str, str], float] = {}
+    streets: list[str] = []
+    for snapshot in ledger.snapshots:
+        if snapshot.street not in streets:
+            streets.append(snapshot.street)
+        key = (snapshot.street, snapshot.player)
+        reached[key] = max(
+            reached.get(key, 0.0), snapshot.street_contribution_after
+        )
+
     issues: list[str] = []
-    for identity, refund in sorted(ledger.refunds.items()):
-        if refund <= _FLOAT_TOLERANCE:
+    for street in streets:
+        wager = max(
+            (value for (on, _seat), value in reached.items() if on == street),
+            default=0.0,
+        )
+        if wager <= _FLOAT_TOLERANCE:
+            # Checked round, or a street of nothing but forced posts and shows.
             continue
-        live: list[str] = []
-        for other, contributed in sorted(ledger.contributions.items()):
-            if other == identity or other in folded:
-                continue
-            # A seat that put nothing in is not "still in the hand" for this
-            # purpose: the ledger already leaves it out of every pot's eligible
-            # set, and a table seat that was never dealt in or folded before the
-            # recording began must not be read as an unanswered decision.
-            if contributed <= _FLOAT_TOLERANCE:
-                continue
-            behind = stacks.get(other)
-            if behind is None or behind - contributed > _FLOAT_TOLERANCE:
-                live.append(names.get(other, other))
-        if live:
-            issues.append(
-                f"{names.get(identity, identity)} is refunded {refund:g} as an "
-                f"uncalled wager, but {', '.join(live)} neither folded nor was "
-                "all-in, so the recorded action line never closed the betting. "
-                "Record the call, fold, raise, or all-in that ended it; no result "
-                "can be derived from a hand that stops mid-wager."
-            )
+        owing = sorted(
+            names.get(identity, identity)
+            for identity in ledger.contributions
+            if owes_a_decision(identity)
+            and reached.get((street, identity), 0.0) + _FLOAT_TOLERANCE < wager
+        )
+        if not owing:
+            continue
+        subject = "is" if len(owing) == 1 else "are"
+        issues.append(
+            f"{', '.join(owing)} {subject} still in the hand with chips behind "
+            f"but never matched the {wager:g} wagered on the {street}, so the "
+            "recorded action line never closed the betting. Record the call, "
+            "fold, raise, or all-in that ended it; no result can be derived from "
+            "a hand that stops mid-wager."
+        )
     return issues
 
 
@@ -613,18 +805,11 @@ def _cross_check(records: _HandRecords, declaration: _Declaration) -> _CrossChec
     hand = records.hand
     players = records.players
     settlement = records.settlement
-    ledger = build_ledger_from_records(
-        players,
-        records.actions,
-        dead_money=declaration.dead_money,
-        winners=declaration.winners,
-        rake=declaration.rake,
-        odd_chip_order=list(declaration.odd_chip_order),
-        flop_seen=records.flop_seen,
-    )
+    ledger, award_issues = _ledger_under_declaration(records, declaration)
     issues = [
         *ledger.warnings,
         *ledger.legality_issues,
+        *award_issues,
         *_unanswered_wager_issues(records.players, ledger),
         *_unreadable_row_issues(records),
     ]

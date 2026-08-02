@@ -934,3 +934,93 @@ def test_antes_do_not_coarsen_an_evenly_chopped_pot() -> None:
         odd_chip_order=("B", "A"),
     )
     assert reversed_order.payouts == pytest.approx(ledger.payouts)
+
+
+# --- Adversarial round 17: what an uncalled refund may and may not take away ---
+#
+# Two contribution figures decide two different questions, and collapsing them
+# into one breaks whichever question loses. What a seat has left IN the pot --
+# live money that stuck, plus every dead chip -- is what SIZES a layer and what
+# caps the eligibility of the seats an all-in stopped short. What a seat PUT UP
+# before any uncalled money came back is what says it played the hand at all.
+# The round-16 repair reported measuring eligibility against the settled figure
+# as a defect in its own fix; these pin both halves of the corrected rule so the
+# next repair to this module cannot quietly collapse them again.
+
+
+def test_a_refunded_seat_still_contests_a_layer_above_what_stayed_in() -> None:
+    """An uncalled bet coming back does not un-play the hand it was bet into.
+
+    Four seats. ``S`` is all-in for nothing but its ante and is capped at the
+    layer holding the antes -- that much is the round-16 rule. ``R`` shoves 100,
+    two seats are all-in for 30 behind dead blinds of 5, and 70 of R's shove is
+    returned as uncalled, leaving 30 of R's chips in a pot whose top layer is cut
+    at 35.
+
+    R matched every live chip its opponents wagered; the 5 they are ahead by is
+    dead money owed to the table, not a wager R declined. Measuring eligibility
+    against what STAYED IN would cap R below that cut and refuse the only
+    truthful declaration on a hand R won, which is the unrecordable-hand failure
+    that started this whole chain. Measuring against what R put up keeps R in.
+    """
+    players = [
+        _player("S", stack=1, seat=0),
+        _player("R", stack=200, seat=1),
+        _player("Z", stack=35, seat=2),
+        _player("W", stack=35, seat=3),
+    ]
+    actions = [
+        _action("S", "ante", 1),
+        LedgerAction(
+            player="Z", street="preflop", kind="post_blind", amount=5, is_live_post=False
+        ),
+        LedgerAction(
+            player="W", street="preflop", kind="post_blind", amount=5, is_live_post=False
+        ),
+        _action("R", "bet", 100),
+        _action("Z", "all-in", 30),
+        _action("W", "all-in", 30),
+    ]
+    layers = build_hand_ledger(players, actions).pots
+
+    assert [pot.amount for pot in layers] == pytest.approx([4, 97])
+    assert layers[0].eligible_players == ("S", "R", "Z", "W")
+    # R has 30 in the pot and the layer is cut at 35, and R is still eligible.
+    assert layers[1].eligible_players == ("R", "Z", "W")
+
+    ledger = build_hand_ledger(players, actions, {0: ("S",), 1: ("R",)})
+    assert ledger.refunds["R"] == pytest.approx(70)
+    assert ledger.payouts["R"] == pytest.approx(97)
+    assert ledger.net_results == pytest.approx({"S": 3, "R": 67, "Z": -35, "W": -35})
+    assert ledger.is_balanced is True
+    assert ledger.legality_issues == ()
+
+
+def test_a_seat_capped_by_an_all_in_is_still_refused_the_layer_above() -> None:
+    """The same hand from the other side: gross commitment is not a free pass.
+
+    ``S`` put up one chip and is out of the layer holding ninety-seven, which is
+    the guarantee the round-16 repair exists to provide. Stated next to the test
+    above so a future change cannot satisfy one by discarding the other.
+    """
+    players = [
+        _player("S", stack=1, seat=0),
+        _player("R", stack=200, seat=1),
+        _player("Z", stack=35, seat=2),
+        _player("W", stack=35, seat=3),
+    ]
+    actions = [
+        _action("S", "ante", 1),
+        LedgerAction(
+            player="Z", street="preflop", kind="post_blind", amount=5, is_live_post=False
+        ),
+        LedgerAction(
+            player="W", street="preflop", kind="post_blind", amount=5, is_live_post=False
+        ),
+        _action("R", "bet", 100),
+        _action("Z", "all-in", 30),
+        _action("W", "all-in", 30),
+    ]
+
+    with pytest.raises(LedgerError):
+        build_hand_ledger(players, actions, {0: ("S",), 1: ("S",)})

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from poker_tracker.math.accounting import LedgerError
 from poker_tracker.math.analytics import compute_session_stats
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import (
@@ -13,6 +14,7 @@ from poker_tracker.persistence.models import (
     SettlementEntry,
 )
 from poker_tracker.services.hand_accounting import (
+    STALE_AWARD_PREFIX,
     persist_reconciliation,
     reconcile_persisted_hand,
 )
@@ -551,4 +553,360 @@ def test_the_block_clears_by_recording_the_action_that_was_missing() -> None:
     assert fixed.is_authoritative is True
     assert fixed.settlement.status == "reconciled"
     assert fixed.ledger.net_results["hero"] == pytest.approx(6.0)
+    db.close()
+
+
+# --- Adversarial round 17: a durable ordinal into a derived structure ---------
+#
+# `settlement_entries.pot_index` is an ordinal into the pot layering this
+# product derives, and the derivation moved: commit 3c3144e began cutting levels
+# at dead contributions as well as live ones, changing both the count and the
+# numbering of the layers of any hand containing a forced post. Awards already
+# stored against the previous layering can name a pot this build does not
+# produce. `_validate_winners` raises for that, and `reconcile_persisted_hand`
+# does not catch it -- so a hand that was reconciled a release ago becomes an
+# unhandled traceback for any caller that is not app.py.
+
+
+def _stale_award_hand(db: PokerDatabase, session_id: int, *, pot_index: int) -> Hand:
+    """A settled heads-up hand whose stored award names ``pot_index``.
+
+    The row is written directly because that is what makes it the real case: an
+    award row carries its ordinal and nothing about the layering that produced
+    it, so a row saved under an older derivation and a row imported from another
+    store are the same bytes here.
+    """
+    hand, hero, _villain, _actions = _create_heads_up_value_hand(db, session_id)
+    db.replace_settlement_entries(
+        hand.id,
+        [
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=pot_index,
+                player_key=hero.player_key,
+                player_name=hero.player_name,
+                amount=20,
+                entry_order=1,
+            )
+        ],
+    )
+    return hand
+
+
+def test_an_award_naming_a_pot_this_hand_no_longer_has_is_a_correction() -> None:
+    """The stale ordinal is reported, not raised, and nothing is renumbered.
+
+    This hand derives one layer. The stored award names pot 1. Before, that was
+    `LedgerError: Winner declaration references missing pot 1` propagating out of
+    `reconcile_persisted_hand` -- past `persist_reconciliation`, past every
+    non-app.py caller -- so a hand that reconciled under the previous layering
+    could not be read at all.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="Stale ordinal"))
+    hand = _stale_award_hand(db, session.id, pot_index=1)
+
+    result = reconcile_persisted_hand(db, hand.id)
+
+    assert result.is_authoritative is False
+    assert any(issue.startswith(STALE_AWARD_PREFIX) for issue in result.issues)
+    # Named precisely enough to act on: which pot was claimed, and how many the
+    # hand actually has.
+    assert any("missing pot 1" in issue for issue in result.issues)
+    assert any("1 pot layer(s)" in issue for issue in result.issues)
+    # The hand is still fully inspectable -- only the settlement is withdrawn.
+    assert len(result.ledger.pots) == 1
+    assert result.ledger.gross_pot == pytest.approx(20)
+    assert result.ledger.is_settled is False
+    # And the stored declaration is untouched, so re-declaring is an edit rather
+    # than a data repair.
+    assert [entry.pot_index for entry in result.entries] == [1]
+    db.close()
+
+
+def test_a_stale_award_persists_as_needs_correction_rather_than_reconciled() -> None:
+    """The blocked verdict reaches the durable row the operator reads."""
+    db = _make_db()
+    session = db.create_session(Session(name="Stale ordinal persisted"))
+    hand = _stale_award_hand(db, session.id, pot_index=1)
+
+    result = persist_reconciliation(db, hand.id)
+
+    assert result.settlement.status == "needs_correction"
+    assert result.is_authoritative is False
+    assert any(
+        warning.startswith(STALE_AWARD_PREFIX) for warning in result.settlement.warnings
+    )
+    db.close()
+
+
+def test_re_declaring_the_award_against_the_derived_layers_clears_the_block() -> None:
+    """The correction is an ordinary settlement edit, not a migration."""
+    db = _make_db()
+    session = db.create_session(Session(name="Stale ordinal cleared"))
+    hand = _stale_award_hand(db, session.id, pot_index=1)
+    assert persist_reconciliation(db, hand.id).is_authoritative is False
+
+    stored = db.fetch_settlement_entries(hand.id)
+    db.replace_settlement_entries(
+        hand.id,
+        [entry.model_copy(update={"pot_index": 0}) for entry in stored],
+    )
+    db.upsert_hand_settlement(
+        db.fetch_hand_settlement(hand.id).model_copy(
+            update={"gross_pot": None, "rake_amount": None, "net_pot": None}
+        )
+    )
+
+    fixed = persist_reconciliation(db, hand.id)
+
+    assert fixed.issues == ()
+    assert fixed.is_authoritative is True
+    assert fixed.settlement.status == "reconciled"
+    db.close()
+
+
+def test_an_award_naming_a_seat_that_layer_no_longer_admits_is_the_same_correction() -> None:
+    """The other half of the family: the index exists, the eligibility does not.
+
+    A seat all-in for nothing but its ante is capped at the layer holding the
+    antes. An award declaring it the winner of the live betting above that layer
+    was recordable before 3c3144e and is refused now, which is the same durable
+    row meeting a changed derivation.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="Stale eligibility"))
+    hand = db.create_hand(
+        Hand(session_id=session.id, hand_number=7, game_type="No-limit Hold'em")
+    )
+    seats = [
+        db.create_hand_player(
+            HandPlayer(
+                hand_id=hand.id,
+                player_key=key,
+                seat_index=index,
+                player_name=key.title(),
+                position=position,
+                starting_stack=stack,
+                is_hero=(key == "short"),
+            )
+        )
+        for index, (key, position, stack) in enumerate(
+            [("short", "BTN", 1.0), ("alpha", "SB", 100.0), ("beta", "BB", 100.0)]
+        )
+    ]
+    rows = [
+        ("short", "ante", 1.0),
+        ("alpha", "ante", 1.0),
+        ("beta", "ante", 1.0),
+        ("alpha", "bet", 10.0),
+        ("beta", "call", 10.0),
+    ]
+    by_key = {seat.player_key: seat for seat in seats}
+    for key, action_type, amount in rows:
+        seat = by_key[key]
+        db.create_action(
+            Action(
+                hand_id=hand.id,
+                player_key=seat.player_key,
+                player_name=seat.player_name,
+                position=seat.position,
+                street="preflop",
+                action_type=action_type,
+                amount=amount,
+                amount_semantics="incremental",
+            )
+        )
+    db.upsert_hand_settlement(HandSettlement(hand_id=hand.id, status="settled"))
+    db.replace_settlement_entries(
+        hand.id,
+        [
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=index,
+                player_key="short",
+                player_name="Short",
+                entry_order=index + 1,
+            )
+            for index in (0, 1)
+        ],
+    )
+
+    result = reconcile_persisted_hand(db, hand.id)
+
+    assert result.is_authoritative is False
+    assert any(issue.startswith(STALE_AWARD_PREFIX) for issue in result.issues)
+    assert any("not eligible for pot 1" in issue for issue in result.issues)
+    assert [pot.amount for pot in result.ledger.pots] == pytest.approx([3, 20])
+    db.close()
+
+
+def test_a_hand_that_is_impossible_without_its_awards_still_raises() -> None:
+    """Withdrawing the awards is the test for whether the awards were the problem.
+
+    A record whose action line cannot be reduced at all is not a settlement
+    mismatch, and reporting it as one would file a misleading correction against
+    a hand whose actual defect is elsewhere. The award-free rebuild raises the
+    same error, so it propagates unchanged.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="Impossible"))
+    hand, hero, _villain, _actions = _create_heads_up_value_hand(db, session.id)
+    db.update_hand_player(hero.model_copy(update={"starting_stack": 1.0}))
+
+    with pytest.raises(LedgerError):
+        reconcile_persisted_hand(db, hand.id)
+    db.close()
+
+
+# --- Adversarial round 17: closure is not the same fact as a refund -----------
+
+
+def _three_handed_truncated_preflop(db: PokerDatabase, session_id: int) -> Hand:
+    """Small blind 1, big blind 2, button calls 2, and the small blind never acts.
+
+    Two seats tie at the top of the street, so nothing is uncalled and no refund
+    is produced. The small blind is still in the hand, owes a chip and has
+    ninety-eight behind.
+    """
+    hand = db.create_hand(
+        Hand(
+            session_id=session_id,
+            hand_number=42,
+            game_type="No-limit Hold'em",
+            pot_size=5,
+            hero_bb_won=2,
+        )
+    )
+    seats = [("sb", "SB", 0, True), ("bb", "BB", 1, False), ("btn", "BTN", 2, False)]
+    for key, position, index, is_hero in seats:
+        db.create_hand_player(
+            HandPlayer(
+                hand_id=hand.id,
+                player_key=key,
+                seat_index=index,
+                player_name=key.upper(),
+                position=position,
+                starting_stack=100,
+                is_hero=is_hero,
+            )
+        )
+    for key, action_type, amount in [
+        ("sb", "post_blind", 1.0),
+        ("bb", "post_blind", 2.0),
+        ("btn", "call", 2.0),
+    ]:
+        db.create_action(
+            Action(
+                hand_id=hand.id,
+                player_key=key,
+                player_name=key.upper(),
+                position=key.upper(),
+                street="preflop",
+                action_type=action_type,
+                amount=amount,
+                amount_semantics="incremental",
+            )
+        )
+    db.upsert_hand_settlement(HandSettlement(hand_id=hand.id, status="settled"))
+    db.replace_settlement_entries(
+        hand.id,
+        [
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=0,
+                player_key="sb",
+                player_name="SB",
+                amount=3,
+                entry_order=1,
+            ),
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=1,
+                player_key="bb",
+                player_name="BB",
+                amount=2,
+                entry_order=2,
+            ),
+        ],
+    )
+    return hand
+
+
+def test_a_line_that_stops_with_no_refund_to_key_on_still_does_not_reconcile() -> None:
+    """The unanswered-wager guard read the symptom, so a tie hid the disease.
+
+    The previous guard started from a REFUND: find a seat handed uncalled money
+    back, then ask whether anybody who could have called it was still there. A
+    refund only exists when one seat is uniquely ahead, so the moment two seats
+    tie at the top of the street the guard never ran at all. This hand -- the
+    small blind never acting after the button flats -- reconciled as
+    authoritative, balanced, legal and warning-free, and recorded the small blind
+    winning two big blinds it never paid to see.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="Tie at the top"))
+    hand = _three_handed_truncated_preflop(db, session.id)
+
+    result = persist_reconciliation(db, hand.id)
+
+    assert all(refund == 0 for refund in result.ledger.refunds.values())
+    assert result.is_authoritative is False
+    assert result.settlement.status == "needs_correction"
+    assert any("never closed the betting" in issue for issue in result.issues)
+    assert any("SB" in issue for issue in result.issues)
+    db.close()
+
+
+def test_recording_the_missing_call_closes_the_line_and_the_hand_reconciles() -> None:
+    """The guard fails closed onto an action the operator can actually record."""
+    db = _make_db()
+    session = db.create_session(Session(name="Tie at the top, corrected"))
+    hand = _three_handed_truncated_preflop(db, session.id)
+    assert persist_reconciliation(db, hand.id).is_authoritative is False
+
+    db.create_action(
+        Action(
+            hand_id=hand.id,
+            player_key="sb",
+            player_name="SB",
+            position="SB",
+            street="preflop",
+            action_type="call",
+            amount=1.0,
+            amount_semantics="incremental",
+        )
+    )
+    db.replace_settlement_entries(
+        hand.id,
+        [
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=0,
+                player_key="sb",
+                player_name="SB",
+                amount=6,
+                entry_order=1,
+            )
+        ],
+    )
+    db.upsert_hand_settlement(
+        db.fetch_hand_settlement(hand.id).model_copy(
+            update={"gross_pot": None, "rake_amount": None, "net_pot": None}
+        )
+    )
+    db.update_hand_facts(
+        db.fetch_hand(hand.id).model_copy(update={"pot_size": 6.0, "hero_bb_won": 4.0})
+    )
+
+    fixed = persist_reconciliation(db, hand.id)
+
+    assert fixed.issues == ()
+    assert fixed.is_authoritative is True
+    assert fixed.ledger.net_results["sb"] == pytest.approx(4)
     db.close()

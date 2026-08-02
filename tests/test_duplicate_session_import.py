@@ -68,7 +68,13 @@ def test_a_reimported_session_is_named_and_annotated_as_a_copy() -> None:
         assert copy.name.startswith("Fri night (re-imported copy #")
         assert str(copy.id) in copy.name
         assert f"session {original.id}" in copy.notes
-        assert "BOTH copies are counted" in copy.notes
+        # The note says what the totals do with this copy, and it has to keep
+        # agreeing with what they actually do: ``analytics.duplicate_import_
+        # sessions`` reads this note to decide, so a note that said the copy was
+        # counted while the totals dropped it would be the same silent-doubling
+        # defect wearing the opposite sign.
+        assert "THIS copy is left out of every" in copy.notes
+        assert f"session {original.id} is the one still counted" in copy.notes
     db.close()
 
 

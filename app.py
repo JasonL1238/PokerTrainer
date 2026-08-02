@@ -1131,24 +1131,6 @@ def _replay_figure_label(hand: Hand, headline: str) -> str:
     return label
 
 
-def _result_provenance_counts(
-    hands: list[Hand], bases: Mapping[int, ResultBasis]
-) -> dict[ResultBasis, int]:
-    """Provenance of the results on screen, counted over hands that carry one.
-
-    The four counts sum to the number of displayed figures, so a surface can
-    print any one of them beside its denominator. A hand with no result is
-    counted under ``none`` and never silently folded into ``observed``.
-    """
-    counts: dict[ResultBasis, int] = {basis: 0 for basis in RESULT_BASIS_LABELS}
-    for hand in hands:
-        basis: ResultBasis = "none" if hand.hero_bb_won is None else "observed"
-        if hand.id is not None:
-            basis = bases.get(hand.id, basis)
-        counts[basis] += 1
-    return counts
-
-
 def _accounting_or_error(
     db: PokerDatabase, hand: Hand, cache: AccountingCache | None = None
 ) -> tuple[AccountingReconciliation | None, str | None]:
@@ -1497,9 +1479,10 @@ def show_product_overview(db: PokerDatabase) -> None:
     hands_by_session = {
         session_id: resolved.hands for session_id, resolved in resolved_by_session.items()
     }
-    # Provenance for the whole library, from the one resolver. The portfolio
-    # summary's own ``derived_result_count`` counts SUBSTITUTIONS, which is a
-    # different question (see ``ResolvedHands``), so this page does not read it.
+    # Provenance for the whole library, from the one resolver, handed to the
+    # portfolio summary so its split is computed from where each number came from
+    # rather than from whether the displayed value differs from the stored column
+    # (see ``ResolvedHands`` for why those are different questions).
     result_bases: dict[int, ResultBasis] = {}
     for resolved in resolved_by_session.values():
         result_bases.update(resolved.bases)
@@ -1514,7 +1497,8 @@ def show_product_overview(db: PokerDatabase) -> None:
     orphan_issues = len(open_issues) - len(listed_issues)
     summary = build_portfolio_summary(
         all_hands,
-        len(sessions),
+        sessions,
+        result_bases=result_bases,
         open_issue_count=len(listed_issues),
         stale_hand_ids=db.fetch_stale_review_hand_ids(),
     )
@@ -1642,8 +1626,9 @@ def show_product_overview(db: PokerDatabase) -> None:
             # which every hand was chip-proven print the same "Reconciled
             # results 0" as one that had never been reconciled -- while the
             # session panel and Insights, which do use the resolver, printed the
-            # opposite about the same hand.
-            provenance = _result_provenance_counts(all_hands, result_bases)
+            # opposite about the same hand. The summary now counts the bases
+            # itself, so this page holds no second opinion to drift from.
+            provenance = summary.result_basis_counts
             provenance_detail = (
                 f"Derived by the accounting ledger; "
                 f"{provenance['observed']} were recorded as observed"
@@ -1674,6 +1659,13 @@ def show_product_overview(db: PokerDatabase) -> None:
         "reviewed; 'Unconfirmed draft result' is CV and unreviewed manual work in progress. "
         "The two are never added together on this page."
     )
+    if summary.excluded_sessions:
+        # Drawn as a warning rather than a caption because it changes what every
+        # figure above means. A re-imported copy holds a second copy of hands
+        # already counted under another session, so counting it makes the library
+        # claim poker the operator did not play; dropping it without saying so
+        # would be the same class of error in the other direction.
+        st.warning(summary.exclusion_statement)
 
     if summary.states is not None and summary.states.hand_count:
         section_header(
@@ -1700,10 +1692,15 @@ def show_product_overview(db: PokerDatabase) -> None:
             ledger=(None if featured_accounting is None else featured_accounting.ledger),
         )
 
+    session_rows = build_session_rows(sessions, hands_by_session)
+    # The list holds every session; the Sessions KPI above holds every session
+    # the totals counted. Those differ as soon as a re-imported copy exists, and
+    # two figures that disagree with nothing naming the gap is the same silent
+    # defect one size down, so the count says which one it is.
     section_header_with_meta(
         "Recent sessions",
         "Newest completed sessions",
-        f"{len(session_rows := build_session_rows(sessions, hands_by_session))} TOTAL",
+        f"{len(session_rows)} LISTED · {summary.session_count} COUNTED",
     )
     if not session_rows:
         empty_state(
@@ -1725,6 +1722,10 @@ def show_product_overview(db: PokerDatabase) -> None:
                     # figure that read as the session's measured result.
                     "Confirmed": f"{row.confirmed_net_bb:+g} BB",
                     "Draft": f"{row.unconfirmed_net_bb:+g} BB",
+                    # A row that is not in the totals above has to say so here,
+                    # or the list and the headline disagree with nothing to
+                    # explain the gap.
+                    "In totals": row.totals_note,
                 }
                 for row in session_rows[:8]
             ],
@@ -1733,7 +1734,9 @@ def show_product_overview(db: PokerDatabase) -> None:
         )
         st.caption(
             "Confirmed covers hands marked reviewed. Draft covers everything else in "
-            "the session, including unreviewed CV reconstructions."
+            "the session, including unreviewed CV reconstructions. A re-imported copy "
+            "is listed so it can be found and deleted, and is left out of every total "
+            "on this page."
         )
 
     _render_overview_processing(db)
@@ -5731,9 +5734,9 @@ def delete_hand_and_artifacts(
 def hand_evidence_badges(
     hand: Hand,
     *,
+    result_basis: ResultBasis,
     open_issue_count: int = 0,
     has_stale_analysis: bool = False,
-    result_basis: ResultBasis | None = None,
 ) -> list[tuple[str, str]]:
     """The evidence state of one hand as ``(badge status, words)`` pairs.
 
@@ -5770,17 +5773,16 @@ def hand_evidence_badges(
                 f"Reconstruction confidence · {confidence.label}",
             )
         )
-    # Provenance from ``resolve_hero_result``, falling back to the substitution
-    # flag only when the caller has no basis to give. The flag alone said
-    # "the displayed figure differs from the stored one", so a hand whose ledger
-    # CONFIRMED its recorded result -- the strongest evidence state the product
-    # can produce -- carried no provenance badge at all.
-    basis = result_basis
-    if basis is None:
-        basis = "reconciled" if hand.derived_result_substituted else None
-    if basis == "reconciled":
+    # Provenance from ``resolve_hero_result`` and from nowhere else, which is why
+    # it is a required argument with no default. The substitution flag it used to
+    # fall back to says "the displayed figure differs from the stored one", so a
+    # hand whose ledger CONFIRMED its recorded result -- the strongest evidence
+    # state the product can produce -- carried no provenance badge at all. A
+    # caller that cannot resolve the basis must pass "none" and say nothing,
+    # rather than reach for the flag and say something false.
+    if result_basis == "reconciled":
         badges.append(("queued", "Result derived from the reconciled ledger"))
-    elif basis == "unattributed":
+    elif result_basis == "unattributed":
         badges.append(
             ("needs_correction", "Result recorded, but no hero seat to attribute it to")
         )
@@ -5857,11 +5859,13 @@ def render_hand_results(
         )
         badges = hand_evidence_badges(
             item,
+            result_basis=page_bases.get(
+                item.id, "none" if item.hero_bb_won is None else "observed"
+            ),
             open_issue_count=(
                 0 if open_issue_counts is None else open_issue_counts.get(item.id, 0)
             ),
             has_stale_analysis=item.id in stale_hand_ids,
-            result_basis=page_bases.get(item.id),
         )
         with st.container(border=True, key=f"{key_prefix}_hand_{item.id}"):
             summary, action = st.columns([6, 1])

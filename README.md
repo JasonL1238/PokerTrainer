@@ -292,7 +292,18 @@ hand and fixed the thing, and the importing operator has looked at nothing.
 Retained coaching travels the same way: the text of every saved review is imported
 in full and marked *stale*, because a review describes the hand, ledger and winners
 of the database that wrote it and nothing in the importing database can verify that
-claim. Re-run coaching there to make it current. Schema
+claim. Re-run coaching there to make it current.
+
+Re-importing a file you already imported still appends a second session — import
+never addresses or replaces an existing one — but the copy is recognised from the
+rows it wrote, renamed `<name> (re-imported copy #<id>)`, and annotated with the
+session it duplicates. **A labelled copy is left out of every portfolio and
+Insights total**: Overview names it and states the sessions, hands and BB it
+dropped, the session list keeps a row for it marked "Not counted", and Insights
+reports it under "In a session the importer labelled a re-imported copy" beside
+the denominator, the same way every other population exclusion is reported. The
+copy is still fully browsable and studiable; delete it (Sessions → Delete session)
+to remove it entirely. Schema
 version 13 is additive: v10 added correction
 history and review staleness, v11 added solver records, v12 added the debugging
 issue queue, and v13 adds explicit hand completion

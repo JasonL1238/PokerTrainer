@@ -3,13 +3,16 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Container, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from poker_tracker.math.analytics import (
     EVIDENCE_CLASS_LABELS,
+    RESULT_BASIS_LABELS,
     EvidenceClass,
+    ResultBasis,
     classify_evidence,
+    duplicate_import_sessions,
 )
 from poker_tracker.persistence.completion import (
     BoundaryEvidence,
@@ -117,6 +120,21 @@ REVIEW_STATE_LABELS = {
 
 
 @dataclass(frozen=True)
+class ExcludedSession:
+    """One session a portfolio total deliberately left out, and what it duplicates.
+
+    Carried rather than counted so the operator can act on it: the name is what
+    the session list shows, and ``duplicate_of`` is the session to keep.
+    """
+
+    session_id: int
+    name: str
+    duplicate_of: int
+    hand_count: int
+    net_bb: float
+
+
+@dataclass(frozen=True)
 class PortfolioSummary:
     session_count: int
     hand_count: int
@@ -133,14 +151,43 @@ class PortfolioSummary:
     unconfirmed_net_bb: float = 0.0
     confirmed_result_hands: int = 0
     unconfirmed_result_hands: int = 0
-    # How each contributing result was arrived at. A derived figure is the
-    # accounting ledger's reconstruction of what the hero must have won; an
-    # observed one was recorded as such. Both are legitimate, and printing a sum
-    # of them without saying which is which is what this pair prevents.
-    derived_result_count: int = 0
-    observed_result_count: int = 0
+    # How each contributing result was arrived at, from the provenance the
+    # resolver returned with the value. A derived figure is the accounting
+    # ledger's reconstruction of what the hero must have won; an observed one was
+    # recorded as such. Both are legitimate, and printing a sum of them without
+    # saying which is which is what this counting prevents.
+    #
+    # The four counts sum to ``hand_count``: a hand carrying no result is counted
+    # under ``none`` rather than folded into ``observed``.
+    result_basis_counts: Mapping[ResultBasis, int] = field(
+        default_factory=lambda: {basis: 0 for basis in RESULT_BASIS_LABELS}
+    )
     open_issue_count: int = 0
     states: EvidenceStates | None = None
+    # What this summary left out and why. A total computed over a set that
+    # silently lost rows is indistinguishable from a total that is right, so the
+    # sessions dropped as re-imported copies are named here and every surface
+    # printing the figures above is expected to print this beside them.
+    excluded_session_count: int = 0
+    excluded_hand_count: int = 0
+    excluded_net_bb: float = 0.0
+    excluded_sessions: tuple[ExcludedSession, ...] = ()
+
+    @property
+    def exclusion_statement(self) -> str:
+        if not self.excluded_sessions:
+            return "No sessions were left out of these totals."
+        listed = "; ".join(
+            f"{item.name} (duplicates session {item.duplicate_of})"
+            for item in self.excluded_sessions
+        )
+        return (
+            f"{self.excluded_session_count} session(s) holding {self.excluded_hand_count} "
+            f"hand(s) and {self.excluded_net_bb:+g} BB are left out of every figure "
+            f"above because the importer recorded them as re-imported copies: {listed}. "
+            "Delete one copy (Sessions → Delete session) to remove the duplicate "
+            "entirely."
+        )
 
 
 @dataclass(frozen=True)
@@ -158,6 +205,21 @@ class SessionRow:
     # reviewed hand's, and a row is exactly where that is hardest to notice.
     confirmed_net_bb: float = 0.0
     unconfirmed_net_bb: float = 0.0
+    # The session this one was recorded as a re-imported copy of, and whether the
+    # portfolio totals counted it. A row stays in the list when it is excluded --
+    # the operator has to be able to find it to delete it -- so the list is where
+    # the exclusion has to be legible.
+    duplicate_of_session_id: int | None = None
+
+    @property
+    def counted_in_totals(self) -> bool:
+        return self.duplicate_of_session_id is None
+
+    @property
+    def totals_note(self) -> str:
+        if self.duplicate_of_session_id is None:
+            return "Counted"
+        return f"Not counted — re-imported copy of session {self.duplicate_of_session_id}"
 
 
 @dataclass(frozen=True)
@@ -188,13 +250,19 @@ class HandRow:
     # A derived result and an observed one are the same float. ``result_bb`` is
     # already the substituted display value on the copies Hands and Insights
     # render, and printing it without this reads a ledger reconstruction as a
-    # recorded fact.
-    result_basis_label: str = "No result recorded"
+    # recorded fact. The basis comes from ``analytics.resolve_hero_result``,
+    # which is the only thing that knows where the number came from; the label is
+    # a property of it so a row cannot carry a basis and a caption that disagree.
+    result_basis: ResultBasis = "none"
     # The sentence behind ``confidence_label`` and whether that label still
     # describes the saved facts. A row that prints the label without consulting
     # this is printing a grade of a read the operator may have overruled.
     confidence_detail: str = ""
     confidence_is_current: bool = True
+
+    @property
+    def result_basis_label(self) -> str:
+        return RESULT_BASIS_LABELS[self.result_basis]
 
 
 @dataclass(frozen=True)
@@ -286,40 +354,79 @@ def build_evidence_states(
 
 def build_portfolio_summary(
     hands: Iterable[Hand],
-    session_count: int,
+    sessions: Iterable[Session],
     *,
+    result_bases: Mapping[int, ResultBasis],
     open_issue_count: int = 0,
     stale_hand_ids: Container[int] = frozenset(),
 ) -> PortfolioSummary:
     """Summarise the whole library, keeping confirmed and unconfirmed results apart.
 
-    ``hands`` are the display copies produced by the accounting substitution, so
-    ``derived_result_substituted`` is already set on the ones whose result the
-    ledger supplied. Reading it here is what lets the Overview say how many of the
-    numbers in its headline were observed and how many were reconstructed.
+    ``result_bases`` is ``analytics.resolve_hero_result``'s provenance for each
+    hand, keyed by hand id, and it is required rather than optional because there
+    is no honest fallback: the substitution flag on a display copy answers "did
+    this value change", which is a different question, and reading it here made
+    the split report zero reconciled results for a library in which every hand
+    was chip-proven. A caller with no bases to give has no provenance to print.
+
+    ``sessions`` rather than a session count, because a session the importer
+    recorded as a re-imported copy holds a second copy of hands that are already
+    in this database and it must not be added to the operator's poker twice. The
+    copies are dropped from every figure here and reported in
+    ``excluded_sessions``, on the same principle the population layer follows:
+    stating what was left out is what makes a filtered total checkable.
     """
-    items = list(hands)
-    reviewed = sum(hand.review_status == "reviewed" for hand in items)
-    results = [hand.hero_bb_won for hand in items if hand.hero_bb_won is not None]
-    with_result = [hand for hand in items if hand.hero_bb_won is not None]
+    known = list(sessions)
+    duplicates = duplicate_import_sessions(known)
+    by_id = {session.id: session for session in known if session.id is not None}
+    counted: list[Hand] = []
+    dropped: dict[int, list[Hand]] = {session_id: [] for session_id in duplicates}
+    for hand in hands:
+        if hand.session_id in duplicates:
+            dropped[hand.session_id].append(hand)
+        else:
+            counted.append(hand)
+
+    reviewed = sum(hand.review_status == "reviewed" for hand in counted)
+    results = [hand.hero_bb_won for hand in counted if hand.hero_bb_won is not None]
+    with_result = [hand for hand in counted if hand.hero_bb_won is not None]
     confirmed = [hand for hand in with_result if hand.review_status == "reviewed"]
     unconfirmed = [hand for hand in with_result if hand.review_status != "reviewed"]
+
+    basis_counts: dict[ResultBasis, int] = {basis: 0 for basis in RESULT_BASIS_LABELS}
+    for hand in counted:
+        basis: ResultBasis = "none" if hand.hero_bb_won is None else "observed"
+        if hand.id is not None:
+            basis = result_bases.get(hand.id, basis)
+        basis_counts[basis] += 1
+
+    excluded = tuple(
+        ExcludedSession(
+            session_id=session_id,
+            name=by_id[session_id].name if session_id in by_id else f"Session {session_id}",
+            duplicate_of=duplicate_of,
+            hand_count=len(dropped[session_id]),
+            net_bb=sum(hand.hero_bb_won or 0 for hand in dropped[session_id]),
+        )
+        for session_id, duplicate_of in sorted(duplicates.items())
+    )
     return PortfolioSummary(
-        session_count=session_count,
-        hand_count=len(items),
+        session_count=sum(1 for session in by_id if session not in duplicates),
+        hand_count=len(counted),
         reviewed_count=reviewed,
-        review_percent=(100 * reviewed / len(items)) if items else 0,
+        review_percent=(100 * reviewed / len(counted)) if counted else 0,
         net_bb=sum(results),
         confirmed_net_bb=sum(hand.hero_bb_won or 0 for hand in confirmed),
         unconfirmed_net_bb=sum(hand.hero_bb_won or 0 for hand in unconfirmed),
         confirmed_result_hands=len(confirmed),
         unconfirmed_result_hands=len(unconfirmed),
-        derived_result_count=sum(hand.derived_result_substituted for hand in with_result),
-        observed_result_count=sum(
-            not hand.derived_result_substituted for hand in with_result
-        ),
+        result_basis_counts=basis_counts,
         open_issue_count=open_issue_count,
-        states=build_evidence_states(items, stale_hand_ids=stale_hand_ids),
+        states=build_evidence_states(counted, stale_hand_ids=stale_hand_ids),
+        excluded_session_count=len(excluded),
+        excluded_hand_count=sum(item.hand_count for item in excluded),
+        excluded_net_bb=sum(item.net_bb for item in excluded),
+        excluded_sessions=excluded,
     )
 
 
@@ -327,8 +434,10 @@ def build_session_rows(
     sessions: Iterable[Session],
     hands_by_session: Mapping[int, Iterable[Hand]],
 ) -> list[SessionRow]:
+    known = list(sessions)
+    duplicates = duplicate_import_sessions(known)
     rows: list[SessionRow] = []
-    for session in sessions:
+    for session in known:
         if session.id is None:
             continue
         hands = list(hands_by_session.get(session.id, []))
@@ -352,6 +461,7 @@ def build_session_rows(
                     for hand in hands
                     if hand.hero_bb_won is not None and hand.review_status != "reviewed"
                 ),
+                duplicate_of_session_id=duplicates.get(session.id),
             )
         )
     return rows
@@ -360,13 +470,26 @@ def build_session_rows(
 def build_hand_rows(
     sessions: Iterable[Session],
     hands: Iterable[Hand],
+    result_bases: Mapping[int, ResultBasis],
 ) -> list[HandRow]:
+    """Rows for a hand list, each carrying where its result came from.
+
+    ``result_bases`` is required and positional for the same reason it is on
+    ``build_portfolio_summary``: provenance is resolved by the pass that
+    substituted the value, and a row built without it would have to guess. The
+    guess it used to make was the substitution flag, which says only that the
+    displayed number differs from the stored column -- so a hand whose ledger
+    CONFIRMED its recorded result, the strongest evidence the product can
+    produce, was labelled "Recorded on the hand" like an unreconciled one.
+    """
     session_names = {session.id: session.name for session in sessions if session.id is not None}
     rows: list[HandRow] = []
     for hand in hands:
         if hand.id is None:
             continue
         confidence = reconstruction_confidence(hand)
+        basis: ResultBasis = "none" if hand.hero_bb_won is None else "observed"
+        basis = result_bases.get(hand.id, basis)
         rows.append(
             HandRow(
                 hand_id=hand.id,
@@ -383,28 +506,12 @@ def build_hand_rows(
                 tags=tuple(hand.tags),
                 evidence_class=classify_evidence(hand),
                 evidence_label=EVIDENCE_CLASS_LABELS[classify_evidence(hand)],
-                result_basis_label=result_basis_label(hand),
+                result_basis=basis,
                 confidence_detail=confidence.detail,
                 confidence_is_current=confidence.describes_current_facts,
             )
         )
     return rows
-
-
-def result_basis_label(hand: Hand) -> str:
-    """Where this hand's displayed result came from.
-
-    Reads ``derived_result_substituted``, which the accounting substitution sets
-    on the display copy, rather than re-deriving it: the flag was already the
-    product's record of "this figure is a reconstruction, not an observation" and
-    had no display consumer at all, so a derived -18 BB printed exactly like a
-    recorded one in every list.
-    """
-    if hand.hero_bb_won is None:
-        return "No result recorded"
-    if hand.derived_result_substituted:
-        return "Derived from the reconciled ledger"
-    return "Recorded on the hand"
 
 
 def job_is_live(status: str) -> bool:

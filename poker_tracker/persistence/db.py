@@ -3750,6 +3750,34 @@ class PokerDatabase:
         self._record_source_correction_in_evidence(hand_id)
 
     def fetch_settlement_entries(self, hand_id: int) -> list[SettlementEntry]:
+        """Read one hand's declared awards and refunds.
+
+        ``pot_index`` is a durable ORDINAL into a structure this product derives
+        rather than stores, and the derivation is not frozen: commit 3c3144e
+        changed which commitments cut a pot level, which moves both the count and
+        the numbering of the layers of any hand containing a forced post. Rows
+        written under an earlier layering therefore survive intact while the
+        thing they point at moves underneath them, and the same is true of any
+        payload imported from a store built by a different revision.
+
+        MIGRATION IMPACT (none; no schema version change)
+
+        No column, index or value is altered here, and no migration renumbers
+        these rows. Renumbering would have to decide which derived layer an old
+        ordinal MEANT, and the layering that produced it is not recoverable from
+        the row -- only the ordinal survives -- so every rule for it is a guess,
+        and a guessed award written back into a durable column is exactly the
+        silently-accepted wrong result this product treats as a release blocker.
+        A store that never meets the mismatch is unaffected, and an older build
+        reads these rows exactly as it wrote them.
+
+        The mismatch is instead detected and reported where the ordinal is USED:
+        ``services.hand_accounting._ledger_under_declaration`` rebuilds the hand
+        with the unusable awards withdrawn and reports a correction naming the
+        stale claim and the layer count, so the hand becomes ``needs_correction``
+        rather than an unhandled ``LedgerError``, and the operator re-declares
+        the winners through the settlement editor.
+        """
         rows = self._execute(
             """
             SELECT * FROM settlement_entries

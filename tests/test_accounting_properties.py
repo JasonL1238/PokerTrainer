@@ -408,6 +408,34 @@ def test_a_seat_all_in_for_only_a_forced_post_can_still_be_declared_the_winner(h
         assert _sum(settled.net_results.values()) == Decimal("0")
 
 
+@given(hand=forced_post_hand())
+@SETTINGS
+def test_every_seat_that_put_a_chip_up_contests_the_main_pot(hand):
+    """Playing the hand is measured by what a seat PUT UP, not by what stayed in.
+
+    An uncalled wager is returned to the seat that made it, and a seat whose only
+    live post came back -- because the money facing it was a forced post nobody
+    had a chip left to call -- ends the hand with nothing of its own in the pot.
+    It still played the hand, and the pot it played for is still there, so it must
+    still be able to be declared the winner of it. Capping main-pot eligibility at
+    the SETTLED figure instead makes that hand unrecordable, which is the failure
+    every widening in this module has been a reaction to.
+
+    The main pot only. Layers above it are capped at what the table matched of a
+    seat's own commitment, and
+    ``test_no_seat_is_paid_more_than_the_table_matched_of_its_own_commitment``
+    is the guarantee on that side.
+    """
+    ledger = build_hand_ledger(hand.players, hand.actions)
+    assume(ledger.pots)
+    for name in hand.names:
+        if name in hand.folded or Decimal(str(ledger.contributions[name])) <= 0:
+            continue
+        assert name in ledger.pots[0].eligible_players, (
+            f"{name} put chips up and never folded, but cannot win the main pot"
+        )
+
+
 @given(hand=forced_post_hand(), policy=rake_policy())
 @SETTINGS
 def test_a_settled_forced_post_hand_conserves_chips(hand, policy):
