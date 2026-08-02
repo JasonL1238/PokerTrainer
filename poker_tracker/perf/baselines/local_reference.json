@@ -1,0 +1,365 @@
+{
+  "checks": [
+    {
+      "certifies_release_gate": false,
+      "components": {},
+      "covers": "storing one recording and reconstructing it end to end",
+      "excludes": "operator review time, solver runs and any second recording",
+      "host_label": null,
+      "limit_seconds": 3600.0,
+      "name": "representative_session_completes_within_one_hour",
+      "observed_seconds": null,
+      "reason": "this baseline has never been produced by a run",
+      "reference_machine": null,
+      "status": "never_run"
+    }
+  ],
+  "elapsed_s": null,
+  "groups_requested": [],
+  "host": {
+    "cpu_count": null,
+    "dependencies": {},
+    "designated_reference_label": null,
+    "env": {},
+    "ffmpeg": null,
+    "git": {},
+    "is_designated_reference": false,
+    "label": null,
+    "load_average_at_start": null,
+    "machine": null,
+    "memory_bytes": null,
+    "platform": null,
+    "processor": null,
+    "python": null,
+    "system": null
+  },
+  "host_fingerprint": {
+    "cpu_count": null,
+    "label": null,
+    "machine": null,
+    "python": null,
+    "system": null
+  },
+  "kind": "pokertrainer_perf_report",
+  "measurements": [
+    {
+      "conditions": {},
+      "description": "Current size of the configured operator data root.",
+      "group": "resources",
+      "lower_is_better": true,
+      "name": "disk.data_root_bytes",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "bytes",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Free space on the volume holding the workspace, after the run.",
+      "group": "resources",
+      "lower_is_better": false,
+      "name": "disk.free_bytes",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "bytes",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Signed change in workspace bytes across the run, not a snapshot.",
+      "group": "resources",
+      "lower_is_better": true,
+      "name": "disk.workspace_growth_bytes",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "bytes",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Cold import of the persistence layer in a fresh interpreter.",
+      "group": "imports",
+      "lower_is_better": true,
+      "name": "import.core_seconds",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "seconds",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Peak resident set of an interpreter that only imported the CV stack.",
+      "group": "imports",
+      "lower_is_better": true,
+      "name": "import.cv_stack_peak_rss_bytes",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "bytes",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Cold import of torch, ultralytics, av and cv2 in a fresh interpreter.",
+      "group": "imports",
+      "lower_is_better": true,
+      "name": "import.cv_stack_seconds",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "seconds",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Cold import of Streamlit in a fresh interpreter.",
+      "group": "imports",
+      "lower_is_better": true,
+      "name": "import.streamlit_seconds",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "seconds",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Signed change in log bytes written under the workspace.",
+      "group": "resources",
+      "lower_is_better": true,
+      "name": "logs.growth_bytes",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "bytes",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Peak resident set of the harness process itself.",
+      "group": "resources",
+      "lower_is_better": true,
+      "name": "memory.harness_peak_rss_bytes",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "bytes",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Card classifier from construction to its first inference; its weights load lazily.",
+      "group": "models",
+      "lower_is_better": true,
+      "name": "model_init.classifier_seconds",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "seconds",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Region detector from construction to its first inference, imports excluded.",
+      "group": "models",
+      "lower_is_better": true,
+      "name": "model_init.detector_seconds",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "seconds",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Peak resident set of an interpreter that loaded both models.",
+      "group": "models",
+      "lower_is_better": true,
+      "name": "model_init.peak_rss_bytes",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "bytes",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Sampled-frame throughput of the reconstruction pipeline.",
+      "group": "reconstruction",
+      "lower_is_better": false,
+      "name": "reconstruction.frames_per_second",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "frames_per_second",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Frames the pipeline sampled during the measured reconstruction.",
+      "group": "reconstruction",
+      "lower_is_better": false,
+      "name": "reconstruction.frames_processed",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "count",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Peak resident set of the reconstruction process.",
+      "group": "reconstruction",
+      "lower_is_better": true,
+      "name": "reconstruction.peak_rss_bytes",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "bytes",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Size of the timeline artifact the measured reconstruction wrote.",
+      "group": "reconstruction",
+      "lower_is_better": true,
+      "name": "reconstruction.timeline_bytes",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "bytes",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "End-to-end two-model reconstruction of one recording.",
+      "group": "reconstruction",
+      "lower_is_better": true,
+      "name": "reconstruction.wall_seconds",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "seconds",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Completed solver runs with a recorded runtime in the database.",
+      "group": "solver",
+      "lower_is_better": false,
+      "name": "solver.recorded_runs",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "count",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Slowest solver run this installation has recorded.",
+      "group": "solver",
+      "lower_is_better": true,
+      "name": "solver.recorded_runtime_max_seconds",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "seconds",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Median runtime of the solver runs this installation has recorded.",
+      "group": "solver",
+      "lower_is_better": true,
+      "name": "solver.recorded_runtime_median_seconds",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "seconds",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Streamlit launch to the first healthy /_stcore/health response.",
+      "group": "startup",
+      "lower_is_better": true,
+      "name": "startup.app_health_seconds",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "seconds",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Bytes held by leftover temporary entries after the run.",
+      "group": "resources",
+      "lower_is_better": true,
+      "name": "tempfiles.leaked_bytes",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "bytes",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Temporary entries the measured work left behind in its own TMPDIR.",
+      "group": "resources",
+      "lower_is_better": true,
+      "name": "tempfiles.leaked_count",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "count",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "First full script run of app.py under AppTest.",
+      "group": "ui",
+      "lower_is_better": true,
+      "name": "ui.first_render_seconds",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "seconds",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Peak resident set of an interpreter rendering every page once.",
+      "group": "ui",
+      "lower_is_better": true,
+      "name": "ui.peak_rss_bytes",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "bytes",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Slowest single navigation rerun across every primary page.",
+      "group": "ui",
+      "lower_is_better": true,
+      "name": "ui.slowest_page_render_seconds",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "seconds",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Sustained write rate of the vault store path, fsync included.",
+      "group": "upload",
+      "lower_is_better": false,
+      "name": "upload.store_megabytes_per_second",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "megabytes_per_second",
+      "value": null
+    },
+    {
+      "conditions": {},
+      "description": "Storing an uploaded recording through the vault's atomic writer.",
+      "group": "upload",
+      "lower_is_better": true,
+      "name": "upload.store_seconds",
+      "not_taken_reason": "no run has ever recorded this metric",
+      "status": "never_measured",
+      "unit": "seconds",
+      "value": null
+    }
+  ],
+  "notes": [
+    "Empty baseline. No measurement in this file was ever taken.",
+    "Replace it with a real run's report once a reference machine is designated; see docs/PERFORMANCE.md."
+  ],
+  "schema_version": 1,
+  "started_at": null,
+  "summary": {
+    "measurements_not_taken": 28,
+    "measurements_taken": 0,
+    "measurements_total": 28
+  }
+}

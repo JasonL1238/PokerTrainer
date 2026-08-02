@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from html import escape
 
 import streamlit as st
@@ -95,10 +95,27 @@ def kpi_card(label: str, value: str, detail: str = "", *, tone: str = "default")
     )
 
 
-def coverage_bar_html(rows: Iterable[tuple[str, int]]) -> str:
-    """Return a compact workflow-status distribution without chart runtime state."""
+def coverage_bar_html(
+    rows: Iterable[tuple[str, int]],
+    *,
+    labels: Mapping[str, str] | None = None,
+    aria_label: str = "",
+) -> str:
+    """Return a compact workflow-status distribution without chart runtime state.
+
+    ``labels`` overrides the display text for a key without changing the key the
+    tone is looked up by. It exists because the derived title-case of a stored
+    enum reads as sloppy for the ones the operator did not choose the spelling of
+    ("cv_import" renders "Cv Import"), and a distribution the product asks
+    someone to trust should not be the one place its own vocabulary slips.
+    """
 
     items = [(status, max(0, int(count))) for status, count in rows]
+    display = dict(labels or {})
+
+    def text(status: str) -> str:
+        return display.get(status, status.replace("_", " ").title())
+
     total = sum(count for _, count in items)
     if total <= 0:
         return '<div class="pt-coverage pt-coverage-empty">No review statuses recorded.</div>'
@@ -106,7 +123,7 @@ def coverage_bar_html(rows: Iterable[tuple[str, int]]) -> str:
         (
             f'<span class="pt-coverage-segment pt-coverage-{_STATUS_TONES.get(status, "neutral")}" '
             f'style="width:{100 * count / total:.6f}%" '
-            f'aria-label="{escape(status.replace("_", " ").title())}: {count}"></span>'
+            f'aria-label="{escape(text(status))}: {count}"></span>'
         )
         for status, count in items
         if count > 0
@@ -115,47 +132,79 @@ def coverage_bar_html(rows: Iterable[tuple[str, int]]) -> str:
         (
             f'<span class="pt-coverage-key pt-coverage-{_STATUS_TONES.get(status, "neutral")}">'
             '<i aria-hidden="true"></i>'
-            f'{escape(status.replace("_", " ").title())} <strong>{count}</strong></span>'
+            f'{escape(text(status))} <strong>{count}</strong></span>'
         )
         for status, count in items
     )
+    described = aria_label or f"Review coverage across {total} hands"
     return (
-        f'<div class="pt-coverage" aria-label="Review coverage across {total} hands">'
+        f'<div class="pt-coverage" aria-label="{escape(described)}">'
         f'<div class="pt-coverage-track">{segments}</div>'
         f'<div class="pt-coverage-legend">{legend}</div></div>'
     )
 
 
-def coverage_bar(rows: Iterable[tuple[str, int]]) -> None:
+def coverage_bar(
+    rows: Iterable[tuple[str, int]],
+    *,
+    labels: Mapping[str, str] | None = None,
+    aria_label: str = "",
+) -> None:
     """Render a review-status distribution in the product design language."""
 
-    st.markdown(coverage_bar_html(rows), unsafe_allow_html=True)
+    st.markdown(
+        coverage_bar_html(rows, labels=labels, aria_label=aria_label),
+        unsafe_allow_html=True,
+    )
 
 
-def frequency_bars_html(rows: Iterable[tuple[str, int]]) -> str:
-    """Return compact proportional bars for small categorical counts."""
+def frequency_bars_html(
+    rows: Iterable[tuple[str, int]],
+    *,
+    denominator: int | None = None,
+    aria_label: str = "",
+) -> str:
+    """Return compact proportional bars for small categorical counts.
+
+    ``denominator`` turns each bar into a share of a stated population instead of
+    a share of the largest count in the list. Without it, a theme on 3 of 4 hands
+    and a theme on 3 of 400 draw the identical full-width bar and print the
+    identical ``3``: the reader is shown a shape that means "dominant" in one case
+    and "negligible" in the other, with nothing on screen to tell them apart. The
+    count then renders as ``3 of 400`` so the figure carries what it is out of.
+    """
 
     items = [(str(label), max(0, int(count))) for label, count in rows]
-    maximum = max((count for _, count in items), default=0)
-    if maximum <= 0:
+    scale = int(denominator) if denominator else max((count for _, count in items), default=0)
+    if scale <= 0:
         return '<div class="pt-frequency pt-frequency-empty">No frequency data recorded.</div>'
     rendered = "".join(
         (
             '<div class="pt-frequency-row">'
             f'<span>{escape(label)}</span>'
             '<div class="pt-frequency-track">'
-            f'<i style="width:{100 * count / maximum:.6f}%"></i></div>'
-            f"<strong>{count}</strong></div>"
+            f'<i style="width:{100 * min(count, scale) / scale:.6f}%" '
+            f'aria-label="{escape(label)}: {count} of {scale}"></i></div>'
+            f"<strong>{count}{'' if denominator is None else f' of {scale}'}</strong></div>"
         )
         for label, count in items
     )
-    return f'<div class="pt-frequency" aria-label="Category frequencies">{rendered}</div>'
+    described = aria_label or "Category frequencies"
+    return f'<div class="pt-frequency" aria-label="{escape(described)}">{rendered}</div>'
 
 
-def frequency_bars(rows: Iterable[tuple[str, int]]) -> None:
+def frequency_bars(
+    rows: Iterable[tuple[str, int]],
+    *,
+    denominator: int | None = None,
+    aria_label: str = "",
+) -> None:
     """Render compact categorical frequencies without a chart runtime."""
 
-    st.markdown(frequency_bars_html(rows), unsafe_allow_html=True)
+    st.markdown(
+        frequency_bars_html(rows, denominator=denominator, aria_label=aria_label),
+        unsafe_allow_html=True,
+    )
 
 
 def status_badge(status: str, *, label: str | None = None) -> str:

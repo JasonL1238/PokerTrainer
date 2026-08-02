@@ -17,9 +17,13 @@ The Streamlit application is organized around seven workflows:
 - **Hands** — searchable cross-session hand library.
 - **Study** — hand replay, recorded math, optional TexasSolver analysis,
   auditable correction, coaching reruns, notes, and review state.
-- **Insights** — evidence-backed review coverage and tagged study themes.
+- **Insights** — metrics over a declared population (confirmed / confirmed and
+  reconciled / all saved), each figure carrying its denominator, its evidence
+  split, and a sample verdict instead of a bare rate.
 - **Import** — completed-session video upload and offline CV reconstruction.
-- **Settings** — ROI calibration, data transfer, math tools, and coaching configuration.
+- **Settings** — storage and database health, runtime configuration, model
+  hashes and supported table layouts, a redacted diagnostics bundle, ROI
+  calibration, data transfer, math tools, and coaching configuration.
 
 CV, equity, solver, and coaching output remain separately labeled by source and
 confidence. The application does not turn approximate inputs into a universal
@@ -96,7 +100,43 @@ The Import workflow connects a saved video to the existing two-model CV pipeline
 9. Retain before/after audit records; reconcile the ledger during validation;
    rerun coaching in Study after approval when needed.
 
-Only one local processing job can run at a time. On restart, dead or stale workers are marked failed instead of remaining stuck. SQLite uses WAL mode so the UI can continue reading while the worker writes. Reconstruction uses Apple MPS or CUDA when available (same models/weights); set `POKER_CV_DEVICE=cpu` to force CPU.
+Only one local processing job can run at a time — the Import launcher, the solver
+launcher and the reconstruction worker itself all refuse to start heavy work
+while another heavy job holds the machine. On restart, dead or stale workers are
+marked failed instead of remaining stuck. SQLite uses WAL mode so the UI can
+continue reading while the worker writes. Reconstruction uses Apple MPS or CUDA
+when available (same models/weights); set `POKER_CV_DEVICE=cpu` to force CPU.
+
+### Bounding a reconstruction
+
+| Variable | Default | What it bounds |
+| --- | --- | --- |
+| `POKERTRAINER_CV_TIMEOUT_SECONDS` | `3600` | Wall-clock time for one reconstruction, from 60 to 86400 |
+| `POKERTRAINER_CV_MEMORY_GB` | unset (no cap) | Address space of the CV pipeline process |
+| `POKERTRAINER_CV_MAX_EXTRACTED_FRAMES` | `2000` | Frames one diagnostic frame extraction may retain on disk |
+
+```bash
+export POKERTRAINER_CV_TIMEOUT_SECONDS=7200   # a slow CPU-only host
+export POKERTRAINER_CV_MEMORY_GB=6            # Linux only; see below
+```
+
+A value that cannot be honoured is refused rather than ignored: a malformed
+number, a timeout outside the range, or a memory cap on a platform that cannot
+install one fails the job immediately with the variable named, instead of
+running on the default while you believe your setting is in force.
+
+`POKERTRAINER_CV_MEMORY_GB` sets `RLIMIT_AS`, so it bounds *address space*, not
+resident memory — PyTorch reserves far more of the former than it uses, so set
+it well above the resident figure you expect. macOS refuses `RLIMIT_AS`
+outright; setting the variable there stops the reconstruction with that
+explanation rather than running it uncapped. Leave it unset for local macOS use
+and set it in the Linux container.
+
+When a reconstruction stops on its timeout, the job says which limit it hit,
+which variable sets that limit, and that its partial timeline and review frames
+were discarded — a killed run leaves nothing behind that could be mistaken for a
+result. Only a completed job keeps its review frames, because the export and the
+validated hands point at them.
 
 Corrections are written transactionally to SQLite. Editing hand facts, players,
 or actions changes CV imports to `corrected_cv`, records the original and
@@ -291,6 +331,14 @@ start — cannot fill the backup mount either. They are stamped at the pre-upgra
 schema version, so `data_health` verifies and restore-drills them without the
 current-version comparison it applies to rotating snapshots. Delete them yourself
 once the upgrade is proven.
+Pre-delete snapshots are pinned the same way. Deleting a session, a hand, or an
+ROI profile writes `poker_tracker-predelete-<scope>-<timestamp>.sqlite3` first,
+in its own five-slot pool, and the deletion does not happen if the snapshot
+cannot be written. Settings -> Storage & health lists every retained snapshot and
+states the restore procedure. Snapshots hold rows only: videos, frames, timelines
+and solver outputs are deliberately not copied, so a snapshot restored after those
+were removed will reference files that are gone.
+
 Per-import snapshots keep the rotating `poker_tracker_<timestamp>.sqlite3` name
 and the newest five are retained. Rotation matches that exact timestamped name and
 nothing else, so your own files in `data/backups` are never deleted even when they
@@ -302,7 +350,7 @@ File layout:
 
 ```text
 data/
-  backups/       pinned pre-migration and rotating pre-import SQLite backups
+  backups/       pinned pre-migration, pre-import and pre-delete SQLite backups
   cv_timelines/  retained reconstruction timelines
   exports/       generated session exports
   frames/        diagnostic extracted frames
@@ -471,6 +519,14 @@ issue application-data writes, although SQLite may create or update its normal
 WAL shared-memory sidecars while opening an active database. Add `--json` for
 automation. The command exits nonzero when a check fails, while a fresh
 installation with no backups reports a warning.
+
+The same audit runs in-product from **Settings -> Storage & health**, behind an
+explicit *Run health check* button so a page repaint never pays for it. That tab
+also builds a redacted **diagnostics bundle**: resolved configuration, dependency
+and model identity, layout support, row counts and the health report, with every
+string scrubbed before serialization. It carries no hand history, note, coaching
+text, video filename or environment value — environment variables are reported by
+name and set/unset only.
 
 ## Test
 

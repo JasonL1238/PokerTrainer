@@ -8,6 +8,7 @@ import cv2
 
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import ExtractedFrame
+from poker_tracker.runtime.limits import bounded_int_from_env
 from poker_tracker.ui.jobs import (
     create_job,
     mark_completed,
@@ -16,6 +17,24 @@ from poker_tracker.ui.jobs import (
     update_progress,
 )
 from poker_tracker.ui.video_storage import FRAMES_DIR, video_frame_dir
+
+# Extracted frames are retained artifacts on the operator's disk, and a caller
+# that passes no max_frames asks for one JPEG per sampled second of a recording
+# the ingest limits allow to be 24 hours long. The ceiling bounds that in every
+# direction, including a caller that asks for more than it.
+FRAME_CEILING_ENV_VAR = "POKERTRAINER_CV_MAX_EXTRACTED_FRAMES"
+DEFAULT_FRAME_CEILING = 2000
+MAX_FRAME_CEILING = 1_000_000
+
+
+def configured_frame_ceiling() -> int:
+    """The retained-frame ceiling, or raise naming the variable that is wrong."""
+    return bounded_int_from_env(
+        FRAME_CEILING_ENV_VAR,
+        default=DEFAULT_FRAME_CEILING,
+        minimum=1,
+        maximum=MAX_FRAME_CEILING,
+    )
 
 
 @dataclass(frozen=True)
@@ -26,6 +45,11 @@ class FrameExtractionSummary:
     output_dir: Path
     duration_seconds: float | None = None
     errors: list[str] | None = None
+    # The two fields below exist so a truncated frame set is never handed back
+    # looking like the whole recording. frame_limit is the bound that applied;
+    # truncated_at_limit says the video had more to give.
+    frame_limit: int | None = None
+    truncated_at_limit: bool = False
 
 
 def extract_frames_for_video(
@@ -49,6 +73,11 @@ def extract_frames_for_video(
         raise ValueError("interval_seconds must be positive.")
     if max_frames is not None and max_frames <= 0:
         raise ValueError("max_frames must be positive.")
+    # Validated before the job row exists, so a misconfigured ceiling is an
+    # error the caller sees now rather than a job that fails a moment later.
+    ceiling = configured_frame_ceiling()
+    frame_limit = ceiling if max_frames is None else min(max_frames, ceiling)
+    ceiling_applied = max_frames is None or max_frames > ceiling
 
     job = create_job(db, video_id)
     output_dir = video_frame_dir(video_id, frames_dir)
@@ -69,7 +98,14 @@ def extract_frames_for_video(
         if end is not None and end < start:
             raise ValueError("end_time_seconds must be after start_time_seconds.")
 
-        timestamps = _target_timestamps(start, end, interval, duration, max_frames)
+        # One past the limit, so the truncation is observed rather than assumed:
+        # a video that happens to end exactly on the limit was not truncated.
+        timestamps = _target_timestamps(start, end, interval, duration, frame_limit + 1)
+        # Truncation is only claimed against a span the video actually reported.
+        # With no readable duration and no end time there is no denominator, so
+        # the limit still applies but "the recording has more" is unevidenced.
+        truncated = end is not None and len(timestamps) > frame_limit
+        timestamps = timestamps[:frame_limit]
         total_targets = max(1, len(timestamps))
         existing_frame_indexes = {frame.frame_index for frame in db.fetch_frames_by_video(video_id)}
 
@@ -108,7 +144,14 @@ def extract_frames_for_video(
                 f"Extracted {extracted} frames",
             )
 
-        mark_completed(db, job.id, f"Extracted {extracted} frames")
+        truncated_at_limit = truncated and ceiling_applied
+        completion = f"Extracted {extracted} frames"
+        if truncated_at_limit:
+            completion += (
+                f"; stopped at the {ceiling}-frame ceiling set by "
+                f"{FRAME_CEILING_ENV_VAR}, so the recording has more"
+            )
+        mark_completed(db, job.id, completion)
         return FrameExtractionSummary(
             video_id=video_id,
             job_id=job.id,
@@ -116,6 +159,8 @@ def extract_frames_for_video(
             output_dir=output_dir,
             duration_seconds=duration,
             errors=errors,
+            frame_limit=frame_limit,
+            truncated_at_limit=truncated_at_limit,
         )
     except Exception as exc:
         mark_failed(db, job.id, str(exc))

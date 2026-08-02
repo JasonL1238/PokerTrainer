@@ -2960,6 +2960,41 @@ live-provider smoke test is not part of any automated run.
 - Every workflow passes a clean-database end-to-end acceptance script and
   representative AppTest coverage.
 
+### Insights, Import and Settings close-out
+
+The acceptance script exists: `tests/test_phase10_insights_settings.py` drives
+all seven surfaces from `init_db` forward, first over an empty store and then
+over a corpus holding every state the product must keep apart, and asserts
+data-derived claims rather than headings.
+
+Insights no longer computes anything over the whole hands table. Every figure is
+drawn from a declared population — confirmed, confirmed and reconciled, or all
+saved — whose rule is written in schema vocabulary, and each metric carries its
+denominator, its evidence split (manual / CV draft / corrected CV / reviewed),
+the provenance of every hero result it summed, and a sample verdict that refuses
+to print a rate below a 30-hand floor. Stale coaching is excluded from the theme
+index and the exclusion is counted on screen.
+
+Import states the post-session-only boundary in the interface, warns when a run's
+table geometry is outside the calibrated range, names the recording behind each
+reconstructed hand (including after a correction), and says out loud that a
+rollback snapshot precedes the first hand import.
+
+Settings gained a Storage & health tab: resolved paths, the previously CLI-only
+health audit behind an explicit button, runtime configuration reported by name
+and set/unset only, model weight hashes, supported and observed table layouts,
+retained snapshots with their restore procedure, and a diagnostics bundle
+scrubbed through `redact_structure` before serialization.
+
+Every destructive control in the product now writes a purpose-scoped `predelete`
+snapshot through one helper, and refuses to delete when the snapshot cannot be
+written.
+
+Still open in this area: ROI calibration preview reproducibility (paths are not
+yet derived from frame and region geometry), and the Solver tab still echoes the
+`TEXAS_SOLVER_PATH` it could not find, which is a local diagnostic rather than a
+secret but is an absolute path on screen.
+
 ## Phase 11 — Persistence, portability, backup, and recovery
 
 ### SQLite integrity

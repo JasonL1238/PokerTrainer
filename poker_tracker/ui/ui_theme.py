@@ -508,10 +508,21 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
         min-width: calc(50% - var(--pt-space-2)) !important;
         flex: 1 1 calc(50% - var(--pt-space-2)) !important;
     }
+    /* Every metric strip on a study page stacks the same way. The three added
+       here -- the data-state axes, the session evidence panel and the storage
+       health strip -- are columns of counts, and a count squeezed to a few
+       characters wide is the one thing this product cannot afford to render
+       ambiguously. */
     .st-key-overview_metrics [data-testid="stHorizontalBlock"],
-    .st-key-session_metrics [data-testid="stHorizontalBlock"] { flex-wrap: wrap; }
+    .st-key-session_metrics [data-testid="stHorizontalBlock"],
+    .st-key-session_evidence [data-testid="stHorizontalBlock"],
+    .st-key-storage_health [data-testid="stHorizontalBlock"],
+    [class*="st-key-data_state_axes"] [data-testid="stHorizontalBlock"] { flex-wrap: wrap; }
     .st-key-overview_metrics [data-testid="stHorizontalBlock"] > div,
-    .st-key-session_metrics [data-testid="stHorizontalBlock"] > div {
+    .st-key-session_metrics [data-testid="stHorizontalBlock"] > div,
+    .st-key-session_evidence [data-testid="stHorizontalBlock"] > div,
+    .st-key-storage_health [data-testid="stHorizontalBlock"] > div,
+    [class*="st-key-data_state_axes"] [data-testid="stHorizontalBlock"] > div {
         min-width: calc(50% - var(--pt-space-2)) !important;
         flex: 1 1 calc(50% - var(--pt-space-2)) !important;
     }
@@ -544,6 +555,17 @@ button:focus-visible, input:focus-visible, textarea:focus-visible,
     .st-key-hand_filters [data-testid="stHorizontalBlock"] > div { width: 100% !important; min-width: 100% !important; flex: 1 1 auto !important; }
     .st-key-login_shell > div > [data-testid="stHorizontalBlock"] > div { width: 100% !important; min-width: 100% !important; flex: 1 1 auto !important; }
     .st-key-overview_actions [data-testid="stHorizontalBlock"] > div:last-child { display: none; }
+    /* One axis per row on a phone. Two half-width coverage bars side by side put
+       four legend entries into about ten characters each, and a legend that
+       wraps mid-count is a number separated from its label. */
+    [class*="st-key-data_state_axes"] [data-testid="stHorizontalBlock"],
+    .st-key-session_evidence [data-testid="stHorizontalBlock"],
+    .st-key-storage_health [data-testid="stHorizontalBlock"] { flex-direction: column; }
+    [class*="st-key-data_state_axes"] [data-testid="stHorizontalBlock"] > div,
+    .st-key-session_evidence [data-testid="stHorizontalBlock"] > div,
+    .st-key-storage_health [data-testid="stHorizontalBlock"] > div {
+        width: 100% !important; min-width: 100% !important; flex: 1 1 auto !important;
+    }
     [data-testid="stForm"] [data-testid="stHorizontalBlock"] { flex-direction: column; }
     [data-testid="stForm"] [data-testid="stHorizontalBlock"] > div {
         width: 100% !important; min-width: 100% !important; flex: 1 1 auto !important;

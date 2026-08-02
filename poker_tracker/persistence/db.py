@@ -3554,6 +3554,33 @@ class PokerDatabase:
         ).fetchone()
         return None if row is None else _hand_settlement_from_row(row)
 
+    def fetch_reconciled_settlement_hand_ids(self) -> set[int]:
+        """Every hand id whose settlement READS as reconciled, in one query.
+
+        Exists so a list view can skip reconciling hands that provably cannot
+        produce a derived hero result: ``reconcile_persisted_hand`` marks a hand
+        authoritative only when its settlement row exists and reads
+        ``reconciled``, and only an authoritative reconciliation is ever
+        substituted into a displayed result. The skip is therefore exact rather
+        than a heuristic -- a hand excluded here would have reconciled to
+        ``is_authoritative=False`` and kept its stored result unchanged.
+
+        Selection is by nothing at all and classification is
+        ``_hand_settlement_from_row(row).status`` -- never ``WHERE status =
+        'reconciled'`` -- because that reader forces ``status`` off ``reconciled``
+        on a row this build cannot validate. A raw column predicate would answer
+        the question in the column's space while the reconciliation answers it in
+        the model's, which is the drift ``_MODEL_SPACE_CLASSIFICATION`` exists to
+        prevent.
+        """
+        rows = self._execute("SELECT * FROM hand_settlements").fetchall()
+        return {
+            int(row["hand_id"])
+            for row in rows
+            if row["hand_id"] is not None
+            and _hand_settlement_from_row(row).status == "reconciled"
+        }
+
     def create_settlement_entry(self, entry: SettlementEntry) -> SettlementEntry:
         """A public writer: an award added here re-declares the winner.
 
@@ -3708,6 +3735,66 @@ class PokerDatabase:
             (hand_id,),
         ).fetchall()
         return [_review_from_row(row) for row in rows]
+
+    def fetch_stale_review_hand_ids(self) -> set[int]:
+        """Every hand id carrying at least one stale retained review, in two queries.
+
+        Both retained tables, because ``_coaching_blockers`` considers both and a
+        list that reported only one would show a clean row beside a blocker the
+        operator cannot see the cause of.
+
+        Selection is by nothing at all and classification is
+        ``reader(row).is_stale`` -- never ``WHERE is_stale = 1`` -- so a stored
+        ``2`` or ``'yes'``, which the readers degrade to stale, is counted here
+        exactly as the blocker counts it. See _MODEL_SPACE_CLASSIFICATION.
+
+        Exists so a surface listing many hands can show staleness without paying
+        two queries per row; ``fetch_reviews_by_hand`` and
+        ``fetch_coaching_reviews_by_hand`` remain the right calls for one hand.
+        """
+        stale: set[int] = set()
+        for table, reader in (
+            ("coaching_reviews", _coaching_response_from_row),
+            ("hand_reviews", _review_from_row),
+        ):
+            rows = self._execute(
+                f"SELECT * FROM {table}"  # noqa: S608
+            ).fetchall()
+            for row in rows:
+                hand_id = row["hand_id"]
+                if hand_id is not None and reader(row).is_stale:
+                    stale.add(int(hand_id))
+        return stale
+
+    def fetch_retained_reviews_by_hand(
+        self,
+    ) -> dict[int, list[CoachingResponse | HandReview]]:
+        """Every retained review in both tables, grouped by hand, in two queries.
+
+        The sibling of ``fetch_stale_review_hand_ids`` for a caller that needs the
+        review CONTENT rather than only the staleness flag -- the Insights theme
+        index reads each review's study lesson and has to know which reviews a
+        correction invalidated, so a set of hand ids is not enough.
+
+        Two queries whatever the corpus size, because the alternative on a list
+        surface is two per row. Hands with no retained review are simply absent
+        from the mapping; ``build_hand_evidence`` treats a missing key as "no
+        retained coaching", which is what it means.
+        """
+        grouped: dict[int, list[CoachingResponse | HandReview]] = {}
+        for table, reader in (
+            ("coaching_reviews", _coaching_response_from_row),
+            ("hand_reviews", _review_from_row),
+        ):
+            rows = self._execute(
+                f"SELECT * FROM {table} ORDER BY created_at DESC, id DESC"  # noqa: S608
+            ).fetchall()
+            for row in rows:
+                hand_id = row["hand_id"]
+                if hand_id is None:
+                    continue
+                grouped.setdefault(int(hand_id), []).append(reader(row))
+        return grouped
 
     def create_coaching_response(self, response: CoachingResponse) -> CoachingResponse:
         payload = response.model_dump()
@@ -4292,6 +4379,20 @@ class PokerDatabase:
         rows = self._execute(
             "SELECT * FROM processing_jobs ORDER BY created_at DESC, id DESC LIMIT ?",
             (limit,),
+        ).fetchall()
+        return [_processing_job_from_row(row) for row in rows]
+
+    def fetch_all_jobs(self) -> list[ProcessingJob]:
+        """Every processing job, newest first, for a surface that states job counts.
+
+        Unbounded on purpose: ``fetch_recent_jobs`` answers "what happened
+        lately", and a count derived from a truncated window is not a count. The
+        table holds one row per reconstruction or extraction run on a local-first
+        store, so the full read is small; a list view should still take the
+        bounded call.
+        """
+        rows = self._execute(
+            "SELECT * FROM processing_jobs ORDER BY created_at DESC, id DESC"
         ).fetchall()
         return [_processing_job_from_row(row) for row in rows]
 

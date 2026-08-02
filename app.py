@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Container, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import date
 from html import escape
@@ -26,8 +27,36 @@ from poker_tracker.coaching.safety import validate_post_session_prompt
 from poker_tracker.coaching.solver_grounding import (
     validate_solver_coaching_response,
 )
+from poker_tracker.maintenance.data_health import HealthReport, audit_data_health
+from poker_tracker.maintenance.diagnostics import (
+    build_diagnostics_payload,
+    environment_variable_report,
+    observed_layout_profiles,
+    serialize_diagnostics,
+    supported_layout_profiles,
+)
 from poker_tracker.math.accounting import LedgerError
-from poker_tracker.math.analytics import compute_session_stats
+from poker_tracker.math.analytics import (
+    DEFAULT_POPULATION,
+    EVIDENCE_CLASS_LABELS,
+    EVIDENCE_CLASS_MEANING,
+    EVIDENCE_CLASSES,
+    EXCLUSION_REASON_LABELS,
+    POPULATIONS,
+    RESULT_BASIS_LABELS,
+    EvidenceClass,
+    Metric,
+    PopulationKey,
+    PopulationSnapshot,
+    SessionStats,
+    ThemeAggregate,
+    aggregate_study_themes,
+    build_hand_evidence,
+    classify_evidence,
+    compute_population_metrics,
+    compute_session_stats,
+    select_population,
+)
 from poker_tracker.math.equity import get_equity_calculator
 from poker_tracker.math.ev import (
     bluff_ev,
@@ -57,6 +86,12 @@ from poker_tracker.math.study_math import (
     outs_to_equity_rule,
     realized_equity,
 )
+from poker_tracker.persistence.backup import (
+    SNAPSHOT_CLASSES,
+    backup_database,
+    backups_dir_for,
+    find_snapshots,
+)
 from poker_tracker.persistence.completion import (
     OBSERVED_TERMINAL_EVENTS,
     CompletionEvidence,
@@ -66,7 +101,7 @@ from poker_tracker.persistence.completion import (
     is_assumption_dependence_code,
     parse_completion_evidence,
 )
-from poker_tracker.persistence.db import DEFAULT_DB_PATH, PokerDatabase
+from poker_tracker.persistence.db import DEFAULT_DB_PATH, SCHEMA_VERSION, PokerDatabase
 from poker_tracker.persistence.import_export import export_hand, export_session, import_session
 from poker_tracker.persistence.models import (
     HAND_TAGS,
@@ -86,6 +121,8 @@ from poker_tracker.persistence.models import (
     utc_now,
 )
 from poker_tracker.player_labels import actor_label
+from poker_tracker.release_gate.models import MODEL_CANDIDATES, resolve_models
+from poker_tracker.safety.redaction import redact_text, safe_error_message
 from poker_tracker.services.action_provenance import backfill_action_provenance
 from poker_tracker.services.hand_accounting import (
     AccountingReconciliation,
@@ -239,6 +276,7 @@ from poker_tracker.ui.roi_profiles import (
     import_roi_profile,
 )
 from poker_tracker.ui.session_library import (
+    HAND_FLAG_FILTERS,
     date_session_name,
     filter_hands,
     filter_sessions,
@@ -252,11 +290,19 @@ from poker_tracker.ui.video_storage import (
     validate_video_extension,
 )
 from poker_tracker.ui.view_models import (
+    COMPLETION_STATE_LABELS,
+    REVIEW_STATE_LABELS,
+    SOURCE_STATE_LABELS,
+    EvidenceStates,
+    build_evidence_states,
     build_job_rows,
     build_portfolio_summary,
     build_session_rows,
     completion_evidence_rows,
-    confidence_label,
+    job_is_live,
+    job_stopped_without_success,
+    job_succeeded,
+    reconstruction_confidence,
 )
 
 STREETS = ["preflop", "flop", "turn", "river", "showdown"]
@@ -294,6 +340,9 @@ HAND_ISSUE_LABELS = {
     "other": "Other",
 }
 MAX_IMPORT_BYTES = 10 * 1024 * 1024  # sane ceiling for JSON imports; videos have their own path
+# The checkout this app is running from, which is where the pinned model weights
+# and the git identity in the diagnostics bundle are resolved against.
+REPO_ROOT = Path(__file__).resolve().parent
 
 
 @st.cache_resource
@@ -485,6 +534,47 @@ def _cv_timeline_identity(hand: Hand) -> tuple[int | None, int | None]:
     if timeline_hand_number is None:
         timeline_hand_number = hand.hand_number
     return job_id, timeline_hand_number
+
+
+def hand_source_recording(db: PokerDatabase, hand: Hand) -> VideoRecord | None:
+    """The recording a reconstructed hand came from, or ``None`` for a manual entry.
+
+    Resolved through the retained ``cv_timeline_identity`` -> job -> video chain
+    rather than through the hand's notes, because a correction rewrites the notes
+    and the identity survives it. That is the whole requirement: a hand the
+    operator has since corrected is still a hand that came from this recording,
+    and the link had existed only as a navigation target -- no surface ever said
+    which file the facts were read from.
+    """
+    if hand.source_type == "manual":
+        return None
+    job_id, _ = _cv_timeline_identity(hand)
+    if job_id is None:
+        return None
+    job = db.fetch_processing_job(job_id)
+    if job is None:
+        return None
+    return db.fetch_video(job.video_id)
+
+
+def render_hand_source_recording(db: PokerDatabase, hand: Hand) -> None:
+    """Name the file this hand's facts were read from, beside the hand."""
+    if hand.source_type == "manual":
+        data_callout("Source", "Entered by hand — no recording")
+        return
+    video = hand_source_recording(db, hand)
+    if video is None:
+        data_callout(
+            "Source recording",
+            "Not resolvable — the reconstruction job or video row is gone",
+        )
+        return
+    job_id, timeline_hand_number = _cv_timeline_identity(hand)
+    data_callout(
+        "Source recording",
+        f"{video.original_filename} · job #{job_id} · timeline hand "
+        f"#{timeline_hand_number}",
+    )
 
 
 def try_approve_hand_after_validation(
@@ -903,11 +993,23 @@ def _reconcile_cached(
 def _hands_with_accounting_results(
     db: PokerDatabase, hands: list[Hand], cache: AccountingCache | None = None
 ) -> list[Hand]:
+    """Substitute the reconciled hero result into display copies of ``hands``.
+
+    Reconciliation is skipped for any hand with no stored ``reconciled``
+    settlement row. That is not an approximation: ``reconcile_persisted_hand``
+    cannot report ``is_authoritative`` without one, and only an authoritative
+    reconciliation is ever substituted below, so the skipped hands take exactly
+    the branch they would have taken after paying for two ledger builds. It
+    matters because the callers hand this whole lists -- a library of CV drafts
+    that have never been through the accounting panel used to cost one full
+    reconciliation each, on every rerun, to arrive at no substitution at all.
+    """
+    settled_hand_ids = db.fetch_reconciled_settlement_hand_ids() if hands else frozenset()
     resolved: list[Hand] = []
     for hand in hands:
         result = hand.hero_bb_won
         substituted = False
-        if hand.id is not None:
+        if hand.id is not None and hand.id in settled_hand_ids:
             accounting, _ = _reconcile_cached(db, hand.id, cache)
             # Not `is_authoritative`. This substitution is where a derived figure
             # becomes the hand's result in every list, the Overview panel, the
@@ -965,6 +1067,310 @@ def _format_persisted_hand_history(db: PokerDatabase, session: Session, hand: Ha
     )
 
 
+def safe_path_label(value: str | Path) -> str:
+    """A stored path shown as ``parent/name``, never the operator's whole filesystem.
+
+    A health readout has to identify which file it audited, and the absolute path
+    identifies the operator instead: a home directory carries their account name
+    and a data root often carries a client's. The last two components separate
+    two stores from each other and say nothing about where either one lives.
+    """
+    path = Path(str(value))
+    parent = path.parent.name
+    return f"{parent}/{path.name}" if parent else path.name
+
+
+# Health states carry a word, not only a colour, and the word is the one the
+# audit chose. `status_badge` supplies the dot; the label is what is readable.
+_HEALTH_STATE_BADGES: dict[str, str] = {
+    "pass": "completed",
+    "warning": "needs_correction",
+    "fail": "failed",
+}
+_HEALTH_STATE_LABELS: dict[str, str] = {
+    "pass": "OK",
+    "warning": "Warning",
+    "fail": "Failing",
+}
+_HEALTH_REPORT_STATE_KEY = "storage_health_report"
+
+
+def _health_report_state_key(key_prefix: str) -> str:
+    return f"{_HEALTH_REPORT_STATE_KEY}_{key_prefix}"
+
+
+def render_storage_health(*, key_prefix: str = "overview") -> None:
+    """Storage and database health, run on request and redacted before display.
+
+    ``audit_data_health`` is a real audit: it opens the database read-only, runs
+    an integrity and foreign-key check, walks every recorded artifact path and
+    restores each retained snapshot into a temporary file. That is the right
+    price for an answer somebody asked for and the wrong price for a page
+    repaint, so it runs behind a button and its report is kept in session state.
+    A rerun therefore redraws the same report instead of re-auditing, which is
+    the idempotence rule applied to a read: pressing the button twice costs two
+    audits and changes nothing, and not pressing it costs none.
+
+    Everything the audit returns is untrusted text for display purposes -- check
+    details carry file paths, SQL fragments and exception strings, and an
+    exception string is exactly where a credential surfaces -- so every line goes
+    through ``redact_text`` and every path through ``safe_path_label``.
+
+    Reusable by any surface that needs the same panel; pass a distinct
+    ``key_prefix`` so two mounts do not share one widget key or one cached report.
+    """
+    section_header(
+        "Storage and database health",
+        "Where this install keeps its data, and whether that data still checks out.",
+    )
+    database_path = Path(str(DEFAULT_DB_PATH))
+    try:
+        size_label = _format_bytes(database_path.stat().st_size)
+    except OSError:
+        size_label = "Not readable"
+    try:
+        usage = shutil.disk_usage(
+            database_path.parent if database_path.parent.exists() else Path.cwd()
+        )
+        free_label = _format_bytes(usage.free)
+    except OSError:
+        free_label = "Unknown"
+
+    with st.container(key="storage_health"):
+        columns = st.columns(4)
+        with columns[0]:
+            kpi_card(
+                "Database",
+                safe_path_label(database_path),
+                "Location shown without its full path",
+            )
+        with columns[1]:
+            kpi_card("Database size", size_label, "On-disk size of the SQLite file")
+        with columns[2]:
+            kpi_card("Free space", free_label, "On the volume holding the database")
+        with columns[3]:
+            kpi_card("Schema version", str(SCHEMA_VERSION), "Version this build expects")
+
+    state_key = _health_report_state_key(key_prefix)
+    if st.button(
+        "Run health check",
+        key=f"{key_prefix}_run_health_check",
+        help="Reads the database and every retained backup. Nothing is modified.",
+    ):
+        try:
+            st.session_state[state_key] = audit_data_health(
+                DEFAULT_DB_PATH,
+                expected_schema_version=SCHEMA_VERSION,
+            )
+        except Exception as exc:  # a health readout must never take the page down
+            st.session_state[state_key] = None
+            st.error(f"Health check could not complete: {safe_error_message(exc)}")
+
+    report = st.session_state.get(state_key)
+    if report is None:
+        st.caption(
+            "No health check has been run in this session. "
+            "Nothing below is claimed about the store until you run one."
+        )
+        return
+    render_health_report(report)
+
+
+def render_health_report(report: HealthReport) -> None:
+    """Draw one audit report, with every string redacted and every path shortened."""
+    failing = [check for check in report.checks if check.status == "fail"]
+    warning = [check for check in report.checks if check.status == "warning"]
+    headline = (
+        f"{len(failing)} failing, {len(warning)} warning, "
+        f"{len(report.checks) - len(failing) - len(warning)} OK "
+        f"of {len(report.checks)} checks"
+    )
+    st.caption(
+        f"{headline} · database {safe_path_label(report.database_path)} · "
+        f"data {safe_path_label(report.data_dir)} · "
+        f"backups {safe_path_label(report.backup_dir)} · "
+        f"checked {report.checked_at}"
+    )
+    for check in report.checks:
+        badge = status_badge(
+            _HEALTH_STATE_BADGES.get(check.status, "unreviewed"),
+            label=_HEALTH_STATE_LABELS.get(check.status, check.status.title()),
+        )
+        st.markdown(
+            f"{badge} **{escape(check.name.replace('_', ' ').title())}** — "
+            f"{escape(redact_text(check.message))}",
+            unsafe_allow_html=True,
+        )
+        if check.details:
+            with st.expander(f"{check.name} details ({len(check.details)})", expanded=False):
+                for detail in check.details:
+                    st.caption(redact_text(str(detail)))
+
+
+def _render_overview_processing(db: PokerDatabase) -> None:
+    """Job counts over every job, a recent table, and a next action for the failures.
+
+    The counts come from the whole table and the table from the recent window,
+    because a count taken from a truncated window is not a count -- an operator
+    reading "6 jobs" beside a store holding forty has been told something false
+    by a page that was only trying to be brief.
+
+    Live/succeeded/stopped are decided by the shared predicates in
+    ``view_models``, not by a status list spelled again here, so a status this
+    build does not recognise lands in "stopped without succeeding" on every
+    surface at once rather than in whichever bucket each page happened to guess.
+    """
+    all_jobs = db.fetch_all_jobs()
+    live_jobs = [job for job in all_jobs if job_is_live(job.status)]
+    succeeded_jobs = [job for job in all_jobs if job_succeeded(job.status)]
+    stopped_jobs = [job for job in all_jobs if job_stopped_without_success(job.status)]
+
+    section_header_with_meta(
+        "Processing",
+        "Offline reconstruction activity across every recording.",
+        f"{len(all_jobs)} JOB{'S' if len(all_jobs) != 1 else ''}",
+    )
+    if not all_jobs:
+        empty_state("No processing jobs", "Uploaded video reconstruction jobs will appear here.")
+        return
+
+    st.caption(
+        f"{len(all_jobs)} total · {len(live_jobs)} in flight · "
+        f"{len(succeeded_jobs)} completed · {len(stopped_jobs)} stopped without succeeding"
+    )
+
+    videos = db.fetch_videos()
+    recent_jobs = db.fetch_recent_jobs(6)
+    # Resolved once for the union of the two lists below, so a job appearing in
+    # both is not queried for its committed count twice in one render.
+    needs_action = stopped_jobs[:4]
+    described = {job.id: job for job in [*recent_jobs, *needs_action] if job.id is not None}
+    outcomes = describe_job_outcomes(db, list(described.values()))
+    job_rows = build_job_rows(recent_jobs, videos, outcomes=outcomes)
+    st.dataframe(
+        [
+            {
+                "Video": row.filename,
+                "Type": row.job_type,
+                "Status": row.status.replace("_", " ").title(),
+                "Progress": row.progress_label,
+                "Outcome": row.outcome_statement,
+                # The worker log is the only account of why a job stopped, so it
+                # travels with the outcome instead of living one page deeper
+                # where nobody knows to look for it.
+                "Log": safe_path_label(row.outcome.log_path) if row.outcome.log_path else "—",
+                "Created": row.age_label,
+            }
+            for row in job_rows
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+
+    if not needs_action:
+        return
+    video_names = {video.id: video.original_filename for video in videos if video.id is not None}
+    st.markdown("##### Jobs that stopped without succeeding")
+    st.caption(
+        f"{len(stopped_jobs)} in total; the {len(needs_action)} most recent are shown with "
+        "the recording each one stopped on."
+    )
+    for job in needs_action:
+        if job.id is None:
+            continue
+        outcome = outcomes.get(job.id) or describe_job_outcome(db, job)
+        with st.container(border=True, key=f"overview_stopped_job_{job.id}"):
+            st.markdown(
+                f"{status_badge('failed', label=outcome.headline)} "
+                f"**{escape(video_names.get(job.video_id, 'Unknown video'))}**",
+                unsafe_allow_html=True,
+            )
+            st.caption(outcome.statement)
+            if outcome.error_message:
+                st.caption(f"Reported failure: {outcome.error_message}")
+            if st.button(
+                "Open this recording in Import",
+                key=f"overview_job_open_import_{job.id}",
+                width="stretch",
+            ):
+                video = db.fetch_video(job.video_id)
+                if video is not None and video.session_id is not None:
+                    _activate_session(video.session_id)
+                st.session_state["video_context_id"] = job.video_id
+                navigate_to(Page.IMPORT)
+                st.rerun()
+            if outcome.log_tail:
+                with st.expander(
+                    f"Worker log · last {len(outcome.log_tail)} lines", expanded=False
+                ):
+                    st.caption(f"Log file · {safe_path_label(outcome.log_path)}")
+                    st.code("\n".join(outcome.log_tail), language=None)
+            elif outcome.log_path:
+                st.caption(f"Worker log · {safe_path_label(outcome.log_path)}")
+            else:
+                st.caption("No worker log was written for this job.")
+
+
+def render_data_state_axes(
+    states: EvidenceStates,
+    *,
+    scope_noun: str = "saved hands",
+    key_prefix: str = "overview",
+) -> None:
+    """The six data states, drawn as the three independent axes they actually are.
+
+    Deliberately not one stacked bar. A hand is complete AND corrected AND
+    reviewed at the same time, so a single six-segment bar would have to pick one
+    of those to be true, and whichever it picked would be six labels over one
+    flag. Each axis below is a genuine partition of the same hands, which is why
+    each carries the same denominator and the closing caption says out loud that
+    they do not sum.
+
+    Shared by Overview and the session dashboard so the two cannot drift into
+    disagreeing about what "partial" or "corrected" means.
+    """
+    if states.hand_count == 0:
+        return
+    total = states.hand_count
+    with st.container(key=f"data_state_axes_{key_prefix}"):
+        left, middle, right = st.columns(3)
+        with left:
+            st.markdown("**Reconstruction completeness**")
+            coverage_bar(
+                states.completion_rows,
+                labels=COMPLETION_STATE_LABELS,
+                aria_label=f"Reconstruction completeness across {total} hands",
+            )
+            st.caption(f"{total} {scope_noun}. Manual entries are not reconstructed, so n/a.")
+        with middle:
+            st.markdown("**Evidence source**")
+            coverage_bar(
+                states.source_rows,
+                labels=SOURCE_STATE_LABELS,
+                aria_label=f"Evidence source across {total} hands",
+            )
+            st.caption(
+                f"{total} {scope_noun}. Provenance only — a hand keeps the source it came "
+                "from after it is reviewed, so this axis never absorbs the one beside it."
+            )
+        with right:
+            st.markdown("**Review state**")
+            coverage_bar(
+                states.review_rows,
+                labels=REVIEW_STATE_LABELS,
+                aria_label=f"Review state across {total} hands",
+            )
+            st.caption(
+                f"{states.stale} of {total} carry retained analysis that a later "
+                "correction made stale."
+            )
+    st.caption(
+        "These three readings are independent: every hand appears once in each, "
+        "so the counts across them do not add up to "
+        f"{total}. 'Marked reviewed' is a workflow step, not a verdict that a hand is correct."
+    )
+
+
 def show_product_overview(db: PokerDatabase) -> None:
     sessions = db.fetch_sessions()
     hands_by_session = {
@@ -973,7 +1379,20 @@ def show_product_overview(db: PokerDatabase) -> None:
         if session.id is not None
     }
     all_hands = [hand for hands in hands_by_session.values() for hand in hands]
-    summary = build_portfolio_summary(all_hands, len(sessions))
+    known_hand_ids = {hand.id for hand in all_hands if hand.id is not None}
+    open_issues = db.fetch_hand_issues(status="open")
+    # Split rather than totalled, because an issue whose hand no longer exists is
+    # still an open row this page would otherwise fold into a count of work the
+    # operator can act on. Saying "N, of which M are orphaned" is the same
+    # discipline as printing a denominator.
+    listed_issues = [issue for issue in open_issues if issue.hand_id in known_hand_ids]
+    orphan_issues = len(open_issues) - len(listed_issues)
+    summary = build_portfolio_summary(
+        all_hands,
+        len(sessions),
+        open_issue_count=len(listed_issues),
+        stale_hand_ids=db.fetch_stale_review_hand_ids(),
+    )
 
     featured = all_hands[-1] if all_hands else None
     if featured is not None and featured.id is not None:
@@ -1046,23 +1465,83 @@ def show_product_overview(db: PokerDatabase) -> None:
             kpi_card(
                 "Review coverage",
                 f"{summary.review_percent:.0f}%",
-                f"{summary.reviewed_count} hands marked reviewed",
+                f"{summary.reviewed_count} of {summary.hand_count} hands marked reviewed",
                 tone="positive" if summary.review_percent >= 75 else "default",
             )
         with columns[3]:
-            result_tone = (
+            kpi_card(
+                "Open issues",
+                str(summary.open_issue_count),
+                (
+                    "Saved debugging issues awaiting resolution"
+                    if not orphan_issues
+                    else f"On listed hands; {orphan_issues} more on hands no longer in the library"
+                ),
+                tone="warning" if summary.open_issue_count else "default",
+            )
+
+        second_row = st.columns(4)
+        with second_row[0]:
+            # The headline result is the CONFIRMED one. Summing every hand's
+            # result put a CV draft -- a pipeline's unreviewed reading of a hand
+            # nobody has checked -- into the same figure as a hand the operator
+            # signed off, where nothing distinguished the two. The draft total
+            # still appears, beside it, labelled as what it is.
+            confirmed_tone = (
                 "positive"
-                if summary.net_bb > 0
+                if summary.confirmed_net_bb > 0
                 else "negative"
-                if summary.net_bb < 0
+                if summary.confirmed_net_bb < 0
                 else "default"
             )
             kpi_card(
-                "Recorded result",
-                f"{summary.net_bb:+g} BB",
-                "Recorded hands only",
-                tone=result_tone,
+                "Confirmed result",
+                f"{summary.confirmed_net_bb:+g} BB",
+                f"From {summary.confirmed_result_hands} reviewed hands with a recorded result",
+                tone=confirmed_tone,
             )
+        with second_row[1]:
+            kpi_card(
+                "Unconfirmed draft result",
+                f"{summary.unconfirmed_net_bb:+g} BB",
+                (
+                    f"From {summary.unconfirmed_result_hands} hands not yet marked reviewed — "
+                    "not study evidence"
+                ),
+                tone="warning" if summary.unconfirmed_result_hands else "default",
+            )
+        with second_row[2]:
+            kpi_card(
+                "Reconciled results",
+                str(summary.derived_result_count),
+                (
+                    f"Derived by the accounting ledger; "
+                    f"{summary.observed_result_count} were recorded as observed"
+                ),
+            )
+        with second_row[3]:
+            kpi_card(
+                "Stale analysis",
+                str(0 if summary.states is None else summary.states.stale),
+                "Hands whose retained coaching or review a correction invalidated",
+                tone=(
+                    "warning"
+                    if summary.states is not None and summary.states.stale
+                    else "default"
+                ),
+            )
+    st.caption(
+        "Evidence class of the figures above: 'Confirmed result' counts only hands marked "
+        "reviewed; 'Unconfirmed draft result' is CV and unreviewed manual work in progress. "
+        "The two are never added together on this page."
+    )
+
+    if summary.states is not None and summary.states.hand_count:
+        section_header(
+            "Data states",
+            "What the library actually knows about each hand, on three separate readings.",
+        )
+        render_data_state_axes(summary.states)
 
     if featured_actions:
         section_header_with_meta(
@@ -1102,43 +1581,24 @@ def show_product_overview(db: PokerDatabase) -> None:
                     "Stakes": row.stakes,
                     "Hands": row.hand_count,
                     "Reviewed": f"{row.reviewed_count}/{row.hand_count}",
-                    "Result": f"{row.net_bb:+g} BB",
+                    # Two columns rather than one, because one column made a
+                    # reviewed hand and an unreviewed CV draft add up into a
+                    # figure that read as the session's measured result.
+                    "Confirmed": f"{row.confirmed_net_bb:+g} BB",
+                    "Draft": f"{row.unconfirmed_net_bb:+g} BB",
                 }
                 for row in session_rows[:8]
             ],
             hide_index=True,
             width="stretch",
         )
-
-    section_header("Processing", "Recent offline reconstruction activity")
-    recent_jobs = db.fetch_recent_jobs(6)
-    job_rows = build_job_rows(
-        recent_jobs,
-        db.fetch_videos(),
-        outcomes=describe_job_outcomes(db, recent_jobs),
-    )
-    if not job_rows:
-        empty_state("No processing jobs", "Uploaded video reconstruction jobs will appear here.")
-    else:
-        st.dataframe(
-            [
-                {
-                    "Video": row.filename,
-                    "Type": row.job_type,
-                    "Status": row.status.replace("_", " ").title(),
-                    "Progress": row.progress_label,
-                    "Outcome": row.outcome_statement,
-                    # The worker log is the only account of why a job stopped,
-                    # so it travels with the outcome instead of living one page
-                    # deeper where nobody knows to look for it.
-                    "Log": row.outcome.log_path or "—",
-                    "Created": row.age_label,
-                }
-                for row in job_rows
-            ],
-            hide_index=True,
-            width="stretch",
+        st.caption(
+            "Confirmed covers hands marked reviewed. Draft covers everything else in "
+            "the session, including unreviewed CV reconstructions."
         )
+
+    _render_overview_processing(db)
+    render_storage_health(key_prefix="overview")
 
 
 def show_sessions_workspace(db: PokerDatabase, session: Session | None) -> None:
@@ -1168,13 +1628,50 @@ def show_sessions_workspace(db: PokerDatabase, session: Session | None) -> None:
         create_hand_form(db, session.id)
 
 
+HAND_FLAG_FILTER_LABELS = {
+    "all": "All",
+    "open_issue": "Open issue",
+    "stale": "Stale analysis",
+    "clean": "Neither",
+}
+HAND_SOURCE_FILTER_LABELS = {"all": "All", **SOURCE_STATE_LABELS}
+
+
+def _hand_issue_index(
+    issues: list[HandIssue],
+) -> tuple[dict[int, int], dict[int, str]]:
+    """Open-issue counts and searchable issue text, keyed by hand id.
+
+    Built once from the single ``fetch_hand_issues`` call the page already makes,
+    because the alternative -- asking per row -- is a query per rendered hand and
+    the badge would then be the most expensive thing on the page.
+    """
+    counts: dict[int, int] = {}
+    text: dict[int, str] = {}
+    for issue in issues:
+        counts[issue.hand_id] = counts.get(issue.hand_id, 0) + 1
+        labels = " ".join(
+            HAND_ISSUE_LABELS.get(issue_type, issue_type.replace("_", " "))
+            for issue_type in issue.issue_types
+        )
+        text[issue.hand_id] = " ".join(
+            (text.get(issue.hand_id, ""), labels, issue.description)
+        ).strip()
+    return counts, text
+
+
 def show_hands_workspace(db: PokerDatabase) -> None:
     page_header(
         "Hand library",
         "Find high-impact and unresolved decisions across every completed session.",
     )
     sessions = db.fetch_sessions()
-    hands = _hands_with_accounting_results(db, db.fetch_all_hands())
+    # Raw rows, deliberately not reconciled here. The accounting substitution is
+    # two ledger builds per hand and it only changes what is DISPLAYED, so it is
+    # paid for on the page being displayed (see the resolver passed to
+    # ``render_hand_results`` below) rather than on every hand in the database
+    # before the first filter has run.
+    hands = db.fetch_all_hands()
     if not hands:
         empty_state(
             "No hands to review", "Import a completed session or add a hand manually first."
@@ -1182,18 +1679,20 @@ def show_hands_workspace(db: PokerDatabase) -> None:
         return
     sessions_by_id = {session.id: session for session in sessions if session.id is not None}
     hands_by_id = {hand.id: hand for hand in hands if hand.id is not None}
-    show_hand_issue_queue(
-        db,
-        db.fetch_hand_issues(status="open"),
-        hands_by_id,
-        sessions_by_id,
-    )
+    open_issues = db.fetch_hand_issues(status="open")
+    show_hand_issue_queue(db, open_issues, hands_by_id, sessions_by_id)
+
+    issue_counts, issue_text = _hand_issue_index(open_issues)
+    # Two queries for the whole library, never two per row. This is what makes a
+    # per-row staleness badge affordable, and the badge is what stops a
+    # correction-invalidated analysis from looking current in the list.
+    stale_hand_ids = db.fetch_stale_review_hand_ids()
 
     with st.container(key="hand_filters"):
         search_col, status_col, result_col = st.columns([2, 1, 1])
         query = search_col.text_input(
             "Find a hand",
-            placeholder="Cards, date, session, stakes, position, tag…",
+            placeholder="Cards, date, session, stakes, position, tag, issue text…",
             key="hand_library_search",
         )
         review_status = status_col.segmented_control(
@@ -1210,17 +1709,65 @@ def show_hands_workspace(db: PokerDatabase) -> None:
             format_func=str.title,
             key="hand_library_result",
         )
-    filtered = filter_hands(
+        source_col, flag_col = st.columns([1, 1])
+        source_filter = source_col.segmented_control(
+            "Evidence source",
+            options=list(HAND_SOURCE_FILTER_LABELS),
+            default="all",
+            format_func=lambda value: HAND_SOURCE_FILTER_LABELS[value],
+            key="hand_library_source",
+        )
+        flag_filter = flag_col.segmented_control(
+            "Flags",
+            options=list(HAND_FLAG_FILTERS),
+            default="all",
+            format_func=lambda value: HAND_FLAG_FILTER_LABELS[value],
+            key="hand_library_flag",
+        )
+    narrowed = filter_hands(
         hands,
         sessions_by_id,
         query=query,
         review_status=review_status or "all",
-        result_filter=result_filter or "all",
+        source_filter=source_filter or "all",
+        flag_filter=flag_filter or "all",
+        issue_text_by_hand=issue_text,
+        issue_hand_ids=set(issue_counts),
+        stale_hand_ids=stale_hand_ids,
     )
-    if not filtered:
+    accounting_cache = new_accounting_cache()
+    if (result_filter or "all") != "all":
+        # A result filter is the one control that cannot be answered from the
+        # stored columns, because a reconciled hand's displayed result may be the
+        # ledger's rather than the recorded one. Reconciling here -- after the
+        # cheap filters have narrowed the set, and only over hands that carry a
+        # reconciled settlement -- keeps the filter honest without paying for the
+        # whole library when it is not engaged.
+        narrowed = filter_hands(
+            _hands_with_accounting_results(db, narrowed, accounting_cache),
+            sessions_by_id,
+            result_filter=result_filter,
+        )
+    if not narrowed:
         empty_state("No matching hands", "Clear one or more filters to broaden the result set.")
         return
-    render_hand_results(db, filtered, sessions_by_id, key_prefix="library")
+    st.caption(
+        f"{len(narrowed)} of {len(hands)} saved hands match. "
+        f"{sum(1 for hand in narrowed if hand.id in issue_counts)} carry an open issue; "
+        f"{sum(1 for hand in narrowed if hand.id in stale_hand_ids)} carry analysis a "
+        "correction made stale."
+    )
+    render_hand_results(
+        db,
+        narrowed,
+        sessions_by_id,
+        key_prefix="library",
+        resolve_page=lambda page_hands: _hands_with_accounting_results(
+            db, page_hands, accounting_cache
+        ),
+        open_issue_counts=issue_counts,
+        stale_hand_ids=stale_hand_ids,
+    )
 
 
 def show_hand_issue_queue(
@@ -1229,18 +1776,61 @@ def show_hand_issue_queue(
     hands_by_id: dict[int, Hand],
     sessions_by_id: dict[int, Session],
 ) -> None:
-    """Render the cross-session inbox an agent can inspect later."""
+    """Render the cross-session inbox an agent can inspect later.
 
-    with st.expander(f"Saved debugging issue queue ({len(issues)} open)", expanded=bool(issues)):
-        if not issues:
+    The header counts what is listed, never what was fetched. An issue whose hand
+    no longer appears in the library cannot be opened from here, and folding it
+    into the headline produced a count of outstanding work with fewer rows under
+    it than the number claimed -- an unresolved-work figure the inbox itself
+    could not substantiate. Orphans are stated separately instead.
+    """
+
+    listed = [issue for issue in issues if issue.hand_id in hands_by_id]
+    orphaned = len(issues) - len(listed)
+    with st.expander(
+        f"Saved debugging issue queue ({len(listed)} open)", expanded=bool(listed)
+    ):
+        if orphaned:
+            st.warning(
+                f"{orphaned} further open issue(s) reference hands that are no longer "
+                "in the library. They cannot be opened from here; delete them with "
+                "the hand or restore the hand from a backup."
+            )
+        if not listed:
             st.caption(
                 "No unresolved hand issues. Flag one during Import validation."
             )
             return
-        for issue in issues:
-            hand = hands_by_id.get(issue.hand_id)
-            if hand is None:
-                continue
+        page_size = 10
+        page_key = "hand_issue_queue_page"
+        total_pages = max(1, (len(listed) + page_size - 1) // page_size)
+        page = min(max(1, int(st.session_state.get(page_key, 1))), total_pages)
+        st.session_state[page_key] = page
+        start = (page - 1) * page_size
+        if total_pages > 1:
+            back_col, label_col, forward_col = st.columns([1, 4, 1])
+            if back_col.button(
+                "← Newer issues",
+                key="hand_issue_queue_previous",
+                disabled=page == 1,
+                width="stretch",
+            ):
+                st.session_state[page_key] = page - 1
+                st.rerun()
+            label_col.caption(
+                f"{len(listed)} open · showing "
+                f"{start + 1}–{min(start + page_size, len(listed))}"
+            )
+            if forward_col.button(
+                "Older issues →",
+                key="hand_issue_queue_next",
+                disabled=page == total_pages,
+                width="stretch",
+            ):
+                st.session_state[page_key] = page + 1
+                st.rerun()
+        for issue in listed[start : start + page_size]:
+            hand = hands_by_id[issue.hand_id]
             session = sessions_by_id.get(hand.session_id)
             label = ", ".join(
                 HAND_ISSUE_LABELS.get(issue_type, issue_type.replace("_", " ").title())
@@ -1416,6 +2006,7 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
             "Change Study inclusion below to return it to the queue after approval."
         )
         show_study_inclusion_controls(db, forced_hand, force_open=True)
+        _render_leave_forced_study_hand(forced_hand, hand_session)
         return
     if forced_hand is not None and forced_hand.review_status != "reviewed":
         st.warning(
@@ -1424,6 +2015,7 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
         )
         _offer_frame_validation_link(db, forced_hand)
         show_study_inclusion_controls(db, forced_hand, force_open=True)
+        _render_leave_forced_study_hand(forced_hand, hand_session)
         return
     if not ordered:
         empty_state(
@@ -1433,6 +2025,16 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
         )
         return
     available_ids = {hand.id for hand in ordered if hand.id is not None}
+    if requested is not None and requested not in available_ids:
+        # The hand that was open has left the queue -- deleted, most often, since
+        # a demoted or excluded one is caught by the forced branches above. Say so
+        # instead of drawing a different hand under the same heading, which reads
+        # as "this is still what you opened" and is how an operator ends up
+        # writing a note about hand A onto hand B.
+        st.warning(
+            "The hand you had open is no longer in this study queue. "
+            "Showing the first queued hand instead."
+        )
     if requested not in available_ids:
         requested = ordered[0].id
         _set_study_hand_id(requested)
@@ -1497,6 +2099,35 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
                 readiness,
                 coaching_reviews,
             )
+
+
+def _clear_study_hand_id() -> None:
+    st.session_state.pop("study_hand_id", None)
+    st.session_state.pop("study_hand_picker", None)
+
+
+def _render_leave_forced_study_hand(forced_hand: Hand, session: Session | None) -> None:
+    """The way out of a hand Study is pinned to but cannot show.
+
+    ``study_hand_id`` survives a session change, so once a correction dropped the
+    open hand out of the queue every later visit re-entered the same forced
+    branch: picking another session in the sidebar changed nothing, and the page
+    offered no control that cleared the pin. The operator was stranded on one
+    hand with the rest of their library unreachable from this page.
+    """
+    st.caption(
+        "Study is pinned to hand "
+        f"#{forced_hand.hand_number}"
+        + (f" in {session.name}" if session is not None else "")
+        + ", so the queue for any other session is not shown."
+    )
+    if st.button(
+        "Leave this hand and show the study queue",
+        key=f"study_release_forced_hand_{forced_hand.id}",
+        width="stretch",
+    ):
+        _clear_study_hand_id()
+        st.rerun()
 
 
 def study_hand_label(hand: Hand) -> str:
@@ -1565,9 +2196,13 @@ def render_study_hand_navigation(
             f"{hand.source_type.replace('_', ' ').title()} · "
             f"{hand.completion_status.replace('_', ' ').title()}"
         )
-        st.caption(
-            f"Reconstruction confidence · {confidence_label(hand.confidence_score)}"
-        )
+        # Through ``reconstruction_confidence``, never ``confidence_label``: the
+        # score is the pipeline's grade of its own read and no correction path
+        # rewrites it, so on a corrected hand the bare label kept describing facts
+        # the operator had already overruled.
+        confidence = reconstruction_confidence(hand)
+        st.caption(f"Reconstruction confidence · {confidence.label}")
+        st.caption(confidence.detail)
 
 
 def _set_study_hand_id(hand_id: int | None) -> None:
@@ -4015,125 +4650,378 @@ def show_accounting_editor(
             st.error(f"Could not reconcile accounting: {exc}")
 
 
-def show_insights_workspace(db: PokerDatabase) -> None:
-    page_header(
-        "Insights",
-        "Evidence-backed patterns from your completed hands—without fabricated solver scores.",
+# ---------------------------------------------------------------------------
+# Insights
+# ---------------------------------------------------------------------------
+
+# The evidence classes and result bases drawn as coverage segments. The KEY only
+# picks the tone; the label carries the words, because a segment a reader can
+# only identify by its colour states nothing.
+_EVIDENCE_CLASS_TONES: dict[str, EvidenceClass] = {
+    "reviewed": "reviewed",
+    "needs_correction": "corrected_cv",
+    "queued": "cv_draft",
+    "unreviewed": "manual",
+}
+_RESULT_BASIS_TONES: dict[str, str] = {
+    "completed": "observed",
+    "queued": "reconciled",
+    "needs_correction": "unattributed",
+    "unreviewed": "none",
+}
+_INSIGHTS_POPULATION_KEY = "insights_population"
+# Full readiness is four queries per hand, so it is paid for over the declared
+# population and bounded. Past this many hands the page reports the share it
+# actually examined rather than quietly scanning a corpus-sized list on every
+# rerun -- the same trade the phase asks for everywhere else: fewer numbers,
+# each carrying what it was computed from.
+_READINESS_SCAN_LIMIT = 200
+
+
+def _insights_population() -> PopulationKey:
+    """The declared population, chosen once and stable across reruns.
+
+    A radio rather than a free-form filter. ``POPULATIONS`` is three named rules
+    a reader can take to the schema and check; an arbitrary subset would make
+    every caption below a promise nobody could verify.
+    """
+    options = list(POPULATIONS)
+    if st.session_state.get(_INSIGHTS_POPULATION_KEY) not in options:
+        st.session_state[_INSIGHTS_POPULATION_KEY] = DEFAULT_POPULATION
+    chosen = st.radio(
+        "Population these metrics are computed over",
+        options=options,
+        format_func=lambda key: POPULATIONS[key].label,
+        horizontal=True,
+        key=_INSIGHTS_POPULATION_KEY,
+        help="Every figure on this page is recomputed from this population alone.",
     )
-    accounting_cache = new_accounting_cache()
-    hands = _hands_with_accounting_results(db, db.fetch_all_hands(), accounting_cache)
-    if not hands:
-        empty_state(
-            "Not enough evidence", "Insights appear after completed hands are imported or recorded."
-        )
-        return
-    tagged: dict[str, int] = {}
-    statuses: dict[str, int] = {}
-    for hand in hands:
-        statuses[hand.review_status] = statuses.get(hand.review_status, 0) + 1
-        for tag in hand.tags:
-            tagged[tag] = tagged.get(tag, 0) + 1
-    unresolved = [hand for hand in hands if hand.review_status != "reviewed"]
-    biggest = sorted(
-        [hand for hand in unresolved if hand.hero_bb_won is not None],
-        key=lambda hand: abs(hand.hero_bb_won or 0),
-        reverse=True,
-    )[:8]
-    with st.container(key="session_metrics"):
-        metric_cols = st.columns(3)
-        with metric_cols[0]:
-            kpi_card("Evidence base", str(len(hands)), "Completed hands")
-        with metric_cols[1]:
-            kpi_card(
-                "Unresolved",
-                str(len(unresolved)),
-                "Review status is not 'reviewed'",
-                tone="negative" if unresolved else "positive",
-            )
-        with metric_cols[2]:
-            # A blocker count, not an aggregate confidence score: one percentage
-            # would read as proof the whole hand is correct. It counts hands, not
-            # blockers, and it consults every category rather than the completion
-            # column alone -- counting completion only reported 0 for a hand whose
-            # ledger did not reconcile. Per-render user confirmation cannot be
-            # evaluated across a list, so it is excluded and named below.
-            blocked = [
-                hand
-                for hand in hands
-                if hand.id is not None
-                and hand.study_inclusion != "skip"
-                and not hand_study_readiness(
-                    db,
-                    hand,
-                    *_accounting_or_error(db, hand, accounting_cache),
-                    user_confirmed=True,
-                ).is_ready
-            ]
-            kpi_card(
-                "Not study-ready",
-                str(len(blocked)),
-                "Completion, cards, layout, accounting, issue, or evidence blockers",
-                tone="negative" if blocked else "positive",
-            )
+    return chosen if chosen in options else DEFAULT_POPULATION
+
+
+def render_population_metric(metric: Metric) -> None:
+    """One metric card that cannot be read without what produced it.
+
+    ``headline`` is the type's own refusal: below the sample floor it returns
+    "Not enough evidence" instead of a figure, so this function never has to
+    decide whether the number it was handed is safe to print.
+    """
+    kpi_card(
+        metric.label,
+        metric.headline,
+        metric.support,
+        tone="default" if metric.is_reportable else "warning",
+    )
+    if not metric.is_reportable and metric.sample.caveat:
+        st.caption(metric.sample.caveat)
+    if metric.is_reportable and metric.interval is not None:
+        st.caption(metric.interval_label)
+    for caveat in metric.caveats:
+        st.caption(caveat)
+
+
+def render_population_scope(snapshot: PopulationSnapshot) -> None:
+    """The declared rule, the size it selects, and where the rest of the corpus went.
+
+    The exclusions are rendered rather than dropped. A population filter that
+    silently loses rows is indistinguishable on screen from one that is right,
+    and "12 of 47" is only checkable if the other 35 are accounted for.
+    """
+    spec = snapshot.spec
     st.caption(
-        "Review status is a workflow label. Study readiness is derived per hand "
-        "and additionally requires your explicit confirmation on the Study page."
+        f"**{spec.label}** · {snapshot.size} of {snapshot.considered_count} saved hands. "
+        f"Rule: {spec.rule}."
     )
+    with st.expander("What this population admits and excludes", expanded=False):
+        st.markdown(f"**Admits.** {spec.admits}")
+        st.markdown(f"**Excludes.** {spec.excludes}")
+        for name in EVIDENCE_CLASSES:
+            st.caption(f"{EVIDENCE_CLASS_LABELS[name]} — {EVIDENCE_CLASS_MEANING[name]}")
+    if snapshot.excluded_by_reason:
+        st.markdown("**Hands this population left out**")
+        frequency_bars(
+            (
+                (EXCLUSION_REASON_LABELS[reason], count)
+                for reason, count in snapshot.excluded_by_reason.items()
+            ),
+            denominator=snapshot.considered_count,
+            aria_label=(
+                f"Reasons hands were excluded from {spec.label.lower()}, "
+                f"out of {snapshot.considered_count} saved hands"
+            ),
+        )
+
+
+def render_evidence_split(snapshot: PopulationSnapshot) -> None:
+    """Manual, CV draft, corrected CV and reviewed hands counted apart, never summed.
+
+    A win rate that adds a reviewed hand to an unconfirmed CV draft is a wrong
+    number wearing a right one's formatting, so the split is rendered beside the
+    figures rather than a page away from them.
+    """
+    mix = snapshot.evidence_mix
+    basis = snapshot.result_basis_mix
     left, right = st.columns(2)
     with left:
-        section_header("Study themes", "Tag frequency and sample size")
-        if tagged:
-            theme_rows = [
-                {
-                    "theme": tag.replace("_", " ").title(),
-                    "hands": count,
-                }
-                for tag, count in sorted(tagged.items(), key=lambda item: -item[1])
-            ]
-            frequency_bars((str(row["theme"]), int(row["hands"])) for row in theme_rows)
-        else:
-            empty_state(
-                "No tagged themes", "Apply tags during review to build a useful leak index."
-            )
-    with right:
-        section_header("Review coverage", "Workflow status, not playing skill")
-        coverage_rows = [
-            {
-                "status": status.replace("_", " ").title(),
-                "hands": count,
-                "tone": status,
-            }
-            for status, count in sorted(statuses.items())
-        ]
+        st.markdown("**Evidence behind these hands**")
         coverage_bar(
-            (
-                str(row["tone"]),
-                int(row["hands"]),
-            )
-            for row in coverage_rows
+            ((tone, mix.get(name, 0)) for tone, name in _EVIDENCE_CLASS_TONES.items()),
+            labels={
+                tone: EVIDENCE_CLASS_LABELS[name]
+                for tone, name in _EVIDENCE_CLASS_TONES.items()
+            },
+            aria_label=f"Evidence classes across {snapshot.size} hands in this population",
         )
-    section_header("Largest unresolved decisions", "Ranked by absolute recorded BB result")
-    if biggest:
-        st.dataframe(
-            [
-                {
-                    "Hand": f"#{hand.hand_number}",
-                    "Result": f"{hand.hero_bb_won:+g} BB",
-                    "Position": hand.hero_position or "—",
-                    "Status": hand.review_status.replace("_", " ").title(),
-                    "Tags": ", ".join(hand.tags) or "—",
-                }
-                for hand in biggest
-            ],
-            hide_index=True,
-            width="stretch",
+        st.caption(
+            f"{snapshot.size} hands in this population. Every hand is counted in "
+            "exactly one class, so these add to the population size."
         )
-    else:
+    with right:
+        st.markdown("**Where each hero result came from**")
+        coverage_bar(
+            ((tone, basis.get(name, 0)) for tone, name in _RESULT_BASIS_TONES.items()),
+            labels={
+                tone: RESULT_BASIS_LABELS[name]
+                for tone, name in _RESULT_BASIS_TONES.items()
+            },
+            aria_label=f"Hero result provenance across {snapshot.size} hands",
+        )
+        st.caption(
+            "A derived figure is the reconciled ledger's reconstruction of what the "
+            "hero must have won; a recorded one was read off the hand. They are the "
+            "same number type and different claims."
+        )
+
+
+def render_study_themes(themes: ThemeAggregate) -> None:
+    """The theme index with its denominator, and what stale coaching cost it."""
+    if not themes.themes:
         empty_state(
-            "No unresolved recorded results",
-            "Every hand with a recorded BB outcome is marked reviewed. That is a "
-            "workflow status, not a study-readiness verdict.",
+            "No themes in this population",
+            "Tags applied during review and current coaching lessons both feed this "
+            "index. Neither exists for the hands selected above.",
         )
+        st.caption(themes.exclusion_statement)
+        return
+    frequency_bars(
+        ((item.theme, item.hands) for item in themes.themes),
+        denominator=themes.denominator,
+        aria_label=(
+            f"Study themes across {themes.denominator} "
+            f"{themes.population.label.lower()}"
+        ),
+    )
+    st.caption(
+        f"{themes.coverage.statement()}. Sources: tags you applied, plus the study "
+        "lesson of each CURRENT coaching review."
+    )
+    st.caption(themes.exclusion_statement)
+
+
+def show_insights_workspace(db: PokerDatabase) -> None:
+    """Metrics over a declared population, each carrying its denominator and provenance.
+
+    The page used to compute every figure over the whole ``hands`` table. That
+    one number stood for four different epistemic states at once -- a reviewed
+    hand, an unconfirmed CV draft, a corrected hand nobody had signed off, and a
+    hand whose only result was a derivation -- and printed the mixture as if it
+    described the operator's play. Everything here now goes through
+    ``poker_tracker.math.analytics``: one population, declared by a rule written
+    in schema vocabulary, with the excluded hands counted rather than dropped.
+
+    Cost is bounded on purpose. Reconciliation runs only for hands carrying a
+    stored ``reconciled`` settlement -- the others cannot produce an established
+    accounting, so skipping them changes no answer -- retained coaching arrives in
+    two queries for the whole corpus, and the readiness scan is capped and says
+    how much of the population it covered.
+    """
+    page_header(
+        "Insights",
+        "Patterns from a population you can name, with the denominator on every figure.",
+    )
+    hands = db.fetch_all_hands()
+    if not hands:
+        empty_state(
+            "Not enough evidence",
+            "Insights appear after completed hands are imported or recorded.",
+        )
+        return
+
+    accounting_cache = new_accounting_cache()
+    settled_hand_ids = db.fetch_reconciled_settlement_hand_ids()
+
+    def reconcile(hand_id: int) -> tuple[AccountingReconciliation | None, str | None]:
+        # Exactly the skip `_hands_with_accounting_results` makes, for exactly the
+        # same reason: without a stored reconciled settlement row the accounting
+        # cannot be established, so the two ledger builds would buy no answer.
+        if hand_id not in settled_hand_ids:
+            return None, None
+        return _reconcile_cached(db, hand_id, accounting_cache)
+
+    evidence = build_hand_evidence(
+        db,
+        hands,
+        reconcile=reconcile,
+        coaching_by_hand=db.fetch_retained_reviews_by_hand(),
+    )
+    population = _insights_population()
+    snapshot = select_population(evidence, population)
+    render_population_scope(snapshot)
+
+    if snapshot.size == 0:
+        empty_state(
+            f"No hands in {snapshot.spec.label.lower()}",
+            "Nothing is computed rather than computing something over a population "
+            "that is empty. Clear the blockers above, or widen the population.",
+        )
+        return
+
+    metrics = compute_population_metrics(snapshot)
+    with st.container(key="insights_population_metrics"):
+        columns = st.columns(4)
+        for column, metric in zip(columns, metrics.metrics, strict=False):
+            with column:
+                render_population_metric(metric)
+
+    render_evidence_split(snapshot)
+
+    section_header(
+        "Unresolved work in this population",
+        "Open issues, analysis a correction invalidated, and hands Study still refuses",
+    )
+    _render_unresolved_work(db, snapshot, accounting_cache)
+
+    section_header(
+        "Study themes",
+        "Tags and current coaching lessons, each as a share of this population",
+    )
+    render_study_themes(aggregate_study_themes(snapshot))
+
+    section_header(
+        "Largest results in this population",
+        "Ranked by absolute result, with the evidence and basis behind each figure",
+    )
+    _render_largest_results(snapshot)
+
+
+def _render_unresolved_work(
+    db: PokerDatabase,
+    snapshot: PopulationSnapshot,
+    accounting_cache: AccountingCache,
+) -> None:
+    """Three counts, each with the denominator it is a share of.
+
+    A numerator alone is the defect this section exists to avoid: "3 unresolved"
+    is a crisis over four hands and a rounding error over four hundred.
+    """
+    member_ids = {member.hand_id for member in snapshot.members if member.hand_id is not None}
+    open_issue_hand_ids = {
+        issue.hand_id
+        for issue in db.fetch_hand_issues(status="open")
+        if issue.hand_id in member_ids
+    }
+    stale_hand_ids = db.fetch_stale_review_hand_ids() & member_ids
+
+    scannable = [member for member in snapshot.members if member.hand_id is not None]
+    scanned = scannable[:_READINESS_SCAN_LIMIT]
+    blocked = [
+        member
+        for member in scanned
+        if not hand_study_readiness(
+            db,
+            member.hand,
+            *_accounting_or_error(db, member.hand, accounting_cache),
+            user_confirmed=True,
+        ).is_ready
+    ]
+
+    columns = st.columns(3)
+    with columns[0]:
+        kpi_card(
+            "Hands with an open issue",
+            f"{len(open_issue_hand_ids)} of {snapshot.size}",
+            f"Saved debugging issues still open, within {snapshot.spec.label.lower()}",
+            tone="negative" if open_issue_hand_ids else "positive",
+        )
+    with columns[1]:
+        kpi_card(
+            "Stale retained analysis",
+            f"{len(stale_hand_ids)} of {snapshot.size}",
+            "Coaching or solver output a later correction invalidated",
+            tone="negative" if stale_hand_ids else "positive",
+        )
+    with columns[2]:
+        kpi_card(
+            "Not study-ready",
+            f"{len(blocked)} of {len(scanned)}",
+            "Completion, cards, layout, accounting, issue, or evidence blockers",
+            tone="negative" if blocked else "positive",
+        )
+    if len(scanned) < len(scannable):
+        st.caption(
+            f"Readiness was evaluated for the first {len(scanned)} of "
+            f"{len(scannable)} hands in this population. The other "
+            f"{len(scannable) - len(scanned)} are not claimed either way."
+        )
+    st.caption(
+        "Review status is a workflow label. Study readiness is derived per hand and "
+        "additionally requires your explicit confirmation on the Study page, which "
+        "cannot be evaluated across a list and is assumed given here."
+    )
+
+
+def _render_largest_results(snapshot: PopulationSnapshot) -> None:
+    """The biggest swings, each row saying what kind of evidence produced it."""
+    with_results = [
+        member for member in snapshot.members if member.result_value is not None
+    ]
+    if not with_results:
+        empty_state(
+            "No recorded results in this population",
+            "No hand selected above carries a hero result, observed or derived, so "
+            "there is nothing to rank.",
+        )
+        return
+    ranked = sorted(
+        with_results, key=lambda member: abs(member.result_value or 0), reverse=True
+    )[:8]
+    st.dataframe(
+        [
+            {
+                "Hand": f"#{member.hand.hand_number}",
+                "Result": f"{member.result_value:+g} BB",
+                "Basis": RESULT_BASIS_LABELS[member.result_basis],
+                "Evidence": EVIDENCE_CLASS_LABELS[member.evidence_class],
+                "Position": member.hand.hero_position or "—",
+                "Tags": ", ".join(member.tags) or "—",
+            }
+            for member in ranked
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+    st.caption(
+        f"{len(ranked)} of {len(with_results)} hands with a result, out of "
+        f"{snapshot.size} in {snapshot.spec.label.lower()}."
+    )
+
+
+def render_post_session_scope() -> None:
+    """State the product's boundary on the one page that could violate it.
+
+    This is a non-negotiable constraint, not a disclaimer: PokerTrainer reads
+    completed recordings only. It is written out here, where an operator is
+    handing the product a video file and is most likely to wonder whether it
+    could watch a table live, because a constraint the interface never states is
+    one the interface is not enforcing in the reader's mind.
+    """
+    panel(
+        "Completed sessions only",
+        "This page accepts a recording of a session you have already finished "
+        "playing. PokerTrainer never captures a live table, never attaches to a "
+        "poker client, and never advises on a hand in progress. Reconstruction "
+        "runs offline against the file, after the fact.",
+    )
 
 
 def show_import_workspace(db: PokerDatabase, session: Session | None) -> None:
@@ -4143,6 +5031,7 @@ def show_import_workspace(db: PokerDatabase, session: Session | None) -> None:
             "Add recordings for one completed session, reconstruct hands, then validate frames.",
             eyebrow="SESSION INGEST",
         )
+        render_post_session_scope()
         sessions = db.fetch_sessions()
         if not sessions:
             empty_state(
@@ -4165,9 +5054,25 @@ def show_import_workspace(db: PokerDatabase, session: Session | None) -> None:
 
 def show_settings_workspace(db: PokerDatabase, session: Session | None) -> None:
     page_header("Settings", "Calibration, portability, and advanced post-session tooling.")
-    calibration_tab, data_tab, math_tab, solver_tab, coach_tab = st.tabs(
-        ["ROI calibration", "Data transfer", "Math tools", "Solver", "Coaching"]
+    (
+        storage_tab,
+        calibration_tab,
+        data_tab,
+        math_tab,
+        solver_tab,
+        coach_tab,
+    ) = st.tabs(
+        [
+            "Storage & health",
+            "ROI calibration",
+            "Data transfer",
+            "Math tools",
+            "Solver",
+            "Coaching",
+        ]
     )
+    with storage_tab:
+        show_storage_and_diagnostics(db)
     with calibration_tab:
         show_roi_calibration(db)
     with data_tab:
@@ -4196,6 +5101,235 @@ def show_settings_workspace(db: PokerDatabase, session: Session | None) -> None:
             )
         else:
             show_coach_review(db, session)
+
+
+_DIAGNOSTICS_STATE_KEY = "settings_diagnostics_bundle"
+
+
+def show_storage_and_diagnostics(db: PokerDatabase) -> None:
+    """Where this install keeps its data, what it is running, and how to get it back.
+
+    Four things the product recorded and never showed: the resolved data paths,
+    the health audit that until now was CLI-only, the identity of the weights a
+    reconstruction was produced by, and the snapshots that make a deletion
+    reversible. They live together because they are what an operator needs when
+    something has already gone wrong.
+
+    No environment VALUE is rendered anywhere on this surface. The variables this
+    build reads are named with their purpose and a set/unset flag; the values are
+    absolute paths through a home directory and, in two cases, credentials.
+    """
+    render_storage_health(key_prefix="settings")
+    _render_environment_guidance()
+    _render_build_identity(db)
+    _render_retained_snapshots(db)
+    _render_diagnostics_download(db)
+
+
+def _render_environment_guidance() -> None:
+    """Every runtime variable this build reads, by name, purpose and set/unset."""
+    section_header(
+        "Runtime configuration",
+        "Settings live in environment variables so nothing secret is committed.",
+    )
+    st.dataframe(
+        [
+            {
+                "Variable": entry["name"],
+                "Configured": "Set" if entry["configured"] else "Not set",
+                "Purpose": entry["purpose"],
+            }
+            for entry in environment_variable_report()
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+    st.caption(
+        "Values are never displayed. Two of these variables are credentials and "
+        "the rest are absolute paths that identify the machine, so this table "
+        "reports only whether each one is set."
+    )
+
+
+@st.cache_data(show_spinner=False)
+def _model_identity_cached(fingerprint: tuple[tuple[str, int, int], ...]) -> dict:
+    return resolve_models(REPO_ROOT)
+
+
+def _model_identity() -> dict:
+    """Model hashes, recomputed only when a weight file actually changes.
+
+    The pinned weights are about 30 MB and hashing them on every page repaint
+    would make a readout cost more than the thing it describes. The cache key is
+    each candidate's size and mtime, so swapping in different weights -- the one
+    event that invalidates a reconstruction verdict -- produces a different key
+    and a fresh hash.
+    """
+    fingerprint: list[tuple[str, int, int]] = []
+    for role, candidates in sorted(MODEL_CANDIDATES.items()):
+        for relative in candidates:
+            path = REPO_ROOT / relative
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            fingerprint.append((f"{role}:{relative}", stat.st_size, stat.st_mtime_ns))
+    return _model_identity_cached(tuple(fingerprint))
+
+
+def _render_build_identity(db: PokerDatabase) -> None:
+    """The model weights and table geometry a reconstruction verdict depends on.
+
+    A reconstruction is only reproducible if the weights that produced it are
+    identified, and until now no detector, classifier or OCR hash was rendered
+    anywhere. The observed-layout table beside it is the other half: the
+    calibrated floor says what this build claims to read, and the stored hands
+    say what it was actually given.
+    """
+    section_header(
+        "Reconstruction build identity",
+        "The weights and table geometry every CV verdict is relative to.",
+    )
+    models = _model_identity()
+    st.dataframe(
+        [
+            {
+                "Model": role.replace("_", " ").title(),
+                "Present": "Yes" if entry.get("present") else "No",
+                "File": safe_path_label(entry["path"]) if entry.get("path") else "—",
+                "SHA-256": str(entry.get("sha256") or "Not resolved"),
+            }
+            for role, entry in sorted(models.items())
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+    if not any(entry.get("present") for entry in models.values()):
+        st.warning(
+            "No pinned weights are present in this checkout, so reconstruction "
+            "cannot run here. Existing hands keep the model versions stamped into "
+            "their completion evidence."
+        )
+
+    calibrated = supported_layout_profiles()
+    data_callout("Supported table layouts", str(calibrated["statement"]))
+    observed = observed_layout_profiles(db)
+    if not observed:
+        st.caption(
+            "No stored hand records a layout profile yet. Reconstructed hands stamp "
+            "one into their completion evidence."
+        )
+        return
+    st.dataframe(
+        [
+            {
+                "Layout profile": row["layout_profile"],
+                "Supported": "Yes" if row["supported"] else "No — readers extrapolating",
+                "Hands": row["hands"],
+            }
+            for row in observed
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+    unsupported = sum(row["hands"] for row in observed if not row["supported"])
+    if unsupported:
+        st.warning(
+            f"{unsupported} stored hand(s) were reconstructed at a geometry below the "
+            "calibrated floor. Treat their card and amount reads as drafts."
+        )
+
+
+def _render_retained_snapshots(db: PokerDatabase) -> None:
+    """The rollback points that exist, so 'recoverable' is checkable rather than claimed."""
+    section_header(
+        "Retained database snapshots",
+        "What a destructive operation can be rolled back to, and how.",
+    )
+    backups = backups_dir_for(Path(db.db_path))
+    rows: list[dict[str, object]] = []
+    for snapshot_class in SNAPSHOT_CLASSES:
+        for path in find_snapshots(backups, purpose=snapshot_class.purpose):
+            try:
+                size = _format_bytes(path.stat().st_size)
+            except OSError:
+                size = "Unreadable"
+            rows.append(
+                {
+                    "Purpose": snapshot_class.purpose,
+                    "Snapshot": path.name,
+                    "Size": size,
+                    "Keeps": snapshot_class.keep,
+                }
+            )
+    if not rows:
+        empty_state(
+            "No snapshots retained yet",
+            "One is written before a schema migration, before a batch of CV hand "
+            "imports, and before anything this product deletes.",
+        )
+    else:
+        st.dataframe(rows, hide_index=True, width="stretch")
+    data_callout("Snapshot directory", safe_path_label(backups))
+    st.caption(
+        "To roll back: stop PokerTrainer, copy the chosen snapshot over the file "
+        "POKER_DB_PATH points at, and start it again. Snapshots hold rows only — "
+        "videos, frames, timelines and solver outputs are deliberately not copied, "
+        "so a snapshot restored after those were deleted will reference files that "
+        "are gone."
+    )
+
+
+def _render_diagnostics_download(db: PokerDatabase) -> None:
+    """A redacted bundle, built on request and scrubbed before it is serialized.
+
+    Built behind a button rather than on every render: assembling it shells out
+    to ``git`` and ``ffmpeg`` and hashes the model weights, which is the right
+    price for an answer somebody asked for and the wrong one for a page repaint.
+    Pressing the button twice produces two equivalent bundles and changes nothing
+    on disk.
+    """
+    section_header(
+        "Diagnostics bundle",
+        "Configuration, build identity, store counts and health, with secrets removed.",
+    )
+    if st.button(
+        "Build diagnostics bundle",
+        key="settings_build_diagnostics",
+        help="Collects configuration and counts. No hand, note or coaching text is included.",
+    ):
+        try:
+            payload = build_diagnostics_payload(
+                db,
+                repo_root=REPO_ROOT,
+                database_path=DEFAULT_DB_PATH,
+                health=st.session_state.get(_health_report_state_key("settings")),
+            )
+            st.session_state[_DIAGNOSTICS_STATE_KEY] = serialize_diagnostics(payload)
+        except Exception as exc:  # a diagnostics readout must never take the page down
+            st.session_state[_DIAGNOSTICS_STATE_KEY] = None
+            st.error(f"Diagnostics could not be built: {safe_error_message(exc)}")
+
+    bundle = st.session_state.get(_DIAGNOSTICS_STATE_KEY)
+    if not bundle:
+        st.caption(
+            "No bundle has been built in this session. Run the health check above "
+            "first if you want its results included."
+        )
+        return
+    st.caption(
+        f"{len(bundle):,} bytes. Contains resolved configuration, dependency and "
+        "model identity, row counts and — if you ran it — the health report. "
+        "Contains no hand history, note, coaching text, video filename or "
+        "environment value."
+    )
+    st.download_button(
+        "Download diagnostics bundle",
+        data=bundle,
+        file_name="pokertrainer-diagnostics.json",
+        mime="application/json",
+        key="settings_download_diagnostics",
+    )
 
 
 def show_solver_settings(db: PokerDatabase) -> None:
@@ -4378,27 +5512,124 @@ def _open_hand_for_study(hand: Hand) -> None:
     navigate_to(Page.STUDY)
 
 
-def delete_hand_and_artifacts(db: PokerDatabase, hand_id: int) -> str | None:
-    """Delete one hand after stopping and removing its solver runs.
+def snapshot_before_destructive(
+    db: PokerDatabase, *, scope: str, what: str
+) -> tuple[Path | None, str | None]:
+    """Write the rollback point for one irreversible product write, or refuse it.
 
-    Returns an error message instead of deleting when an active solver cannot be
-    stopped yet. This is the writer behind every 'Delete hand' control, and it
+    Returns ``(snapshot, error)``. Every caller treats a missing snapshot as "do
+    not proceed", which is the point: a deletion the product cannot undo and did
+    not snapshot is exactly the state this helper exists to make unreachable, and
+    the moment before the write is the last moment at which refusing still helps.
+    That is the same rule the CV import already applies to itself.
+
+    Reporting is left to the caller rather than done here, because the callers
+    differ: one renders the failure beside its confirmation checkbox and one
+    hands it back up a return value. Doing both would print the same failure
+    twice.
+
+    ``predelete`` snapshots keep their own retention slots, so a burst of routine
+    copies cannot evict the one file that can bring a deleted session back. The
+    scope names the row being removed and is deliberately not used to skip a
+    second snapshot -- two deletions are two different states to roll back to.
+    """
+    try:
+        return backup_database(Path(db.db_path), purpose="predelete", scope=scope), None
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        return None, (
+            f"No rollback snapshot could be written, so {what} was not deleted: "
+            f"{safe_error_message(exc)}"
+        )
+
+
+def snapshot_recovery_note(snapshot: Path) -> str:
+    """One sentence naming the file this deletion can be undone from."""
+    return (
+        f"A database snapshot was written to {safe_path_label(snapshot)} first. "
+        "Settings → Storage & health lists it and explains how to restore it."
+    )
+
+
+def delete_hand_and_artifacts(
+    db: PokerDatabase, hand_id: int
+) -> tuple[str | None, Path | None]:
+    """Delete one hand after snapshotting, then stopping and removing its solver runs.
+
+    Returns ``(error, snapshot)``. An error message instead of deleting when an
+    active solver cannot be stopped yet, or when no rollback point could be
+    written. This is the writer behind every 'Delete hand' control, and it
     exists because ``NEW_RECONSTRUCTION_STEPS`` names the deletion as part of its
     clearing action: an import ADDS the rebuilt hands beside the existing ones,
     so the superseded copy must be deletable from the session's hand list or the
     blocker names an action the product cannot perform.
+
+    The snapshot is taken here rather than at each control, so a delete button
+    added later is recoverable by construction. It is taken BEFORE the solver
+    artifacts are removed because that removal is itself irreversible.
     """
+    snapshot, snapshot_error = snapshot_before_destructive(
+        db, scope=f"hand{hand_id}", what="this hand"
+    )
+    if snapshot is None:
+        return snapshot_error, None
     for run in db.fetch_solver_runs_by_hand(hand_id):
         if run.status in {"queued", "running", "cancelling"}:
             cancelled = cancel_solver_run(db, run.id)
             if cancelled.status == "cancelling":
                 return (
                     "The active solver could not be stopped yet. "
-                    "Try deleting again after it exits."
+                    "Try deleting again after it exits.",
+                    snapshot,
                 )
         remove_solver_run_artifacts(run)
     db.delete_hand(hand_id)
-    return None
+    return None, snapshot
+
+
+def hand_evidence_badges(
+    hand: Hand,
+    *,
+    open_issue_count: int = 0,
+    has_stale_analysis: bool = False,
+) -> list[tuple[str, str]]:
+    """The evidence state of one hand as ``(badge status, words)`` pairs.
+
+    Every state carries its own words. ``status_badge`` supplies a coloured dot
+    and the product forbids a status that can only be read as a colour, so the
+    second element of each pair -- not the first -- is what has to be sufficient
+    on its own.
+
+    This is what makes Study unnecessary for the question "can I believe this
+    row?". Before it, the library printed a review status and a completion status
+    and nothing else, so a hand with two open issues and a coaching review a
+    correction had invalidated looked exactly like a clean one.
+    """
+    badges: list[tuple[str, str]] = [
+        (
+            "reviewed" if classify_evidence(hand) == "reviewed" else "unreviewed",
+            EVIDENCE_CLASS_LABELS[classify_evidence(hand)],
+        )
+    ]
+    if open_issue_count:
+        badges.append(
+            (
+                "needs_correction",
+                f"{open_issue_count} open issue" + ("s" if open_issue_count > 1 else ""),
+            )
+        )
+    if has_stale_analysis:
+        badges.append(("needs_correction", "Stale analysis — rerun before trusting"))
+    confidence = reconstruction_confidence(hand)
+    if hand.source_type != "manual":
+        badges.append(
+            (
+                "unreviewed" if confidence.describes_current_facts else "needs_correction",
+                f"Reconstruction confidence · {confidence.label}",
+            )
+        )
+    if hand.derived_result_substituted:
+        badges.append(("queued", "Result derived from the reconciled ledger"))
+    return badges
 
 
 def render_hand_results(
@@ -4408,8 +5639,18 @@ def render_hand_results(
     *,
     key_prefix: str,
     page_size: int = 20,
+    resolve_page: Callable[[list[Hand]], list[Hand]] | None = None,
+    open_issue_counts: Mapping[int, int] | None = None,
+    stale_hand_ids: Container[int] = frozenset(),
 ) -> None:
-    """Render scan-friendly hand rows with a direct Study action on every row."""
+    """Render scan-friendly hand rows with a direct Study action on every row.
+
+    ``resolve_page`` is applied to the page slice and nothing else. It exists so
+    a caller can defer per-hand reconciliation until after pagination has chosen
+    the twenty rows that will actually be drawn: the Hands library used to
+    reconcile every hand in the database before this function was reached, so the
+    work the pagination was there to bound was already spent by the time it ran.
+    """
 
     page_key = f"{key_prefix}_hand_page"
     total_pages = max(1, (len(hands) + page_size - 1) // page_size)
@@ -4438,7 +5679,10 @@ def render_hand_results(
         st.session_state[page_key] = page + 1
         st.rerun()
 
-    for item in hands[start : start + page_size]:
+    page_items = hands[start : start + page_size]
+    if resolve_page is not None:
+        page_items = resolve_page(page_items)
+    for item in page_items:
         if item.id is None:
             continue
         session = sessions_by_id[item.session_id]
@@ -4446,6 +5690,13 @@ def render_hand_results(
         completion_label = item.completion_status.replace("_", " ").title()
         study_label = STUDY_INCLUSION_LABELS.get(
             item.study_inclusion, item.study_inclusion
+        )
+        badges = hand_evidence_badges(
+            item,
+            open_issue_count=(
+                0 if open_issue_counts is None else open_issue_counts.get(item.id, 0)
+            ),
+            has_stale_analysis=item.id in stale_hand_ids,
         )
         with st.container(border=True, key=f"{key_prefix}_hand_{item.id}"):
             summary, action = st.columns([6, 1])
@@ -4460,6 +5711,12 @@ def render_hand_results(
                     f"{item.review_status.replace('_', ' ').title()} · "
                     f"{completion_label} · {study_label} · "
                     f"{', '.join(item.tags) or 'No tags'}"
+                )
+                st.markdown(
+                    " ".join(
+                        status_badge(status, label=words) for status, words in badges
+                    ),
+                    unsafe_allow_html=True,
                 )
             if action.button(
                 "Study",
@@ -4503,7 +5760,8 @@ def render_hand_results(
                 st.warning(
                     f"Deleting hand #{item.hand_number} removes its actions, "
                     "players, settlement, reviews, issues, and solver runs. "
-                    "This cannot be undone."
+                    "A database snapshot is written first; nothing else in the "
+                    "product will bring the rows back."
                 )
                 confirm_delete = st.checkbox(
                     "I understand this permanently deletes this hand and all "
@@ -4515,11 +5773,16 @@ def render_hand_results(
                     key=f"{key_prefix}_delete_{item.id}",
                     disabled=not confirm_delete,
                 ):
-                    error = delete_hand_and_artifacts(db, item.id)
+                    error, snapshot = delete_hand_and_artifacts(db, item.id)
                     if error:
                         st.error(error)
                     else:
-                        flash(f"Hand #{item.hand_number} deleted.")
+                        flash(
+                            f"Hand #{item.hand_number} deleted. "
+                            f"{snapshot_recovery_note(snapshot)}"
+                            if snapshot is not None
+                            else f"Hand #{item.hand_number} deleted."
+                        )
                         st.rerun()
 
 
@@ -4553,12 +5816,29 @@ def show_session_hand_browser(db: PokerDatabase, session: Session) -> None:
             review_status=review_status or "all",
         )
         if filtered:
+            # The same lookups the Hands library passes. Without them the shared
+            # row builder still runs, but two of its five badges have nothing to
+            # report, so one hand reads "Open issue · Stale analysis" in the
+            # library and clean here. A row that states less on one surface than
+            # on another is the harder defect to notice, because neither screen
+            # looks wrong on its own. Two queries for the whole session, on the
+            # already-fetched hand ids, never two per row.
+            hand_ids = {hand.id for hand in hands if hand.id is not None}
+            issue_counts, _ = _hand_issue_index(
+                [
+                    issue
+                    for issue in db.fetch_hand_issues(status="open")
+                    if issue.hand_id in hand_ids
+                ]
+            )
             render_hand_results(
                 db,
                 filtered,
                 {session.id: session},
                 key_prefix=f"session_{session.id}",
                 page_size=15,
+                open_issue_counts=issue_counts,
+                stale_hand_ids=db.fetch_stale_review_hand_ids() & hand_ids,
             )
         else:
             st.caption("No hands match those filters.")
@@ -4958,10 +6238,98 @@ def _import_collect_is_open(session_id: int, *, has_videos: bool) -> bool:
     return bool(st.session_state[key])
 
 
+def render_session_evidence_panel(
+    db: PokerDatabase, session: Session, stats: SessionStats, hands: list[Hand]
+) -> None:
+    """Open work and data provenance for one session, in a bounded number of queries.
+
+    Four questions this page could not previously answer about the session it was
+    describing: what is still flagged, what analysis a correction invalidated,
+    how much is unfinished, and where the hero result on the card above actually
+    came from. The last one is the reason ``SessionStats`` has carried
+    ``reconciled_result_count`` and ``observed_result_count`` all along with
+    nothing reading them -- the session Total is a mixture of figures the ledger
+    DERIVED and figures that were RECORDED, and printed as one number it reads
+    as a measurement throughout.
+
+    Issues and staleness are each one query for the whole session rather than one
+    per hand, because this panel sits above a list that can hold hundreds.
+    """
+    if session.id is None:
+        return
+    hand_ids = {hand.id for hand in hands if hand.id is not None}
+    open_issues = [
+        issue
+        for issue in db.fetch_hand_issues(status="open")
+        if issue.hand_id in hand_ids
+    ]
+    issue_hand_ids = {issue.hand_id for issue in open_issues}
+    stale_hand_ids = db.fetch_stale_review_hand_ids() & hand_ids
+    unresolved = [
+        hand
+        for hand in hands
+        if hand.review_status != "reviewed" or hand.id in issue_hand_ids
+    ]
+    total = len(hands)
+    no_result = total - stats.reconciled_result_count - stats.observed_result_count
+
+    section_header(
+        "Open work and evidence in this session",
+        "What is still unresolved here, and how much of the result above was derived.",
+    )
+    with st.container(key="session_evidence"):
+        columns = st.columns(4)
+        with columns[0]:
+            kpi_card(
+                "Open debugging issues",
+                str(len(open_issues)),
+                f"On {len(issue_hand_ids)} of {total} hands in this session",
+                tone="warning" if open_issues else "default",
+            )
+        with columns[1]:
+            kpi_card(
+                "Stale analysis",
+                str(len(stale_hand_ids)),
+                "Coaching or review a later correction invalidated",
+                tone="warning" if stale_hand_ids else "default",
+            )
+        with columns[2]:
+            kpi_card(
+                "Unresolved hands",
+                f"{len(unresolved)} of {total}",
+                "Not marked reviewed, or carrying an open issue",
+                tone="warning" if unresolved else "positive",
+            )
+        with columns[3]:
+            kpi_card(
+                "Result provenance",
+                f"{stats.reconciled_result_count} reconciled",
+                (
+                    f"{stats.observed_result_count} recorded as observed · "
+                    f"{max(0, no_result)} with no result"
+                ),
+            )
+    st.caption(
+        "A reconciled result is what the accounting ledger derives the hero must have "
+        "won; an observed one was recorded as such. The session total above is the sum "
+        "of both, so it is only as measured as this split says it is."
+    )
+    render_data_state_axes(
+        build_evidence_states(hands, stale_hand_ids=stale_hand_ids),
+        scope_noun="hands in this session",
+        key_prefix="session",
+    )
+
+
 def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
     if session.id is None:
         return
-    stats = compute_session_stats(db, session.id)
+    # Fetched once and handed to both readers. `compute_session_stats` would
+    # otherwise re-read the same rows, and the evidence panel below has to count
+    # states over exactly the hands the stats were computed from or the two
+    # halves of this page would describe different sets.
+    session_hands = db.fetch_hands_by_session(session.id)
+    stats = compute_session_stats(db, session.id, session_hands)
     st.subheader(session.name)
     st.caption(
         f"{session.date_played} · {session.stakes or 'stakes not set'} · {session.platform or 'platform not set'}"
@@ -4987,7 +6355,11 @@ def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
             kpi_card(
                 "Hero result",
                 f"{stats.total_hero_bb:+g} BB",
-                "Recorded results only",
+                (
+                    f"{stats.hands_with_result} of {stats.hand_count} hands with a result · "
+                    f"{stats.reconciled_result_count} derived by the ledger, "
+                    f"{stats.observed_result_count} observed"
+                ),
                 tone=result_tone,
             )
         with third:
@@ -4995,7 +6367,7 @@ def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
         with fourth:
             kpi_card(
                 "Reviewed",
-                str(stats.hands_by_review_status.get("reviewed", 0)),
+                f"{stats.hands_by_review_status.get('reviewed', 0)} of {stats.hand_count}",
                 "Completed review workflow",
                 tone="positive",
             )
@@ -5020,8 +6392,15 @@ def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
             kpi_card("Passive actions", str(stats.passive_count), "Check or call")
 
     if stats.hand_count == 0:
-        st.info("No hands recorded yet. Add hands in the Add hands tab to see session stats.")
+        empty_state(
+            "No hands recorded yet",
+            "Add hands in the Add hands tab, or attach a recording in Videos, "
+            "to see session stats.",
+        )
+        _render_session_danger_zone(db, session, stats)
         return
+
+    render_session_evidence_panel(db, session, stats, session_hands)
 
     winning_col, losing_col = st.columns(2)
     with winning_col:
@@ -5065,16 +6444,43 @@ def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
         else:
             st.caption("No street actions recorded yet.")
 
+    _render_session_danger_zone(db, session, stats)
+
+
+def _render_session_danger_zone(
+    db: PokerDatabase, session: Session, stats: SessionStats
+) -> None:
+    """The delete control, reachable on an empty session as well as a full one.
+
+    Extracted because the dashboard returns early when a session holds no hands,
+    and the only way to remove a session was below that return: an empty session
+    -- the one most likely to have been created by mistake -- was the one that
+    could not be deleted from the page describing it.
+    """
+    if session.id is None:
+        return
     with st.expander("Danger zone: delete this session"):
         st.warning(
             f"Deleting **{session.name}** removes all {stats.hand_count} hands, actions, and "
-            "reviews in it. Uploaded videos are kept but unlinked. This cannot be undone."
+            "reviews in it. Uploaded videos are kept but unlinked. Nothing in the "
+            "product will bring the rows back — only the snapshot below will."
+        )
+        st.caption(
+            "A database snapshot is written immediately before the delete and kept "
+            "in its own retention pool. If the snapshot cannot be written, the "
+            "delete does not happen."
         )
         confirm = st.checkbox(
             "I understand this permanently deletes the session and its hands.",
             key=f"confirm_delete_session_{session.id}",
         )
         if st.button("Delete session", disabled=not confirm, key=f"delete_session_{session.id}"):
+            snapshot, snapshot_error = snapshot_before_destructive(
+                db, scope=f"session{session.id}", what=f"session '{session.name}'"
+            )
+            if snapshot is None:
+                st.error(snapshot_error or "No rollback snapshot could be written.")
+                return
             for session_hand in db.fetch_hands_by_session(session.id):
                 if session_hand.id is not None:
                     for run in db.fetch_solver_runs_by_hand(session_hand.id):
@@ -5088,7 +6494,7 @@ def show_session_dashboard(db: PokerDatabase, session: Session) -> None:
                                 return
                         remove_solver_run_artifacts(run)
             db.delete_session(session.id)
-            flash(f"Session '{session.name}' deleted.")
+            flash(f"Session '{session.name}' deleted. {snapshot_recovery_note(snapshot)}")
             st.rerun()
 
 
@@ -5541,10 +6947,12 @@ def show_saved_hands(db: PokerDatabase, session: Session) -> None:
                 "Confirm delete this hand and all related rows", key=f"confirm_delete_{hand.id}"
             )
             if st.button("Delete hand", key=f"delete_hand_{hand.id}", disabled=not confirm_delete):
-                error = delete_hand_and_artifacts(db, hand.id)
+                error, snapshot = delete_hand_and_artifacts(db, hand.id)
                 if error:
                     st.error(error)
                     return
+                if snapshot is not None:
+                    flash(snapshot_recovery_note(snapshot))
                 st.rerun()
 
 
@@ -8425,6 +9833,57 @@ def _render_job_log(outcome) -> None:
         st.code("\n".join(outcome.log_tail), language="text")
 
 
+def _render_timeline_layout_support(timeline: dict) -> None:
+    """Say which table geometry this run read, and whether it is one we calibrate for.
+
+    The spine stamps ``layout_profile`` into every timeline and appends
+    ``-unsupported`` when the client window is below the calibrated floor. Until
+    now that fact reached the operator only as a downstream symptom -- a hand
+    whose cards read wrong -- so the one screen where they decide whether to
+    trust the run said nothing about the thing most likely to have broken it.
+    """
+    metadata = timeline.get("metadata") or {}
+    profile = str(metadata.get("layout_profile") or "").strip()
+    calibrated = supported_layout_profiles()
+    if not profile:
+        st.caption(
+            "This run recorded no layout profile. "
+            f"Calibrated for: {calibrated['statement']}"
+        )
+        return
+    if profile.endswith("-unsupported"):
+        st.warning(
+            f"Table layout {profile} is outside the calibrated geometries. "
+            f"{calibrated['statement']} Card and amount reads from this run are "
+            "drafts even where the frames look right."
+        )
+        return
+    data_callout("Table layout", f"{profile} · within the calibrated range")
+
+
+def _render_import_rollback_point(db: PokerDatabase, job_id: int) -> None:
+    """Say out loud that a snapshot precedes this job's hand imports.
+
+    The pre-import snapshot has always been taken and has never been mentioned,
+    so the safety the operator is relying on when they press an import control
+    was invisible at the moment they pressed it.
+    """
+    snapshots = find_snapshots(
+        backups_dir_for(Path(db.db_path)), purpose="preimport", scope=f"job{job_id}"
+    )
+    if snapshots:
+        data_callout(
+            "Rollback point",
+            f"{snapshots[0].name} — taken before this job's first hand import",
+        )
+        return
+    st.caption(
+        "No hand from this job has been imported yet. A database snapshot is "
+        "written before the first one lands, and the import is refused if it "
+        "cannot be written."
+    )
+
+
 def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
     """Review each retained reconstruction frame beside the history it produced."""
     if job.id is None:
@@ -8515,6 +9974,8 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
         summary[1].metric("Used frames", total_frames)
         summary[2].metric("Validated", f"{reviewed_frames}/{total_frames}")
         summary[3].metric("Needs improvement", incorrect)
+    _render_timeline_layout_support(timeline)
+    _render_import_rollback_point(db, job.id)
 
     progress_rows = []
     for hand in hands:
@@ -8691,6 +10152,14 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
                 st.caption(
                     "Draft ready — edit beside frames; finish with no open issues for Study."
                 )
+            # Layout profile, its supported flag and the model versions, on the
+            # screen where the operator is deciding whether to believe this hand.
+            # Every one of these fields was recorded by the pipeline and rendered
+            # only in Settings, two pages from the decision they inform.
+            render_hand_source_recording(db, db_hand)
+            show_reconstruction_evidence(
+                db_hand, parse_completion_evidence(db_hand.completion_evidence)
+            )
         elif draft_result is not None and draft_result.status == "blocked":
             st.caption(
                 "Reasons: " + ("; ".join(draft_result.reasons) or "blocked")
@@ -9051,10 +10520,18 @@ def _mark_evidence_correct(
         else:
             flash("Frame marked correct. Progress is saved — stop anytime.")
         # Auto-import path remains for full hands that were never drafted early.
+        # The failure is reported rather than swallowed: the branch above has
+        # already told the operator "Progress is saved", and a silent exception
+        # here -- a full disk refusing the pre-import snapshot, say -- meant the
+        # hand never landed while the screen said it had. The blanket except also
+        # hid programming errors for as long as they existed.
         try:
             ensure_hand_imported(db, job_id, hand_number, mode="auto")
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - keep the validation UI usable
+            flash(
+                f"Frame marked correct and saved, but hand #{hand_number} could "
+                f"not be added to the session: {safe_error_message(exc)}"
+            )
         if draft.hand_id is not None:
             hand = db.fetch_hand(draft.hand_id)
             if hand is not None and hand.review_status != "reviewed":
@@ -9347,7 +10824,9 @@ def show_roi_calibration(db: PokerDatabase) -> None:
         st.rerun()
     with st.expander("Danger zone: delete this profile"):
         st.warning(
-            f"Deleting **{profile.name}** removes all its calibrated regions. This cannot be undone."
+            f"Deleting **{profile.name}** removes all its calibrated regions. "
+            "A database snapshot is written first; nothing else in the product "
+            "will bring the calibration back."
         )
         confirm_profile = st.checkbox(
             "I understand this permanently deletes the profile and its regions.",
@@ -9356,8 +10835,16 @@ def show_roi_calibration(db: PokerDatabase) -> None:
         if st.button(
             "Delete profile", key=f"roi_delete_{profile.id}", disabled=not confirm_profile
         ):
+            snapshot, snapshot_error = snapshot_before_destructive(
+                db, scope=f"roi{profile.id}", what=f"profile '{profile.name}'"
+            )
+            if snapshot is None:
+                st.error(snapshot_error or "No rollback snapshot could be written.")
+                return
             db.delete_roi_profile(profile.id)
-            flash(f"Deleted ROI profile '{profile.name}'.")
+            flash(
+                f"Deleted ROI profile '{profile.name}'. {snapshot_recovery_note(snapshot)}"
+            )
             st.rerun()
 
     show_roi_import_export(db, profile)

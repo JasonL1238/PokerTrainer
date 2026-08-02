@@ -10,6 +10,7 @@ import hashlib
 import os
 import stat
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -36,6 +37,12 @@ DEFAULT_MAX_DURATION_SECONDS = 24 * 60 * 60  # 24h
 DEFAULT_MIN_FPS = 1.0
 DEFAULT_MAX_FPS = 120.0
 DEFAULT_MIN_FRAME_COUNT = 1
+
+# Half-written uploads. The prefix is the one _atomic_copy hands to mkstemp, and
+# the age is far longer than any upload the size limit above permits, so a
+# partial older than this belongs to a process that is not coming back.
+UPLOAD_PARTIAL_PREFIX = ".upload_"
+UPLOAD_PARTIAL_MAX_AGE_SECONDS = 24 * 60 * 60
 
 # Container/codec names reported by PyAV (lowercase).
 ALLOWED_CONTAINERS = frozenset({"mp4", "mov", "avi", "matroska", "quicktime"})
@@ -88,6 +95,7 @@ def ingest_uploaded_video(
     validate_video_extension(original_filename)
     ensure_data_directories(videos_dir.parent)
     assert_safe_storage_dir(videos_dir)
+    sweep_stale_upload_partials(videos_dir)
 
     destination = unique_stored_video_path(original_filename, videos_dir)
     assert_safe_destination(destination, videos_dir)
@@ -109,6 +117,47 @@ def ingest_uploaded_video(
         file_size_bytes=file_size,
         content_sha256=digest,
     )
+
+
+def sweep_stale_upload_partials(
+    videos_dir: Path,
+    *,
+    max_age_seconds: float = UPLOAD_PARTIAL_MAX_AGE_SECONDS,
+    now: float | None = None,
+) -> int:
+    """Delete abandoned upload partials and return how many went. Never raises.
+
+    ``_atomic_copy`` cleans up after every failure it can observe, but a killed
+    worker, a full disk or a container replacement mid-write leaves the partial
+    behind and nothing else ever looks at it: retention manages generated
+    artifacts only, and the video vault is deliberately never expired by age
+    because the recordings are the irreplaceable input. One aborted multi-
+    gigabyte upload a week is the whole mount inside a year.
+
+    Age is the guard against deleting a live upload. Only files this module
+    itself creates are considered, and only ones untouched for a full day, which
+    is far longer than an upload the size limit allows can take.
+    """
+    threshold = (time.time() if now is None else now) - max_age_seconds
+    removed = 0
+    try:
+        entries = list(videos_dir.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.name.startswith(UPLOAD_PARTIAL_PREFIX):
+            continue
+        try:
+            info = entry.lstat()
+            # A symlink or a directory wearing the prefix is not something this
+            # module wrote, so it is not this function's to remove.
+            if not stat.S_ISREG(info.st_mode) or info.st_mtime > threshold:
+                continue
+            entry.unlink()
+        except OSError:
+            continue
+        removed += 1
+    return removed
 
 
 def require_playable_video(
@@ -267,7 +316,7 @@ def _atomic_copy(source: BinaryIO, destination: Path, *, max_bytes: int) -> int:
     """Write to a temp file in the same directory, then replace into place."""
     videos_dir = destination.parent
     fd, temp_name = tempfile.mkstemp(
-        prefix=".upload_",
+        prefix=UPLOAD_PARTIAL_PREFIX,
         suffix=destination.suffix.lower() or ".part",
         dir=str(videos_dir),
     )
@@ -412,5 +461,6 @@ __all__ = [
     "require_playable_video",
     "resolve_stored_video_path",
     "sha256_file",
+    "sweep_stale_upload_partials",
     "validate_video_extension",
 ]

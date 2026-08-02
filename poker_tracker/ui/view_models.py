@@ -1,10 +1,16 @@
 """Pure display transformations used by the product UI."""
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections import Counter
+from collections.abc import Container, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from poker_tracker.math.analytics import (
+    EVIDENCE_CLASS_LABELS,
+    EvidenceClass,
+    classify_evidence,
+)
 from poker_tracker.persistence.completion import (
     BoundaryEvidence,
     CompletionEvidence,
@@ -31,12 +37,110 @@ _UNKNOWN_UNIT = ("record", "records", "written")
 
 
 @dataclass(frozen=True)
+class EvidenceStates:
+    """How many hands sit in each data state the product has to tell apart.
+
+    Three INDEPENDENT axes and one reading that cuts across them, not a single
+    six-way split. Every hand carries a completion status, an evidence source and
+    a review status at the same time, and staleness is a property of the retained
+    analysis hanging off it rather than of the hand. Flattening those into one
+    partition would be six labels over one flag, which says nothing the flag did
+    not already say; keeping them separate is why each axis below is rendered
+    with its own denominator instead of implying the counts add up.
+
+    ``completion_not_applicable`` is the manual-entry case, not a fourth grade of
+    reconstruction: completion status only ever described hands a pipeline read.
+    """
+
+    hand_count: int
+    completed: int
+    partial: int
+    uncertain: int
+    completion_not_applicable: int
+    manual: int
+    cv_draft: int
+    corrected: int
+    reviewed: int
+    unreviewed: int
+    needs_correction: int
+    stale: int
+
+    @property
+    def completion_rows(self) -> tuple[tuple[str, int], ...]:
+        return (
+            ("completed", self.completed),
+            ("partial", self.partial),
+            ("uncertain", self.uncertain),
+            ("not_applicable", self.completion_not_applicable),
+        )
+
+    @property
+    def source_rows(self) -> tuple[tuple[str, int], ...]:
+        return (
+            ("manual", self.manual),
+            ("cv_import", self.cv_draft),
+            ("corrected_cv", self.corrected),
+        )
+
+    @property
+    def review_rows(self) -> tuple[tuple[str, int], ...]:
+        return (
+            ("reviewed", self.reviewed),
+            ("unreviewed", self.unreviewed),
+            ("needs_correction", self.needs_correction),
+        )
+
+
+# Display text for the stored enum values above. The keys stay the stored ones so
+# tone lookup and the counts keep agreeing with the database.
+COMPLETION_STATE_LABELS = {
+    "completed": "Completed",
+    "partial": "Partial",
+    "uncertain": "Uncertain",
+    "not_applicable": "Manual entry (n/a)",
+}
+# Derived from the evidence-class vocabulary rather than respelled, so the
+# provenance axis and Insights cannot drift into calling the same thing two
+# names. The KEYS differ on purpose: ``classify_evidence`` lets ``reviewed`` win
+# over provenance because it is the stronger statement about a row, while this
+# axis reports provenance alone and leaves review status to its own axis.
+SOURCE_STATE_LABELS = {
+    "manual": EVIDENCE_CLASS_LABELS["manual"],
+    "cv_import": EVIDENCE_CLASS_LABELS["cv_draft"],
+    "corrected_cv": EVIDENCE_CLASS_LABELS["corrected_cv"],
+}
+REVIEW_STATE_LABELS = {
+    "reviewed": "Marked reviewed",
+    "unreviewed": "Unreviewed",
+    "needs_correction": "Needs correction",
+}
+
+
+@dataclass(frozen=True)
 class PortfolioSummary:
     session_count: int
     hand_count: int
     reviewed_count: int
     review_percent: float
     net_bb: float
+    # The result total, split by whether the operator has confirmed the hand it
+    # came from. ``net_bb`` remains the sum over everything so no existing caller
+    # changes meaning, but no surface may print it without also printing this
+    # split: a CV draft's hero result is a pipeline's reading of a hand nobody
+    # has checked, and added into one figure beside confirmed hands it becomes
+    # indistinguishable from measured performance.
+    confirmed_net_bb: float = 0.0
+    unconfirmed_net_bb: float = 0.0
+    confirmed_result_hands: int = 0
+    unconfirmed_result_hands: int = 0
+    # How each contributing result was arrived at. A derived figure is the
+    # accounting ledger's reconstruction of what the hero must have won; an
+    # observed one was recorded as such. Both are legitimate, and printing a sum
+    # of them without saying which is which is what this pair prevents.
+    derived_result_count: int = 0
+    observed_result_count: int = 0
+    open_issue_count: int = 0
+    states: EvidenceStates | None = None
 
 
 @dataclass(frozen=True)
@@ -49,6 +153,11 @@ class SessionRow:
     hand_count: int
     reviewed_count: int
     net_bb: float
+    # Same split as ``PortfolioSummary``, for the same reason: a session listing
+    # that prints one Result column has silently added a CV draft's reading to a
+    # reviewed hand's, and a row is exactly where that is hardest to notice.
+    confirmed_net_bb: float = 0.0
+    unconfirmed_net_bb: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -62,9 +171,30 @@ class HandRow:
     position: str
     result_bb: float | None
     review_status: str
+    # Read from ``reconstruction_confidence``, not ``confidence_label``. On a
+    # corrected hand this now reads "Superseded by your corrections" instead of
+    # the pipeline's original grade, which is a value change for any consumer
+    # that formats this field.
     confidence_label: str
     source_label: str
     tags: tuple[str, ...]
+    # Which of the four metric evidence classes this row belongs to, from
+    # ``analytics.classify_evidence`` rather than a second local rule, so a row
+    # is labelled with the same class the Insights denominator counted it in.
+    # ``source_label`` above is retained unchanged and still reports provenance;
+    # this is the stronger statement about whether the row can be believed.
+    evidence_class: EvidenceClass = "manual"
+    evidence_label: str = "Manual entry"
+    # A derived result and an observed one are the same float. ``result_bb`` is
+    # already the substituted display value on the copies Hands and Insights
+    # render, and printing it without this reads a ledger reconstruction as a
+    # recorded fact.
+    result_basis_label: str = "No result recorded"
+    # The sentence behind ``confidence_label`` and whether that label still
+    # describes the saved facts. A row that prints the label without consulting
+    # this is printing a grade of a read the operator may have overruled.
+    confidence_detail: str = ""
+    confidence_is_current: bool = True
 
 
 @dataclass(frozen=True)
@@ -123,16 +253,73 @@ class JobRow:
         return self.outcome.statement
 
 
-def build_portfolio_summary(hands: Iterable[Hand], session_count: int) -> PortfolioSummary:
+def build_evidence_states(
+    hands: Iterable[Hand],
+    *,
+    stale_hand_ids: Container[int] = frozenset(),
+) -> EvidenceStates:
+    """Count the six data states over one set of hands.
+
+    ``stale_hand_ids`` is supplied by the caller rather than queried here so this
+    stays a pure transformation and the staleness lookup stays one bounded query
+    for the whole list instead of two per row.
+    """
+    items = list(hands)
+    completion: Counter[str] = Counter(hand.completion_status for hand in items)
+    source: Counter[str] = Counter(hand.source_type for hand in items)
+    review: Counter[str] = Counter(hand.review_status for hand in items)
+    return EvidenceStates(
+        hand_count=len(items),
+        completed=completion.get("complete", 0),
+        partial=completion.get("partial", 0),
+        uncertain=completion.get("uncertain", 0),
+        completion_not_applicable=completion.get("not_applicable", 0),
+        manual=source.get("manual", 0),
+        cv_draft=source.get("cv_import", 0),
+        corrected=source.get("corrected_cv", 0),
+        reviewed=review.get("reviewed", 0),
+        unreviewed=review.get("unreviewed", 0),
+        needs_correction=review.get("needs_correction", 0),
+        stale=sum(1 for hand in items if hand.id is not None and hand.id in stale_hand_ids),
+    )
+
+
+def build_portfolio_summary(
+    hands: Iterable[Hand],
+    session_count: int,
+    *,
+    open_issue_count: int = 0,
+    stale_hand_ids: Container[int] = frozenset(),
+) -> PortfolioSummary:
+    """Summarise the whole library, keeping confirmed and unconfirmed results apart.
+
+    ``hands`` are the display copies produced by the accounting substitution, so
+    ``derived_result_substituted`` is already set on the ones whose result the
+    ledger supplied. Reading it here is what lets the Overview say how many of the
+    numbers in its headline were observed and how many were reconstructed.
+    """
     items = list(hands)
     reviewed = sum(hand.review_status == "reviewed" for hand in items)
     results = [hand.hero_bb_won for hand in items if hand.hero_bb_won is not None]
+    with_result = [hand for hand in items if hand.hero_bb_won is not None]
+    confirmed = [hand for hand in with_result if hand.review_status == "reviewed"]
+    unconfirmed = [hand for hand in with_result if hand.review_status != "reviewed"]
     return PortfolioSummary(
         session_count=session_count,
         hand_count=len(items),
         reviewed_count=reviewed,
         review_percent=(100 * reviewed / len(items)) if items else 0,
         net_bb=sum(results),
+        confirmed_net_bb=sum(hand.hero_bb_won or 0 for hand in confirmed),
+        unconfirmed_net_bb=sum(hand.hero_bb_won or 0 for hand in unconfirmed),
+        confirmed_result_hands=len(confirmed),
+        unconfirmed_result_hands=len(unconfirmed),
+        derived_result_count=sum(hand.derived_result_substituted for hand in with_result),
+        observed_result_count=sum(
+            not hand.derived_result_substituted for hand in with_result
+        ),
+        open_issue_count=open_issue_count,
+        states=build_evidence_states(items, stale_hand_ids=stale_hand_ids),
     )
 
 
@@ -155,6 +342,16 @@ def build_session_rows(
                 hand_count=len(hands),
                 reviewed_count=sum(hand.review_status == "reviewed" for hand in hands),
                 net_bb=sum(hand.hero_bb_won for hand in hands if hand.hero_bb_won is not None),
+                confirmed_net_bb=sum(
+                    hand.hero_bb_won
+                    for hand in hands
+                    if hand.hero_bb_won is not None and hand.review_status == "reviewed"
+                ),
+                unconfirmed_net_bb=sum(
+                    hand.hero_bb_won
+                    for hand in hands
+                    if hand.hero_bb_won is not None and hand.review_status != "reviewed"
+                ),
             )
         )
     return rows
@@ -169,6 +366,7 @@ def build_hand_rows(
     for hand in hands:
         if hand.id is None:
             continue
+        confidence = reconstruction_confidence(hand)
         rows.append(
             HandRow(
                 hand_id=hand.id,
@@ -180,12 +378,33 @@ def build_hand_rows(
                 position=hand.hero_position or "—",
                 result_bb=hand.hero_bb_won,
                 review_status=hand.review_status,
-                confidence_label=confidence_label(hand.confidence_score),
+                confidence_label=confidence.label,
                 source_label=hand.source_type.replace("_", " ").title(),
                 tags=tuple(hand.tags),
+                evidence_class=classify_evidence(hand),
+                evidence_label=EVIDENCE_CLASS_LABELS[classify_evidence(hand)],
+                result_basis_label=result_basis_label(hand),
+                confidence_detail=confidence.detail,
+                confidence_is_current=confidence.describes_current_facts,
             )
         )
     return rows
+
+
+def result_basis_label(hand: Hand) -> str:
+    """Where this hand's displayed result came from.
+
+    Reads ``derived_result_substituted``, which the accounting substitution sets
+    on the display copy, rather than re-deriving it: the flag was already the
+    product's record of "this figure is a reconstruction, not an observation" and
+    had no display consumer at all, so a derived -18 BB printed exactly like a
+    recorded one in every list.
+    """
+    if hand.hero_bb_won is None:
+        return "No result recorded"
+    if hand.derived_result_substituted:
+        return "Derived from the reconciled ledger"
+    return "Recorded on the hand"
 
 
 def job_is_live(status: str) -> bool:
@@ -471,6 +690,64 @@ def confidence_label(score: float | None) -> str:
     if score >= 0.6:
         return "Medium"
     return "Low"
+
+
+@dataclass(frozen=True)
+class ConfidenceReading:
+    """How a stored ``confidence_score`` may be shown, given what has happened since.
+
+    ``label`` is the word a surface prints; ``detail`` is the sentence that says
+    what the word is about. ``describes_current_facts`` is what a caller checks
+    before treating the reading as a live grade of the hand in front of it.
+    """
+
+    label: str
+    detail: str
+    describes_current_facts: bool
+
+
+def reconstruction_confidence(hand: Hand) -> ConfidenceReading:
+    """The pipeline's confidence in its own read, or the fact that it is superseded.
+
+    ``hands.confidence_score`` is written once by the CV exporter and no
+    correction path touches it, so ``confidence_label`` alone kept reporting
+    "High" about hero cards and a pot the operator had since overruled. That is a
+    stale analytics badge surviving a correction, which the product treats as a
+    release blocker rather than a cosmetic one, and it is fixed here rather than
+    at the two call sites so a third consumer cannot reintroduce it: the
+    supersession is a property of the reading, not of the page showing it.
+
+    ``source_type == 'corrected_cv'`` is the marker, because every correction
+    writer flips it (``db._record_hand_correction``) in the same transaction that
+    files the audit row. Deliberately NOT the retained-analysis staleness flag:
+    re-assigning a pot award stales coaching without saying anything about
+    whether the pipeline read the cards correctly, and conflating the two would
+    retire a still-accurate reading.
+    """
+    if hand.source_type == "manual":
+        return ConfidenceReading(
+            label="Not applicable",
+            detail="Entered by hand — no reconstruction scored this.",
+            describes_current_facts=False,
+        )
+    if hand.source_type == "corrected_cv":
+        return ConfidenceReading(
+            label="Superseded by your corrections",
+            detail=(
+                "The pipeline scored its own read "
+                f"'{confidence_label(hand.confidence_score)}'. You have corrected this "
+                "hand since, so that score no longer describes the saved facts."
+            ),
+            describes_current_facts=False,
+        )
+    return ConfidenceReading(
+        label=confidence_label(hand.confidence_score),
+        detail=(
+            "The CV pipeline's confidence in its own read. Not a verdict that the "
+            "hand is correct."
+        ),
+        describes_current_facts=True,
+    )
 
 
 def format_age(value: datetime, now: datetime | None = None) -> str:

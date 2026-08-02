@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -17,7 +19,18 @@ from poker_tracker.maintenance.data_health import verify_snapshot
 from poker_tracker.persistence.backup import BACKUP_KEEP_COUNT, backup_database
 from poker_tracker.persistence.db import PokerDatabase
 from poker_tracker.persistence.models import Session
+from poker_tracker.runtime.limits import (
+    bounded_int_from_env,
+    format_gb,
+    memory_limit_bytes_from_env,
+    memory_limiter,
+)
 from poker_tracker.safety.redaction import safe_error_message
+
+# _pid_is_alive is the reconciler's own liveness predicate. Admission and
+# reconciliation have to agree on what "the worker is still there" means, and
+# two copies of that answer drift.
+from poker_tracker.ui.cv_jobs import _pid_is_alive
 from poker_tracker.ui.jobs import mark_cancelled, mark_failed, update_progress
 from poker_tracker.ui.video_ingest import (
     assert_stored_video_matches_record,
@@ -31,10 +44,59 @@ PIPELINE_SCRIPT = REPO_ROOT / "cv_lab" / "scripts" / "pipeline" / "run_two_model
 DEFAULT_TIMEOUT_SECONDS = 60 * 60
 HEARTBEAT_INTERVAL_SECONDS = 2
 
+# The two bounds this worker is allowed to be given. Both are read here rather
+# than passed down from cv_jobs.start_cv_job, because the worker is also a
+# public entrypoint (`python -m poker_tracker.ui.run_cv_job`) and a bound only
+# the UI path applies is not a bound.
+CV_TIMEOUT_ENV_VAR = "POKERTRAINER_CV_TIMEOUT_SECONDS"
+CV_MEMORY_ENV_VAR = "POKERTRAINER_CV_MEMORY_GB"
+# A minute is below any real reconstruction and a day is above any recording the
+# ingest limits accept, so a value outside the range is a typo, not a choice.
+MIN_TIMEOUT_SECONDS = 60
+MAX_TIMEOUT_SECONDS = 24 * 60 * 60
+
 # backup_database now lives in the persistence package so db.py can snapshot
 # before a migration; re-exported here because callers and tests import it from
 # this module.
-__all__ = ["BACKUP_KEEP_COUNT", "backup_database", "run_job", "main"]
+__all__ = [
+    "BACKUP_KEEP_COUNT",
+    "CV_MEMORY_ENV_VAR",
+    "CV_TIMEOUT_ENV_VAR",
+    "CVJobLimits",
+    "backup_database",
+    "main",
+    "resolve_limits",
+    "run_job",
+]
+
+
+@dataclass(frozen=True)
+class CVJobLimits:
+    """The bounds one reconstruction runs under, after validation."""
+
+    timeout_seconds: int
+    memory_limit_bytes: int | None
+
+
+def resolve_limits(timeout_seconds: int | None = None) -> CVJobLimits:
+    """Validate both CV bounds, or raise naming the variable that is wrong.
+
+    Called before any video is opened and before any model is loaded, so a
+    misconfigured host spends nothing on work it is going to abandon. An
+    explicit ``timeout_seconds`` from the CLI wins over the variable; the
+    variable still has to parse, because an operator who set both and typo'd one
+    should hear about it.
+    """
+    configured = bounded_int_from_env(
+        CV_TIMEOUT_ENV_VAR,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        minimum=MIN_TIMEOUT_SECONDS,
+        maximum=MAX_TIMEOUT_SECONDS,
+    )
+    return CVJobLimits(
+        timeout_seconds=configured if timeout_seconds is None else timeout_seconds,
+        memory_limit_bytes=memory_limit_bytes_from_env(CV_MEMORY_ENV_VAR),
+    )
 
 
 def _pipeline_device() -> str:
@@ -65,7 +127,7 @@ def run_job(
     session_name: str,
     db_path: Path,
     target_session_id: int | None = None,
-    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    timeout_seconds: int | None = None,
 ) -> int:
     db = PokerDatabase(db_path)
     db.init_db()
@@ -74,12 +136,23 @@ def run_job(
     progress_path = timeline_path.with_name(f"job_{job_id}_progress.json")
     export_path = Path(paths["exports"]) / f"job_{job_id}_session.json"
     frame_root = Path(paths.get("frames", timeline_path.parent / "frames"))
-    deadline = time.monotonic() + timeout_seconds
+    frame_dir = frame_root / f"cv_job_{job_id}"
+    # Only artifacts this invocation produced are ever discarded. Re-running a
+    # completed job's id and failing before the pipeline starts must not take
+    # the frames the earlier run's validated hands point at.
+    pipeline_started = False
+    reconstruction_completed = False
     try:
+        # Both bounds are resolved inside the try so a bad value becomes a
+        # failed job carrying the variable's name, which is what the operator
+        # reads, rather than a traceback in a detached worker's log.
+        limits = resolve_limits(timeout_seconds)
+        deadline = time.monotonic() + limits.timeout_seconds
         _assert_not_cancelled(db, job_id)
         job = db.fetch_processing_job(job_id)
         if job is None:
             raise ValueError(f"Processing job #{job_id} was not found.")
+        _assert_no_foreign_heavy_job(db, job_id)
         video = db.fetch_video(job.video_id)
         if video is None:
             raise ValueError(f"Video #{job.video_id} was not found.")
@@ -113,11 +186,12 @@ def run_job(
             "--out",
             str(timeline_path),
             "--frame-dir",
-            str(frame_root / f"cv_job_{job_id}"),
+            str(frame_dir),
             "--progress-file",
             str(progress_path),
         ]
-        _run_pipeline(command, db, job_id, deadline, progress_path)
+        pipeline_started = True
+        _run_pipeline(command, db, job_id, deadline, progress_path, limits)
 
         _assert_not_cancelled(db, job_id)
         _heartbeat(db, job_id, 82, "Validating reconstructed hands")
@@ -130,7 +204,7 @@ def run_job(
             # add lands them in the session later.
             include_incomplete=True,
         )
-        _check_deadline(deadline)
+        _check_deadline(deadline, limits.timeout_seconds)
         _assert_not_cancelled(db, job_id)
         _heartbeat(db, job_id, 92, "Backing up study database")
         data_root = Path(paths.get("data", Path(paths["backups"]).parent))
@@ -178,6 +252,7 @@ def run_job(
                 completed_at=datetime.now(UTC),
             )
             db.update_video_session(video_id, destination.id)
+        reconstruction_completed = True
         return 0
     except JobCancelled as exc:
         try:
@@ -198,7 +273,70 @@ def run_job(
         return 1
     finally:
         progress_path.unlink(missing_ok=True)
+        if pipeline_started and not reconstruction_completed:
+            _discard_partial_artifacts(timeline_path, frame_dir)
         db.close()
+
+
+def _holds_the_machine(status: str, pid: int | None) -> bool:
+    """Whether a live row is evidence of heavy work actually occupying the host.
+
+    The launcher refuses on the row alone, which is right for it: it is deciding
+    whether to create a second row. The worker is deciding whether a second
+    heavy *process* would exist, and rows outlive processes — an unclean
+    shutdown leaves 'running' rows with dead workers for the fifteen minutes
+    reconcile_stuck_jobs takes to notice. Refusing on those would make the
+    recovery entrypoint unusable exactly when it is needed. A queued row still
+    blocks, because its worker is about to start.
+    """
+    return status == "queued" or (pid is not None and _pid_is_alive(pid))
+
+
+def _assert_no_foreign_heavy_job(db: PokerDatabase, job_id: int) -> None:
+    """Refuse to start heavy work while another heavy job already holds the host.
+
+    ``cv_jobs.start_cv_job`` decides this before it creates the row, but the
+    worker is reachable without it: ``python -m poker_tracker.ui.run_cv_job``
+    is a documented recovery entrypoint and the release gate spawns the same
+    pipeline. Two detectors plus a solve on the reference host is how the OOM
+    killer picks which job dies, so the admission decision belongs where the
+    heavy work actually starts as well as where the button is.
+    """
+    conflicts = [
+        f"{other.job_type.replace('_', ' ')} job #{other.id} is already {other.status}"
+        for other in db.fetch_active_jobs()
+        if other.id != job_id and _holds_the_machine(other.status, other.pid)
+    ]
+    conflicts.extend(
+        f"solver run #{run.id} is already {run.status}"
+        for run in db.fetch_active_solver_runs()
+        if _holds_the_machine(run.status, run.pid)
+    )
+    if not conflicts:
+        return
+    raise RuntimeError(
+        f"Reconstruction was not started: {conflicts[0]}. Only one heavy "
+        "CV/solver job runs at a time. Wait for it to finish or cancel it, then "
+        "start this reconstruction again — nothing was read from the recording "
+        "and no artifacts were written."
+    )
+
+
+def _discard_partial_artifacts(timeline_path: Path, frame_dir: Path) -> None:
+    """Leave nothing behind that a later reader could mistake for a result.
+
+    The pipeline prunes its review frames only when it reaches the end, so a run
+    that was killed, timed out or cancelled leaves one JPEG per sampled frame —
+    a 90-minute recording at one second is 5,400 files — plus whatever partial
+    timeline was on disk. Neither is evidence of anything: the recording is
+    still there and re-running rebuilds both. Only a completed job keeps its
+    frames, because the export and the validated hands point at them.
+    """
+    try:
+        timeline_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    shutil.rmtree(frame_dir, ignore_errors=True)
 
 
 def _verified_backup_note(
@@ -231,13 +369,37 @@ def _run_pipeline(
     job_id: int,
     deadline: float,
     progress_path: Path,
+    limits: CVJobLimits | None = None,
 ) -> None:
-    process = subprocess.Popen(
-        command,
-        cwd=str(REPO_ROOT),
-        start_new_session=True,
-        close_fds=True,
-    )
+    bounds = limits or CVJobLimits(DEFAULT_TIMEOUT_SECONDS, None)
+    memory_limit_bytes = bounds.memory_limit_bytes
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(REPO_ROOT),
+            start_new_session=True,
+            close_fds=True,
+            preexec_fn=(
+                memory_limiter(memory_limit_bytes, variable=CV_MEMORY_ENV_VAR)
+                if os.name == "posix" and memory_limit_bytes is not None
+                else None
+            ),
+        )
+    except subprocess.SubprocessError as exc:
+        if memory_limit_bytes is None:
+            raise
+        # subprocess reports a hook failure only as "Exception occurred in
+        # preexec_fn", so the reason the operator needs has to be restated.
+        # Refusing to reconstruct is the point: a cap that was asked for and not
+        # applied is how a detector plus a decoder reaches the host OOM killer
+        # while the operator believes the job is bounded.
+        raise RuntimeError(
+            f"The {format_gb(memory_limit_bytes)} reconstruction memory cap from "
+            f"{CV_MEMORY_ENV_VAR} could not be applied, so no reconstruction was "
+            "started and nothing was written. macOS rejects RLIMIT_AS outright; "
+            "unset the variable to reconstruct without a cap, or run the job in "
+            "the Linux container where the cap holds."
+        ) from exc
     pid_path = _pipeline_pid_path(progress_path)
     try:
         pid_path.write_text(str(process.pid), encoding="utf-8")
@@ -247,7 +409,7 @@ def _run_pipeline(
     last_progress = 8.0
     try:
         while process.poll() is None:
-            _check_deadline(deadline)
+            _check_deadline(deadline, bounds.timeout_seconds)
             _assert_not_cancelled(db, job_id)
             now = time.monotonic()
             if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
@@ -268,19 +430,40 @@ def _run_pipeline(
                 _heartbeat(db, job_id, last_progress, message)
                 last_heartbeat = now
             time.sleep(1)
-    except BaseException:
-        _terminate_process_group(process.pid)
+    except BaseException as exc:
+        stopped = _terminate_process_group(process.pid)
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            _terminate_process_group(process.pid)
-            process.wait(timeout=5)
+            stopped = _terminate_process_group(process.pid)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                stopped = False
+        if isinstance(exc, TimeoutError) and not stopped:
+            # An orphaned pipeline keeps its detector, its decoder and its
+            # memory, so the operator has to be told to go find it rather than
+            # assume the timeout cleaned up after itself.
+            raise TimeoutError(
+                f"{exc} The reconstruction process (pid {process.pid}) could not "
+                "be confirmed stopped and may still be running."
+            ) from exc
         raise
     finally:
         if pid_path is not None:
             pid_path.unlink(missing_ok=True)
     if process.returncode:
-        raise RuntimeError(f"Reconstruction pipeline exited with code {process.returncode}.")
+        detail = f"Reconstruction pipeline exited with code {process.returncode}."
+        if memory_limit_bytes is not None:
+            # Not a claim about the cause. RLIMIT_AS surfaces as an ordinary
+            # allocation failure in the child, indistinguishable from any other
+            # crash from out here, so this says where to look and stops short of
+            # saying what happened.
+            detail += (
+                f" Its address space was capped at {format_gb(memory_limit_bytes)} "
+                f"by {CV_MEMORY_ENV_VAR}; check the job log before raising it."
+            )
+        raise RuntimeError(detail)
 
 
 def _ensure_destination_session(
@@ -349,41 +532,66 @@ def _assert_not_cancelled(db: PokerDatabase, job_id: int) -> None:
         raise JobCancelled("Cancelled by user.")
 
 
-def _check_deadline(deadline: float) -> None:
+def _check_deadline(deadline: float, timeout_seconds: int) -> None:
+    """Stop the job at its wall-clock bound, saying what the bound was.
+
+    A terminal state has to state its outcome, not its last progress reading:
+    "82%" is what the row said a moment ago, and the operator needs to know the
+    run is over, which limit ended it, where that limit comes from, and that the
+    partial work is gone.
+    """
     if time.monotonic() > deadline:
-        raise TimeoutError("Reconstruction exceeded the configured timeout.")
+        raise TimeoutError(
+            f"Reconstruction stopped after exceeding its {timeout_seconds}-second "
+            f"wall-clock limit, set by {CV_TIMEOUT_ENV_VAR}. No hands were "
+            "exported and the partial timeline and review frames were discarded. "
+            "Raise the limit or shorten the recording, then run it again."
+        )
 
 
-def _terminate_process_group(pid: int | None) -> None:
+def _terminate_process_group(pid: int | None) -> bool:
+    """Stop the pipeline and everything it forked. True only when the pid is gone."""
     if pid is None:
-        return
+        return True
     try:
         os.killpg(pid, signal.SIGTERM)
     except ProcessLookupError:
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
-            return
+            return True
     except PermissionError:
-        return
+        return False
     deadline = time.monotonic() + 0.5
     while time.monotonic() < deadline:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            return
+            return True
         except PermissionError:
-            return
+            return False
         time.sleep(0.05)
     try:
         os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
         try:
             os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
     except PermissionError:
-        pass
+        return False
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        time.sleep(0.05)
+    return False
 
 
 def main() -> int:
@@ -393,7 +601,15 @@ def main() -> int:
     parser.add_argument("--session-name", required=True)
     parser.add_argument("--db", type=Path, required=True)
     parser.add_argument("--target-session-id", type=int)
-    parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=None,
+        help=(
+            f"Wall-clock bound in seconds. Defaults to {CV_TIMEOUT_ENV_VAR}, "
+            f"or {DEFAULT_TIMEOUT_SECONDS} when that is unset."
+        ),
+    )
     args = parser.parse_args()
     return run_job(
         job_id=args.job_id,

@@ -60,6 +60,7 @@ BACKUP_KEEP_COUNT = 5
 # operator's backup mount with full copies.
 PINNED_KEEP_COUNT = 5
 PREIMPORT_KEEP_COUNT = 5
+PREDELETE_KEEP_COUNT = 5
 
 ROUTINE = SnapshotClass(
     purpose="routine",
@@ -80,7 +81,19 @@ PREIMPORT = SnapshotClass(
     name=re.compile(rf"^poker_tracker-preimport-{_SCOPE}-{_STAMP}\.sqlite3$"),
     scoped=True,
 )
-SNAPSHOT_CLASSES: tuple[SnapshotClass, ...] = (ROUTINE, PREMIGRATION, PREIMPORT)
+PREDELETE = SnapshotClass(
+    purpose="predelete",
+    prefix="poker_tracker-predelete-",
+    keep=PREDELETE_KEEP_COUNT,
+    name=re.compile(rf"^poker_tracker-predelete-{_SCOPE}-{_STAMP}\.sqlite3$"),
+    scoped=True,
+)
+SNAPSHOT_CLASSES: tuple[SnapshotClass, ...] = (
+    ROUTINE,
+    PREMIGRATION,
+    PREIMPORT,
+    PREDELETE,
+)
 # Everything that is not a routine periodic copy is a rollback point for an
 # operation that already happened; the audit treats the two groups differently.
 EVIDENCE_CLASSES: tuple[SnapshotClass, ...] = tuple(
@@ -149,10 +162,19 @@ def backup_database(
     keeps its own slots. ``pinned=True`` is the pre-migration spelling ``db.py``
     uses.
 
+    ``predelete`` is the same argument applied to the product's own destructive
+    controls. Deleting a session removes its hands, actions, reviews, corrections
+    and settlement rows, and nothing else in the product can bring any of it
+    back; the snapshot taken immediately before is the only artifact that can, so
+    it keeps its own slots rather than competing with a routine copy.
+
     ``scope`` names the single operation an evidence snapshot precedes (a CV job,
     say). It becomes part of the filename, which is what lets a caller ask
     ``find_snapshots`` whether that operation has already been snapshotted
-    instead of taking one copy of the database per imported row.
+    instead of taking one copy of the database per imported row. A ``predelete``
+    scope names the row being removed instead, and is deliberately NOT used to
+    skip a second snapshot: two deletions are two different states to roll back
+    to.
 
     An artifact inventory is written beside the snapshot: the rows are only half
     the study history, and the recordings, frames, timelines and solver outputs

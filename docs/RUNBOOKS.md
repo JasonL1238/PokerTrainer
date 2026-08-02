@@ -151,6 +151,28 @@ before applying one to data you care about.
 Backups rotate: the newest `BACKUP_KEEP_COUNT` are retained and older ones are
 evicted. A backup is only a backup once it has been restored somewhere else.
 
+### Undoing a deletion made in the product
+
+Deleting a session, a hand or an ROI profile writes a snapshot first, into its
+own retention pool, and refuses the deletion if the snapshot cannot be written.
+**Settings -> Storage & health** lists every retained snapshot with its purpose.
+To roll one back:
+
+```bash
+# 1. Stop PokerTrainer.
+# 2. Pick the snapshot taken before the deletion.
+ls -t data/backups/poker_tracker-predelete-*.sqlite3 | head
+# 3. Verify it in isolation BEFORE overwriting anything.
+DRILL=$(mktemp -d)
+cp data/backups/poker_tracker-predelete-session12-<stamp>.sqlite3 "$DRILL/restored.db"
+python -m poker_tracker.maintenance --db "$DRILL/restored.db" --data-dir "$DRILL/data" --json
+# 4. Copy it over the file POKER_DB_PATH points at, then start the app.
+```
+
+Snapshots hold rows only. Videos, frames, timelines and solver outputs live
+outside SQLite and are not copied, so a snapshot restored after those files were
+removed will reference artifacts that are gone; the health audit reports them.
+
 ```bash
 # Verify every retained backup by restoring it into memory and checking it.
 python -m poker_tracker.maintenance --restore-backups --json > /tmp/health.json
@@ -283,9 +305,38 @@ still diagnosing.
 Then re-run reconstruction. Re-running is safe: completed imports are guarded
 against duplication.
 
+### A job that stopped on a resource bound
+
+Three failures are configuration, not a defect, and each names the variable that
+caused it in `error_message`:
+
+| Message contains | What happened | What to do |
+| --- | --- | --- |
+| `exceeding its N-second wall-clock limit` | The reconstruction ran past `POKERTRAINER_CV_TIMEOUT_SECONDS`. The partial timeline and review frames were discarded; no hands were exported. | Raise the variable (60–86400) or shorten the recording, then re-run. |
+| `could not be applied` | `POKERTRAINER_CV_MEMORY_GB` was set on a platform that refuses `RLIMIT_AS` — macOS does. Nothing was started and nothing was written. | Unset it for local macOS runs, or run the job in the Linux container. |
+| `Reconstruction was not started: … is already running` | Another heavy CV or solver job holds the machine. Nothing was read from the recording. | Wait for it, cancel it, or reconcile it (above), then re-run. |
+
+A timeout message that also says the process "could not be confirmed stopped"
+means a pipeline child outlived the worker. Find it before re-running:
+
+```bash
+pgrep -f run_two_model_pipeline
+```
+
+The bounds are documented in README.md. `POKERTRAINER_CV_MEMORY_GB` caps address
+space, not resident memory, so it has to sit well above the resident figure you
+expect from PyTorch.
+
 ---
 
 ## 8. Data-health and storage audit
+
+The same audit is available in-product at **Settings -> Storage & health**,
+behind an explicit *Run health check* button, alongside the redacted diagnostics
+bundle (configuration, dependency and model identity, layout support, row counts,
+and the health report). Attach the bundle to a report rather than pasting
+configuration by hand: it is scrubbed before it is written and reports
+environment variables by name and set/unset only.
 
 ```bash
 python -m poker_tracker.maintenance                      # database, artifacts, backups

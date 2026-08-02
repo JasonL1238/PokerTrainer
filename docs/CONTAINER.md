@@ -106,6 +106,17 @@ same image.
 | `POKER_DB_PATH` | `/data/poker_tracker.db` | SQLite database |
 | `POKERTRAINER_SOLVER_THREADS` | `2` | TexasSolver thread ceiling |
 | `POKERTRAINER_SOLVER_MEMORY_GB` | `8` | TexasSolver address-space ceiling |
+| `POKERTRAINER_CV_TIMEOUT_SECONDS` | `3600` | Wall-clock ceiling for one CV reconstruction (60–86400) |
+| `POKERTRAINER_CV_MEMORY_GB` | unset | CV pipeline address-space ceiling; refuses to start rather than run uncapped |
+| `POKERTRAINER_CV_MAX_EXTRACTED_FRAMES` | `2000` | Frames one diagnostic extraction may retain |
+
+`POKERTRAINER_CV_MEMORY_GB` is deliberately not defaulted in the image. It sets
+`RLIMIT_AS`, and PyTorch reserves far more address space than it makes resident,
+so a value guessed without a measurement on the target architecture would fail
+the pipeline at import rather than at exhaustion. Measure a reconstruction's
+peak `VmPeak` on the host first, then set the variable above it — a job that
+cannot install the cap refuses to start and says so, so a value that is too low
+fails loudly rather than silently.
 | `POKERTRAINER_REQUIRE_DATA_MOUNT` | unset | `true` refuses to start without a mount at `/data` |
 | `POKERTRAINER_REQUIRE_MODELS` | unset | `true` refuses to start without verified CV weights |
 | `HOME`, `MPLCONFIGDIR`, `YOLO_CONFIG_DIR` | under `/data` | Every runtime write goes to the mount, never `/app` |
