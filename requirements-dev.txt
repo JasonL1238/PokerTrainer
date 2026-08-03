@@ -8,3 +8,9 @@ hypothesis>=6.100,<7
 # pytest-cov registers a pytest plugin on install and so changes every run on
 # the machine, while `coverage run -m pytest` only measures when asked.
 coverage>=7,<8
+# deploy/tests reads the Dockerfile and both compose.yaml files, and pyproject's
+# testpaths names deploy/tests -- so a bare `pytest`, and therefore CI, cannot
+# even collect the suite without a YAML parser. Here rather than in
+# requirements.txt because no product code imports it, and pinned to the version
+# requirements-cv.txt already verifies so every install resolves the same PyYAML.
+pyyaml==6.0.3
