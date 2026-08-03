@@ -284,12 +284,23 @@ all-in does not either when the all-in covered the wager. Once a cut is drawn it
 applies to every seat by that seat's own **live** contribution: an opponent never
 matches your ante, so your own forced posts cannot raise the level the rest of the
 table is charged into the pot below at. Every dead chip — antes, dead blinds and
-any dead money you declare — goes whole into the main pot, which is what keeps a
-seat all-in for nothing but its ante eligible for the layer holding its chips.
+any dead money you declare — is owed to the table rather than wagered, so it is
+never handed back as an uncalled bet, and a seat all-in for nothing but its ante
+stays eligible for the layer holding its chips. It does not all land in the main
+pot, though: as described above, each seat collects dead money only up to its own
+total commitment and the excess rises into the layer above, so nobody is paid out
+of chips they could never have matched.
 Which chips are dead is decided by **what the row is, not by how it was spelled**:
 a forced post that took its poster's last chip is often recorded as an all-in, and
 the `Forced post` and `Post status` fields on an action row are what the ledger
-reads, so relabelling one row cannot move a chip.
+reads, so relabelling one row cannot move a chip. The `Forced post` field says
+*which* forced post a row is; it cannot make one. Only `ante`, `post_blind` and
+`all-in` rows can be posts — a bet, a call or a raise answers a wager level,
+which is the one thing a forced post never does — so a `Forced post` value on one
+of those is a contradiction between two things you told the product. It derives
+the row from its action type, exactly as if the field were blank, and reports the
+contradiction as a legality issue naming the row. Clearing the field or
+correcting the action type in `Edit actions` resolves it.
 
 **One case is deliberately refused rather than answered.** When a seat is all-in
 for less than *another* seat's forced post — a stack short of its own ante, or a
@@ -404,29 +415,31 @@ settings, and v19 declares no blind structure for any existing hand rather than
 guessing one from the posts it can see. **v20 is the one migration that visibly
 demotes stored hands**: every hand containing an ante reads `ante_mode IS NULL`,
 which is ambiguous rather than defaulted, so hands that previously reconciled
-start reporting `needs_correction` with the anteing seats named. For that
-population nothing is rewritten and no figure moves — the layers shown are the
-capped reading, which is what the product derived before the column existed —
-and one ordinary settlement save clears each hand. Count it with `SELECT
+start reporting `needs_correction` with the anteing seats named. No row is
+rewritten and the layers shown beside the refusal are the capped reading, and
+one ordinary settlement save clears each hand. Count it with `SELECT
 COUNT(DISTINCT hand_id) FROM actions WHERE action_type = 'ante' OR
 forced_bet_type IN ('ante','big_blind_ante')`.
 
-**v20 touches a second, separate population, and this one does move chips.** The
-same release caps operator-typed external dead money against each collecting
-seat's own commitment instead of dropping it whole into the main pot. On a
-stored hand where the declared amount exceeds the smallest commitment contesting
-the main pot, the pot count, the eligible sets and the gross all stay the same
-while the *distribution* changes — so every cross-check still passes and the
-hero result moves anyway. Those hands need no declaration and may contain no
-ante at all. The new figure is the right one, but coaching and solver output
-retained beside them was written against the old one, so v20 marks that analysis
-stale and study readiness blocks on `STALE_COACHING_EVIDENCE` until you rerun
-it. Your `review_status` is not touched and nothing is deleted — only the
-freshness flags move. The predicate is `dead_money > 0` because a schema
-migration cannot run the reducer to find the floor, so it is deliberately
-over-strict: some hands whose figures did not move ask for a coaching rerun.
-Count it with `SELECT COUNT(*) FROM hand_settlements WHERE dead_money > 0`. A
-hand in neither population is untouched in every respect. Startup
+**v20 touches a second, wider population, and this one does move chips.** The
+same release caps dead money against each collecting seat's own total
+commitment instead of dropping it whole into the lowest layer. That covers dead
+money the recording holds — an ante, a dead or missed blind, a penalty post —
+*and* the external amount you typed into `dead_money`; a hand can carry the
+first with the second at zero. Where a dead contribution exceeds the smallest
+commitment contesting the layer it sits in, the pot count, the eligible sets and
+the gross all stay the same while the *distribution* changes — so every
+cross-check still passes and the hero result moves anyway. Those hands need no
+declaration and may contain no ante at all. The new figure is the right one, but
+coaching and solver output retained beside them was written against the old one,
+so v20 marks that analysis stale and study readiness blocks on
+`STALE_COACHING_EVIDENCE` until you rerun it. Your `review_status` is not
+touched and nothing is deleted — only the freshness flags move. The predicate is
+"this hand holds dead money" rather than "a dead contribution exceeds the floor",
+because a schema migration cannot run the reducer to find the floor, so it is
+deliberately over-strict: some hands whose figures did not move ask for a
+coaching rerun. A hand whose forced posts are all live blinds — every ordinary
+cash-game hand — holds no dead money and is untouched in every respect. Startup
 migrates older
 databases automatically; older application versions intentionally refuse to open
 a newer database, and a version 6 export cannot be read back by an older release,
@@ -617,9 +630,13 @@ all — a setup problem, not a measurement.
 Two report fields are load-bearing and easy to misread. `aggregate.measured`
 is `false` when nothing was scored, and the counts beside it read `null` rather
 than `0`, because zero errors over zero measurements is not a result.
-`certification.release_certifying` is `false` in `fixture` mode, which decodes
-no video and loads no model — a passing fixture report is a regression check,
-not a release.
+`certification` is computed from `certification.executed`, the list of acts the
+run actually performed, so a mode that quietly does less than its name says
+cannot inflate its own claim. `release_certifying` is `true` only when the run
+decoded video, loaded the pinned weights, reconstructed the recordings and
+scored the result. `fixture` mode does none of the first three. `container` mode
+runs the *fixture* gate inside the image, so it certifies that the image
+reproduces the host's verdict, not that the product reconstructs video.
 
 The committed corpus currently exits `2`: Phase 2 has produced no answer keys,
 so no accuracy claim can be evaluated. CI asserts that it still fails closed, so
@@ -633,17 +650,27 @@ python -m poker_tracker.maintenance.retention_cli --apply
 ```
 
 Frames, timelines, job logs, exports and ROI previews expire on per-category
-windows (`POKER_RETAIN_*_DAYS`). A file the database still references is never
+windows (`POKER_RETAIN_*_DAYS`). A file the product still expects is never
 offered for deletion at any age, and the audit always prints its plan before
 `--apply` acts. Source recordings need an explicit `--include-orphan-videos`,
 because a recording is the one artifact nothing can rebuild.
 
-Three things about "still references" are worth knowing, because each of them was
+Four things about "still expects" are worth knowing, because each of them was
 once wrong in a way that deleted or offered to delete a file:
 
 - **The reference list covers every artifact column, including regression
   fixtures.** A fixture attached to a resolved issue is frequently a frame or a
   recording under a managed directory, and it used to be missing from the list.
+- **Some artifacts have no column at all, and the columns alone were the whole
+  list.** A completed reconstruction job's CV timeline is addressed by job id,
+  not by a stored path, so it counted as unreferenced from the moment it was
+  written and its 90-day window deleted it — while nothing in the product deletes
+  a `processing_jobs` row, so the completed job goes on expecting that timeline
+  forever and every remaining validated-hand import for it stays blocked with no
+  way to rebuild. The frames a timeline's states name have no column either until
+  the operator reviews one, so the same question expired exactly the frames still
+  waiting to be reviewed. Both are now resolved through the same naming rule the
+  snapshot inventory and the health audit use.
 - **Files are matched by identity, not by spelling.** On a case-insensitive
   filesystem a recording stored as `Session.MOV` and recorded as `session.mov`
   looked like an orphan. Matching is `(st_dev, st_ino)` where the file exists and
@@ -664,6 +691,16 @@ still requires `--include-orphan-videos` for recordings.
 Exit codes are the same whatever `--json` does to the output: `0` nothing to do,
 would delete, or deleted; `1` a deletion failed; `2` the configuration is
 invalid; `3` the sweep refused to act.
+
+That contract holds for everything the CLI examines, and **not** for failures
+that stop it examining anything. Opening the database and preparing the data
+directory happen before the reporting path, so an unopenable database or an
+unusable `--data-dir` leaves an unhandled traceback on stderr, exits `1`, and
+under `--json` writes a zero-byte document. An unattended caller reading `1`
+will look for a filesystem problem when what it has is a configuration one —
+the case `2` is reserved for — and a `--json` consumer that treats an empty
+document as "no findings" will read a sweep that examined nothing as a clean
+one. Check for an empty document before trusting the code.
 
 The age shown is the file's modification time, not how long it has been
 unreferenced — nothing records when a row stopped pointing at a file. Backups are
@@ -726,11 +763,22 @@ python -m poker_tracker.maintenance.recovery \
   --target "$(mktemp -d)"
 ```
 
-It checks what recovery has to mean: the schema, foreign keys, row counts against
-the snapshot's own artifact inventory, issue evidence, one completed hand read
-*through the application* rather than by raw select, and which recordings, frames,
-timelines and solver outputs are missing. Missing artifacts are reported as a
-**partial recovery** with each file named, not as a warning.
+It checks what recovery has to mean: the schema, foreign keys, issue evidence,
+one completed hand read *through the application* rather than by raw select, and
+which recordings, frames, timelines and solver outputs are missing. Missing
+artifacts are reported as a **partial recovery** with each file named, not as a
+warning.
+
+**It does not compare row counts against the snapshot, so a `RECOVERED` verdict
+does not mean the complete history came back.** The drill is written to compare
+its restored session, hand, completed-hand and issue totals against the
+inventory beside the snapshot, but `build_inventory` records artifacts only and
+writes no counts, so there is nothing on the other side of that comparison. It
+says so on every run — "artifact references are verified; totals are
+self-reported" — and it still fails outright on a restore that holds no sessions
+or no hands, which is the one loss it can prove. Anything short of total
+emptiness is unproven. Read `RECOVERED` as "it restored, migrated, and reads
+back through the application".
 
 Exit `0` is `RECOVERED`. Exit `1` is `PARTIAL` (something is provably gone) or
 `UNVERIFIED` (it restored cleanly but no inventory accompanied the snapshot, so
@@ -738,6 +786,11 @@ completeness is unproven). Exit `2` means the drill did not run and **nothing wa
 checked** — it refuses outright if its target overlaps `POKER_DATA_DIR`, contains
 `POKER_DB_PATH`, or already holds a database, because a drill that restored an
 old snapshot over your live file would destroy the history it was run to protect.
+
+Because the counts comparison is inert, those first two are currently inverted
+against the evidence: a snapshot carrying **no** inventory exits 1 as
+`UNVERIFIED`, while one carrying an inventory exits 0 — keeping the completeness
+reference produces the weaker verdict, not the stronger one.
 
 Run it before you need it, on the machine you would actually recover onto. The
 full procedure, including what to bring to a fresh machine and what each failing

@@ -86,10 +86,19 @@ Two things in the report are easy to misread and worth checking explicitly:
 - **`aggregate.measured`.** When `false`, every count beside it is `null`
   rather than `0`, because zero errors over zero measurements is not a result.
   If you find yourself quoting "0 critical errors", check this field first.
-- **`certification.release_certifying`.** `fixture` mode is `false`: it scores
-  retained timelines without decoding video or loading models, and cannot tell a
-  pipeline's timeline from one written by hand. A passing fixture report is a
-  regression check, not a release.
+- **`certification.release_certifying`.** Read `certification.executed` first:
+  it lists what the run performed, and everything else in the block is computed
+  from it rather than from the mode you asked for. `release_certifying` is
+  `true` only when the run decoded video, loaded the pinned weights,
+  reconstructed the recordings and scored the result.
+  - `fixture` scores retained timelines and cannot tell a pipeline's timeline
+    from one written by hand. A passing fixture report is a regression check.
+  - `container` runs the **fixture** gate inside the image: the image gets the
+    manifest directory and no vault. It certifies that the image reproduces the
+    host's fixture verdict, and nothing about video reconstruction.
+  - A `full` run that stopped before decoding anything — no vault, no FFmpeg, no
+    weights — reports an empty `executed` and claims no decoding, which is why
+    an exit `2` full run must never be quoted as a certified one.
 - **`duration_source` on a full-mode case.** `manifest` means the case declared
   `recording.duration_s`; `probed_from_recording` means the manifest did not and
   the file was measured. A case whose length can be established neither way
@@ -258,6 +267,14 @@ The drill will not run at all if its target overlaps `POKER_DATA_DIR`, contains
 warning — a drill that restored a three-month-old snapshot over the live file
 would destroy exactly the history it was run to protect.
 
+Overlap is decided by file identity, not by spelling: `$DATA/drill` and
+`$data/drill` are one directory on the case-insensitive filesystem macOS ships,
+and the drill refuses both. It uses the same comparison retention does, and it
+deliberately over-matches — on a case-sensitive filesystem, where two spellings
+really could be two directories, it still refuses. A target it will not accept
+costs you one `--target` argument; the error in the other direction costs the
+study history.
+
 What each failing check means:
 
 | Check | Failing means |
@@ -351,10 +368,24 @@ python -m poker_tracker.maintenance.retention_cli --apply
 ```
 
 The retention audit is a dry run by default and always prints its plan before
-`--apply` acts. Four things to understand before using it:
+`--apply` acts. Five things to understand before using it:
 
-- **A file the database references is never offered**, at any age. Windows only
-  apply to files nothing points at.
+- **A file the product still expects is never offered**, at any age. Windows only
+  apply to files nothing expects.
+- **"Expects" is wider than "a column names it".** Two artifact classes are
+  addressed by convention rather than by a database column, and both are retained
+  for as long as the job that produced them exists:
+  - `cv_timelines/job_<id>_timeline.json` for a **completed** reconstruction job.
+    Nothing in the product deletes a `processing_jobs` row, so a deleted timeline
+    leaves that job permanently expecting a file that cannot be rebuilt: every
+    remaining validated-hand import for it is blocked, and the recovery drill
+    reports `PARTIAL` forever afterwards on an otherwise healthy machine.
+  - The frames under `frames/cv_job_<id>/` that a timeline's states name. A
+    reconstructed frame gets a database reference only once you review it, so
+    asking the columns alone expired exactly the frames still waiting for review.
+  A timeline that will not parse is treated as unreadable, not as empty: it still
+  named frames and nothing can say which, so the whole sweep is held back and the
+  run exits `3`.
 - **The age shown is the file's mtime, not how long it has been unreferenced.**
   Nothing records when a row stopped pointing at a file, so a recording orphaned
   moments ago still reports its original age. This matters most for

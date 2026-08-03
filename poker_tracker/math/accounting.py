@@ -55,6 +55,21 @@ _LIVE_STRUCTURAL_FORCED_BETS = frozenset(
     {"small_blind", "big_blind", "straddle", "bring_in"}
 )
 _FORCED_POST_KINDS = {"ante", "post_blind"}
+# The kinds a forced post can legitimately be BOOKED UNDER. What makes a
+# commitment a forced post is its kind; ``forced_bet_type`` only refines WHICH
+# forced post it is. ``all-in`` is here because a post that took its poster's
+# last chip is routinely booked that way and the type is then the only thing
+# naming it -- that is the whole reason the field reaches the reducer.
+#
+# ``bet``, ``call`` and ``raise`` are answers to a wager level, which is the one
+# thing a forced post never is, so no room can produce one of them as a post.
+# Letting a type promote them was a defect with teeth: ``call`` is the kind whose
+# legality is an equality against ``to_call``, so a big blind all-in for 4 in a
+# 5/10 game with the button calling 5 read as ILLEGAL unlabelled and LEGAL the
+# moment the button's row carried any type at all, and a ``dead_blind`` label on
+# that same call moved a chip out of the pot as well. The non-commitment kinds
+# are excluded for the same reason and cost nothing: they commit no chips.
+_FORCED_POST_CAPABLE_KINDS = _FORCED_POST_KINDS | {"all-in"}
 # Forced-bet names that identify an ANTE: money owed to the table by the seat
 # rather than wagered against an opponent, and the ONLY pool the declared ante
 # mode governs. ``dead_blind``, missed blinds and penalty posts are deliberately
@@ -442,10 +457,14 @@ def build_hand_ledger(
 
     THE SCOPE OF THAT REFUSAL, STATED HONESTLY.  It reaches a forced post the
     RECORDING IDENTIFIES as one -- by ``kind == "post_blind"``, or by a
-    ``forced_bet_type`` naming a live structural bet on a row booked under
-    another kind (see ``_is_live_structural_post``).  A recording that books a
-    short blind as a plain ``all-in`` and states no forced-bet type has said
-    nothing that distinguishes it from an ordinary short shove, and nothing here
+    ``forced_bet_type`` naming a live structural bet on a row booked as
+    ``all-in``, which is the only other kind a post can be written under (see
+    ``_is_live_structural_post`` and ``_FORCED_POST_CAPABLE_KINDS``).  A
+    ``bet``, ``call`` or ``raise`` carrying such a type is a contradictory
+    recording rather than a post: it is derived from its kind and refused, and
+    the refusal is what ``_mislabelled_forced_bet`` writes.  A recording that
+    books a short blind as a plain ``all-in`` and states no forced-bet type has
+    said nothing that distinguishes it from an ordinary short shove, and nothing here
     can tell them apart; such a hand still derives ``to_call`` from the observed
     maximum and is NOT refused.  The CV reconstruction spine emits exactly that
     shape for a seat whose stack reads zero, so this refusal does not cover
@@ -654,6 +673,20 @@ def build_hand_ledger(
         if action.kind == "all-in" and amount != stack_before:
             legality_issues.append(
                 f"{action_label}: all-in commits {amount}, but {stack_before} remains."
+            )
+        # Outside the ``structure_unreadable`` guard with the stack check above,
+        # and for the same reason: it reads no wager level, only the row's own
+        # two fields.
+        if _mislabelled_forced_bet(action):
+            legality_issues.append(
+                f"{action_label}: this row is booked as {action.kind!r} but "
+                f"typed as a {action.forced_bet_type!r} forced post. A "
+                f"{action.kind} is never a forced post, so the kind and the "
+                "forced-post type describe two different events -- chips the "
+                "seat chose to put in, or chips the room required -- and the "
+                "pot model will not choose which one the recording meant. It is "
+                f"derived as an ordinary {action.kind}. Either correct the "
+                "action kind or clear the forced post field in Edit actions."
             )
 
         if action.kind in _COMMITMENT_KINDS:
@@ -1114,6 +1147,29 @@ def blind_structure(
     )
 
 
+def _mislabelled_forced_bet(action: LedgerAction) -> bool:
+    """Whether this row names a forced bet its own kind says it cannot be.
+
+    Two operator-supplied facts that contradict each other. The hand editor
+    offers the "Forced post" selectbox on EVERY action row, so ``call`` typed
+    ``big_blind`` and ``fold`` typed ``ante`` are both one mis-click away, and an
+    importer can write the same pair.
+
+    The reducer derives such a row from its KIND, which is the strict direction
+    and is byte-identical to the row with the field cleared, and then refuses the
+    hand. It does not pick the other reading and it does not stay quiet: the two
+    readings are different events -- one is chips the seat chose to wager and the
+    other is chips the room required -- and on the dead types they give different
+    pots. Choosing between two operator-supplied facts is exactly what
+    ``_resolve_ante_mode`` refuses to do for the ante mode, for the same reason.
+    """
+
+    return (
+        action.forced_bet_type is not None
+        and action.kind not in _FORCED_POST_CAPABLE_KINDS
+    )
+
+
 def _is_forced_post(action: LedgerAction) -> bool:
     """Whether this commitment was posted under duress rather than chosen.
 
@@ -1121,9 +1177,20 @@ def _is_forced_post(action: LedgerAction) -> bool:
     about what the seat would have done -- and, for the ordering question below,
     they are the rows a recording may legitimately list in any order relative to
     one another.
+
+    THE KIND DECIDES, THE TYPE REFINES. ``forced_bet_type`` is read only on a
+    kind that could be a post in the first place (``_FORCED_POST_CAPABLE_KINDS``),
+    because a label is not allowed to turn a voluntary action into a forced one.
+    It was: any type at all on a ``call`` excused it from the preflop wager floor,
+    and a dead type on one moved its chips out of the live pool as well. See
+    ``_mislabelled_forced_bet``, which refuses the contradiction rather than
+    letting either reading win silently.
     """
 
-    return action.kind in _FORCED_POST_KINDS or action.forced_bet_type is not None
+    return action.kind in _FORCED_POST_KINDS or (
+        action.kind in _FORCED_POST_CAPABLE_KINDS
+        and action.forced_bet_type is not None
+    )
 
 
 def _is_ante_post(action: LedgerAction) -> bool:
@@ -1140,9 +1207,15 @@ def _is_ante_post(action: LedgerAction) -> bool:
 
     A row the recording says nothing about falls back to its kind, which is the
     only signal there is and is what every existing construction supplies.
+
+    The name is read only on a kind that could be a forced post at all, for the
+    reason ``_is_forced_post`` gives: a ``call`` typed ``ante`` is a contradictory
+    recording, not an ante, and reading the name there put chosen chips in the
+    ante pool and raised the undeclared-ante-mode refusal against a hand with no
+    antes in it.
     """
 
-    if action.kind not in _COMMITMENT_KINDS:
+    if action.kind not in _FORCED_POST_CAPABLE_KINDS:
         return False
     if action.forced_bet_type is not None:
         return action.forced_bet_type in _ANTE_FORCED_BET_TYPES
@@ -1258,9 +1331,13 @@ def _is_live_structural_post(action: LedgerAction) -> bool:
     as chosen live money.  ``ante`` is never structural whatever type is carried,
     because an ante sets no wager level -- that is what
     ``_LIVE_STRUCTURAL_FORCED_BETS`` exists to say.
+
+    Like every other reader of the name, this one asks the KIND first: a
+    ``bet``, ``call`` or ``raise`` answers a wager level and can never be the
+    thing that sets one, whatever type it carries.
     """
 
-    if action.kind not in _COMMITMENT_KINDS or action.kind == "ante":
+    if action.kind not in _FORCED_POST_CAPABLE_KINDS or action.kind == "ante":
         return False
     if action.forced_bet_type is not None:
         return (

@@ -12,6 +12,7 @@ from poker_tracker.persistence.completion import (
     dump_completion_evidence,
 )
 from poker_tracker.persistence.models import (
+    RELEASE_BLOCKING_ISSUE_TYPES,
     CoachingResponse,
     Hand,
     HandIssue,
@@ -102,12 +103,14 @@ def _manual_hand(**overrides: Any) -> Hand:
     return Hand(**values)
 
 
-def _issue(status: str = "open") -> HandIssue:
+def _issue(
+    status: str = "open", *, issue_types: list[str] | None = None
+) -> HandIssue:
     return HandIssue(
         id=3,
         hand_id=7,
         status=status,
-        issue_types=["pot_or_result"],
+        issue_types=issue_types or ["pot_or_result"],  # type: ignore[arg-type]
         description="Pot does not match the recording.",
         resolution_notes="" if status == "open" else "Fixed.",
     )
@@ -261,6 +264,87 @@ def test_evidence_missing_suppresses_the_duplicate_warning_blocker() -> None:
 
     assert readiness.has("COMPLETION_EVIDENCE_MISSING") is True
     assert readiness.has("UNRESOLVED_SOURCE_WARNING") is False
+
+
+def _issue_blocker(issue: HandIssue) -> Any:
+    readiness = _evaluate(_manual_hand(), hand_issues=(issue,))
+    return next(
+        blocker
+        for blocker in readiness.blockers
+        if blocker.code == "OPEN_DEBUGGING_ISSUE"
+    )
+
+
+@pytest.mark.parametrize("issue_type", sorted(RELEASE_BLOCKING_ISSUE_TYPES))
+def test_the_issue_blocker_discloses_the_regression_gate_it_will_hit(
+    issue_type: str,
+) -> None:
+    """Regression: the clearing action named half the precondition on closing.
+
+    ``resolve_hand_issue`` refuses a release-blocking category until a linked
+    regression has been observed failing before the fix and passing after it,
+    and no control creates one. The blocker said only "resolve each issue with
+    resolution notes", so following it produced a refusal naming a promotion the
+    product cannot perform. Parametrised over the set itself so a category added
+    to ``RELEASE_BLOCKING_ISSUE_TYPES`` cannot be enforced without also being
+    disclosed here.
+    """
+    blocker = _issue_blocker(_issue(issue_types=[issue_type]))
+
+    assert "regression" in blocker.clearing_action
+    assert "failing before the fix and passing after it" in blocker.clearing_action
+    assert "docs/RUNBOOKS.md section 12" in blocker.clearing_action
+    assert any("release-blocking" in item for item in blocker.detail)
+
+
+@pytest.mark.parametrize("issue_type", ["coaching", "other"])
+def test_a_non_blocking_category_is_not_told_it_needs_a_regression(
+    issue_type: str,
+) -> None:
+    """The two categories outside the set close on a note, and must not be scared off it."""
+    blocker = _issue_blocker(_issue(issue_types=[issue_type]))
+
+    assert "regression" not in blocker.clearing_action
+    assert blocker.detail == (f"#3: {issue_type}",)
+
+
+def test_an_issue_whose_categories_could_not_be_read_is_disclosed_as_gated() -> None:
+    """The writer gates an unreadable row too, so the blocker has to say so.
+
+    ``_regression_blocker`` treats a row whose ``issue_types`` could not be read
+    as release-blocking, on the ground that a degraded row may only ever add a
+    requirement. A blocker reading the salvaged ``other`` category alone would
+    promise a closure the writer refuses.
+    """
+    issue = _issue(issue_types=["other"]).model_copy(
+        update={"unreadable_columns": ("issue_types",)}
+    )
+    blocker = _issue_blocker(issue)
+
+    assert "regression" in blocker.clearing_action
+    assert any("categories unreadable" in item for item in blocker.detail)
+
+
+def test_a_mixed_issue_list_counts_only_the_gated_ones() -> None:
+    open_blocking = _issue(issue_types=["accounting"])
+    open_free = _issue(issue_types=["coaching"]).model_copy(update={"id": 4})
+    resolved_blocking = _issue(status="resolved", issue_types=["cards"]).model_copy(
+        update={"id": 5}
+    )
+    readiness = _evaluate(
+        _manual_hand(),
+        hand_issues=(open_blocking, open_free, resolved_blocking),
+    )
+    blocker = next(
+        b for b in readiness.blockers if b.code == "OPEN_DEBUGGING_ISSUE"
+    )
+
+    assert "2 unresolved debugging issue(s)" in blocker.reason
+    assert "1 of them falls in a release-blocking category" in blocker.clearing_action
+    assert blocker.detail == (
+        "#3: accounting — release-blocking; needs a proven regression to close",
+        "#4: coaching",
+    )
 
 
 # Every clearing action must name one of these, and every entry that names a

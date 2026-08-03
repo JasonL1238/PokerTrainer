@@ -952,8 +952,14 @@ def test_every_review_status_write_is_routed_through_the_guard() -> None:
     guard_end = source.index("\ndef ", guard_start + 1)
     assert "db.update_hand_status(" in source[guard_start:guard_end]
     # Every remaining promotion site must call the guard rather than the store.
-    assert source.count("guarded_update_hand_status(") >= 6
+    # The count is a floor on the guard's callers, not a target, and it went down
+    # when the three coaching surfaces stopped promoting individually: they now
+    # promote through one choke point that also refuses a response that failed
+    # its grounding check. What makes the routing total is the single
+    # ``db.update_hand_status`` asserted above, not how many callers there are.
+    assert source.count("guarded_update_hand_status(") >= 4
     assert "def approve_hand_for_study(" in source
+    assert "def save_hand_coaching(" in source
     assert "def load_study_session_hands(" in source
 
 

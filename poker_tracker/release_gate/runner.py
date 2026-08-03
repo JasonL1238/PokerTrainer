@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from poker_tracker.release_gate import certification as cert
 from poker_tracker.release_gate.environment import (
     collect_environment,
     ffmpeg_version,
@@ -20,6 +21,7 @@ from poker_tracker.release_gate.environment import (
 )
 from poker_tracker.release_gate.evaluate import evaluate_answer_key_against_timeline
 from poker_tracker.release_gate.models import (
+    MODEL_CANDIDATES,
     allowlist_violations,
     partially_pinned_cases,
     resolve_models,
@@ -51,6 +53,15 @@ PIPELINE_SCRIPT = (
 FULL_CASE_TIMEOUT_SECONDS = 3 * 60 * 60
 CONTAINER_TIMEOUT_SECONDS = 60 * 60
 DEFAULT_CONTAINER_IMAGE = "pokertrainer:release-gate"
+# Every model role a reconstruction runs. Pinning is complete only when all of
+# them are pinned, so the roles come from the same table the resolver uses.
+MODEL_ROLES = frozenset(MODEL_CANDIDATES)
+# The stage that performs the run, per mode.
+EXECUTION_STAGE_NAMES: dict[str, str] = {
+    "fixture": "fixture_eval",
+    "full": "full_video",
+    "container": "container",
+}
 
 
 @dataclass
@@ -131,6 +142,12 @@ def run_release_gate(
             "ok": False,
             "exit_code": EXIT_SETUP_INVALID,
             "mode": mode,
+            # Every report carries a certification block, including this one. A
+            # consumer that reads coverage off each report must find "covered
+            # nothing" here rather than a missing key it has to interpret.
+            "certification": cert.certification(
+                mode=mode, executed=[], measured=False
+            ),
             "issues": issues,
             "stages": stages,
             "environment": collect_environment(repo_root),
@@ -245,11 +262,7 @@ def run_release_gate(
 
     # --- Stage: mode-specific execution ---
     t1 = time.perf_counter()
-    stage_name = {
-        "fixture": "fixture_eval",
-        "full": "full_video",
-        "container": "container",
-    }[mode]
+    stage_name = EXECUTION_STAGE_NAMES[mode]
     try:
         if mode == "fixture":
             detail = _run_fixture_predictions(manifest_path)
@@ -314,7 +327,13 @@ def run_release_gate(
         # Present only when this run was launched by an outer container-mode run,
         # which uses it to prove the report it reads is the one it just caused.
         "run_token": os.environ.get("POKER_RELEASE_GATE_RUN_TOKEN") or None,
-        "certification": _certification(mode, aggregate),
+        # Derived from what the mode-specific stage reported doing, never from
+        # the mode that was requested.
+        "certification": cert.certification(
+            mode=mode,
+            executed=detail.get("executed"),
+            measured=bool(aggregate.get("measured")),
+        ),
         "manifest_path": _portable_path(manifest_path, repo_root),
         "manifest_sha256": (
             sha256_file(manifest_path) if manifest_path.is_file() else None
@@ -342,53 +361,6 @@ def run_release_gate(
         report=report,
         report_path=path,
     )
-
-
-def _certification(mode: str, aggregate: dict[str, Any]) -> dict[str, Any]:
-    """State in the report itself what this verdict does and does not cover.
-
-    ``fixture`` mode scores retained prediction timelines. It decodes no video,
-    loads no model, and cannot tell a timeline the pipeline produced from one a
-    person wrote by hand next to the answer key. That makes it a fast regression
-    check, not a release certification — and an ``ok: true`` fixture report is
-    otherwise indistinguishable from a real one at a glance.
-    """
-    certifying = mode in {"full", "container"}
-    covered = [
-        "answer-key and manifest schema integrity",
-        "hand-level scoring of whatever timelines were supplied",
-    ]
-    not_covered: list[str] = []
-    if not certifying:
-        not_covered.extend(
-            [
-                "video decoding, sampling, anchoring, and hand-boundary detection",
-                "model execution (no weights are loaded in fixture mode)",
-                "provenance of the scored timelines: retained inputs are trusted "
-                "as given and are not attributed to a pipeline run",
-            ]
-        )
-    else:
-        covered.extend(
-            [
-                "video decoding with the pinned weights",
-                "end-to-end reconstruction of each corpus recording",
-            ]
-        )
-    if not aggregate.get("measured"):
-        not_covered.append("accuracy: no hand was scored in this run")
-    return {
-        "release_certifying": certifying,
-        "mode": mode,
-        "summary": (
-            "Release-certifying run."
-            if certifying
-            else "NOT a release certification: fixture mode scores retained "
-            "timelines without decoding video or loading models."
-        ),
-        "covers": covered,
-        "does_not_cover": not_covered,
-    }
 
 
 def _aggregate_metrics(detail: dict[str, Any]) -> dict[str, Any]:
@@ -550,6 +522,9 @@ def _run_fixture_predictions(manifest_path: Path) -> dict[str, Any]:
         "cases_scored": scored,
         "cases_failed": failed,
         "cases": case_reports,
+        # Scoring is claimed only when a case was actually scored; a run that
+        # found no readable prediction performed no act at all.
+        "executed": [cert.SCORE_TIMELINES] if scored else [],
     }
 
 
@@ -627,6 +602,9 @@ def _run_full_reconstruction(
     artifact_dir.mkdir(parents=True, exist_ok=True)
     case_reports: list[dict[str, Any]] = []
     artifacts: list[str] = []
+    # Acts are accumulated from cases that actually got that far. A full-mode run
+    # that fails every case before decoding claims no decoding.
+    executed: set[str] = set()
     scored = 0
     failed = 0
     setup_invalid = False
@@ -684,6 +662,7 @@ def _run_full_reconstruction(
             classifier=resolved_models["card_classifier"]["path"],
         )
         elapsed = round(time.perf_counter() - started, 3)
+        executed.update(cert.normalize_acts(run.get("executed")))
         if not run["ok"]:
             case_reports.append(
                 {
@@ -701,6 +680,15 @@ def _run_full_reconstruction(
         artifacts.append(str(timeline_path))
         report = _score_case(manifest_path, case, timeline_path)
         report["recording"] = logical_name
+        # Which weights this case's timeline came out of, alongside the hashes of
+        # the timeline itself, so the score can be tied to what produced it.
+        report["models_used"] = {
+            role: {
+                "path": path,
+                "sha256": (resolved_models.get(role) or {}).get("sha256"),
+            }
+            for role, path in sorted((run.get("weights") or {}).items())
+        }
         # The window that was actually reconstructed, and where its bound came
         # from. A score covers the stretch of recording that was sampled, and a
         # reader cannot tell that from the hand counts alone.
@@ -712,6 +700,7 @@ def _run_full_reconstruction(
             case_reports.append(report)
             continue
         scored += 1
+        executed.add(cert.SCORE_TIMELINES)
         if not report.get("ok"):
             failed += 1
         case_reports.append(report)
@@ -724,6 +713,7 @@ def _run_full_reconstruction(
         "cases_failed": failed,
         "cases": case_reports,
         "artifacts": artifacts,
+        "executed": sorted(executed),
     }
 
 
@@ -790,10 +780,15 @@ def _run_pipeline_for_case(
         "--out",
         str(timeline_path),
     ]
+    # What actually goes on the command line, so the record of weights used is
+    # taken from the invocation rather than from what the caller resolved.
+    weights: dict[str, str] = {}
     if detector:
         command += ["--model1", str(repo_root / detector)]
+        weights["region_detector"] = str(detector)
     if classifier:
         command += ["--model2", str(repo_root / classifier)]
+        weights["card_classifier"] = str(classifier)
     try:
         completed = subprocess.run(
             command,
@@ -815,7 +810,14 @@ def _run_pipeline_for_case(
         }
     if not timeline_path.is_file():
         return {"ok": False, "error": "reconstruction produced no timeline"}
-    return {"ok": True, "error": None}
+    # A timeline out of a pipeline that exited cleanly is the evidence that this
+    # recording was decoded and reconstructed. Pinned-weight execution is claimed
+    # only when both roles were pinned on the command line: a role left off runs
+    # whatever default the script picks, which is not the pinned weights.
+    executed = [cert.DECODE_VIDEO, cert.RECONSTRUCT]
+    if len(weights) == len(MODEL_ROLES):
+        executed.append(cert.LOAD_WEIGHTS)
+    return {"ok": True, "error": None, "executed": executed, "weights": weights}
 
 
 def _run_container_acceptance(
@@ -830,6 +832,12 @@ def _run_container_acceptance(
     The point is that the container and the host reach the same verdict, so this
     executes the gate itself in the image and compares exit codes rather than
     reimplementing any checks.
+
+    What runs inside is the FIXTURE gate: the image is built without the corpus
+    vault and is given the manifest directory alone, so it decodes no video and
+    loads no weights. The acts this returns therefore come from the inner
+    report, and a container run does not certify a release on its own -- it
+    certifies that the image reproduces the host's fixture verdict.
     """
     docker = _docker_available()
     if docker is not None:
@@ -958,6 +966,27 @@ def _run_container_acceptance(
         )
         return detail
     detail["cases"] = _container_case_reports(inner)
+    detail["inner_mode"] = inner.get("mode")
+    # The acts this run performed are the acts the inner gate performed, plus the
+    # fact that the image ran the gate at all. They are read from the inner
+    # report -- which the token above proves this run caused -- rather than
+    # assumed from the mode this function asked for, because what the outer run
+    # requests and what the image executes are two different things.
+    inner_certification = inner.get("certification")
+    inner_acts = set(
+        cert.normalize_acts(
+            inner_certification.get("executed")
+            if isinstance(inner_certification, dict)
+            else None
+        )
+    )
+    if any(int(case.get("hands_scored") or 0) > 0 for case in detail["cases"]):
+        # Scored hands in the inner case reports are evidence of scoring in their
+        # own right, and an image built from an older gate carries no act record
+        # at all. Reading it from the reports keeps that image's coverage honest
+        # in both directions.
+        inner_acts.add(cert.SCORE_TIMELINES)
+    detail["executed"] = [cert.RUN_IN_IMAGE, *sorted(inner_acts)]
     detail["cases_scored"] = int(
         (inner.get("aggregate") or {}).get("cases_scored") or 0
     )
@@ -973,11 +1002,21 @@ def _run_container_acceptance(
 
 
 def _container_case_reports(inner: dict[str, Any]) -> list[dict[str, Any]]:
+    """The inner run's per-case reports, found by the mode the inner run says it ran.
+
+    Looking only under ``fixture_eval`` would silently return nothing if the gate
+    inside the image ever ran a different mode, and no cases reads downstream as
+    a run with nothing to score rather than as a report this code failed to read.
+    """
+    wanted = EXECUTION_STAGE_NAMES.get(str(inner.get("mode")))
+    names = {wanted} if wanted else set(EXECUTION_STAGE_NAMES.values())
     for stage in inner.get("stages") or []:
-        if isinstance(stage, dict) and stage.get("name") == "fixture_eval":
-            cases = (stage.get("detail") or {}).get("cases")
-            if isinstance(cases, list):
-                return [case for case in cases if isinstance(case, dict)]
+        if not isinstance(stage, dict) or stage.get("name") not in names:
+            continue
+        detail = stage.get("detail")
+        cases = detail.get("cases") if isinstance(detail, dict) else None
+        if isinstance(cases, list):
+            return [case for case in cases if isinstance(case, dict)]
     return []
 
 

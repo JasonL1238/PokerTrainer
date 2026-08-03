@@ -109,6 +109,7 @@ from poker_tracker.persistence.import_export import export_hand, export_session,
 from poker_tracker.persistence.models import (
     HAND_TAGS,
     Action,
+    CoachingResponse,
     Hand,
     HandIssue,
     HandPlayer,
@@ -663,6 +664,44 @@ def guarded_update_hand_status(
             st.error(str(exc))
         return False
     return True
+
+
+def save_hand_coaching(
+    db: PokerDatabase,
+    hand: Hand,
+    readiness: StudyReadiness,
+    response: CoachingResponse,
+    *,
+    label: str,
+) -> CoachingResponse:
+    """Persist one hand's coaching and promote the hand only if the answer earned it.
+
+    Three separate surfaces generate hand coaching and all three promote the hand
+    in the same breath, so "was this answer checked against the prompt that
+    produced it?" has to be asked in one place or the fourth surface will not ask
+    it at all. ``build_coaching_response`` decides the answer; this decides what
+    the decision means for the hand.
+
+    A rejected answer is kept and shown -- it was paid for, and the operator
+    cannot judge a rejection they cannot read -- but it is not what marks a hand
+    studied. The wording says the review was rejected rather than that the hand
+    was not ready, because those are different problems with different fixes.
+    """
+    saved = db.create_coaching_response(response)
+    if saved.is_stale:
+        flash(
+            f"Saved {label} #{saved.id} as retained history, not current analysis. "
+            f"{saved.stale_reason} Review status unchanged."
+        )
+        return saved
+    if readiness.is_ready and guarded_update_hand_status(db, hand, readiness, "reviewed"):
+        flash(f"Saved {label} #{saved.id}.")
+    else:
+        flash(
+            f"Saved {label} #{saved.id}. Review status unchanged: this hand is "
+            "not study-ready."
+        )
+    return saved
 
 
 def review_status_options(hand: Hand, readiness: StudyReadiness) -> tuple[list[str], int]:
@@ -3852,7 +3891,12 @@ def show_study_coach_review(
                 raw_response = provider.generate_hand_review(prompt)
             if solver_evidence is not None:
                 validate_solver_coaching_response(raw_response, solver_evidence)
-            saved = db.create_coaching_response(
+            # The coaching is kept either way; only the promotion is gated. flash()
+            # is used so the outcome survives the rerun below.
+            save_hand_coaching(
+                db,
+                hand,
+                readiness,
                 build_coaching_response(
                     provider=provider,
                     prompt=prompt,
@@ -3860,19 +3904,9 @@ def show_study_coach_review(
                     review_type="hand",
                     hand_id=hand.id,
                     session_id=session.id,
-                )
+                ),
+                label="corrected-hand coaching review",
             )
-            # The coaching is kept either way; only the promotion is gated. flash()
-            # is used so the outcome survives the rerun below.
-            if readiness.is_ready and guarded_update_hand_status(
-                db, hand, readiness, "reviewed"
-            ):
-                flash(f"Saved current coaching review #{saved.id}.")
-            else:
-                flash(
-                    f"Saved coaching review #{saved.id}. Review status unchanged: "
-                    "this hand is not study-ready."
-                )
             st.rerun()
         except (LLMProviderError, ValueError) as exc:
             st.error(f"Could not generate coaching: {exc}")
@@ -4347,7 +4381,11 @@ def _show_solver_runs(
             with st.spinner("Explaining saved solver evidence..."):
                 raw_response = provider.generate_hand_review(prompt)
             validate_solver_coaching_response(raw_response, evidence)
-            saved = db.create_coaching_response(
+            # The explanation is kept either way; only the promotion is gated.
+            save_hand_coaching(
+                db,
+                hand,
+                readiness,
                 build_coaching_response(
                     provider=provider,
                     prompt=prompt,
@@ -4355,18 +4393,9 @@ def _show_solver_runs(
                     review_type="hand",
                     hand_id=hand.id,
                     session_id=session.id,
-                )
+                ),
+                label="solver-grounded coaching review",
             )
-            # The explanation is kept either way; only the promotion is gated.
-            if readiness.is_ready and guarded_update_hand_status(
-                db, hand, readiness, "reviewed"
-            ):
-                flash(f"Saved solver-grounded coaching review #{saved.id}.")
-            else:
-                flash(
-                    f"Saved solver-grounded coaching review #{saved.id}. Review status "
-                    "unchanged: this hand is not study-ready."
-                )
             st.rerun()
         except (LLMProviderError, ValueError) as exc:
             st.error(f"Could not explain solver result: {exc}")
@@ -9479,7 +9508,11 @@ def show_hand_coach_review(
         try:
             with st.spinner("Generating hand review..."):
                 raw_response = provider.generate_hand_review(prompt)
-            saved = db.create_coaching_response(
+            # The review is kept either way; only the promotion is gated.
+            save_hand_coaching(
+                db,
+                hand,
+                readiness,
                 build_coaching_response(
                     provider=provider,
                     prompt=prompt,
@@ -9487,18 +9520,9 @@ def show_hand_coach_review(
                     review_type="hand",
                     hand_id=hand.id,
                     session_id=session.id,
-                )
+                ),
+                label="provider review",
             )
-            # The review is kept either way; only the promotion is gated.
-            if readiness.is_ready and guarded_update_hand_status(
-                db, hand, readiness, "reviewed"
-            ):
-                flash(f"Saved provider review #{saved.id}.")
-            else:
-                flash(
-                    f"Saved provider review #{saved.id}. Review status unchanged: "
-                    "this hand is not study-ready."
-                )
             st.rerun()
         except (LLMProviderError, ValueError) as exc:
             st.error(f"Could not generate review: {exc}")
@@ -9574,7 +9598,13 @@ def show_session_coach_review(
                     session_id=session.id,
                 )
             )
-            flash(f"Saved provider session review #{saved.id}.")
+            if saved.is_stale:
+                flash(
+                    f"Saved provider session review #{saved.id} as retained "
+                    f"history, not current analysis. {saved.stale_reason}"
+                )
+            else:
+                flash(f"Saved provider session review #{saved.id}.")
             st.rerun()
         except (LLMProviderError, ValueError) as exc:
             st.error(f"Could not generate session review: {exc}")
@@ -9651,11 +9681,24 @@ def show_saved_provider_reviews(reviews) -> None:
 
 
 def show_prompt_safety(prompt: str) -> None:
+    """Say which half was checked.
+
+    This green sits directly above the button that generates and stores a review,
+    and it used to read "Prompt safety check passed" without ever saying that the
+    subject was the outgoing prompt. An operator reads a green above an answer as
+    a verdict on the answer. The answer is checked too, but only after the
+    provider has replied and only at the point it is stored, so nothing here can
+    be reporting on it yet.
+    """
     result = validate_post_session_prompt(prompt)
     if result.is_safe:
-        st.success("Prompt safety check passed: post-session review only.")
+        st.success(
+            "Outgoing prompt checked: post-session review only. This says nothing "
+            "about the provider's answer, which is checked against this prompt "
+            "when it is saved."
+        )
     else:
-        st.error("Prompt safety check failed: " + "; ".join(result.errors))
+        st.error("Outgoing prompt check failed: " + "; ".join(result.errors))
 
 
 def _accounting_is_established(

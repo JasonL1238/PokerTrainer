@@ -323,12 +323,32 @@ than on the pair. `ACCOUNTING_ASSUMPTION_DEPENDENT` is scoped by
 `requires_user_confirmation`, which delegates to it. See "Who must attest".
 
 **A blocker never names an action the product cannot perform.** This is a
-standing rule, not an aspiration, and it has been violated in at least four
+standing rule, not an aspiration, and it has been violated in at least five
 distinct ways over the fifteen rounds — a named panel that is not drawn, a
 deletion no control performed, a re-import that appends instead of replacing, a
-discard writer that did not exist. Every clearing action must name a control that
-exists on a page the operator can reach, and adding a blocker means checking
-that.
+discard writer that did not exist, and a promotion no control performs. Every
+clearing action must name a control that exists on a page the operator can reach,
+and adding a blocker means checking that.
+
+The fifth is the one that shows why the existing guard is not sufficient.
+`test_every_control_a_clearing_action_names_exists_in_the_app` proves the named
+control is *drawn*; it cannot prove the writer behind it will accept the
+submission. `OPEN_DEBUGGING_ISSUE` named the Saved debugging issue queue — which
+is drawn, and which the test passed on — while `resolve_hand_issue` refuses
+seven of the nine offered categories until a linked regression has been observed
+both failing before the fix and passing after it, and nothing in the app creates
+one. The blocker now discloses that requirement per issue and points at
+`docs/RUNBOOKS.md` §12, and
+`tests/test_issue_blocker_matches_the_resolution_gate.py` asserts the
+equivalence — the blocker discloses the gate exactly when the writer applies
+it — for every category the flagging control offers.
+
+**Still open (round 5, B2).** Disclosure is not a remedy. `promote_issue_to
+_regression` has no production caller, so the only way to close a release-blocking
+issue remains a Python REPL, and until that is a control the honest clearing
+action names a runbook rather than a button. Whether to surface the promotion —
+and if so, how much of the fail-before/pass-after evidence an operator can
+legitimately record from the UI — is a product ruling, not a defect repair.
 
 ### Assumption-dependent reconciliation
 
@@ -508,29 +528,38 @@ reconciled**, and that is the ruling rather than a side effect. Every stored han
 containing an ante reads `ante_mode IS NULL`, which is ambiguous rather than
 defaulted, so it gains one legality issue naming the anteing seats, `is_legal`
 goes False, `persist_reconciliation` writes `needs_correction`, and study
-readiness blocks on `ACCOUNTING_NOT_AUTHORITATIVE`. No row is rewritten and no
-chip figure moves: the layers published beside the refusal are the capped
-(PER_PLAYER) reading, which is the strict direction and byte-for-byte what the
-product derived before the column existed. The clearing action is one ordinary
-settlement save. **Hands with no ante rows are never asked for a declaration** —
+readiness blocks on `ACCOUNTING_NOT_AUTHORITATIVE`. No row is rewritten: the
+layers published beside the refusal are the capped (PER_PLAYER) reading, which
+is the strict direction and byte-for-byte what the reducer produced immediately
+before the column existed. Its chip figures do move against the *first*
+schema-19 build, because an ante is dead money and the amended cap below reaches
+it; that is what the staling in the next paragraph is for. The clearing action
+is one ordinary settlement save. **Hands with no ante rows are never asked for a declaration** —
 `NONE` is not a guess for them, so the absent declaration resolves silently.
 Count what will block with `SELECT COUNT(DISTINCT hand_id) FROM actions WHERE
 action_type = 'ante' OR forced_bet_type IN ('ante','big_blind_ante')`.
-**v20 reaches a second population, for a different reason, and this one does
-move chips.** Ruling 5 ships in the same release and caps operator-typed
-external dead money against each collecting seat's own commitment; a stored hand
-whose declared amount exceeds the smallest commitment contesting the main pot
-keeps its gross, its pot count and its eligible sets while the distribution — and
-therefore the hero result — changes, so no existing cross-check can see it. Such
-a hand may contain no ante and asks for no declaration. The new figure is the
-correct one, so the migration does not touch the settlement, the awards or
-`review_status`; what it does is mark the coaching and solver output retained
-beside those hands stale, because that analysis was written against a result
-this build no longer produces and `is_stale` is a stored flag that a change in
-the derivation rule otherwise never sets. Study readiness then blocks on
-`STALE_COACHING_EVIDENCE`. The predicate is `dead_money > 0`, deliberately
-over-strict because a schema migration cannot run the reducer to find the floor;
-count it with `SELECT COUNT(*) FROM hand_settlements WHERE dead_money > 0`. A
+**v20 reaches a second, wider population, for a different reason, and this one
+does move chips.** The amended cap ships in the same release and caps dead money
+against each collecting seat's own total commitment. Dead money reaches a hand
+two ways and both are in scope: RECORDED in the action line (an ante, a dead or
+missed blind, a penalty post) and DECLARED externally in
+`hand_settlements.dead_money`. A stored hand where a dead contribution exceeds
+the smallest commitment contesting the layer it sits in keeps its gross, its pot
+count and its eligible sets while the distribution — and therefore the hero
+result — changes, so no existing cross-check can see it. Such a hand may contain
+no ante and asks for no declaration. The new figure is the correct one, so the
+migration does not touch the settlement, the awards or `review_status`; what it
+does is mark the coaching and solver output retained beside those hands stale,
+because that analysis was written against a result this build no longer produces
+and `is_stale` is a stored flag that a change in the derivation rule otherwise
+never sets. Study readiness then blocks on `STALE_COACHING_EVIDENCE`. The
+predicate is "this hand holds dead money", deliberately over-strict because a
+schema migration cannot run the reducer to find the floor; it is the `_affected`
+union in `_migrate_to_v20`, and it excludes the small blind, big blind, straddle
+and bring-in that are live money, so an ordinary cash-game hand is not swept in.
+Keying it on `dead_money > 0` alone was a release blocker of its own: that column
+is the declared external amount, so a hand whose dead money was entirely recorded
+republished a changed hero result under coaching written about the old one. A
 hand in neither population is untouched in every respect.
 JSON export is at **version 6** and imports accept 1
 through 6.
@@ -695,6 +724,16 @@ The other standing rules in this area:
   `tests/test_accounting_pot_layering_model.py`, and the history is in
   `cv_lab/notes/17_release_adversarial_rounds.md`. The honest verdict on the
   module is still not-yet-caught rather than correct.
+- **A forced-bet label refines a post; it cannot create one.** What makes a
+  commitment forced is its action kind — `ante`, `post_blind`, or the `all-in` a
+  post that took its poster's last chip is booked under. `forced_bet_type` says
+  which of those it is. Reading the label on any kind was a release blocker: a
+  `call` carrying any label at all was exempted from the preflop wager floor, so
+  declared blinds 5/10 with the big blind all-in for 4 and the button calling 5
+  reported the call illegal unlabelled and legal the moment the row carried a
+  label, and a `dead_blind` label on that call moved a chip out of the pot as
+  well. A label on a kind that cannot be a post is now derived from the kind and
+  reported as a legality issue rather than resolved in either direction.
 - **WHICH dead chips that cap governs is a DECLARED input, never inferred.** The
   ante mode (`hand_settlements.ante_mode`) is one of `NONE`, `PER_PLAYER` or
   `SINGLE_PAYER_TABLE_ANTE`. Under `PER_PLAYER` every ante is capped, which is
@@ -1125,6 +1164,21 @@ The release report must include:
 - skipped/unavailable checks;
 - generated artifact paths;
 - adversarial-round summaries when present.
+
+**A durable report cannot currently be tied to the run that produced it (round
+5, A2-6).** `write_report` always targets the fixed path
+`<report-dir>/release_gate_report.json`, and it is called outside any `try` in
+`run_release_gate`, so a report directory that has become unwritable lets the
+exception escape `main()`, exits `1`, and leaves the **previous** run's verdict
+— possibly `ok: true, exit_code: 0` — sitting at the path a CI step reads next.
+The report body is deliberately stripped of everything that varies between two
+identical verdicts so that `diff` shows verdict changes only, which is the right
+trade for comparison and the wrong one for provenance: it carries no timestamp
+and no run identity, and `environment.commit` distinguishes two runs only when
+the commit moved. The container path was hardened against exactly this with a
+fresh directory and a `run_token`; the host path has neither. Until it does,
+treat the report as evidence only when the run that wrote it exited cleanly in
+the same invocation.
 
 Exit codes:
 
@@ -1777,10 +1831,14 @@ half is unresolved.
 
 ## Phase 9 — Finish and certify coaching
 
-**Status: grounding implemented; live-provider evaluation not run.** Responses
-are now checked against the prompt that produced them, so an invented card or a
-solver-shaped frequency with no retained solver evidence is caught. Provider
-retention, fail-closed behavior and staleness were already present. The opt-in
+**Status: grounding implemented and enforced; live-provider evaluation not run.**
+Every response is checked against the prompt that produced it at the one
+constructor that turns provider text into a persistable row, so an invented card
+or a solver-shaped frequency with no retained solver evidence is caught on the
+path that stores it, not only in the offline eval. A response that fails is
+retained and rendered with its reason but stored stale, so it is never shown as
+current analysis and never promotes a hand to reviewed. Provider retention,
+fail-closed behavior and staleness were already present. The opt-in
 live-provider smoke test is not part of any automated run.
 
 
@@ -2024,11 +2082,29 @@ What landed:
 - **Recovery has an execution, not only a definition.**
   `python -m poker_tracker.maintenance.recovery` restores a chosen snapshot in
   isolation, refuses to target the live root, and verifies what recovery has to
-  mean: schema, foreign keys, counts against the inventory, issue evidence, one
-  completed hand read *through the application* rather than by raw select, and
-  which artifacts are missing — reported as `PARTIAL RECOVERY` with each file
-  named, not as a warning. Its refusal to run is exit 2 and means nothing was
-  checked. The procedure is in `docs/RUNBOOKS.md`.
+  mean: schema, foreign keys, issue evidence, one completed hand read *through
+  the application* rather than by raw select, and which artifacts are missing —
+  reported as `PARTIAL RECOVERY` with each file named, not as a warning. Its
+  refusal to run is exit 2 and means nothing was checked. The procedure is in
+  `docs/RUNBOOKS.md`.
+
+**The completeness comparison is inert (round 5, A2-3).** This document and the
+README both described the drill as verifying "counts against the inventory".
+`_history_checks` is written to do that, but `build_inventory` writes no `counts`
+block, so `inventory.counts` is empty on every inventory the product has ever
+produced: the comparison iterates nothing, and the drill's own
+`backup_inventory` check downgrades to a warning reading "artifact references are
+verified; totals are self-reported". The counts the drill prints are read back
+out of the restored database and compared with nothing. The one loss it can still
+catch is total emptiness, which `_history_checks` fails on explicitly.
+
+That also inverts the verdict against the evidence: a snapshot with **no**
+inventory fails `backup_inventory` and exits 1 as `UNVERIFIED`, while a snapshot
+**with** an inventory passes to `RECOVERED` and exit 0 on a warning — so keeping
+the completeness reference produces the weaker verdict. Until either
+`build_inventory` records the counts or the absent comparison routes through the
+existing `unverified` path, a `RECOVERED` verdict means "it restored and reads
+back", not "the complete history came back".
 
 **What has not happened.** The drill has only ever been run against synthetic
 histories — fixtures this suite built. No real operator database has been backed
@@ -2587,6 +2663,36 @@ clean-round counter is 0 of the required 2.**
 
 The findings themselves are recorded in
 `cv_lab/notes/17_release_adversarial_rounds.md`.
+
+### The coverage pass on `bc597c5`, and what it leaves unexamined
+
+The last round was re-run against the frozen tree at `bc597c5` with a different
+mandate: cover the half of the product the accounting-focused rounds had left
+alone. It found a critical and four highs, none of them in the pot model —
+coaching responses stored and rendered with no runtime grounding check under a
+green *prompt* safety banner; a v20 staling predicate keyed on the declared
+external dead-money column while the rule change reaches recorded dead posts
+too; a `forced_bet_type` on a `call` row exempting it from the legality check
+that reads `to_call`; container-mode certification derived from the mode string
+rather than from what executed; and retention deleting live CV timelines it has
+no reference source for. All five were independently reproduced.
+
+**Two surfaces have still never been adversarially examined, and one of them
+decides releases.** `poker_tracker/release_gate/evaluate.py` — `_score_hand`,
+the per-fact comparison, the hand matching and merge logic, and the completion
+confusion matrix — has been read for its fail-closed entry branches and nothing
+else. It is the engine that decides whether the CV pipeline is accurate enough
+to ship, so an over-crediting scoring rule there produces a green certification
+over a bad pipeline with nothing downstream to contradict it, and the round that
+proved the certification *wrapper* overclaims never touched the scorer inside
+it. `poker_tracker/persistence/backup.py` — four independent five-slot
+rotations, `_rotate`, `classify_snapshot`, `_remove_sidecars`, `_remove_inventory`
+and `backups_dir_for` — has been read and not attacked, and two independent
+analysts in the same round read its snapshot routing two different ways.
+
+Both must be assigned explicitly before a round is allowed to count. A clean
+verdict over an unattacked scoring engine would repeat the failure that produced
+this table, in a corner nobody was looking at.
 
 **This is the counter the release stopping rule reads.** Phase 1 ran its own
 fifteen-round, phase-scoped series (`cv_lab/notes/16_phase1_adversarial_rounds.md`),

@@ -37,6 +37,45 @@ POST_SESSION_SAFETY = (
     "live table capture, poker-client overlays, hotkeys, or capture guidance."
 )
 
+# The heading this module writes above the solver block, and the body it writes
+# when there is no run to describe.
+SOLVER_EVIDENCE_HEADING = "Solver evidence:"
+NO_SOLVER_EVIDENCE = "- none provided"
+
+
+def retained_solver_evidence(prompt: str) -> str | None:
+    """Recover the solver block a prompt actually carried, or None if it carried none.
+
+    A saved response has to stay checkable long after the run behind it was
+    deleted or superseded, and the prompt is the one record that is certainly the
+    response's own. Reading the evidence back out of the prompt is also what stops
+    a checker from being handed evidence the model was never shown: there is no
+    parameter to pass the wrong thing to.
+
+    The last heading wins. Hero notes travel into the prompt inside the hand
+    history, so an operator could write this heading there; the block this module
+    appends is always the later one.
+    """
+    lines = prompt.splitlines()
+    start = next(
+        (
+            index
+            for index in range(len(lines) - 1, -1, -1)
+            if lines[index] == SOLVER_EVIDENCE_HEADING
+        ),
+        None,
+    )
+    if start is None:
+        return None
+    block: list[str] = []
+    for line in lines[start + 1 :]:
+        if not line.startswith("- "):
+            break
+        block.append(line)
+    if not block or block == [NO_SOLVER_EVIDENCE]:
+        return None
+    return "\n".join(block)
+
 
 def build_hand_review_prompt(
     session: Session,

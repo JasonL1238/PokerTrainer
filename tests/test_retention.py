@@ -350,6 +350,199 @@ def test_an_orphan_video_does_not_claim_to_have_been_unused(workspace):
     assert "does NOT mean it has been unused" in entry.reason
 
 
+# --- A file the product expects is not an orphan ----------------------------
+#
+# Two artifact classes are addressed by convention rather than by a column, so
+# `referenced_artifact_paths` cannot see either and retention expired both.
+
+
+def _completed_cv_job(db) -> int:
+    """A completed reconstruction job, exactly as a finished worker leaves one."""
+    video = db._execute(
+        "INSERT INTO videos (session_id, original_filename, stored_path,"
+        " file_size_bytes, content_sha256, uploaded_at, notes)"
+        " VALUES (NULL, 'rec.mov', '/nonexistent/rec.mov', 1, '',"
+        " '2026-01-01T00:00:00Z', '')"
+    ).lastrowid
+    job_id = db._execute(
+        "INSERT INTO processing_jobs (video_id, job_type, status,"
+        " progress_percent, message, error_message, created_at)"
+        " VALUES (?, 'cv_reconstruction', 'completed', 100, '', '',"
+        " '2026-01-01T00:00:00Z')",
+        (video,),
+    ).lastrowid
+    db._commit()
+    return int(job_id)
+
+
+def _write_timeline(paths, job_id: int, *, age_days: float, images=()) -> Path:
+    """Write a job's timeline naming ``images``, as the pipeline does."""
+    payload = {
+        "hands": [],
+        "states": [
+            {"state_index": index, "time_s": float(index), "image": str(image)}
+            for index, image in enumerate(images)
+        ],
+    }
+    path = paths["cv_timelines"] / f"job_{job_id}_timeline.json"
+    return _write(path, age_days=age_days, content=json.dumps(payload).encode())
+
+
+def test_a_completed_jobs_timeline_is_never_offered_however_old(workspace):
+    """A timeline nothing can rebuild must outlive its retention window.
+
+    No column names a timeline, so the reference check called it an orphan from
+    the moment it was written. Nothing in the product deletes a `processing_jobs`
+    row, so a deleted timeline leaves the completed job expecting a file that can
+    never come back: every remaining validated-hand import for it is blocked and
+    the recovery drill reports PARTIAL forever on a healthy machine.
+    """
+    db, paths = workspace
+    job_id = _completed_cv_job(db)
+    timeline = _write_timeline(paths, job_id, age_days=3000)
+
+    audit = _audit(db, paths)
+    entry = next(f for f in audit.files if f.path == timeline)
+    assert entry.referenced is True
+    assert entry.deletable is False
+
+    apply_retention(audit, confirm=True)
+    assert timeline.is_file()
+
+
+def test_purging_now_still_keeps_a_completed_jobs_timeline(workspace):
+    """--purge-now waives windows, never the reference rule."""
+    db, paths = workspace
+    job_id = _completed_cv_job(db)
+    timeline = _write_timeline(paths, job_id, age_days=0)
+
+    audit = _audit(db, paths, purge_immediately=True)
+    entry = next(f for f in audit.files if f.path == timeline)
+    assert entry.deletable is False
+    apply_retention(audit, confirm=True)
+    assert timeline.is_file()
+
+
+def test_retention_protects_the_timelines_the_inventory_records(workspace):
+    """Retention and the snapshot inventory must name the same file for a job.
+
+    Two definitions of where a job's timeline lives is how one component protects
+    a path the other never looks at.
+    """
+    from poker_tracker.persistence import backup_inventory
+
+    db, paths = workspace
+    job_id = _completed_cv_job(db)
+    _write_timeline(paths, job_id, age_days=3000)
+
+    expected = backup_inventory.timeline_paths(
+        db._connection, backup_inventory.timeline_dir_for(paths["data"])
+    )
+    assert expected  # the fixture really did produce a completed job
+    audit = _audit(db, paths)
+    for stored in expected:
+        entry = next(f for f in audit.files if f.path == Path(stored))
+        assert entry.referenced is True, stored
+
+
+def test_a_frame_the_timeline_still_names_is_not_an_orphan(workspace):
+    """The frames waiting for review were exactly the ones age expired.
+
+    A reconstructed frame acquires a column reference only when the operator
+    reviews it, so asking the columns alone deleted precisely the evidence the
+    remaining hands still have to be validated against -- and the loss is silent:
+    nothing that reads the timeline afterwards can say the frame ever existed.
+    """
+    db, paths = workspace
+    job_id = _completed_cv_job(db)
+    frame = _write(paths["frames"] / f"cv_job_{job_id}" / "t000012.00.jpg", age_days=400)
+    _write_timeline(paths, job_id, age_days=400, images=[frame.resolve()])
+
+    audit = _audit(db, paths)
+    entry = next(f for f in audit.files if f.path == frame)
+    assert entry.referenced is True
+    assert entry.deletable is False
+
+    apply_retention(audit, confirm=True)
+    assert frame.is_file()
+
+
+def test_a_frame_no_timeline_names_is_still_expirable(workspace):
+    """The protection is what the timeline names, not the directory it sits in.
+
+    The pipeline deletes every sampled frame no state kept, so a leftover in a
+    job's frame directory is genuinely disposable. Protecting the whole directory
+    would quietly turn the largest retention category off.
+    """
+    db, paths = workspace
+    job_id = _completed_cv_job(db)
+    kept = _write(paths["frames"] / f"cv_job_{job_id}" / "kept.jpg", age_days=400)
+    stale = _write(paths["frames"] / f"cv_job_{job_id}" / "stale.jpg", age_days=400)
+    _write_timeline(paths, job_id, age_days=400, images=[kept.resolve()])
+
+    audit = _audit(db, paths)
+    assert next(f for f in audit.files if f.path == kept).deletable is False
+    assert next(f for f in audit.files if f.path == stale).deletable is True
+
+
+def test_a_timeline_that_will_not_parse_holds_the_whole_sweep_back(workspace):
+    """An unreadable reference source is not a source that names nothing.
+
+    A timeline that will not parse still named frames; nothing can say which, so
+    offering any of them would be a deletion no one can prove is safe.
+    """
+    db, paths = workspace
+    job_id = _completed_cv_job(db)
+    timeline = _write(
+        paths["cv_timelines"] / f"job_{job_id}_timeline.json",
+        age_days=400,
+        content=b"{ this is not json",
+    )
+    frame = _write(paths["frames"] / f"cv_job_{job_id}" / "t0.jpg", age_days=400)
+
+    audit = _audit(db, paths)
+    assert audit.unreadable_references
+    assert any(str(timeline) in item for item in audit.unreadable_references)
+    assert audit.deletable == []
+    assert next(f for f in audit.files if f.path == frame).deletable is False
+
+    outcome = apply_retention(audit, confirm=True)
+    assert outcome.removed == []
+    assert frame.is_file()
+
+
+def test_a_timeline_that_does_not_decode_is_unreadable_not_empty(workspace):
+    """Bytes that are not UTF-8 must hold the sweep back, not crash the audit."""
+    db, paths = workspace
+    job_id = _completed_cv_job(db)
+    _write(
+        paths["cv_timelines"] / f"job_{job_id}_timeline.json",
+        age_days=400,
+        content=b"\xff\xfe not utf-8 at all",
+    )
+    _write(paths["frames"] / f"cv_job_{job_id}" / "t0.jpg", age_days=400)
+
+    audit = _audit(db, paths)
+    assert audit.unreadable_references
+    assert audit.deletable == []
+
+
+def test_a_timeline_without_a_states_list_is_unreadable_not_empty(workspace):
+    """"No states key" and "no frames" must never produce the same answer."""
+    db, paths = workspace
+    job_id = _completed_cv_job(db)
+    _write(
+        paths["cv_timelines"] / f"job_{job_id}_timeline.json",
+        age_days=400,
+        content=json.dumps({"hands": []}).encode(),
+    )
+    _write(paths["frames"] / f"cv_job_{job_id}" / "t0.jpg", age_days=400)
+
+    audit = _audit(db, paths)
+    assert audit.unreadable_references
+    assert audit.deletable == []
+
+
 # --- B-2: a path is a file, not a string -----------------------------------
 
 

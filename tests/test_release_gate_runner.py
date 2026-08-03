@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from poker_tracker.release_gate import certification as cert
+from poker_tracker.release_gate import runner as gate_runner
 from poker_tracker.release_gate.evaluate import FACT_SEVERITY
 from poker_tracker.release_gate.models import (
     allowlist_violations,
@@ -487,6 +489,204 @@ def test_report_carries_no_absolute_host_paths(release_corpus, tmp_path: Path):
     stage = next(s for s in body["stages"] if s["name"] == "fixture_eval")
     for case in stage["detail"]["cases"]:
         assert not case["prediction_path"].startswith("/")
+
+
+# --- Certification is computed from what ran, not from what was asked for ----
+
+
+class _DockerCompleted:
+    """The shape ``subprocess.run`` returns for the ``docker run`` call."""
+
+    def __init__(self, returncode: int) -> None:
+        self.returncode = returncode
+        self.stdout = ""
+        self.stderr = ""
+
+
+@pytest.fixture
+def fake_container(monkeypatch):
+    """Run the gate the image would run, in-process, from the real docker argv.
+
+    The container is stubbed but the inner run is not: the manifest, the mode and
+    the report directory are read off the command line this code builds, and the
+    inner report is produced by the same gate. So what the image executed is
+    whatever the argv says, which is the thing under test.
+    """
+
+    def install(manifest: Path) -> list[list[str]]:
+        commands: list[list[str]] = []
+        real_run = gate_runner.subprocess.run
+        monkeypatch.setattr(gate_runner, "_docker_available", lambda: None)
+        monkeypatch.setattr(gate_runner, "_image_present", lambda image: True)
+
+        def _fake_run(command, **kwargs):
+            # Only the docker invocation is simulated; the report collects real
+            # environment facts through subprocess too.
+            if not command or command[0] != "docker":
+                return real_run(command, **kwargs)
+            commands.append(list(command))
+            reports = next(
+                arg.split(":")[0] for arg in command if str(arg).endswith(":/reports")
+            )
+            token = next(
+                str(arg).split("=", 1)[1]
+                for arg in command
+                if str(arg).startswith("POKER_RELEASE_GATE_RUN_TOKEN=")
+            )
+            inner_mode = command[command.index("--mode") + 1]
+            monkeypatch.setenv("POKER_RELEASE_GATE_RUN_TOKEN", token)
+            try:
+                inner = run_release_gate(
+                    manifest_path=manifest,
+                    mode=inner_mode,
+                    report_dir=Path(reports),
+                )
+            finally:
+                monkeypatch.delenv("POKER_RELEASE_GATE_RUN_TOKEN", raising=False)
+            return _DockerCompleted(inner.exit_code)
+
+        monkeypatch.setattr(gate_runner.subprocess, "run", _fake_run)
+        return commands
+
+    return install
+
+
+def test_container_mode_certifies_only_what_the_image_actually_ran(
+    release_corpus, fake_container, tmp_path: Path
+):
+    """The container gate runs the FIXTURE path inside the image.
+
+    Certification used to be read off the mode label, so a container run
+    advertised video decoding and end-to-end reconstruction that no code in the
+    image performed. The claim has to be assembled from the acts the run
+    reported, which for this argv are scoring and running the gate in the image.
+    """
+    manifest = release_corpus()
+    commands = fake_container(manifest)
+    result = run_release_gate(
+        manifest_path=manifest,
+        mode="container",
+        report_dir=tmp_path / "reports",
+        container_image="pokertrainer:test",
+    )
+
+    argv = commands[0]
+    assert argv[argv.index("--mode") + 1] == "fixture", "premise of this test"
+    # The image ran the gate and it scored every case: the strongest result a
+    # container run can produce, and still not a decoding result.
+    detail = next(
+        s["detail"] for s in result.report["stages"] if s["name"] == "container"
+    )
+    assert detail["fail_closed"] is None
+    assert detail["cases_scored"] == 10
+    assert result.report["aggregate"]["measured"] is True
+
+    certification = result.report["certification"]
+    covers = " ".join(certification["covers"])
+    assert "decoding" not in covers
+    assert "reconstruction" not in covers
+    missing = " ".join(certification["does_not_cover"])
+    assert "decoding" in missing
+    assert "model execution" in missing
+    assert certification["release_certifying"] is False
+    assert certification["executed"] == [cert.SCORE_TIMELINES, cert.RUN_IN_IMAGE]
+
+
+def test_a_full_run_that_decoded_nothing_claims_no_decoding(
+    release_corpus, tmp_path: Path, monkeypatch
+):
+    """Full mode returns before decoding when the vault is absent.
+
+    Its coverage statement came from the mode, so the report of a run that
+    executed nothing still said it covered decoding with the pinned weights.
+    """
+    monkeypatch.delenv("POKER_VALIDATION_ROOT", raising=False)
+    result = run_release_gate(
+        manifest_path=release_corpus(),
+        mode="full",
+        report_dir=tmp_path / "reports",
+    )
+    certification = result.report["certification"]
+    assert not any("decoding" in claim for claim in certification["covers"])
+    assert not any("reconstruction" in claim for claim in certification["covers"])
+    assert certification["release_certifying"] is False
+    assert cert.DECODE_VIDEO in certification["missing_for_certification"]
+    assert certification["executed"] == []
+
+
+def test_a_reconstruction_records_the_acts_it_performed(monkeypatch, tmp_path: Path):
+    """The positive control: a run that does the work may claim the work."""
+    def _fake_run(command, **kwargs):
+        Path(command[command.index("--out") + 1]).write_text("{}", encoding="utf-8")
+        return _DockerCompleted(0)
+
+    monkeypatch.setattr(gate_runner.subprocess, "run", _fake_run)
+    run = gate_runner._run_pipeline_for_case(
+        video_path=tmp_path / "case.mp4",
+        timeline_path=tmp_path / "case.timeline.json",
+        duration_s=30.0,
+        detector="cv_lab/models/region_spine_v1.pt",
+        classifier="cv_lab/models/card_cls_v1.pt",
+    )
+    assert run["ok"] is True
+    assert set(run["executed"]) == {
+        cert.DECODE_VIDEO,
+        cert.RECONSTRUCT,
+        cert.LOAD_WEIGHTS,
+    }
+    assert set(run["weights"]) == {"region_detector", "card_classifier"}
+
+    certifying = cert.certification(
+        mode="full",
+        executed=[*run["executed"], cert.SCORE_TIMELINES],
+        measured=True,
+    )
+    assert certifying["release_certifying"] is True
+    assert certifying["missing_for_certification"] == []
+
+
+def test_a_half_pinned_reconstruction_does_not_claim_the_pinned_weights(
+    monkeypatch, tmp_path: Path
+):
+    """One role left off the command line runs whatever default the script picks."""
+    def _fake_run(command, **kwargs):
+        Path(command[command.index("--out") + 1]).write_text("{}", encoding="utf-8")
+        return _DockerCompleted(0)
+
+    monkeypatch.setattr(gate_runner.subprocess, "run", _fake_run)
+    run = gate_runner._run_pipeline_for_case(
+        video_path=tmp_path / "case.mp4",
+        timeline_path=tmp_path / "case.timeline.json",
+        duration_s=30.0,
+        detector="cv_lab/models/region_spine_v1.pt",
+        classifier=None,
+    )
+    assert cert.LOAD_WEIGHTS not in run["executed"]
+
+
+def test_every_report_carries_a_certification_block(tmp_path: Path):
+    """Including the one for a mode that never ran: absent is not the same as none."""
+    result = run_release_gate(
+        manifest_path=MANIFEST,
+        mode="bogus",  # type: ignore[arg-type]
+        report_dir=tmp_path / "reports",
+    )
+    assert result.exit_code == EXIT_SETUP_INVALID
+    certification = result.report["certification"]
+    assert certification["release_certifying"] is False
+    assert certification["executed"] == []
+
+
+def test_an_unrecognized_act_cannot_invent_coverage():
+    """Coverage is a fixed vocabulary; a stray record entry buys nothing."""
+    statement = cert.certification(
+        mode="full",
+        executed=["decoded_everything_honest", cert.DECODE_VIDEO],
+        measured=True,
+    )
+    assert statement["executed"] == [cert.DECODE_VIDEO]
+    assert statement["release_certifying"] is False
+    assert not any("honest" in claim for claim in statement["covers"])
 
 
 def test_environment_redacts_credentials_under_unanticipated_names(

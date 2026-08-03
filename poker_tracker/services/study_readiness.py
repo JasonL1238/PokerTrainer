@@ -46,6 +46,7 @@ from poker_tracker.services.hand_accounting import (
     AccountingReconciliation,
     AssumptionDependence,
 )
+from poker_tracker.services.regression_promotion import is_release_blocking
 
 BlockerCategory = Literal[
     "completion",
@@ -975,10 +976,77 @@ def _assumption_blockers(
     ]
 
 
+def _requires_proven_regression(issue: HandIssue) -> bool:
+    """Will the writer refuse to close this issue on a resolution note alone?
+
+    The category half is ``regression_promotion.is_release_blocking`` rather
+    than a fourth copy of the set, so a category added to
+    ``RELEASE_BLOCKING_ISSUE_TYPES`` cannot be enforced without also being
+    disclosed. The unreadable half mirrors ``PokerDatabase._regression_blocker``
+    and ``resolution_blocker``, which both gate a row whose categories could not
+    be read: the reader's fallback is ``other``, outside the set, so believing it
+    would let row damage clear the gate. That branch cannot be shared with them
+    because both need the database; this predicate answers from the record the
+    readiness pass was already handed.
+    """
+    if "issue_types" in issue.unreadable_columns:
+        return True
+    return is_release_blocking(list(issue.issue_types))
+
+
+def _issue_detail(issue: HandIssue) -> str:
+    categories = ", ".join(issue.issue_types)
+    if "issue_types" in issue.unreadable_columns:
+        return (
+            f"#{issue.id}: categories unreadable (salvaged as {categories}), so it "
+            "is gated as release-blocking and needs a proven regression to close"
+        )
+    if _requires_proven_regression(issue):
+        return (
+            f"#{issue.id}: {categories} — release-blocking; needs a proven "
+            "regression to close"
+        )
+    return f"#{issue.id}: {categories}"
+
+
 def _issue_blockers(issues: list[HandIssue]) -> list[StudyBlocker]:
+    """Name the whole precondition on closing an issue, not the half a note covers.
+
+    Seven of the nine categories the flagging control offers are in
+    ``RELEASE_BLOCKING_ISSUE_TYPES``, and ``resolve_hand_issue`` refuses one of
+    those on a resolution note alone until a linked regression has been observed
+    both failing before the fix and passing after it. This blocker used to say
+    only "resolve each issue with resolution notes", so following it literally
+    produced a refusal naming a promotion no control performs -- the same shape
+    as the four clearing actions PLAN.md already records as having named an
+    action the product could not perform, and the reason
+    ``test_every_control_a_clearing_action_names_exists_in_the_app`` is not
+    enough on its own: it proves the control is drawn, not that the writer
+    behind it will accept the submission.
+
+    Until the promotion has a control, the honest thing to name is the procedure
+    that does exist. Saying so here also stops the operator reading a permanent
+    gate as a step they have not found yet.
+    """
     open_issues = [issue for issue in issues if issue.status == "open"]
     if not open_issues:
         return []
+    gated = [issue for issue in open_issues if _requires_proven_regression(issue)]
+    clearing_action = (
+        "Resolve each issue in the Saved debugging issue queue with resolution "
+        "notes; the issue and its evidence snapshot are retained as history."
+    )
+    if gated:
+        falls = "falls" if len(gated) == 1 else "fall"
+        clearing_action += (
+            f" {len(gated)} of them {falls} in a release-blocking category, and a "
+            "resolution note alone will not close those: each needs a regression "
+            "case linked to the issue and observed BOTH failing before the fix "
+            "and passing after it. No control in the app creates one — the "
+            "procedure is docs/RUNBOOKS.md section 12 "
+            "(promote_issue_to_regression, then record_regression_observation "
+            "twice) — so this hand stays out of study until that is done."
+        )
     return [
         StudyBlocker(
             code="OPEN_DEBUGGING_ISSUE",
@@ -987,13 +1055,8 @@ def _issue_blockers(issues: list[HandIssue]) -> list[StudyBlocker]:
                 f"{len(open_issues)} unresolved debugging issue(s) are recorded "
                 "against this hand."
             ),
-            clearing_action=(
-                "Resolve each issue in the Saved debugging issue queue with resolution "
-                "notes; the issue and its evidence snapshot are retained as history."
-            ),
-            detail=tuple(
-                f"#{issue.id}: {', '.join(issue.issue_types)}" for issue in open_issues
-            ),
+            clearing_action=clearing_action,
+            detail=tuple(_issue_detail(issue) for issue in open_issues),
         )
     ]
 

@@ -116,14 +116,24 @@ def all_in_hand(draw):
 # Written here from the specification sentence "forced posts are not live", so
 # this suite identifies a forced post without importing the reducer's opinion.
 _LIVE_STRUCTURAL_TYPES = frozenset({"small_blind", "big_blind", "straddle", "bring_in"})
+# The kinds a forced post can be written under: the two that are one by
+# definition, plus ``all-in`` for a post that took its poster's last chip. A
+# ``bet``, ``call`` or ``raise`` answers a wager level, so a forced-bet name on
+# one is a contradiction and never promotes it. The generator below cannot emit
+# that shape, so these mirrors would agree with the reducer either way; they are
+# written correctly so that a generator which later CAN emit it fails against
+# the specification rather than against a stale copy of it.
+_POST_CAPABLE_KINDS = frozenset({"ante", "post_blind", "all-in"})
 
 
 def _is_forced_row(action: LedgerAction) -> bool:
-    return action.kind in {"ante", "post_blind"} or action.forced_bet_type is not None
+    return action.kind in {"ante", "post_blind"} or (
+        action.kind in _POST_CAPABLE_KINDS and action.forced_bet_type is not None
+    )
 
 
 def _is_live_structural_row(action: LedgerAction) -> bool:
-    if action.kind == "ante":
+    if action.kind not in _POST_CAPABLE_KINDS or action.kind == "ante":
         return False
     if action.forced_bet_type is not None:
         return action.forced_bet_type in _LIVE_STRUCTURAL_TYPES and bool(

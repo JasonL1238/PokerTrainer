@@ -5405,28 +5405,39 @@ def _migrate_to_v20(db: PokerDatabase) -> None:
 
     WHAT HAPPENS TO EXISTING HANDS, precisely.
 
-      * A HAND WITH NO ANTE ROWS AND NO DECLARED ``dead_money`` -- the
-        overwhelming majority, and every ordinary cash-game hand -- is
-        COMPLETELY UNTOUCHED. It reads ``ante_mode IS NULL``, the reducer
-        resolves that to ``NONE`` without a refusal because ``NONE`` is not a
-        guess for a hand that has no antes, and every figure, verdict, status
-        and readiness result is byte-identical to schema 19. There is no new
-        blocker, no new warning, and no re-save needed.
+      * A HAND WITH NO DEAD MONEY OF ANY KIND -- no ante row, no dead or missed
+        blind, no penalty post, and no declared ``dead_money`` -- is COMPLETELY
+        UNTOUCHED. It reads ``ante_mode IS NULL``, the reducer resolves that to
+        ``NONE`` without a refusal because ``NONE`` is not a guess for a hand
+        that has no antes, and every figure, verdict, status and readiness
+        result is byte-identical to the first schema-19 build. There is no new
+        blocker, no new warning, and no re-save needed. That is every ordinary
+        cash-game hand, whose forced posts are all live blinds.
 
-      * A HAND WITH ``dead_money > 0`` IS NOT IN THAT SET, WHETHER OR NOT IT
-        CONTAINS AN ANTE, AND THAT IS WHY THIS MIGRATION WRITES ROWS AT ALL.
-        The same release carries ruling 5: operator-typed external dead money,
-        which schema 19 dropped WHOLE into the lowest layer, is now capped
-        against the collecting seat's own total commitment exactly like a
-        recorded dead post. On any stored hand where the declared amount exceeds
-        the smallest total commitment among the seats contesting the main pot,
-        THE STORED HERO RESULT MOVES on the day the build is upgraded -- the
-        gross pot, the pot count and every eligible set stay identical, so the
-        distribution changes underneath a stored award row and every existing
-        cross-check (recorded gross, recorded net, ``is_balanced``,
-        ``_validate_winners``) still passes.
+      * A HAND CARRYING DEAD MONEY IS NOT IN THAT SET, WHETHER THE DEAD CHIPS
+        ARE RECORDED OR DECLARED, AND THAT IS WHY THIS MIGRATION WRITES ROWS AT
+        ALL. Dead money -- an ante, a dead or missed blind, a penalty post, and
+        under ruling 5 the operator-typed external amount too -- used to drop
+        WHOLE into the lowest layer and is now capped against the collecting
+        seat's own total commitment. On any stored hand where a dead
+        contribution exceeds the smallest total commitment among the seats
+        contesting the layer it sits in, THE STORED HERO RESULT MOVES on the day
+        the build is upgraded -- the gross pot, the pot count and every eligible
+        set stay identical, so the distribution changes underneath a stored
+        award row and every existing cross-check (recorded gross, recorded net,
+        ``is_balanced``, ``_validate_winners``) still passes.
 
-        Ruling 5 is the operator's and the new arithmetic is the right one; the
+        BOTH KINDS OF DEAD CHIP MOVE, and only one of them has a column of its
+        own. ``hand_settlements.dead_money`` is the DECLARED EXTERNAL amount; a
+        hand whose dead money is entirely RECORDED -- a dead blind in the action
+        line -- carries ``dead_money = 0`` and is re-derived just the same. A
+        staling predicate keyed on the column alone therefore missed exactly the
+        population the recorded-post half of the rule moves, and left its
+        retained coaching labelled current beside a hero result that had
+        changed.
+
+        The amended cap is the operator's and the new arithmetic is the right
+        one; the
         re-derivation is what an upgrade is FOR and nothing here second-guesses
         it. What is not acceptable is the SECOND-ORDER effect: coaching and
         solver output retained beside those hands was written against a hero
@@ -5452,13 +5463,23 @@ def _migrate_to_v20(db: PokerDatabase) -> None:
         complete hand specifically as a state a migration must not casually
         knock back.
 
-        THE PREDICATE IS ``dead_money > 0``, NOT "the amount exceeds the floor",
-        because the floor is the smallest total commitment among the seats
-        contesting the main pot and SQL cannot compute it -- it needs the whole
-        action line run through the reducer, which a schema migration does not
-        have. So it is DELIBERATELY OVER-STRICT: it also stales analysis beside
-        hands whose declared amount sat under the floor and whose figures did
-        not move. Staling is the right place to spend that imprecision --
+        THE PREDICATE IS "this hand holds dead money", NOT "a dead contribution
+        exceeds the floor", because the floor is the smallest total commitment
+        among that layer's eligible seats and SQL cannot compute it -- it needs
+        the whole action line run through the reducer, which a schema migration
+        does not have. It is two branches unioned, because dead money reaches a
+        hand two ways: ``hand_settlements.dead_money > 0`` for the declared
+        external amount, and an ``actions`` row that is a forced post and is not
+        a LIVE structural bet for the recorded kind. The second branch mirrors
+        the reducer's ``_is_live_money`` -- kind ``ante``, kind ``post_blind``,
+        or a row of another kind naming its ``forced_bet_type``, minus the
+        small blind, big blind, straddle and bring-in that are still live -- so
+        a live-blinds-only hand is not swept in and does not ask for a rerun it
+        does not need.
+
+        So it is DELIBERATELY OVER-STRICT: it also stales analysis beside hands
+        whose dead chips all sat under the floor and whose figures did not move.
+        Staling is the right place to spend that imprecision --
         ``is_stale`` already means "may have been derived from something that
         changed", and the settlement writers set it on every save without
         checking whether the figures moved either. A rerun the operator did not
@@ -5470,9 +5491,10 @@ def _migrate_to_v20(db: PokerDatabase) -> None:
         awards, the actions, the review status and the coaching text itself are
         all untouched, and only the freshness flags move.
 
-        WHY THIS LIVES IN THE v20 STEP rather than a step of its own. Ruling 5
-        changes no schema, so it has no version of its own to hang on; every
-        database that reaches the new build's behaviour passes through exactly
+        WHY THIS LIVES IN THE v20 STEP rather than a step of its own. The
+        amended cap changes no schema, so it has no version of its own to hang
+        on; every database that reaches the new build's behaviour passes
+        through exactly
         this migration, so this is the one place that runs once per upgraded
         file. A database already stamped 20 has already been through it.
 
@@ -5512,11 +5534,12 @@ def _migrate_to_v20(db: PokerDatabase) -> None:
         is not parsed, and no ante mode is read out of it -- for the same reason
         no chip size is.
 
-    HOW MANY HANDS. Query both populations rather than guessing:
+    HOW MANY HANDS. Query both populations rather than guessing.
     ``SELECT COUNT(DISTINCT hand_id) FROM actions WHERE action_type = 'ante' OR
-    forced_bet_type IN ('ante','big_blind_ante')`` asks for a declaration, and
-    ``SELECT COUNT(*) FROM hand_settlements WHERE dead_money > 0`` is re-derived
-    under ruling 5 and demoted here. A hand in neither set is untouched.
+    forced_bet_type IN ('ante','big_blind_ante')`` asks for a declaration. The
+    re-derived population is the ``_affected`` union below, which is a superset
+    of it: every hand holding dead money, recorded or declared. A hand in
+    neither set is untouched.
 
     DOWNGRADE: an older build does not read a v20 database at all.
     ``_assert_supported_schema_version`` refuses any stamp above the build's own
@@ -5526,9 +5549,10 @@ def _migrate_to_v20(db: PokerDatabase) -> None:
     forward is a no-op.
 
     RE-RUNNING THE STALING is idempotent in the strict sense -- it keys on
-    ``dead_money``, which this migration never writes, and it only ever sets
-    flags that are already set -- so replaying it re-stales analysis the
-    operator may have rerun since, and nothing else. That is a weaker hazard
+    ``dead_money`` and on the action rows, neither of which this migration
+    writes, and it only ever sets flags that are already set -- so replaying it
+    re-stales analysis the operator may have rerun since, and nothing else.
+    That is a weaker hazard
     than ``_migrate_to_v13``'s replay, which discards confirmations outright,
     and it is weaker on purpose: this step touches no ``review_status``, no
     ``completion_status``, and no analysis TEXT. No production path replays a
@@ -5538,15 +5562,47 @@ def _migrate_to_v20(db: PokerDatabase) -> None:
 
     db._ensure_column("hand_settlements", "ante_mode", "TEXT")
 
-    # RULING 5's stored population. See MIGRATION IMPACT above: these hands are
+    # The re-derived population. See MIGRATION IMPACT above: these hands are
     # re-derived by the same release, so the analysis retained beside them was
     # written against a figure this build no longer produces.
     _reason = (
-        "External dead money is now capped against each seat's own total "
-        "commitment; this hand's pot layers were re-derived. Re-check the "
-        "result and rerun coaching."
+        "Dead money -- every recorded forced post, and any declared external "
+        "amount -- is now capped against each seat's own total commitment; this "
+        "hand's pot layers were re-derived. Re-check the result and rerun "
+        "coaching."
     )
-    _affected = "SELECT hand_id FROM hand_settlements WHERE dead_money > 0"
+    # BOTH halves of the amended cap, because the rule and the column it was
+    # first described against are not the same set. ``dead_money`` is the
+    # DECLARED EXTERNAL amount; the cap applies equally to dead money the
+    # recording itself holds, and a hand can carry the second with the first at
+    # zero. Keying on the column alone left those hands' retained coaching
+    # labelled current beside a hero result that had moved -- same gross, same
+    # pot count, same eligible sets, same verdicts, different distribution, so
+    # no cross-check could see it either.
+    #
+    # The second half mirrors the reducer's ``_is_live_money``: a forced post
+    # (kind ``ante``/``post_blind``, or another kind naming its forced-bet type)
+    # that is not a LIVE structural bet is dead money. It is written in SQL
+    # rather than derived, because a migration cannot run the reducer -- and it
+    # is deliberately over-strict in the same way and for the same reason the
+    # ``dead_money`` half is: it cannot compute the cap, so it names every hand
+    # the cap could have moved. A coaching rerun nobody needed is cheap.
+    _affected = """
+        SELECT hand_id FROM hand_settlements WHERE dead_money > 0
+        UNION
+        SELECT hand_id FROM actions
+        WHERE action_type IN ('ante', 'post_blind', 'all-in', 'all_in')
+          AND (action_type IN ('ante', 'post_blind') OR forced_bet_type IS NOT NULL)
+          AND NOT (
+              action_type <> 'ante'
+              AND COALESCE(is_live_post, 1) <> 0
+              AND (
+                  forced_bet_type IN
+                      ('small_blind', 'big_blind', 'straddle', 'bring_in')
+                  OR (forced_bet_type IS NULL AND action_type = 'post_blind')
+              )
+          )
+    """
     db._execute(
         f"""
         UPDATE hand_reviews

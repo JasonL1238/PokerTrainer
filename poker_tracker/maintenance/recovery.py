@@ -50,6 +50,7 @@ from poker_tracker.persistence.backup import resolve_artifact_path
 from poker_tracker.persistence.db import SCHEMA_VERSION, PokerDatabase
 from poker_tracker.persistence.models import Hand
 from poker_tracker.services.hand_accounting import reconcile_persisted_hand
+from poker_tracker.services.retention import is_within, same_file
 from poker_tracker.services.study_readiness import evaluate_study_readiness
 from poker_tracker.ui.video_storage import ensure_data_directories
 
@@ -298,22 +299,28 @@ def _refusals(
     history it was run to protect. ``data_health``'s constants are the single
     definition of where the live roots are, and they are read through the module
     so that redirecting them redirects this too.
+
+    Every path question here goes through ``services.retention``, which compares
+    by file identity rather than by spelling. Comparing the text made
+    ``DATA/drill`` and ``data/drill`` -- one directory on the filesystem macOS
+    ships -- look unrelated, so the guard that exists to refuse a run failed
+    open, which is the only direction a refusal must never fail.
     """
     live_database = _absolute(data_health.DEFAULT_DATABASE_PATH)
     live_data = _absolute(data_health.DEFAULT_DATA_DIR)
     reasons: list[str] = []
 
-    if restored.resolve() == live_database.resolve():
+    if same_file(restored, live_database):
         reasons.append(
             f"the restored database would be written to the live database "
             f"{live_database}"
         )
-    if _is_within(live_database, target_root):
+    if is_within(live_database, target_root):
         reasons.append(
             f"the drill location {target_root} contains the live database "
             f"{live_database}"
         )
-    if _is_within(live_data, target_root) or _is_within(target_root, live_data):
+    if is_within(live_data, target_root) or is_within(target_root, live_data):
         reasons.append(
             f"the drill location {target_root} overlaps the live data directory "
             f"{live_data}"
@@ -330,7 +337,7 @@ def _refusals(
     else:
         if not stat.S_ISREG(backup_stat.st_mode):
             reasons.append(f"the backup {backup} is not a regular file")
-        elif backup.resolve() == live_database.resolve():
+        elif same_file(backup, live_database):
             reasons.append(
                 "the live database is not a backup of itself; supply a snapshot"
             )
@@ -945,7 +952,7 @@ def _referenced_timelines(
         ) as connection:
             connection.execute("PRAGMA query_only = ON")
             return backup_inventory.timeline_paths(
-                connection, data_root / "cv_timelines"
+                connection, backup_inventory.timeline_dir_for(data_root)
             ), None
     except sqlite3.Error as exc:
         return [], f"{backup_inventory.TIMELINE_SOURCE}: {type(exc).__name__}: {exc}"
@@ -1056,14 +1063,6 @@ def _absolute(value: str | Path) -> Path:
     except RuntimeError:
         pass
     return path.absolute()
-
-
-def _is_within(child: Path, parent: Path) -> bool:
-    try:
-        child.resolve().relative_to(parent.resolve())
-    except ValueError:
-        return False
-    return True
 
 
 def _limited(details: Sequence[str]) -> tuple[str, ...]:

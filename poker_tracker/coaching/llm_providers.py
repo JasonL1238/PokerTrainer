@@ -6,6 +6,8 @@ import urllib.error
 import urllib.request
 from typing import Protocol
 
+from poker_tracker.coaching.coaching_prompts import retained_solver_evidence
+from poker_tracker.coaching.grounding import check_grounding, grounding_stale_reason
 from poker_tracker.coaching.safety import ensure_post_session_prompt
 from poker_tracker.persistence.models import CoachingResponse, LLMProviderConfig
 
@@ -233,7 +235,27 @@ def build_coaching_response(
     hand_id: int | None = None,
     session_id: int | None = None,
 ) -> CoachingResponse:
-    """Create a persistable coaching response model from provider output."""
+    """Create a persistable coaching response model from provider output.
+
+    The grounding check runs here rather than at each call site because this is
+    the one constructor standing between a provider's text and the database. A
+    check a caller has to remember is a check some future caller forgets, and the
+    forgetting is silent: the row still stores, still renders, and still reads as
+    reviewed analysis. There is nothing to forget if there is nowhere to put it.
+
+    A response that fails is still built and still persisted. The operator paid
+    for it and has to be able to read what the provider actually said, and a
+    rejection nobody can see is indistinguishable from no check at all. It is
+    built stale instead, which is this schema's existing word for "retained, not
+    current analysis": stale rows are filtered out of the current-review list,
+    are rendered with their reason, and raise STALE_COACHING_EVIDENCE so the hand
+    cannot be called studied on the strength of them.
+    """
+    report = check_grounding(
+        prompt,
+        raw_response,
+        solver_evidence=retained_solver_evidence(prompt),
+    )
     return CoachingResponse(
         provider_name=provider.provider_name,
         model_name=provider.model_name,
@@ -243,6 +265,8 @@ def build_coaching_response(
         hand_id=hand_id,
         session_id=session_id,
         parsed_sections=parse_sections(raw_response),
+        is_stale=not report.ok,
+        stale_reason=grounding_stale_reason(report),
     )
 
 

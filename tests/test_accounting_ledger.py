@@ -9,6 +9,10 @@ from poker_tracker.math.accounting import (
     LedgerError,
     LedgerPlayer,
     RakePolicy,
+    _is_ante_post,
+    _is_forced_post,
+    _is_live_structural_post,
+    _mislabelled_forced_bet,
     blind_structure,
     build_hand_ledger,
 )
@@ -2003,3 +2007,158 @@ def test_a_short_ante_is_not_a_live_forced_bet_whatever_kind_carries_it() -> Non
         "Declare the blind structure" in issue for issue in ledger.legality_issues
     )
     assert ledger.is_legal is True
+
+
+# Every forced-bet name ``persistence.models.ForcedBetType`` can spell. Written
+# out rather than imported so this suite states the vocabulary it is defending
+# instead of agreeing with whatever the reducer currently believes.
+_ALL_FORCED_BET_TYPES = (
+    "small_blind",
+    "big_blind",
+    "ante",
+    "big_blind_ante",
+    "straddle",
+    "dead_blind",
+    "bring_in",
+)
+# The kinds a forced post can be booked under. ``all-in`` is one because a post
+# that exhausts its poster is routinely written that way; the rest of the
+# commitment vocabulary answers a wager level and can never be a post.
+_POST_CAPABLE_KINDS = ("ante", "post_blind", "all-in")
+_VOLUNTARY_KINDS = ("bet", "call", "raise", "all-in", "fold", "check")
+
+
+@pytest.mark.parametrize("forced", _ALL_FORCED_BET_TYPES)
+def test_a_forced_bet_label_on_a_call_cannot_decide_whether_the_hand_is_legal(
+    forced: str,
+) -> None:
+    """A label refined which forced post a row was; it must not create one.
+
+    Declared blinds 5/10, the big blind all-in for 4, the button calling 5. That
+    call is illegal -- the amount to call is 10, and a short blind does not lower
+    what anybody else owes. Putting ANY forced-bet name on the BUTTON's row made
+    the reducer treat it as a forced post, which exempted it from the preflop
+    wager floor, so the illegal call reported legal and warning-free. A
+    ``dead_blind`` name moved its chips out of the live pool as well and shrank
+    the gross pot from 14 to 13.
+
+    The button's row is the only thing that varies here. The chips and the
+    verdict must not.
+    """
+    players = [_player("SB", 100, 0), _player("BB", 4, 1), _player("BTN", 100, 2)]
+
+    def hand(button: LedgerAction):
+        return build_hand_ledger(
+            players,
+            [
+                LedgerAction("SB", "preflop", "post_blind", 5),
+                LedgerAction("BB", "preflop", "all-in", 4, forced_bet_type="big_blind"),
+                button,
+            ],
+            winners={0: ("BB",), 1: ("SB",)},
+            blinds=BlindStructure(5, 10),
+        )
+
+    unlabelled = hand(LedgerAction("BTN", "preflop", "call", 5))
+    labelled = hand(LedgerAction("BTN", "preflop", "call", 5, forced_bet_type=forced))
+
+    assert unlabelled.is_legal is False
+    assert "Action 3: call commits 5, but the amount to call is 10." in (
+        unlabelled.legality_issues
+    )
+    assert labelled.is_legal is False
+    assert "Action 3: call commits 5, but the amount to call is 10." in (
+        labelled.legality_issues
+    )
+    assert labelled.gross_pot == pytest.approx(unlabelled.gross_pot)
+    assert labelled.gross_pot == pytest.approx(14)
+    assert labelled.contributions == pytest.approx(unlabelled.contributions)
+    assert labelled.net_results == pytest.approx(unlabelled.net_results)
+    assert [pot.amount for pot in labelled.pots] == pytest.approx(
+        [pot.amount for pot in unlabelled.pots]
+    )
+    # The contradiction is reported rather than resolved in either direction.
+    assert any(
+        "booked as 'call' but typed as a" in issue
+        for issue in labelled.legality_issues
+    )
+
+
+@pytest.mark.parametrize("kind", _VOLUNTARY_KINDS)
+@pytest.mark.parametrize("forced", _ALL_FORCED_BET_TYPES)
+def test_no_forced_bet_label_moves_a_chip_on_a_kind_that_cannot_be_a_post(
+    kind: str, forced: str
+) -> None:
+    """The family, swept: kind x label, against the row with the field cleared.
+
+    ``all-in`` is in the parameter list on purpose and is the one exception --
+    a post that took its poster's last chip is booked that way and the label is
+    then the only thing naming it, so there the label is ALLOWED to decide. Every
+    other kind must derive byte-identically labelled and unlabelled.
+    """
+    players = [_player("A", 100, 0), _player("B", 100, 1), _player("C", 40, 2)]
+
+    def hand(c_row: LedgerAction):
+        return build_hand_ledger(
+            players,
+            [
+                LedgerAction("A", "preflop", "post_blind", 5),
+                LedgerAction("B", "preflop", "post_blind", 10),
+                c_row,
+                LedgerAction("A", "preflop", "call", 5),
+            ],
+            blinds=BlindStructure(5, 10),
+            ante_mode=AnteMode.NONE,
+        )
+
+    amount = 0 if kind in {"fold", "check"} else (40 if kind == "all-in" else 10)
+    plain = hand(LedgerAction("C", "preflop", kind, amount))
+    tagged = hand(
+        LedgerAction("C", "preflop", kind, amount, forced_bet_type=forced)
+    )
+
+    if kind in _POST_CAPABLE_KINDS:
+        return
+
+    assert tagged.contributions == pytest.approx(plain.contributions)
+    assert tagged.gross_pot == pytest.approx(plain.gross_pot)
+    assert tagged.net_results == pytest.approx(plain.net_results)
+    assert len(tagged.pots) == len(plain.pots)
+    assert [pot.amount for pot in tagged.pots] == pytest.approx(
+        [pot.amount for pot in plain.pots]
+    )
+    assert [pot.eligible_players for pot in tagged.pots] == [
+        pot.eligible_players for pot in plain.pots
+    ]
+    # A mislabelled row is refused, and the refusal is the ONLY thing the label
+    # adds. Anything the recording itself was already saying is unchanged.
+    contradiction = [
+        issue for issue in tagged.legality_issues if "but typed as a" in issue
+    ]
+    assert len(contradiction) == 1
+    assert f"booked as {kind!r}" in contradiction[0]
+    assert [
+        issue for issue in tagged.legality_issues if issue not in contradiction
+    ] == list(plain.legality_issues)
+
+
+@pytest.mark.parametrize("forced", _ALL_FORCED_BET_TYPES)
+def test_a_post_exhausting_its_poster_may_still_be_named_by_its_label(
+    forced: str,
+) -> None:
+    """The exception the kind gate must not close.
+
+    ``all-in`` stays forced-post-capable because that is the shape a real
+    recording produces when a post takes the last chip, and the type is then the
+    only signal there is. A gate that swept ``all-in`` in with ``call`` would
+    silently revert the repair this label vocabulary was added for.
+    """
+    action = LedgerAction("C", "preflop", "all-in", 1, forced_bet_type=forced)
+    assert _is_forced_post(action) is True
+    assert _mislabelled_forced_bet(action) is False
+    for kind in ("bet", "call", "raise"):
+        voluntary = LedgerAction("C", "preflop", kind, 1, forced_bet_type=forced)
+        assert _is_forced_post(voluntary) is False
+        assert _is_live_structural_post(voluntary) is False
+        assert _is_ante_post(voluntary) is False
+        assert _mislabelled_forced_bet(voluntary) is True

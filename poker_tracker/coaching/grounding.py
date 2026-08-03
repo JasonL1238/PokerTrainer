@@ -150,6 +150,28 @@ def check_grounding(
     )
 
 
+# What a retained-but-rejected review says about itself wherever it is rendered.
+# It leads with the disposition rather than the detail because the list of
+# invented cards means nothing to an operator who does not yet know the answer
+# was rejected.
+UNGROUNDED_STALE_PREFIX = (
+    "Not current analysis: this answer asserted facts the prompt it was "
+    "generated from does not support. "
+)
+
+
+def grounding_stale_reason(report: GroundingReport) -> str:
+    """The retained-review note for a response that failed its own prompt.
+
+    Empty for a response that passed, so a caller can assign it unconditionally
+    and let the empty string mean what it already means everywhere else in the
+    coaching tables: nothing is wrong with this row.
+    """
+    if report.ok:
+        return ""
+    return UNGROUNDED_STALE_PREFIX + "; ".join(report.failures) + "."
+
+
 def response_attributes_to_solver(response: str) -> bool:
     """Whether the response credits a solver for anything at all."""
     return bool(_SOLVER_ATTRIBUTION_RE.search(response))

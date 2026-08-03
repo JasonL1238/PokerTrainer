@@ -5,15 +5,29 @@ Phase 4 requires two things that are easy to get backwards. Retention has to be
 exports live — and nothing may be deleted without the operator seeing an audit
 first.
 
-The safety rule this module is built around: **a file the database still points
-at is never deletable, at any age.** Retention windows only ever apply to files
-nothing references. That inverts the usual "delete things older than N days",
-which would happily remove the source frame behind a saved issue because the
-issue is six months old. Age is the second question here, never the first.
+The safety rule this module is built around: **a file the product still expects
+is never deletable, at any age.** Retention windows only ever apply to files
+nothing expects. That inverts the usual "delete things older than N days", which
+would happily remove the source frame behind a saved issue because the issue is
+six months old. Age is the second question here, never the first.
 
-Two consequences of that rule shape the code below more than anything else.
+"The product still expects it" is deliberately wider than "a column names it".
+Most references are a column -- ``PokerDatabase.ARTIFACT_PATH_COLUMNS`` -- but
+two artifact classes are addressed by convention instead, and asking only the
+columns deleted both. A completed reconstruction job's timeline has no column
+anywhere; it is found from the job id, and losing it hard-blocks every remaining
+validated-hand import for that job with no way to rebuild it, because nothing in
+the product deletes a ``processing_jobs`` row, so the expectation is permanent.
+The frames that timeline's states name have no column either until the operator
+reviews one, which means asking the columns expired exactly the frames still
+waiting to be reviewed. Both are read through
+:mod:`poker_tracker.persistence.backup_inventory`, which already owns the naming
+rule the snapshot inventory and the health audit share, so retention cannot look
+for a job's artifacts somewhere the rest of the product does not.
 
-First, "the database still points at this file" is a question about file
+Three consequences of that rule shape the code below more than anything else.
+
+First, "the product still points at this file" is a question about file
 identity, not about spelling. macOS ships a case-insensitive filesystem, so
 ``Session.MOV`` on disk and ``session.mov`` in SQLite are one file that two
 strings describe; comparing the strings reports an orphan and deletes live
@@ -24,7 +38,12 @@ folded textual key only when the file cannot be stat'd. The fallback deliberatel
 over-matches: mistaking two files for one keeps an orphan, mistaking one file for
 two deletes something live.
 
-Second, an audit is a proposal and never an authorization. A CV job that
+Second, a reference source that cannot be read is not a source that holds no
+references. A timeline that will not parse still names frames; nothing can say
+which, so the whole sweep is held back rather than treating those frames as
+orphans.
+
+Third, an audit is a proposal and never an authorization. A CV job that
 completes between the audit and the sweep makes a row point at a file the audit
 already classified as an orphan, so :func:`apply_retention` re-confirms every
 path against the database through the same :class:`ReferenceCheck` the audit
@@ -45,6 +64,7 @@ data cannot demonstrate.
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
@@ -53,6 +73,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from poker_tracker.persistence import backup_inventory
 from poker_tracker.persistence.db import PokerDatabase
 
 # Category -> environment variable holding its retention window in days.
@@ -141,13 +162,26 @@ def path_identity_keys(path: Path | str) -> frozenset[tuple[Any, ...]]:
     return frozenset(keys)
 
 
-def _is_within(child: Path | str, parent: Path | str) -> bool:
-    """Whether ``child`` is ``parent`` or sits underneath it, spelling aside."""
+def is_within(child: Path | str, parent: Path | str) -> bool:
+    """Whether ``child`` is ``parent`` or sits underneath it, spelling aside.
+
+    Public because it is the repository's containment test, not just retention's.
+    A caller that wants "is this path inside that tree" and writes its own
+    ``relative_to`` gets a comparison that is case-sensitive on a filesystem that
+    is not, which reports two spellings of one directory as unrelated -- and a
+    containment check exists precisely to refuse something, so failing that way
+    fails open.
+    """
     child_key = _textual_key(child)
     parent_key = _textual_key(parent)
     return child_key == parent_key or child_key.startswith(
         os.path.join(parent_key, "")
     )
+
+
+def same_file(left: Path | str, right: Path | str) -> bool:
+    """Whether two paths name one file, by identity where the file exists."""
+    return bool(path_identity_keys(left) & path_identity_keys(right))
 
 
 # --- Policy -----------------------------------------------------------------
@@ -230,6 +264,107 @@ class RetentionPolicy:
         return _validate_window(category, value, purge_immediately=False)
 
 
+# --- References no artifact column records ----------------------------------
+#
+# The naming rules live in persistence.backup_inventory, which the snapshot
+# inventory and the health audit already share. Retention reads them from there
+# so the three cannot look for a job's timeline in three different places.
+#
+# OPEN PRODUCT QUESTION, deliberately settled the conservative way here rather
+# than decided: a completed job's timeline and frames are now retained for the
+# life of the job, which in practice is forever, because nothing deletes a
+# processing_jobs row. data_health's timeline check says a timeline is
+# "genuinely disposable" once every hand from its job has been imported, and
+# that is true -- but no column records whether that has happened, and the
+# recovery drill reports PARTIAL for any completed job whose timeline is absent.
+# Retaining costs disk; the alternative costs work nobody can recover. Narrowing
+# this needs a durable record that a job has been retired, plus the drill
+# agreeing to accept a retired job's absent timeline, and both are product
+# decisions rather than corrections.
+
+# ensure_data_directories keys each directory by its own basename, so the key
+# retention looks up and the name backup_inventory builds a path from are the
+# same string. Reading it from there rather than spelling it again is what stops
+# the two from drifting apart on a rename.
+TIMELINE_DIR_KEY = backup_inventory.TIMELINE_DIR_NAME
+
+
+def timeline_directory(paths: dict[str, Path]) -> Path | None:
+    """Where this data root keeps reconstruction timelines, if it has one."""
+    directory = paths.get(TIMELINE_DIR_KEY)
+    if directory is not None:
+        return Path(directory)
+    root = paths.get(DATA_ROOT_KEY)
+    return None if root is None else backup_inventory.timeline_dir_for(Path(root))
+
+
+def _timeline_frame_paths(payload: Any) -> set[str] | None:
+    """The frame each retained state came from, or None if the timeline is unusable.
+
+    ``None`` rather than an empty set: a timeline whose ``states`` list is missing
+    or malformed is not a timeline that names no frames, and treating the two the
+    same would offer every frame of that job as an orphan.
+    """
+    if not isinstance(payload, dict):
+        return None
+    states = payload.get("states")
+    if not isinstance(states, list):
+        return None
+    images: set[str] = set()
+    for state in states:
+        if not isinstance(state, dict):
+            continue
+        image = state.get("image")
+        if isinstance(image, str) and image.strip():
+            images.add(image.strip())
+    return images
+
+
+def _expected_by_convention(
+    db: PokerDatabase, timeline_dir: Path | None
+) -> tuple[set[str], list[str]]:
+    """Files a completed reconstruction job expects that no column names.
+
+    The job's timeline, and the frames the timeline's own states came from. A
+    frame acquires a column reference only when the operator reviews it, so
+    without this the sweep expired precisely the frames still waiting for review,
+    and with them the ability to ever validate those hands.
+    """
+    if timeline_dir is None:
+        return set(), []
+    try:
+        # The connection rather than a public reader: no public method enumerates
+        # every completed job, and the naming rule belongs to backup_inventory.
+        timelines = backup_inventory.timeline_paths(db._connection, timeline_dir)
+    except (sqlite3.Error, AttributeError):
+        return set(), [backup_inventory.TIMELINE_SOURCE]
+    found: set[str] = set()
+    unreadable: list[str] = []
+    for stored in timelines:
+        found.add(stored)
+        path = Path(stored)
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            # Already gone. data_health reports that; nothing here can protect
+            # frames a vanished timeline would have named.
+            continue
+        except (OSError, ValueError) as exc:
+            # ValueError covers UnicodeDecodeError: a timeline written as bytes
+            # this build cannot decode is unreadable, not empty.
+            unreadable.append(f"{backup_inventory.TIMELINE_SOURCE} {path} ({exc})")
+            continue
+        try:
+            images = _timeline_frame_paths(json.loads(raw))
+        except ValueError:
+            images = None
+        if images is None:
+            unreadable.append(f"{backup_inventory.TIMELINE_SOURCE} {path}")
+            continue
+        found |= images
+    return found, unreadable
+
+
 # --- The one reference check ------------------------------------------------
 
 
@@ -264,10 +399,15 @@ class ReferenceCheck:
     """
 
     def __init__(
-        self, db: PokerDatabase, *, anchors: Sequence[Path | str] = ()
+        self,
+        db: PokerDatabase,
+        *,
+        anchors: Sequence[Path | str] = (),
+        timeline_dir: Path | str | None = None,
     ) -> None:
         self._db = db
         self._anchors = [Path(anchor) for anchor in anchors]
+        self._timeline_dir = None if timeline_dir is None else Path(timeline_dir)
         self._keys: set[tuple[Any, ...]] = set()
         self._unreadable: list[str] = []
         self._token: tuple[int, int] | None = None
@@ -300,11 +440,14 @@ class ReferenceCheck:
 
     def refresh(self) -> None:
         raw_paths, unreadable = self._db.referenced_artifact_paths()
+        expected, expected_unreadable = _expected_by_convention(
+            self._db, self._timeline_dir
+        )
         keys: set[tuple[Any, ...]] = set()
-        for raw in raw_paths:
+        for raw in (*raw_paths, *expected):
             keys |= self._reference_keys(raw)
         self._keys = keys
-        for label in unreadable:
+        for label in (*unreadable, *expected_unreadable):
             if label not in self._unreadable:
                 self._unreadable.append(label)
         self._token = self._change_token()
@@ -413,7 +556,7 @@ def _managed_directories(paths: dict[str, Path]) -> dict[str, Path]:
     for name, path in paths.items():
         if name in NEVER_MANAGED or name not in RETENTION_ENV_VARS:
             continue
-        if any(_is_within(path, blocked) for blocked in forbidden):
+        if any(is_within(path, blocked) for blocked in forbidden):
             continue
         managed[name] = path
     return managed
@@ -441,7 +584,11 @@ def audit_storage(
     """
     rules = policy or RetentionPolicy.from_env()
     current = now if now is not None else time.time()
-    check = ReferenceCheck(db, anchors=_reference_anchors(db, paths))
+    check = ReferenceCheck(
+        db,
+        anchors=_reference_anchors(db, paths),
+        timeline_dir=timeline_directory(paths),
+    )
     audit = StorageAudit(reference_check=check)
 
     for category, directory in _managed_directories(paths).items():
@@ -508,7 +655,10 @@ def _classify(
     rules: RetentionPolicy,
 ) -> tuple[bool, str]:
     if referenced:
-        return False, "referenced by the database"
+        # "the study history" rather than "the database": a completed job's
+        # timeline and the frames it names are expected by convention, and no
+        # column mentions either.
+        return False, "referenced by the study history"
     if category == "videos" and not rules.include_orphan_videos:
         return False, "source recording; orphan removal not requested"
     if age_days < window:

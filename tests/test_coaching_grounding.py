@@ -14,6 +14,7 @@ from poker_tracker.coaching.grounding import (
     AMBIGUOUS_CARD_TOKENS,
     cards_in_text,
     check_grounding,
+    grounding_stale_reason,
     response_attributes_to_solver,
     solver_claims,
     ungrounded_cards,
@@ -154,3 +155,21 @@ def test_solver_evidence_only_excuses_the_solver_half():
     assert report.ungrounded_solver_claims == []
     assert report.ungrounded_cards == ["Qh"]
     assert report.ok is False
+
+
+# --- What a rejected response says about itself -----------------------------
+
+
+def test_a_passing_report_leaves_the_retained_reason_empty():
+    """Empty is what "nothing is wrong with this row" already means in that column."""
+    report = check_grounding(PROMPT, "Kd Qd is two overcards on 2c 7d 9h.")
+    assert grounding_stale_reason(report) == ""
+
+
+def test_the_retained_reason_leads_with_the_disposition_then_the_detail():
+    """A reader who does not yet know the answer was rejected cannot use a card list."""
+    report = check_grounding(PROMPT, "Your Qh gave you the flush draw.")
+    reason = grounding_stale_reason(report)
+    assert reason.startswith("Not current analysis:")
+    assert "Qh" in reason
+    assert reason.endswith(".")

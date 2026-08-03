@@ -89,10 +89,13 @@ def _rewritten_columns(stored_version: int | None) -> dict[str, frozenset[str]]:
         # needs_correction for every hand that is not provably manual.
         rewritten["hands"] = frozenset({"review_status"})
     if version < 20:
-        # _migrate_to_v20's MIGRATION IMPACT: the same release caps
-        # operator-typed external dead money, so every stored hand with
-        # dead_money > 0 is re-derived and the analysis retained beside it was
-        # written against a hero result this build no longer produces. Only the
+        # _migrate_to_v20's MIGRATION IMPACT: the same release caps dead money
+        # against each seat's own total commitment, so every stored hand that
+        # holds any -- recorded in the action line, or declared in
+        # hand_settlements.dead_money -- is re-derived and the analysis retained
+        # beside it was written against a hero result this build no longer
+        # produces. Which hands that is, and which are left alone, is proved in
+        # tests/test_migration_v20_dead_money_staling.py. Only the
         # FRESHNESS columns move -- the coaching text, the awards, the actions,
         # the settlement and the operator's own review_status are all untouched,
         # which is why `hands` is deliberately absent from this entry.
