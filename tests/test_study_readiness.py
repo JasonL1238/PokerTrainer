@@ -5,8 +5,14 @@ from typing import Any
 
 import pytest
 
+from poker_tracker.coaching.grounding import UNGROUNDED_STALE_PREFIX
+from poker_tracker.math.accounting import HandLedger
 from poker_tracker.persistence.completion import (
     EVIDENCE_SCHEMA_VERSION,
+    IMPORTED_HAND_KEY,
+    OPERATOR_MANUAL_COMPLETION_KEY,
+    OPERATOR_TERMINAL_EVENT_KEY,
+    UNREADABLE_CARDS_KEY,
     UNREADABLE_HAND_COLUMNS_KEY,
     CompletionEvidence,
     dump_completion_evidence,
@@ -16,6 +22,7 @@ from poker_tracker.persistence.models import (
     CoachingResponse,
     Hand,
     HandIssue,
+    HandSettlement,
     SolverRun,
 )
 from poker_tracker.services.hand_accounting import (
@@ -116,7 +123,9 @@ def _issue(
     )
 
 
-def _coaching(*, is_stale: bool, minutes: int) -> CoachingResponse:
+def _coaching(
+    *, is_stale: bool, minutes: int, stale_reason: str = ""
+) -> CoachingResponse:
     return CoachingResponse(
         provider_name="test",
         model_name="fixture",
@@ -125,15 +134,24 @@ def _coaching(*, is_stale: bool, minutes: int) -> CoachingResponse:
         review_type="hand",
         hand_id=7,
         is_stale=is_stale,
+        stale_reason=stale_reason,
         created_at=_BASE + timedelta(minutes=minutes),
     )
 
 
-def _solver(*, status: str, minutes: int) -> SolverRun:
+def _solver(
+    *,
+    status: str,
+    minutes: int,
+    error_message: str = "",
+    unreadable_columns: tuple[str, ...] = (),
+) -> SolverRun:
     return SolverRun(
         hand_id=7,
         status=status,
         input_hash="hash",
+        error_message=error_message,
+        unreadable_columns=unreadable_columns,
         created_at=_BASE + timedelta(minutes=minutes),
     )
 
@@ -884,3 +902,514 @@ def test_manual_readiness_is_exhaustive_and_never_emits_reconstructed_blockers()
 
     assert failures == []
     assert _MANUAL_APPLICABLE < set(BLOCKER_ORDER)
+
+
+# ---------------------------------------------------------------------------
+# A blocker explains the condition that fired, not a sibling condition
+#
+# Every code below is raised by more than one condition. The reason is what an
+# operator reads when deciding what to DO, so a reason belonging to a sibling
+# condition sends them to the wrong action -- "a later correction invalidated
+# this" says re-run coaching, while "the answer failed its own grounding check"
+# says something quite different about the answer they just paid for.
+# ---------------------------------------------------------------------------
+
+
+def _ledger(*, reconciles: bool) -> HandLedger:
+    """The three flags readiness reads, on a real ledger rather than a stand-in."""
+    return HandLedger(
+        contributions={},
+        refunds={},
+        payouts={},
+        net_results={},
+        gross_pot=0.0,
+        rake=0.0,
+        net_pot=0.0,
+        pots=(),
+        snapshots=(),
+        folded_players=(),
+        warnings=(),
+        legality_issues=(),
+        is_settled=reconciles,
+        is_balanced=reconciles,
+        is_legal=reconciles,
+    )
+
+
+def _reconciliation(
+    *,
+    ledger_reconciles: bool,
+    settlement: HandSettlement | None,
+    issues: tuple[str, ...],
+) -> AccountingReconciliation:
+    return AccountingReconciliation(
+        ledger=_ledger(reconciles=ledger_reconciles),
+        settlement=settlement,
+        entries=(),
+        issues=issues,
+        is_authoritative=False,
+    )
+
+
+def _blocker(readiness: Any, code: str) -> Any:
+    match = [blocker for blocker in readiness.blockers if blocker.code == code]
+    assert match, f"{code} did not fire: {readiness.codes()}"
+    return match[0]
+
+
+_GROUNDING_FAILURE = (
+    UNGROUNDED_STALE_PREFIX
+    + "Response makes a solver-specific claim with no retained solver evidence: "
+    "'checks 75%'."
+)
+
+
+def test_a_review_that_failed_its_grounding_check_is_not_blamed_on_a_correction() -> None:
+    """The rejected answer and the invalidated answer want opposite responses."""
+    readiness = _evaluate(
+        _cv_hand(),
+        coaching_reviews=(
+            _coaching(is_stale=True, minutes=10, stale_reason=_GROUNDING_FAILURE),
+        ),
+    )
+    blocker = _blocker(readiness, "STALE_COACHING_EVIDENCE")
+
+    assert "correction" not in blocker.reason
+    assert "grounding check" in blocker.reason
+    assert "does not support" in blocker.reason
+    assert blocker.detail == (_GROUNDING_FAILURE,)
+
+
+def test_a_correction_staled_review_still_says_a_correction_staled_it() -> None:
+    readiness = _evaluate(
+        _cv_hand(),
+        coaching_reviews=(
+            _coaching(
+                is_stale=True,
+                minutes=10,
+                stale_reason="Hand evidence changed; rerun coaching.",
+            ),
+        ),
+    )
+    blocker = _blocker(readiness, "STALE_COACHING_EVIDENCE")
+
+    assert "invalidated" in blocker.reason
+    assert "grounding" not in blocker.reason
+    assert blocker.detail == ("Hand evidence changed; rerun coaching.",)
+
+
+def test_a_stale_review_with_no_recorded_reason_does_not_invent_one() -> None:
+    """A hand-edited or pre-migration row records no cause, so none is asserted."""
+    readiness = _evaluate(
+        _cv_hand(), coaching_reviews=(_coaching(is_stale=True, minutes=10),)
+    )
+    blocker = _blocker(readiness, "STALE_COACHING_EVIDENCE")
+
+    assert "does not record" in blocker.reason
+    assert "correction" not in blocker.reason
+    assert "grounding" not in blocker.reason
+    assert blocker.detail == ()
+
+
+def test_a_rejected_solver_frequency_never_reaches_a_blocker_reason() -> None:
+    """StudyBlocker.reason is documented as never carrying a percentage.
+
+    A grounding rejection quotes the claim it rejected, and a rejected claim is
+    routinely a frequency, so quoting the recorded cause into the reason would
+    have put one there. The recorded text belongs in the detail.
+    """
+    readiness = _evaluate(
+        _cv_hand(),
+        coaching_reviews=(
+            _coaching(is_stale=True, minutes=10, stale_reason=_GROUNDING_FAILURE),
+        ),
+        solver_runs=(
+            _solver(
+                status="stale",
+                minutes=10,
+                error_message="TexasSolver reported 3% exploitability and stopped.",
+            ),
+        ),
+    )
+
+    for blocker in readiness.blockers:
+        assert "%" not in blocker.reason, blocker.code
+
+
+def test_a_cancelled_solver_run_is_not_blamed_on_a_correction() -> None:
+    """A finished cancellation lands in 'stale' with no message and no result."""
+    readiness = _evaluate(_cv_hand(), solver_runs=(_solver(status="stale", minutes=10),))
+    blocker = _blocker(readiness, "STALE_SOLVER_EVIDENCE")
+
+    assert "invalidated" not in blocker.reason
+    assert "does not record why" in blocker.reason
+
+
+def test_a_correction_staled_solver_run_still_says_so() -> None:
+    readiness = _evaluate(
+        _cv_hand(),
+        solver_runs=(
+            _solver(
+                status="stale",
+                minutes=10,
+                error_message="Hand evidence changed; rerun solver analysis.",
+            ),
+        ),
+    )
+    blocker = _blocker(readiness, "STALE_SOLVER_EVIDENCE")
+
+    assert "invalidated" in blocker.reason
+    assert "cannot read" not in blocker.reason
+    assert blocker.detail == ("Hand evidence changed; rerun solver analysis.",)
+
+
+def test_a_solver_run_this_build_cannot_read_says_that_and_not_correction() -> None:
+    """db degrades a completed run whose row it cannot read to 'stale' on purpose."""
+    readiness = _evaluate(
+        _cv_hand(),
+        solver_runs=(
+            _solver(status="stale", minutes=10, unreadable_columns=("evidence",)),
+        ),
+    )
+    blocker = _blocker(readiness, "STALE_SOLVER_EVIDENCE")
+
+    assert "cannot read" in blocker.reason
+    assert "invalidated" not in blocker.reason
+    assert "evidence could not be read" in blocker.detail
+
+
+def test_a_stale_run_is_read_for_its_cause_not_a_newer_cancelling_one() -> None:
+    """The blocker is about the finished stale run; a cancelling run has no cause yet."""
+    readiness = _evaluate(
+        _cv_hand(),
+        solver_runs=(
+            _solver(
+                status="stale",
+                minutes=10,
+                error_message="Hand was flagged for future debugging.",
+            ),
+            _solver(status="cancelling", minutes=20),
+        ),
+    )
+    blocker = _blocker(readiness, "STALE_SOLVER_EVIDENCE")
+
+    assert blocker.detail == ("Hand was flagged for future debugging.",)
+
+
+def test_an_unreadable_card_column_is_not_called_an_invalid_card_set() -> None:
+    """Nobody knows whether a value this build cannot read is a valid, unique set."""
+    readiness = _evaluate(
+        _cv_hand(
+            completion_evidence={
+                **dump_completion_evidence(_clean_evidence()),
+                UNREADABLE_CARDS_KEY: {"board_cards": "2c 2c 2c"},
+            }
+        )
+    )
+    blocker = _blocker(readiness, "INVALID_HERO_OR_BOARD_CARDS")
+
+    assert "cannot read" in blocker.reason
+    assert "not a valid, unique set" not in blocker.reason
+
+
+def test_an_attested_showdown_without_five_board_cards_names_a_clearing_action() -> None:
+    """The old action said the board must hold 0, 3, 4, or 5 cards -- which it did."""
+    evidence = dump_completion_evidence(
+        _clean_evidence(partial_end=True, terminal_event=None)
+    )
+    readiness = _evaluate(
+        _cv_hand(
+            board_cards="2c 3d 4h",
+            completion_evidence={
+                **evidence,
+                OPERATOR_MANUAL_COMPLETION_KEY: True,
+                OPERATOR_TERMINAL_EVENT_KEY: "showdown",
+            },
+        )
+    )
+    blocker = _blocker(readiness, "INVALID_HERO_OR_BOARD_CARDS")
+
+    assert "showdown" in blocker.reason
+    assert "not a valid, unique set" not in blocker.reason
+    assert "record the full five-card board" in blocker.clearing_action
+    assert "must hold 0, 3, 4, or 5 cards" not in blocker.clearing_action
+
+
+def test_a_blank_table_size_is_not_reported_as_an_unconfirmed_layout() -> None:
+    """The reconstruction confirmed this layout; the hand's own column is blank."""
+    readiness = _evaluate(_cv_hand(table_size=None))
+    blocker = _blocker(readiness, "UNSUPPORTED_TABLE_LAYOUT")
+
+    assert "did not confirm the seating layout" not in blocker.reason
+    assert "does not record how many seats" in blocker.reason
+
+
+def test_disagreeing_seat_counts_are_reported_as_a_disagreement() -> None:
+    readiness = _evaluate(_cv_hand(table_size=9))
+    blocker = _blocker(readiness, "UNSUPPORTED_TABLE_LAYOUT")
+
+    assert "disagree" in blocker.reason
+    assert "did not confirm the seating layout" not in blocker.reason
+
+
+def test_an_unconfirmed_layout_still_says_the_reconstruction_did_not_confirm_it() -> None:
+    readiness = _evaluate(
+        _cv_hand(
+            completion_evidence=dump_completion_evidence(
+                _clean_evidence(layout_supported=False)
+            )
+        )
+    )
+    blocker = _blocker(readiness, "UNSUPPORTED_TABLE_LAYOUT")
+
+    assert "did not confirm the seating layout" in blocker.reason
+
+
+def test_a_ledger_that_refused_to_build_is_not_reported_as_failing_to_balance() -> None:
+    readiness = _evaluate(
+        _cv_hand(),
+        accounting=None,
+        accounting_error="Player 'BB' commits more than their recorded stack.",
+    )
+    blocker = _blocker(readiness, "ACCOUNTING_NOT_AUTHORITATIVE")
+
+    assert "could not be built at all" in blocker.reason
+    assert "does not reconcile" not in blocker.reason
+
+
+def test_a_balanced_ledger_with_no_saved_settlement_is_not_called_unbalanced() -> None:
+    """A hand whose accounting panel has never been opened has no settlement row."""
+    readiness = _evaluate(
+        _cv_hand(),
+        accounting=_reconciliation(
+            ledger_reconciles=True,
+            settlement=None,
+            issues=("No persisted settlement assumptions or awards.",),
+        ),
+    )
+    blocker = _blocker(readiness, "ACCOUNTING_NOT_AUTHORITATIVE")
+
+    assert "chips themselves balance" in blocker.reason
+    assert "chip ledger does not reconcile" not in blocker.reason
+    assert "nothing to correct first" in blocker.clearing_action
+
+
+def test_a_ledger_that_really_fails_still_says_it_does_not_reconcile() -> None:
+    readiness = _evaluate(
+        _cv_hand(),
+        accounting=_reconciliation(
+            ledger_reconciles=False,
+            settlement=HandSettlement(hand_id=7),
+            issues=("Chip conservation fails.",),
+        ),
+    )
+    blocker = _blocker(readiness, "ACCOUNTING_NOT_AUTHORITATIVE")
+
+    assert "The chip ledger does not reconcile" in blocker.reason
+    assert blocker.detail == ("Chip conservation fails.",)
+
+
+def test_a_second_finding_beside_the_missing_settlement_keeps_the_defect_wording() -> None:
+    """The absent-settlement sentence must not swallow a real finding under it."""
+    readiness = _evaluate(
+        _cv_hand(),
+        accounting=_reconciliation(
+            ledger_reconciles=True,
+            settlement=None,
+            issues=(
+                "No persisted settlement assumptions or awards.",
+                "Observed final pot does not match the derived gross pot.",
+            ),
+        ),
+    )
+    blocker = _blocker(readiness, "ACCOUNTING_NOT_AUTHORITATIVE")
+
+    assert "The chip ledger does not reconcile" in blocker.reason
+    assert "chips themselves balance" not in blocker.reason
+
+
+# ---------------------------------------------------------------------------
+# The two guards that keep the pattern from coming back
+# ---------------------------------------------------------------------------
+
+# One row per CONDITION that can raise a code, for every code raised by more
+# than one. Two conditions of the same code that produce the same sentence mean
+# one of them is being explained by the other.
+_CONDITION_MATRIX: tuple[tuple[str, str, dict[str, Any], dict[str, Any]], ...] = (
+    ("INVALID_HERO_OR_BOARD_CARDS", "unreadable column", {
+        "completion_evidence": {
+            **dump_completion_evidence(_clean_evidence()),
+            UNREADABLE_CARDS_KEY: {"board_cards": "2c 2c 2c"},
+        }
+    }, {}),
+    ("INVALID_HERO_OR_BOARD_CARDS", "invalid set", {"hero_cards": ""}, {}),
+    ("INVALID_HERO_OR_BOARD_CARDS", "attested showdown, short board", {
+        "board_cards": "2c 3d 4h",
+        "completion_evidence": {
+            **dump_completion_evidence(
+                _clean_evidence(partial_end=True, terminal_event=None)
+            ),
+            OPERATOR_MANUAL_COMPLETION_KEY: True,
+            OPERATOR_TERMINAL_EVENT_KEY: "showdown",
+        },
+    }, {}),
+    ("UNSUPPORTED_TABLE_LAYOUT", "layout unsupported", {
+        "completion_evidence": dump_completion_evidence(
+            _clean_evidence(layout_supported=False)
+        )
+    }, {}),
+    ("UNSUPPORTED_TABLE_LAYOUT", "hand table size blank", {"table_size": None}, {}),
+    ("UNSUPPORTED_TABLE_LAYOUT", "seat counts disagree", {"table_size": 9}, {}),
+    ("UNSUPPORTED_TABLE_LAYOUT", "hero seat warning", {
+        "completion_evidence": dump_completion_evidence(
+            _clean_evidence(warning_codes=["hero_seat_mismatch"])
+        )
+    }, {}),
+    ("UNSUPPORTED_TABLE_LAYOUT", "hero seat rejected", {
+        "completion_evidence": dump_completion_evidence(
+            _clean_evidence(rejection_codes=["hero_seat_mismatch"])
+        )
+    }, {}),
+    ("ACCOUNTING_NOT_AUTHORITATIVE", "ledger refused to build", {}, {
+        "accounting": None,
+        "accounting_error": "Player 'BB' commits more than their recorded stack.",
+    }),
+    ("ACCOUNTING_NOT_AUTHORITATIVE", "no reconciliation", {}, {"accounting": None}),
+    ("ACCOUNTING_NOT_AUTHORITATIVE", "verdict predates record", {}, {
+        "accounting": _reconciliation(
+            ledger_reconciles=True,
+            settlement=HandSettlement(hand_id=7),
+            issues=(),
+        )
+    }),
+    # The reconciliation itself failing is ONE condition by ruling: a recorded
+    # figure that contradicts a balanced ledger is reported as a failure to
+    # reconcile, pinned by test_a_real_accounting_defect_is_still_reported_as_one
+    # in tests/test_reconciliation_convergence.py, so the two are not split.
+    ("ACCOUNTING_NOT_AUTHORITATIVE", "reconciliation fails", {}, {
+        "accounting": _reconciliation(
+            ledger_reconciles=False,
+            settlement=HandSettlement(hand_id=7),
+            issues=("Chip conservation fails.",),
+        )
+    }),
+    ("ACCOUNTING_NOT_AUTHORITATIVE", "no settlement saved", {}, {
+        "accounting": _reconciliation(
+            ledger_reconciles=True,
+            settlement=None,
+            issues=("No persisted settlement assumptions or awards.",),
+        )
+    }),
+    ("STALE_COACHING_EVIDENCE", "grounding rejection", {}, {
+        "coaching_reviews": (
+            _coaching(is_stale=True, minutes=10, stale_reason=_GROUNDING_FAILURE),
+        )
+    }),
+    ("STALE_COACHING_EVIDENCE", "correction", {}, {
+        "coaching_reviews": (
+            _coaching(
+                is_stale=True,
+                minutes=10,
+                stale_reason="Hand evidence changed; rerun coaching.",
+            ),
+        )
+    }),
+    ("STALE_COACHING_EVIDENCE", "no recorded cause", {}, {
+        "coaching_reviews": (_coaching(is_stale=True, minutes=10),)
+    }),
+    ("STALE_SOLVER_EVIDENCE", "cancellation in flight", {}, {
+        "solver_runs": (_solver(status="cancelling", minutes=10),)
+    }),
+    ("STALE_SOLVER_EVIDENCE", "cancellation finished", {}, {
+        "solver_runs": (_solver(status="stale", minutes=10),)
+    }),
+    ("STALE_SOLVER_EVIDENCE", "correction", {}, {
+        "solver_runs": (
+            _solver(
+                status="stale",
+                minutes=10,
+                error_message="Hand evidence changed; rerun solver analysis.",
+            ),
+        )
+    }),
+    ("STALE_SOLVER_EVIDENCE", "row could not be read", {}, {
+        "solver_runs": (
+            _solver(status="stale", minutes=10, unreadable_columns=("evidence",)),
+        )
+    }),
+    ("UNRESOLVED_SOURCE_WARNING", "rejection", {}, {}),
+    ("UNRESOLVED_SOURCE_WARNING", "warning", {}, {}),
+    ("USER_CONFIRMATION_MISSING", "reconstructed", {}, {"user_confirmed": False}),
+    ("USER_CONFIRMATION_MISSING", "imported", {}, {"user_confirmed": False}),
+)
+
+# The two UNRESOLVED_SOURCE_WARNING rows and the two USER_CONFIRMATION_MISSING
+# rows need a different hand rather than different overrides, so they are built
+# here instead of in the table above.
+_CONDITION_HANDS: dict[tuple[str, str], Hand] = {
+    ("UNRESOLVED_SOURCE_WARNING", "rejection"): _cv_hand(
+        completion_evidence=dump_completion_evidence(
+            _clean_evidence(rejection_codes=["board_read_conflict"])
+        )
+    ),
+    ("UNRESOLVED_SOURCE_WARNING", "warning"): _cv_hand(
+        completion_evidence=dump_completion_evidence(
+            _clean_evidence(warning_codes=["pot_read_low_confidence"])
+        )
+    ),
+    ("USER_CONFIRMATION_MISSING", "imported"): _manual_hand(
+        completion_evidence={IMPORTED_HAND_KEY: True}
+    ),
+}
+
+
+def test_each_condition_of_a_blocker_gets_its_own_explanation() -> None:
+    """Two conditions of one code sharing a sentence means one explains the other."""
+    reasons: dict[str, dict[str, str]] = {}
+    for code, condition, hand_overrides, call_overrides in _CONDITION_MATRIX:
+        hand = _CONDITION_HANDS.get((code, condition)) or _cv_hand(**hand_overrides)
+        readiness = _evaluate(hand, **call_overrides)
+        reasons.setdefault(code, {})[condition] = _blocker(readiness, code).reason
+
+    collisions = {
+        code: sorted(by_condition)
+        for code, by_condition in reasons.items()
+        if len(set(by_condition.values())) != len(by_condition)
+    }
+    assert collisions == {}
+
+
+# Codes whose reason is either raised by exactly one condition, or produced by a
+# dedicated function of the condition (_completion_reason). Everything else must
+# go through _blocker_from_causes, which can only get its sentence from a _Cause
+# and therefore cannot inherit a sibling condition's explanation.
+_SINGLE_CONDITION_CODES = frozenset(
+    {
+        "ACCOUNTING_ASSUMPTION_DEPENDENT",
+        "COMPLETION_EVIDENCE_MISSING",
+        "COMPLETION_NOT_COMPLETE",
+        "OPEN_DEBUGGING_ISSUE",
+        "STUDY_EXCLUDED_BY_OPERATOR",
+        "UNREADABLE_HAND_COLUMNS",
+    }
+)
+
+
+def test_no_multi_condition_blocker_asserts_its_reason_at_the_raising_site() -> None:
+    """The raw constructor is reserved for codes one condition can reach.
+
+    Adding a second condition to any other code now means adding a _Cause, which
+    carries its own sentence; the shape that let STALE_COACHING_EVIDENCE explain
+    a rejected answer as a correction is not reachable by forgetting something.
+    """
+    import re
+    from pathlib import Path
+
+    import poker_tracker.services.study_readiness as module
+
+    source = Path(module.__file__).read_text()
+    raised_directly = set(
+        re.findall(r"StudyBlocker\(\s*\n\s*code=\"([A-Z_]+)\"", source)
+    )
+
+    assert raised_directly == _SINGLE_CONDITION_CODES

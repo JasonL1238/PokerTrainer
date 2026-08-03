@@ -392,6 +392,13 @@ def _attestation_corroboration_check(connection: sqlite3.Connection) -> CheckRes
                 (f"missing table: {table}",),
             )
     details: list[str] = []
+    # Counted, because a pass with no denominator reads as a verification of a
+    # population that may not exist. Every other check on this report says how
+    # many things it looked at -- "All 0 completed reconstruction timeline(s) are
+    # present" -- and this one used to say only that all of them were fine, which
+    # a database holding no attestations answers just as confidently as one
+    # holding four hundred.
+    examined = 0
     for row in connection.execute(
         "SELECT id, completion_evidence FROM hands "
         "WHERE completion_evidence LIKE '%confirmed_assumption_codes%'"
@@ -412,18 +419,23 @@ def _attestation_corroboration_check(connection: sqlite3.Connection) -> CheckRes
             )
         )
         for code in codes:
-            if isinstance(code, str) and code and code not in recorded:
+            if not isinstance(code, str) or not code:
+                continue
+            examined += 1
+            if code not in recorded:
                 details.append(f"hand {row['id']}: {code}")
     if not details:
         return CheckResult(
             "settlement_attestations",
             "pass",
-            "Every stored settlement attestation has a matching correction record.",
+            f"All {examined} stored settlement attestation(s) have a matching "
+            "correction record.",
         )
     return CheckResult(
         "settlement_attestations",
         "warning",
-        f"{len(details)} settlement attestation(s) have no correction record.",
+        f"{len(details)} of {examined} settlement attestation(s) have no "
+        "correction record.",
         _limited_details(details),
     )
 

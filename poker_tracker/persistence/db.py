@@ -5527,8 +5527,11 @@ def _migrate_to_v20(db: PokerDatabase) -> None:
       * Antes are identified the same way the rest of this module identifies
         forced posts: an action typed ``ante``, or any action carrying a
         ``forced_bet_type`` of ``ante`` or ``big_blind_ante``. A row spelled
-        ``ante`` but typed ``dead_blind`` is a dead blind and does not trigger
-        the refusal, because the mode is an ANTE mode.
+        ``ante`` but typed ``dead_blind`` names two different forced posts, so
+        the ledger refuses it rather than letting either win quietly -- a label
+        that could take a row out of the ante pool would switch this refusal off
+        from a selectbox. It counts as an ante here, which the query below
+        already did: it selects on the kind as well as the type.
 
       * ``hands.blinds_antes`` is untouched and is still free display text. It
         is not parsed, and no ante mode is read out of it -- for the same reason

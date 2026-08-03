@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, Protocol
 
+from poker_tracker.coaching.grounding import UNGROUNDED_STALE_PREFIX
 from poker_tracker.math.cards import (
     CardParseError,
     parse_board_cards,
@@ -116,10 +117,18 @@ class RetainedReview(Protocol):
     provider path) and the legacy ``hand_reviews`` rows, which
     ``_invalidate_hand_derivatives`` stales identically and which the Hands
     workspace still renders.
+
+    ``stale_reason`` is part of the protocol because ``is_stale`` alone no longer
+    says what happened: a review is staled both by a correction to the hand and
+    by failing its own grounding check, and that column is the only thing that
+    tells the two apart.
     """
 
     @property
     def is_stale(self) -> bool: ...
+
+    @property
+    def stale_reason(self) -> str: ...
 
     @property
     def created_at(self) -> datetime: ...
@@ -134,6 +143,30 @@ class StudyBlocker:
     reason: str  # why this blocks, in plain language, never a percentage
     clearing_action: str  # the exact action that clears it
     detail: tuple[str, ...] = ()  # concrete offending values
+
+
+@dataclass(frozen=True)
+class _Cause:
+    """One condition that made a blocker fire, carrying its own explanation.
+
+    A blocker code covers a FAMILY of conditions -- STALE_COACHING_EVIDENCE
+    covers a review a correction invalidated and a review that failed its own
+    grounding check, UNSUPPORTED_TABLE_LAYOUT covers five -- and the sentence an
+    operator acts on has to come from the condition that actually fired. Stating
+    it where the blocker is raised looks equivalent and is not: the second
+    condition routed to a code silently inherits the first one's explanation, and
+    nothing fails. That is how STALE_COACHING_EVIDENCE came to tell an operator
+    "a later correction invalidated this", which means re-run coaching, about an
+    answer that was rejected for naming a card the hand never held, which means
+    something quite different about the answer they just paid for.
+
+    Binding the sentence to the condition makes that mistake require deleting
+    text rather than merely forgetting to add it.
+    """
+
+    reason: str
+    clearing_action: str
+    detail: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -157,6 +190,33 @@ class StudyReadiness:
             if matches:
                 grouped[category] = matches
         return grouped
+
+
+def _joined(values: Iterable[str]) -> str:
+    """Join distinct, non-empty sentences in the order their conditions were found."""
+    return " ".join(dict.fromkeys(value for value in values if value))
+
+
+def _blocker_from_causes(
+    code: BlockerCode, category: BlockerCategory, causes: list[_Cause]
+) -> list[StudyBlocker]:
+    """Compose one blocker out of the conditions that actually fired, or none.
+
+    Repeated sentences are dropped, so two conditions that share a clearing
+    action -- both evidence-borne layout faults name the same reconstruction --
+    do not print it twice.
+    """
+    if not causes:
+        return []
+    return [
+        StudyBlocker(
+            code=code,
+            category=category,
+            reason=_joined(cause.reason for cause in causes),
+            clearing_action=_joined(cause.clearing_action for cause in causes),
+            detail=tuple(item for cause in causes for item in cause.detail),
+        )
+    ]
 
 
 def is_reconstructed_hand(hand: Hand) -> bool:
@@ -389,21 +449,27 @@ def evaluate_study_readiness(
         # the reconstructed predicate's two strings, and this blocker was the
         # last line between that payload and an empty blocker tuple. What a
         # payload cannot manufacture is having been entered here.
-        blockers.append(
-            StudyBlocker(
-                code="USER_CONFIRMATION_MISSING",
-                category="confirmation",
-                reason=(
-                    "You have not confirmed that this reconstructed hand is correct."
-                    if is_reconstructed
-                    else (
-                        "This hand arrived in an import payload, and you have not "
-                        "confirmed that it is correct."
+        blockers.extend(
+            _blocker_from_causes(
+                "USER_CONFIRMATION_MISSING",
+                "confirmation",
+                [
+                    _Cause(
+                        reason=(
+                            "You have not confirmed that this reconstructed hand "
+                            "is correct."
+                            if is_reconstructed
+                            else (
+                                "This hand arrived in an import payload, and you "
+                                "have not confirmed that it is correct."
+                            )
+                        ),
+                        clearing_action=(
+                            "Press 'Finish validation — send to Study' on Import "
+                            "validation."
+                        ),
                     )
-                ),
-                clearing_action=(
-                    "Press 'Finish validation — send to Study' on Import validation."
-                ),
+                ],
             )
         )
 
@@ -611,40 +677,84 @@ def _card_blockers(
     records what it read under ``UNREADABLE_CARDS_KEY``. That record is checked
     first: without it a hand-edited board silently became "no board recorded",
     which is a legitimate state for a manual hand and blocked nothing.
+
+    Three unlike conditions raise this one code, and one sentence covered all
+    three. "The hero and board cards are not a valid, unique set" is false of a
+    column this build could not read back -- nobody knows whether that value is a
+    valid set -- and false of a five-card board requirement that a legal
+    three-card flop fails, where the cards are fine and it is the attested ending
+    they contradict. The old clearing action was worse than the reason there: it
+    said the board must hold 0, 3, 4, or 5 cards, which a three-card board
+    already does, so following it verbatim could not clear the blocker.
     """
-    problem = _unreadable_card_columns(evidence) or _card_problem(
-        hand, is_reconstructed=is_reconstructed
-    )
-    if problem is None and has_operator_manual_completion(evidence):
-        # Only enforce terminal/board agreement for operator-attested terminals.
-        # Pipeline-observed showdown with a missing board is already handled by
-        # completion_status; applying it broadly broke every clean-hand fixture.
-        op_terminal = evidence.extra.get("operator_terminal_event")
-        effective_terminal = (
-            op_terminal
-            if isinstance(op_terminal, str) and op_terminal
-            else evidence.terminal_event
-        )
-        if effective_terminal == "showdown" and len((hand.board_cards or "").split()) != 5:
-            problem = (
-                "operator terminal event is showdown but board_cards does not "
-                f"hold five cards (board={hand.board_cards!r})"
+    causes: list[_Cause] = []
+    unreadable = _unreadable_card_columns(evidence)
+    if unreadable is not None:
+        causes.append(
+            _Cause(
+                reason=(
+                    "A stored card column of this hand holds a value this build "
+                    "cannot read, so the cards shown for it are a blank fallback "
+                    "rather than the stored record."
+                ),
+                clearing_action=(
+                    "Open Hand facts and re-enter the hero and board cards; "
+                    "saving the correction rewrites the column with a value this "
+                    "build can read."
+                ),
+                detail=(unreadable,),
             )
-    if problem is None:
-        return []
-    return [
-        StudyBlocker(
-            code="INVALID_HERO_OR_BOARD_CARDS",
-            category="cards",
-            reason="The hero and board cards are not a valid, unique set.",
-            clearing_action=(
-                "Open Hand facts and fix the hero and board cards; every "
-                "visible card must appear exactly once and the board must hold 0, 3, "
-                "4, or 5 cards."
-            ),
-            detail=(problem,),
         )
-    ]
+    else:
+        problem = _card_problem(hand, is_reconstructed=is_reconstructed)
+        if problem is not None:
+            causes.append(
+                _Cause(
+                    reason="The hero and board cards are not a valid, unique set.",
+                    clearing_action=(
+                        "Open Hand facts and fix the hero and board cards; every "
+                        "visible card must appear exactly once and the board must "
+                        "hold 0, 3, 4, or 5 cards."
+                    ),
+                    detail=(problem,),
+                )
+            )
+        elif has_operator_manual_completion(evidence):
+            # Only enforce terminal/board agreement for operator-attested
+            # terminals. Pipeline-observed showdown with a missing board is
+            # already handled by completion_status; applying it broadly broke
+            # every clean-hand fixture.
+            op_terminal = evidence.extra.get("operator_terminal_event")
+            effective_terminal = (
+                op_terminal
+                if isinstance(op_terminal, str) and op_terminal
+                else evidence.terminal_event
+            )
+            if (
+                effective_terminal == "showdown"
+                and len((hand.board_cards or "").split()) != 5
+            ):
+                causes.append(
+                    _Cause(
+                        reason=(
+                            "You attested that this hand ended in a showdown, but "
+                            "its board does not hold five cards, so the cards "
+                            "recorded and the ending recorded cannot both be right."
+                        ),
+                        clearing_action=(
+                            "Open Hand facts and record the full five-card board "
+                            "the showdown was played to. If the hand did not reach "
+                            "a showdown, re-run Import validation → Edit this hand "
+                            "→ Other fixes → Finalize incomplete hand and attest "
+                            "the terminal event that actually ended it."
+                        ),
+                        detail=(
+                            "operator terminal event is showdown but board_cards "
+                            f"does not hold five cards (board={hand.board_cards!r})",
+                        ),
+                    )
+                )
+    return _blocker_from_causes("INVALID_HERO_OR_BOARD_CARDS", "cards", causes)
 
 
 def _unreadable_column_blockers(evidence: CompletionEvidence) -> list[StudyBlocker]:
@@ -773,67 +883,187 @@ def _layout_blockers(hand: Hand, evidence: CompletionEvidence) -> list[StudyBloc
     seats against evidence for 6 -- and the gate was satisfied by any typed
     value, so "record the table size" was a box to tick rather than a fact to
     state.
+
+    The reason is now composed the same way, for the same reason the action had
+    to be. "The seating layout for this hand was not confirmed" describes the
+    evidence-borne causes and is false of the other two: a hand whose only fault
+    is a blank ``hand.table_size`` column has a layout the reconstruction DID
+    confirm, and a hand whose two seat counts disagree has two confirmations
+    rather than none. An operator told the layout was never confirmed reaches for
+    a re-run; an operator told the two records disagree reaches for the one that
+    is wrong.
     """
-    detail: list[str] = []
-    actions: list[str] = []
+    causes: list[_Cause] = []
+    evidence_detail: list[str] = []
     if evidence.layout_supported is not True:
-        detail.append(f"layout_supported={evidence.layout_supported}")
+        evidence_detail.append(f"layout_supported={evidence.layout_supported}")
     if evidence.table_size is None or not 2 <= evidence.table_size <= 10:
-        detail.append(f"evidence.table_size={evidence.table_size}")
-    if detail:
-        actions.append(_RECONSTRUCTION_ACTION)
+        evidence_detail.append(f"evidence.table_size={evidence.table_size}")
+    if evidence_detail:
+        causes.append(
+            _Cause(
+                reason=(
+                    "The reconstruction did not confirm the seating layout for "
+                    "this hand, so seat, position, and hero attribution cannot be "
+                    "trusted."
+                ),
+                clearing_action=_RECONSTRUCTION_ACTION,
+                detail=tuple(evidence_detail),
+            )
+        )
     if hand.table_size is None:
-        detail.append("hand.table_size is not recorded")
-        actions.append(
-            "Record the table size in Hand facts: that column is the "
-            "hand's own, and typing it clears this line."
+        causes.append(
+            _Cause(
+                reason=(
+                    "This hand does not record how many seats were at the table, "
+                    "so position cannot be derived from its seat numbers."
+                ),
+                clearing_action=(
+                    "Record the table size in Hand facts: that column is the "
+                    "hand's own, and typing it clears this line."
+                ),
+                detail=("hand.table_size is not recorded",),
+            )
         )
     elif evidence.table_size is not None and hand.table_size != evidence.table_size:
-        detail.append(
-            f"hand.table_size={hand.table_size} disagrees with "
-            f"evidence.table_size={evidence.table_size}"
-        )
-        actions.append(
-            "The recorded table size and the reconstructed one disagree. Set the "
-            "table size in Hand facts to the seat count the recording "
-            "shows, or re-run the reconstruction if the evidence is the wrong one."
+        causes.append(
+            _Cause(
+                reason=(
+                    "The seat count this hand records and the seat count the "
+                    "reconstruction observed disagree, so seat, position, and hero "
+                    "attribution rest on whichever of the two is right."
+                ),
+                clearing_action=(
+                    "The recorded table size and the reconstructed one disagree. Set the "
+                    "table size in Hand facts to the seat count the recording "
+                    "shows, or re-run the reconstruction if the evidence is the wrong one."
+                ),
+                detail=(
+                    f"hand.table_size={hand.table_size} disagrees with "
+                    f"evidence.table_size={evidence.table_size}",
+                ),
+            )
         )
     if "hero_seat_mismatch" in evidence.unresolved_warning_codes:
-        detail.append("hero_seat_mismatch")
-        actions.append(
-            "Accept hero_seat_mismatch with Acknowledge in the Source warnings "
-            "panel, which records it as an auditable correction, or re-run the "
-            "reconstruction to remove it."
+        causes.append(
+            _Cause(
+                reason=(
+                    "The reconstruction flagged that the hero was not in the seat "
+                    "it expected, so hero attribution is unconfirmed."
+                ),
+                clearing_action=(
+                    "Accept hero_seat_mismatch with Acknowledge in the Source warnings "
+                    "panel, which records it as an auditable correction, or re-run the "
+                    "reconstruction to remove it."
+                ),
+                detail=("hero_seat_mismatch",),
+            )
         )
     elif "hero_seat_mismatch" in evidence.unresolved_rejection_codes:
-        detail.append("hero_seat_mismatch (rejected)")
-        actions.append(
-            "The pipeline REJECTED hero_seat_mismatch, which is a refusal rather "
-            f"than a note you can accept: {_RECONSTRUCTION_ACTION}"
+        causes.append(
+            _Cause(
+                reason=(
+                    "The reconstruction REJECTED this hand's hero seat, so hero "
+                    "attribution is unconfirmed."
+                ),
+                clearing_action=(
+                    "The pipeline REJECTED hero_seat_mismatch, which is a refusal rather "
+                    f"than a note you can accept: {_RECONSTRUCTION_ACTION}"
+                ),
+                detail=("hero_seat_mismatch (rejected)",),
+            )
         )
-    if not detail:
-        return []
-    return [
-        StudyBlocker(
-            code="UNSUPPORTED_TABLE_LAYOUT",
-            category="layout",
-            reason=(
-                "The seating layout for this hand was not confirmed, so seat, "
-                "position, and hero attribution cannot be trusted."
-            ),
-            clearing_action=" ".join(actions),
-            detail=tuple(detail),
-        )
-    ]
+    return _blocker_from_causes("UNSUPPORTED_TABLE_LAYOUT", "layout", causes)
+
+
+# The settlement editor, named once for the conditions whose fix really is
+# "correct what the cross-check flagged, then save".
+_SETTLEMENT_ACTION = (
+    "Open Import validation → Edit this hand → Other fixes → "
+    "Chip stacks / accounting, fix the flagged contributions or awards, "
+    "and save the settlement until its status reads reconciled."
+)
 
 
 def _accounting_blockers(
     accounting: AccountingReconciliation | None, accounting_error: str | None
 ) -> list[StudyBlocker]:
+    """One code, several conditions, and the operator is told which one fired.
+
+    ``stale_accounting_verdict`` split the first of these out already, for
+    exactly the reason repeated below: "The chip ledger does not reconcile" was
+    being printed over a hand whose ledger reconciles perfectly, with an empty
+    issue list beneath it, and the operator could not tell that from a genuine
+    chip defect. The same sentence was still being printed over two more
+    conditions it is not true of.
+
+    * A ``LedgerError`` means the ledger REFUSED TO BUILD, which is not a failure
+      to balance; the clearing action already branched on it while the reason did
+      not.
+    * A hand with no settlement row at all -- a hand entered here whose
+      accounting panel has never been opened -- has nothing to disagree with, and
+      its chips usually balance. Telling that operator the ledger does not
+      reconcile sends them hunting a defect that is not there, and the action
+      told them to "fix the flagged contributions or awards" when nothing is
+      flagged and nothing needs fixing but the missing save.
+
+    A ledger that balances against a RECORDED figure that contradicts it keeps
+    the original sentence. That is a deliberate ruling, pinned by
+    ``test_a_real_accounting_defect_is_still_reported_as_one``: a hand whose
+    recorded pot contradicts its own action line has a genuine defect and the
+    reconciliation, not merely the label, is what failed.
+    """
     if accounting is not None and accounting.is_authoritative and not accounting_error:
         return []
-    detail: tuple[str, ...] = (accounting_error,) if accounting_error else ()
-    stale_verdict = None if accounting_error else stale_accounting_verdict(accounting)
+    if accounting_error:
+        # A LedgerError means the ledger REFUSED to build -- a player commits more
+        # than their recorded stack, an action references an identity that is not
+        # seated -- and none of that is editable in the Accounting reconciliation
+        # panel, which only edits dead money, the rake policy, awards and refunds. The
+        # blocker used to name that panel for both branches, so following it literally
+        # could not clear the blocker; the panel's own inline caption already said so.
+        return _blocker_from_causes(
+            "ACCOUNTING_NOT_AUTHORITATIVE",
+            "accounting",
+            [
+                _Cause(
+                    reason=(
+                        "This hand's chip ledger could not be built at all, so the "
+                        "pot, result, and every derived number are unproven."
+                    ),
+                    clearing_action=(
+                        "Open Import validation → Edit this hand and correct the "
+                        "stack sizes, action amounts, or players the ledger "
+                        "rejected — the Accounting reconciliation panel cannot "
+                        "change them. Reopen Other fixes → Chip stacks / accounting "
+                        "afterwards and save the settlement until its status reads "
+                        "reconciled."
+                    ),
+                    detail=(accounting_error,),
+                )
+            ],
+        )
+    if accounting is None:
+        return _blocker_from_causes(
+            "ACCOUNTING_NOT_AUTHORITATIVE",
+            "accounting",
+            [
+                _Cause(
+                    reason=(
+                        "No accounting reconciliation was produced for this hand, "
+                        "so nothing has established its pot or its result."
+                    ),
+                    clearing_action=(
+                        "Open Import validation → Edit this hand → Other fixes → "
+                        "Chip stacks / accounting (Accounting reconciliation) and "
+                        "save the settlement. If no reconciliation appears at all, "
+                        "record a debugging issue against the hand instead of "
+                        "promoting it."
+                    ),
+                )
+            ],
+        )
+    stale_verdict = stale_accounting_verdict(accounting)
     if stale_verdict is not None:
         # Said in the blocker rather than left to the operator to infer, because
         # the alternative is what shipped: a hand blocked by an accounting
@@ -842,60 +1072,58 @@ def _accounting_blockers(
         # verdict it reached BEFORE that repair, so the pass that fixes the
         # record and the pass that blesses it are two passes, and only one of
         # them is announced.
-        return [
-            StudyBlocker(
-                code="ACCOUNTING_NOT_AUTHORITATIVE",
-                category="accounting",
-                reason=(
-                    "This hand's chip ledger reconciles, but no saved settlement "
-                    "records that verdict, so the pot and result are not yet "
-                    "proven by anything durable."
-                ),
-                clearing_action=(
-                    "Open Import validation → Edit this hand → Other fixes → "
-                    "Chip stacks / accounting and press Save and reconcile once. "
-                    "The ledger already balances; the stored settlement status is "
-                    "what is out of date."
-                ),
-                detail=(
-                    "Settlement status reads "
-                    f"{stale_verdict.status!r}, not 'reconciled'.",
-                ),
-            )
-        ]
-    if not detail and accounting is not None:
-        detail = tuple(accounting.issues[:4])
-    # A LedgerError means the ledger REFUSED to build -- a player commits more
-    # than their recorded stack, an action references an identity that is not
-    # seated -- and none of that is editable in the Accounting reconciliation
-    # panel, which only edits dead money, the rake policy, awards and refunds. The
-    # blocker used to name that panel for both branches, so following it literally
-    # could not clear the blocker; the panel's own inline caption already said so.
-    clearing_action = (
-        "Open Import validation → Edit this hand and correct the stack sizes, "
-        "action amounts, or players the ledger rejected — the Accounting "
-        "reconciliation panel cannot change them. Reopen Other fixes → "
-        "Chip stacks / accounting afterwards and save the settlement until its "
-        "status reads reconciled."
-        if accounting_error
-        else (
-            "Open Import validation → Edit this hand → Other fixes → "
-            "Chip stacks / accounting, fix the flagged contributions or awards, "
-            "and save the settlement until its status reads reconciled."
+        cause = _Cause(
+            reason=(
+                "This hand's chip ledger reconciles, but no saved settlement "
+                "records that verdict, so the pot and result are not yet "
+                "proven by anything durable."
+            ),
+            clearing_action=(
+                "Open Import validation → Edit this hand → Other fixes → "
+                "Chip stacks / accounting and press Save and reconcile once. "
+                "The ledger already balances; the stored settlement status is "
+                "what is out of date."
+            ),
+            detail=(
+                f"Settlement status reads {stale_verdict.status!r}, not 'reconciled'.",
+            ),
         )
+        return _blocker_from_causes("ACCOUNTING_NOT_AUTHORITATIVE", "accounting", [cause])
+    detail = tuple(accounting.issues[:4])
+    ledger = accounting.ledger
+    ledger_reconciles = ledger is not None and (
+        ledger.is_settled and ledger.is_balanced and ledger.is_legal
     )
-    return [
-        StudyBlocker(
-            code="ACCOUNTING_NOT_AUTHORITATIVE",
-            category="accounting",
+    # `_cross_check` contributes exactly one issue for an absent settlement, so a
+    # second issue means there is a real finding underneath and the established
+    # sentence stands. `reconcile_persisted_hand` always supplies a ledger; a
+    # reconciliation that arrives without one tells us nothing about the chips,
+    # and also keeps the sentence that claims the least.
+    if ledger_reconciles and accounting.settlement is None and len(detail) <= 1:
+        cause = _Cause(
+            reason=(
+                "The chips themselves balance, but no settlement has ever been "
+                "saved for this hand, so nothing durable records who was paid "
+                "what and the pot and result stay unproven."
+            ),
+            clearing_action=(
+                "Open Import validation → Edit this hand → Other fixes → "
+                "Chip stacks / accounting (Accounting reconciliation) and press "
+                "Save and reconcile once. There is nothing to correct first; what "
+                "is missing is the saved settlement itself."
+            ),
+            detail=detail,
+        )
+    else:
+        cause = _Cause(
             reason=(
                 "The chip ledger does not reconcile, so the pot, result, and every "
                 "derived number are unproven."
             ),
-            clearing_action=clearing_action,
+            clearing_action=_SETTLEMENT_ACTION,
             detail=detail,
         )
-    ]
+    return _blocker_from_causes("ACCOUNTING_NOT_AUTHORITATIVE", "accounting", [cause])
 
 
 def _assumption_blockers(
@@ -1083,42 +1311,39 @@ def _source_warning_blockers(evidence: CompletionEvidence) -> list[StudyBlocker]
         if has_operator_manual_completion(evidence)
         else evidence.unresolved_rejection_codes
     )
-    unresolved = tuple([*rejections, *warnings])
-    if not unresolved:
-        return []
-
-    reasons: list[str] = []
-    actions: list[str] = []
+    causes: list[_Cause] = []
     if rejections:
-        reasons.append(
-            f"The pipeline REJECTED {len(rejections)} of this hand's source "
-            "fact(s), which is a refusal rather than a note you can accept."
-        )
-        actions.append(
-            "A rejection cannot be acknowledged away. If you reconstructed the "
-            "whole hand yourself, acknowledge remaining warnings then use "
-            "Finalize incomplete hand. Alternatively, only a new reconstruction "
-            f"clears {', '.join(rejections)}: {NEW_RECONSTRUCTION_STEPS}"
+        causes.append(
+            _Cause(
+                reason=(
+                    f"The pipeline REJECTED {len(rejections)} of this hand's source "
+                    "fact(s), which is a refusal rather than a note you can accept."
+                ),
+                clearing_action=(
+                    "A rejection cannot be acknowledged away. If you reconstructed the "
+                    "whole hand yourself, acknowledge remaining warnings then use "
+                    "Finalize incomplete hand. Alternatively, only a new reconstruction "
+                    f"clears {', '.join(rejections)}: {NEW_RECONSTRUCTION_STEPS}"
+                ),
+                detail=tuple(rejections),
+            )
         )
     if warnings:
-        reasons.append(
-            f"The pipeline flagged {len(warnings)} unresolved source warning(s)."
+        causes.append(
+            _Cause(
+                reason=(
+                    f"The pipeline flagged {len(warnings)} unresolved source warning(s)."
+                ),
+                clearing_action=(
+                    f"For {', '.join(warnings)}: fix each listed field in Correct hand "
+                    "facts, then acknowledge the remaining codes in the Source warnings "
+                    "panel. Acknowledging records the accepted code as an auditable "
+                    "correction."
+                ),
+                detail=tuple(warnings),
+            )
         )
-        actions.append(
-            f"For {', '.join(warnings)}: fix each listed field in Correct hand "
-            "facts, then acknowledge the remaining codes in the Source warnings "
-            "panel. Acknowledging records the accepted code as an auditable "
-            "correction."
-        )
-    return [
-        StudyBlocker(
-            code="UNRESOLVED_SOURCE_WARNING",
-            category="completion",
-            reason=" ".join(reasons),
-            clearing_action=" ".join(actions),
-            detail=unresolved,
-        )
-    ]
+    return _blocker_from_causes("UNRESOLVED_SOURCE_WARNING", "completion", causes)
 
 
 def _coaching_blockers(reviews: list[RetainedReview]) -> list[StudyBlocker]:
@@ -1127,39 +1352,87 @@ def _coaching_blockers(reviews: list[RetainedReview]) -> list[StudyBlocker]:
     Both retained coaching tables are considered: the legacy ``hand_reviews`` rows
     are staled by the same correction path and are still rendered in the Hands
     workspace, so a stale one is stale evidence presented as current.
+
+    ``is_stale`` carries more than one cause and only ``stale_reason`` tells them
+    apart, so that column decides what this says. A correction invalidated the
+    answer, which means the facts moved under it and re-running is the point; or
+    the answer failed its own grounding check -- it named a card the hand never
+    held, or quoted a solver-shaped frequency with no retained solver evidence --
+    which says something about the answer itself, not about the hand; or the row
+    records nothing, which is what a hand-edited or pre-migration row looks like
+    and is not an invitation to guess. All three leave the same two ways out, so
+    only the sentence differs.
+
+    The recorded text is placed in the detail rather than inlined into the
+    reason: a grounding failure quotes the rejected claim back, and a rejected
+    claim is routinely a percentage, which a blocker reason may never contain.
     """
-    stale = [review.created_at for review in reviews if review.is_stale]
+    stale = [review for review in reviews if review.is_stale]
     current = [review.created_at for review in reviews if not review.is_stale]
     if not stale:
         return []
-    newest_stale = max(stale)
+    governing = max(stale, key=lambda review: review.created_at)
     newest_current = max(current) if current else None
-    if newest_current is not None and newest_current >= newest_stale:
+    if newest_current is not None and newest_current >= governing.created_at:
         return []
-    return [
-        StudyBlocker(
-            code="STALE_COACHING_EVIDENCE",
-            category="coaching",
-            reason=(
-                "The saved coaching for this hand was invalidated by a later "
-                "correction and has not been re-run."
-            ),
-            clearing_action=(
-                "Re-run coaching in Analyze → AI coach, or press Discard stale coaching "
-                "there. Re-running keeps the stale review visible as retained "
-                "history; discarding is the way out when no coaching provider is "
-                "configured, which is every imported hand's starting state."
-            ),
+    recorded = (governing.stale_reason or "").strip()
+    if recorded.startswith(UNGROUNDED_STALE_PREFIX):
+        # The marker the writer stamps on a rejected answer, imported rather than
+        # restated, because a second copy of the sentence drifts from the first.
+        reason = (
+            "The saved coaching for this hand failed its own grounding check: it "
+            "asserted facts the prompt it was generated from does not support, so "
+            "it is retained as history rather than as analysis."
         )
-    ]
+    elif recorded:
+        reason = (
+            "The saved coaching for this hand was invalidated by a later change "
+            "to the hand or its session, and has not been re-run."
+        )
+    else:
+        reason = (
+            "The saved coaching for this hand is marked not current and has not "
+            "been re-run; the review does not record what made it stale."
+        )
+    return _blocker_from_causes(
+        "STALE_COACHING_EVIDENCE",
+        "coaching",
+        [
+            _Cause(
+                reason=reason,
+                clearing_action=(
+                    "Re-run coaching in Analyze → AI coach, or press Discard stale coaching "
+                    "there. Re-running keeps the stale review visible as retained "
+                    "history; discarding is the way out when no coaching provider is "
+                    "configured, which is every imported hand's starting state."
+                ),
+                detail=(recorded,) if recorded else (),
+            )
+        ],
+    )
 
 
 def _solver_blockers(runs: list[SolverRun]) -> list[StudyBlocker]:
-    """A failed or cancelled solve is not stale evidence being shown as current."""
-    stale = [run.created_at for run in runs if run.status in _STALE_SOLVER_STATUSES]
+    """A failed or cancelled solve is not stale evidence being shown as current.
+
+    ``status == 'stale'`` is reached by four unlike routes and the blocker
+    asserted one of them. A correction to the hand or its session stales a
+    completed run and records why in ``error_message``; so does flagging the hand
+    for debugging, and so did the v20 dead-money re-derivation. A cancellation
+    that finishes lands in the same status with no message and no result -- there
+    was nothing to invalidate. And a completed run whose stored row this build
+    cannot read is degraded to ``stale`` deliberately, because ``completed`` would
+    grant study evidence over a blob nobody can read.
+
+    So the sentence comes from the run's own record -- the message each staling
+    writer leaves, and the columns the reader had to give up -- rather than from
+    this line. The recorded message goes in the detail, not the reason, for the
+    same reason the coaching one does: a solver message may carry a percentage.
+    """
+    stale = [run for run in runs if run.status in _STALE_SOLVER_STATUSES]
     if not stale:
         return []
-    newest_stale = max(stale)
+    newest_stale = max(run.created_at for run in stale)
     # ``>=``, matching _coaching_blockers. The two describe the same situation and
     # used to disagree on ties: a re-run recorded at the same timestamp as the
     # staling event cleared the coaching blocker but not this one, which then named
@@ -1168,37 +1441,62 @@ def _solver_blockers(runs: list[SolverRun]) -> list[StudyBlocker]:
         run.status == "completed" and run.created_at >= newest_stale for run in runs
     ):
         return []
-    if all(run.status != "stale" for run in runs):
+    finished = [run for run in stale if run.status == "stale"]
+    if not finished:
         # Only a cancellation is in flight. Nothing was invalidated by a
         # correction and there is no saved result, so saying so would be false --
         # and the Delete stale run control is not drawn while a run is cancelling.
-        return [
-            StudyBlocker(
-                code="STALE_SOLVER_EVIDENCE",
-                category="solver",
-                reason=(
-                    "A solver run for this hand is still being cancelled, so no "
-                    "solver evidence for it is current."
-                ),
-                clearing_action=(
-                    "Wait for the cancellation to finish in Analyze → TexasSolver, then "
-                    "either re-run the solve or press Delete stale run beside the "
-                    "cancelled run."
-                ),
-            )
-        ]
-    return [
-        StudyBlocker(
-            code="STALE_SOLVER_EVIDENCE",
-            category="solver",
-            reason=(
-                "A saved solver result for this hand was invalidated by a later "
-                "correction and has not been re-run."
-            ),
-            clearing_action=(
-                "Re-run the solve in Analyze → TexasSolver, or press Delete stale run "
-                "beside it. Deleting is the only clearing action when the hand is "
-                "no longer solver-eligible, which is why the control exists."
-            ),
+        return _blocker_from_causes(
+            "STALE_SOLVER_EVIDENCE",
+            "solver",
+            [
+                _Cause(
+                    reason=(
+                        "A solver run for this hand is still being cancelled, so no "
+                        "solver evidence for it is current."
+                    ),
+                    clearing_action=(
+                        "Wait for the cancellation to finish in Analyze → TexasSolver, then "
+                        "either re-run the solve or press Delete stale run beside the "
+                        "cancelled run."
+                    ),
+                )
+            ],
         )
-    ]
+    governing = max(finished, key=lambda run: run.created_at)
+    recorded = (governing.error_message or "").strip()
+    detail: tuple[str, ...] = (recorded,) if recorded else ()
+    if governing.unreadable_columns:
+        reason = (
+            "A saved solver run for this hand holds stored values this build "
+            "cannot read, so it cannot stand as current solver evidence."
+        )
+        detail = (
+            *detail,
+            *(f"{column} could not be read" for column in governing.unreadable_columns),
+        )
+    elif recorded:
+        reason = (
+            "A saved solver result for this hand was invalidated by a later change "
+            "to the hand or its session, and has not been re-run."
+        )
+    else:
+        reason = (
+            "A solver run for this hand ended without leaving a usable result, so "
+            "there is no current solver evidence for it; the run does not record why."
+        )
+    return _blocker_from_causes(
+        "STALE_SOLVER_EVIDENCE",
+        "solver",
+        [
+            _Cause(
+                reason=reason,
+                clearing_action=(
+                    "Re-run the solve in Analyze → TexasSolver, or press Delete stale run "
+                    "beside it. Deleting is the only clearing action when the hand is "
+                    "no longer solver-eligible, which is why the control exists."
+                ),
+                detail=detail,
+            )
+        ],
+    )

@@ -397,7 +397,7 @@ the denominator, the same way every other population exclusion is reported. The
 copy is still fully browsable and studiable; delete it (Sessions → Delete session)
 to remove it entirely.
 
-The database is at **schema version 19** and every migration is additive: v10
+The database is at **schema version 20** and every migration is additive: v10
 added correction history and review staleness, v11 solver records, v12 the
 debugging issue queue, v13 explicit hand completion
 (`complete`/`partial`/`uncertain`/`not_applicable`) and its versioned
@@ -413,11 +413,38 @@ intact, and the later migrations are deliberately unbackfilled: an old solver ru
 reports its abstraction as unknown rather than being labelled with today's
 settings, and v19 declares no blind structure for any existing hand rather than
 guessing one from the posts it can see. **v20 is the one migration that visibly
-demotes stored hands**: every hand containing an ante reads `ante_mode IS NULL`,
+blocks stored hands**: every hand containing an ante reads `ante_mode IS NULL`,
 which is ambiguous rather than defaulted, so hands that previously reconciled
-start reporting `needs_correction` with the anteing seats named. No row is
-rewritten and the layers shown beside the refusal are the capped reading, and
-one ordinary settlement save clears each hand. Count it with `SELECT
+start refusing, with the anteing seats named, and stop being study-ready. No row
+is rewritten and the layers shown beside the refusal are the capped reading, and
+one ordinary settlement save clears each hand.
+
+Three things about that population are worth knowing before you go looking,
+because the surfaces disagree about it:
+
+- **`review_status` is not demoted, by design** — the migration will not discard
+  a confirmation to announce a change. A hand you had marked `reviewed` still
+  reads *Reviewed* in the Hands library. The library's badges cover evidence
+  class, open issues, stale analysis and reconstruction confidence, and none of
+  them is readiness — so unless the hand carried retained coaching or solver
+  output (which v20 does mark *Stale analysis*), nothing on that row says the
+  ledger stopped reconciling. Insights still admits it to **Confirmed hands**,
+  whose "Admits" sentence claims the promotion guard only allows a hand in "once
+  every readiness blocker is clear". For this population that sentence is false:
+  the guard never ran on it. The same Insights page counts the hand under its
+  *Not study-ready* tile. **Read the readiness tile, not the review badge**, and
+  prefer the **Confirmed and reconciled** population, which does require the
+  ledger.
+- **The Study checklist drops the detail.** It shows the blocker's headline —
+  "The chip ledger does not reconcile" — and points at *Edit this hand → actions
+  or Chip stacks*. The blocker itself names the ante mode, the anteing seats and
+  the three choices; that text is only rendered in the accounting panel. Open the
+  hand's accounting panel to see what to declare.
+- **A manually-entered hand with no linked recording has no route to the
+  settlement editor.** The editor lives inside the CV reconstruction validation
+  flow, and Import shows only "No videos linked yet" for such a hand.
+
+Count the ante population with `SELECT
 COUNT(DISTINCT hand_id) FROM actions WHERE action_type = 'ante' OR
 forced_bet_type IN ('ante','big_blind_ante')`.
 
@@ -521,7 +548,38 @@ export ANTHROPIC_API_KEY=your_key
 export OPENAI_API_KEY=your_key
 ```
 
-Every generated prompt passes the post-session safety check and can be inspected before use.
+Every generated prompt passes the post-session safety check and can be inspected
+before use. **The answer is checked too, and the two checks are not the same
+verdict.** The prompt check confirms the question was a post-session one; the
+grounding check compares the response against the prompt that produced it. It
+covers two fabrication classes: **cards the prompt never contained**, and
+**solver-shaped quantities** — an action frequency, an EV figure or an
+exploitability number — asserted with no retained solver evidence carrying that
+figure. It does **not** check invented pot sizes, invented actions, or a bare
+"loses 4.2 BB" that does not name EV; those pass.
+
+That check runs where the response becomes a database row, so no coaching
+surface can skip it. A response that fails is still saved and still shown
+verbatim — you paid for it, and a rejection you cannot read is no better than no
+check — but it is saved **stale**, with the reason on the row:
+
+- it is kept out of the current-review list and shown under retained stale
+  evidence, labelled `STALE` with its reason above the text;
+- it does **not** promote the hand to `reviewed`, whatever the hand's readiness
+  says. The message names the rejected review rather than the hand's readiness,
+  because those are different problems;
+- it raises `STALE_COACHING_EVIDENCE`, so the hand is not study-ready until you
+  re-run coaching or discard the retained review in **Analyze → AI coach**.
+
+The detector is deliberately biased toward silence on ambiguous text, so a
+reported failure is worth investigating rather than routine; it is not a proof
+that a response that passed is correct.
+
+One limit worth knowing: a provider *failure* is displayed as the client library
+worded it, without the redaction pass the health-check and diagnostics surfaces
+apply. No failure reachable offline echoes a key, so this is an unguarded path
+rather than a known leak — but do not paste a coaching error into a bug report
+without reading it first.
 
 ## TexasSolver postflop review
 
@@ -738,6 +796,14 @@ issue application-data writes, although SQLite may create or update its normal
 WAL shared-memory sidecars while opening an active database. Add `--json` for
 automation. The command exits nonzero when a check fails, while a fresh
 installation with no backups reports a warning.
+
+**This audit is the only surface that notices a missing recording.** Nothing on
+the Import or Sessions card checks that the file behind a `videos` row still
+exists, so a recording deleted from disk keeps rendering its duration,
+resolution and size as current fact with **Run CV reconstruction** and **Extract
+frames** enabled. Both buttons then fail truthfully and name the missing path, so
+no wrong result is produced — but the browse surfaces will not tell you until you
+either press one or run this check.
 
 The same audit runs in-product from **Settings -> Storage & health**, behind an
 explicit *Run health check* button so a page repaint never pays for it. Each

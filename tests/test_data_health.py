@@ -796,3 +796,52 @@ def test_an_older_database_is_not_judged_against_todays_schema(tmp_path: Path) -
     )
 
     assert _checks_by_name(report)["schema_contract"].status == "pass"
+
+
+def test_the_attestation_check_states_how_many_attestations_it_examined(
+    tmp_path: Path,
+) -> None:
+    """A pass with no denominator is the shape a whole round of findings shared.
+
+    Every other check on this report says what it looked at, and this one used to
+    say only that all of them were fine -- a sentence an empty database answers
+    exactly as confidently as a full one. The number is what tells an operator
+    whether the pass is evidence.
+    """
+    from poker_tracker.persistence.models import Hand, Session
+
+    database = tmp_path / "poker_tracker.db"
+    db = _current_schema_database(database)
+    session = db.create_session(Session(name="Attestations"))
+    db.close()
+
+    empty = audit_data_health(
+        database, data_dir=tmp_path / "data", restore_backups=False
+    )
+    check = _checks_by_name(empty)["settlement_attestations"]
+    assert check.status == "pass"
+    assert "All 0 " in check.message
+
+    db = PokerDatabase(database)
+    db.init_db()
+    hand = db.create_hand(
+        Hand(
+            session_id=session.id,
+            hand_number=1,
+            completion_evidence={"confirmed_assumption_codes": ["code-a", "code-b"]},
+        )
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO hand_corrections (hand_id, correction_type, notes, "
+            "created_at) VALUES (?, 'settlement', ?, '2026-01-01T00:00:00')",
+            (hand.id, "attested code-a and code-b"),
+        )
+    db.close()
+
+    populated = audit_data_health(
+        database, data_dir=tmp_path / "data", restore_backups=False
+    )
+    check = _checks_by_name(populated)["settlement_attestations"]
+    assert check.status == "pass"
+    assert "All 2 " in check.message

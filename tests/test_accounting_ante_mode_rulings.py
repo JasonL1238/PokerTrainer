@@ -600,14 +600,22 @@ def test_a_short_ante_booked_as_an_all_in_is_still_an_ante():
         assert declared.net_results["SB"] == pytest.approx(4)
 
 
-def test_an_ante_row_the_recording_typed_as_a_dead_blind_is_a_dead_blind():
-    """The other direction of the same rule: where the recording names it, it decides.
+def test_an_ante_row_the_recording_typed_as_a_dead_blind_is_refused():
+    """Two operator facts contradict, so the hand is refused rather than resolved.
 
-    A row spelled ``ante`` but typed ``dead_blind`` is a dead blind. It must not
-    trigger the ante declaration (the mode names antes) and it must not receive
-    the consolidated-ante exemption. Reading the kind first is the defect
-    ``_is_live_structural_post`` already recorded having been fixed once for
-    liveness; it must not come back for the pool split.
+    This test previously asserted that the label decides: a row spelled ``ante``
+    but typed ``dead_blind`` was a dead blind, and so did not trigger the ante
+    declaration. That reading is what let the Forced-post selectbox switch the
+    declaration off. Tagging the only ante row anything else emptied the ante
+    pool, and a hand the product exists to refuse became one it accepted, with
+    no chip moving to make it visible.
+
+    The rule the operator set for the ante mode itself settles this: refuse an
+    ambiguous hand rather than infer the format. A kind and a label naming two
+    different forced posts is that ambiguity, and neither one gets to win
+    quietly. The chips are unchanged -- the labelled row lays out exactly as the
+    same row with the field cleared -- so what the refusal costs is a correction,
+    not a number.
     """
 
     players = [_player("A", 40), _player("short", 4), _player("B", 40)]
@@ -625,16 +633,40 @@ def test_an_ante_row_the_recording_typed_as_a_dead_blind_is_a_dead_blind():
         _live("B", "call", 4),
     ]
 
-    # No ante anywhere, so no declaration is needed and none is refused.
-    ledger = build_hand_ledger(players, actions, {0: ("short",), 1: ("A",)})
-    assert ledger.legality_issues == ()
-    assert any(note for note in ledger.warnings) is False
-
-    # And a table-ante declaration does not exempt it: it is capped at 4 in the
-    # main pot with 26 above, under both modes.
-    for mode in (PER_PLAYER, SINGLE_PAYER):
-        declared = build_hand_ledger(
-            players, actions, {0: ("short",), 1: ("A",)}, ante_mode=mode
+    cleared = [
+        action
+        if action.forced_bet_type is None
+        else LedgerAction(
+            player=action.player,
+            street=action.street,
+            kind=action.kind,
+            amount=action.amount,
+            is_live_post=action.is_live_post,
         )
-        assert [pot.amount for pot in declared.pots] == pytest.approx([16, 26])
-        assert declared.payouts["short"] == pytest.approx(16)
+        for action in actions
+    ]
+
+    # Undeclared, the contradiction is named AND the ante declaration still
+    # fires -- which is the whole point: the label cannot switch it off.
+    ledger = build_hand_ledger(players, actions, {0: ("short",), 1: ("A",)})
+    assert ledger.is_legal is False
+    assert any("two different forced posts" in issue for issue in ledger.legality_issues)
+    assert any("no ante mode is declared" in issue for issue in ledger.legality_issues)
+
+    # The refusal costs a correction, not a number: the labelled row derives
+    # exactly as the same row with the field cleared.
+    declared = build_hand_ledger(
+        players, actions, {0: ("short",), 1: ("A",)}, ante_mode=PER_PLAYER
+    )
+    without_label = build_hand_ledger(
+        players, cleared, {0: ("short",), 1: ("A",)}, ante_mode=PER_PLAYER
+    )
+    assert [pot.amount for pot in declared.pots] == pytest.approx([16, 26])
+    assert declared.payouts["short"] == pytest.approx(16)
+    assert [pot.amount for pot in declared.pots] == pytest.approx(
+        [pot.amount for pot in without_label.pots]
+    )
+    assert declared.payouts == without_label.payouts
+    # Only the verdict differs, and only in the safe direction.
+    assert without_label.is_legal is True
+    assert declared.is_legal is False
