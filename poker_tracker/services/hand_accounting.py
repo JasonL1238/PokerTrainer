@@ -708,12 +708,33 @@ def _ledger_under_declaration(
         # Withdrawing the awards is the whole difference between the two builds,
         # so if this one refuses as well, the awards were never the problem.
         withdrawn = build(declaration.without_awards())
+        # WHY THIS SENTENCE NO LONGER DIAGNOSES. It used to end "Stored awards
+        # are numbered against the pot layering in force when they were saved,
+        # and this hand no longer produces that layering" -- one cause, asserted
+        # as the cause. That was true of the migration case it was written for
+        # and false of the ordinary one: an award saved seconds ago by this build
+        # against this build's ladder lands here whenever the winner named is not
+        # eligible for the layer it was declared against, and the amendment made
+        # that the common path rather than the rare one, because a dead layer's
+        # eligible set is now cut on TOTAL commitment and the seat that won the
+        # hand often cannot win the layer holding an opponent's capped ante. The
+        # message sent that operator to re-number correct awards when what the
+        # hand needed was a layer awarded to a seat that lost it. The reducer's
+        # own error text already says which pot and which player; what belongs
+        # here is the two things it cannot know -- how many layers this build
+        # derives, and that eligibility is per layer -- with neither cause
+        # claimed over the other.
+        layers = "; ".join(
+            f"{pot.index} {pot.label.lower()} ({', '.join(pot.eligible_players)})"
+            for pot in withdrawn.pots
+        )
         return withdrawn, [
             f"{STALE_AWARD_PREFIX}: {error} This hand derives "
-            f"{len(withdrawn.pots)} pot layer(s); re-declare the winner of each "
-            "one in Edit settlement. Stored awards are numbered against the pot "
-            "layering in force when they were saved, and this hand no longer "
-            "produces that layering."
+            f"{len(withdrawn.pots)} pot layer(s), each winnable only by the seats "
+            f"named beside it: {layers}. Re-declare the winner of each one in "
+            "Edit settlement -- a stored award can name a layer this hand no "
+            "longer produces, or a seat that is not eligible for the layer it "
+            "was declared against."
         ]
 
 

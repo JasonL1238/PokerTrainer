@@ -229,13 +229,32 @@ class PotLayer:
         folded small blind holds nothing but live wagering between the players
         who stayed.
 
-        ``_build_pots`` only ever emits a boundary at a LIVE contribution level
-        that a seat still in the hand failed to reach, so every layer after the
-        first IS a side pot and this mapping has no third case to name.  In
-        particular no layer above the main pot ever holds a forced post: dead
-        money cannot open a boundary and cannot sit above one.  The main pot
-        itself may be nothing but forced posts -- that is what a table with a
-        stack all-in for its ante produces -- and it is still the main pot.
+        ``_build_pots`` emits a boundary in exactly two places, and both of them
+        name a seat still in the hand that cannot win the layer above: a LIVE
+        contribution level a seat failed to reach, and -- under the operator's
+        amended rule 2 -- a dead-money cap a seat's TOTAL commitment failed to
+        reach.  So every layer after the first IS a side pot and this mapping has
+        no third case to name.
+
+        AND IT IS NOW ACTUALLY DERIVED.  ``cause`` used to be computed as
+        ``"main" if index == 0 else "side"`` -- a fact about the list, under a
+        docstring claiming to state a fact about the layer.  The two agree only
+        while ``_build_pots`` emits the widest eligible set first, which nothing
+        checked, so any reordering of the ladder relabelled the pots and every
+        consumer believed the new labels.  The main pot is now identified as the
+        layer whose eligible set contains every other layer's, which is what the
+        word means and which a reordering cannot fake.
+
+        WHAT THE AMENDMENT CHANGED ABOUT THIS SENTENCE.  It used to read "no
+        layer above the main pot ever holds a forced post".  That is no longer
+        true and must not be relied on: a forced post larger than the smallest
+        total commitment in the layer it started in has its excess lifted into a
+        layer above, and that layer can hold nothing but dead money.  Worked
+        example (e) is exactly it -- a 60-chip seat against three 100-chip antes
+        lays out as 240 everyone may win and 120 only the three anteing seats
+        may.  The main pot itself may still be nothing but forced posts -- that is
+        what a table with a stack all-in for its ante produces -- and it is still
+        the main pot.
         """
 
         return _POT_LAYER_LABELS[self.cause]
@@ -275,12 +294,17 @@ def build_hand_ledger(
 
     ``winners`` maps each generated pot index to one or more ordered winners.
     Pot 0 is the main pot; a later layer is generated only where a player still
-    in the hand failed to cover the LIVE wagering, which is what makes it a side
-    pot, and ``PotLayer.cause`` records that.  Boundaries are cut at live
+    in the hand cannot win it, which is what makes it a side pot, and
+    ``PotLayer.cause`` records that.  LIVE boundaries are cut at live
     contribution levels only: unequal dead money -- one seat's ante against
-    another's dead blind, a button ante -- never opens a layer, because no
+    another's dead blind, a button ante -- never opens a live band, because no
     opponent can decline a forced post, and a short seat's own dead posts never
-    raise the level its opponents are charged into the main pot at.  See
+    raise the level its opponents are charged into the main pot at.  Dead money
+    starts in the lowest layer and, under the operator's amended rule 2, the part
+    of a forced post above the smallest TOTAL commitment among that layer's
+    eligible seats rises into a layer of its own, eligible to the seats whose own
+    total reached past the cap.  Those two ladders do not nest in general, so the
+    eligible sets are ordered widest-first rather than chained.  See
     ``_build_pots`` for the model in full.  Omitting winners returns a useful but
     explicitly unsettled ledger. ``flop_seen`` is an
     optional completed-hand fact for histories where a board ran out without
@@ -606,11 +630,14 @@ def build_hand_ledger(
     }
     # The two figures decide two different questions and must stay apart.
     # ``settled_contributions`` is LIVE money that stuck: it is what a seat chose
-    # to wager, so it is the only thing that cuts a layer boundary and the only
-    # thing that decides who may contest a layer above the main pot.
-    # ``dead_contributions`` is owed to the table: it joins the LOWEST layer whole
-    # and opens no boundary anywhere. ``dead`` -- the UNATTRIBUTED dead money --
-    # does the same, and buys its declarer nothing, because no seat wagered it.
+    # to wager, so it is the only thing that cuts a LIVE boundary and the only
+    # thing that decides who may contest a live band. ``dead_contributions`` is
+    # owed to the table: it starts in the LOWEST layer, and under the amended
+    # rule 2 the part of it above the smallest total commitment among that
+    # layer's eligible seats rises into a layer of its own, eligible by total.
+    # ``dead`` -- the UNATTRIBUTED dead money -- has no contributor to cap it
+    # against, so it stays in the lowest layer whole and buys its declarer
+    # nothing, because no seat wagered it.
     raw_pots = _build_pots(
         player_order,
         settled_contributions,
@@ -635,8 +662,13 @@ def build_hand_ledger(
                 "are misordered; this hand cannot be settled as recorded."
             )
     warnings.extend(
-        _uncovered_forced_post_warnings(
-            raw_pots, settled_contributions, dead_contributions
+        _unruled_dead_money_warnings(
+            player_order,
+            settled_contributions,
+            dead_contributions,
+            contributions,
+            folded,
+            dead,
         )
     )
     _validate_winners(winner_map, raw_pots, starting, folded)
@@ -1144,46 +1176,100 @@ def _build_pots(
     folded: set[str],
     external_dead: Decimal,
 ) -> list[dict]:
-    """Cut the pot at distinct LIVE contribution levels, and nowhere else.
+    """Lay the pot out under the operator's model, rule 2 AS AMENDED.
 
-    THE MODEL, in four sentences.  It is the poker rule, and every deviation from
-    it in this module's history produced a payout no opponent had matched:
+    THE MODEL, in four sentences.  Rule 2 is the only one the operator changed;
+    the other three are unchanged, and worked examples (a)-(d) must come out to
+    the chip exactly as they did before:
 
       1. Layer boundaries are cut at the distinct LIVE contribution levels,
          measured after uncalled-bet refunds have been returned.  Live money is
-         what a player CHOSE to wager.  Forced posts are not live.
-      2. ALL dead money -- antes, big-blind antes, dead blinds and externally
-         declared dead money -- goes entirely into the LOWEST layer.  It is owed
-         to the table, nobody can decline it, and it therefore never opens a
-         boundary.
+         what a player CHOSE to wager.  Forced posts are never live.
+      2. Dead money -- antes, big-blind antes, dead blinds and externally
+         declared dead money -- goes into the LOWEST layer, but EACH
+         CONTRIBUTOR'S dead chips count into a layer only up to the smallest
+         TOTAL commitment among that layer's eligible seats.  The excess rises
+         into the layer above, eligible to the seats whose own total reached
+         above that cap.
       3. A seat is eligible for a layer if its own LIVE contribution reaches that
          layer's level.  Every unfolded seat that put ANY chip up -- live or dead
          -- is eligible for the main pot.
       4. A folded seat's chips stay in the layers they reached and it is eligible
          for none.
 
-    HOW 2 AND 3 COEXIST.  When an unfolded seat posted dead money but wagered
-    nothing live -- a stack all-in for its ante -- rule 3 gives the main pot a
-    wider eligible set than the first live band has.  So the layout starts with a
-    level-0 band holding every dead chip, whose eligible set is "every unfolded
-    seat that put a chip up", sitting underneath the live bands.  That is not a
-    boundary in the sense rule 2 forbids: the cut is at live level ZERO, which is
-    a live contribution level, never at a total-commitment level.  Adjacent bands
-    with the SAME eligible set are indistinguishable to any settlement and are
-    emitted as one layer, which is what collapses the ordinary hand -- where the
-    dead band and the first live band are contested by the same seats -- back to
-    a single pot.
+    WHAT THE AMENDMENT FIXED.  Rule 2 used to be unconditional: every dead chip
+    went whole into the lowest layer.  That paid a seat whose ENTIRE commitment
+    was smaller than an opponent's forced post more than the table had matched of
+    it -- a 60-chip seat against three 100-chip antes collected 360 where the
+    table had matched 240 of it, and a 40-chip seat against five 100-chip antes
+    collected 540.  The previous round could not resolve that from the four
+    worked examples, so it published the number and refused to call the hand
+    study-ready.  The operator has now ruled, and the cap below is that ruling.
+
+    TWO LADDERS, BUILT INDEPENDENTLY AND THEN INTERLEAVED.
+
+      THE LIVE LADDER (rule 1).  Distinct positive live levels l_1 < ... < l_m
+      cut bands (l_{j-1}, l_j].  Band j holds each seat's live money clamped into
+      it and is eligible to every unfolded seat with live >= l_j (rule 3, first
+      sentence).
+
+      THE DEAD LADDER (rule 2, amended).  A cascade of caps:
+
+          E_0    = every unfolded seat that put ANY chip up   (rule 3, 2nd sent.)
+          c_k    = min{ commitment[m] : m in E_k }            (the layer's cap)
+          E_k+1  = { m unfolded : commitment[m] > c_k }       (rule 2, 2nd sent.)
+
+      Seat n's CUMULATIVE dead money placed through dead layer k is
+      min(dead[n], c_k), so what it places IN layer k is
+      min(dead[n], c_k) - min(dead[n], c_{k-1}).  The caps strictly increase --
+      every member of E_{k+1} has a commitment above c_k, so the next minimum is
+      above it too -- which is what makes the cascade terminate.
+
+    WHY THE DEAD LADDER IS NOT FOLDED INTO THE LIVE BANDS.  The cheaper
+    implementation -- let risen dead money spill into whatever live band sits
+    above the cap -- is wrong, and worked example (b)'s invariant is why.  Take A
+    with a 100 ante and no live money, B live 100, C live 40, none folded.  The
+    cap is 40, so 60 of A's ante rises; the live band above the cap is (40, 100],
+    eligible to B alone.  Spilling A's 60 in there leaves A -- still in the hand,
+    having committed 100 -- able to win at most 40 and guaranteed to lose 60
+    whatever it holds, which breaks "a seat that wins every layer it is eligible
+    for cannot lose chips" (that is exactly what "ao wins the main pot and comes
+    out at zero" asserts).  Making A eligible for that live band instead is
+    worse: A would collect B's live money A never matched.  The risen dead money
+    keeps its own layer, eligible by TOTAL, which is what rule 2's second
+    sentence says in so many words.
+
+    A CONSEQUENCE, STATED SO NOTHING DOWNSTREAM ASSUMES OTHERWISE.  The eligible
+    sets no longer form a chain.  A dead layer's eligible set is a cut on TOTAL
+    commitment and a live band's is a cut on LIVE contribution, and neither need
+    contain the other: the A/B/C hand above lays out as 40 {A,B,C} / 80 {B,C} /
+    60 {A,B} / 60 {B}, in which {B,C} and {A,B} do not nest.  Layers are emitted
+    widest-eligible-set first, then by lower bound, then dead before live, which
+    reproduces the conventional main/side ordering on every hand where the model
+    does nest.  Every layer's eligible set is still contained in the main pot's,
+    and no two layers share one.
 
     WHAT EACH ARGUMENT IS.  ``live_settled`` is live money that stuck, after
-    refunds: it cuts the boundaries, it sizes the live bands, and it decides
-    eligibility for every layer above the main pot.  ``dead_posted`` is each
-    seat's forced posts and ``external_dead`` is dead money declared for the table
-    with no contributing seat; both go whole into the lowest layer.  ``put_up`` is
-    what a seat committed BEFORE any uncalled money came back, and it answers one
-    question only: did this seat play the hand at all.  A seat whose sole live
-    post was returned -- because the only money facing it was a forced post
-    nobody had a chip left to call -- still played, and still contests the pot it
-    played for.
+    refunds: it cuts the live boundaries, sizes the live bands, and decides
+    eligibility for every live band.  ``dead_posted`` is each seat's forced posts
+    and ``external_dead`` is dead money declared for the table with no
+    contributing seat.  ``put_up`` is what a seat committed BEFORE any uncalled
+    money came back, and it answers one question: did this seat play the hand at
+    all.  A seat whose sole live post was returned -- because the only money
+    facing it was a forced post nobody had a chip left to call -- still played,
+    and still contests the pot it played for.
+
+    WHERE ``put_up`` REACHES THE CAP, AND WHY IT MUST.  Rule 2's operand is a
+    seat's TOTAL COMMITMENT, which is its live money after refunds plus its own
+    dead posts.  For the one seat shape where that is zero and the seat is still
+    in the hand -- its only live money was returned uncalled, which can only
+    happen when no other seat has live money at all -- the commitment is read at
+    the same point rule 3's "put ANY chip up" is read: what it put up.  Reading
+    it as zero instead would cap every layer that seat is eligible for at zero,
+    empty the main pot, and make a hand that seat won unrecordable.  Reading
+    ``put_up`` for a seat whose post-refund commitment is POSITIVE would be the
+    old overpayment in a new place -- a seat refunded 90 of a 100-chip bet has 10
+    at risk, not 100 -- so it is deliberately not done.
 
     THE FIVE FAILURES THIS REPLACES, in the order they happened:
 
@@ -1192,26 +1278,25 @@ def _build_pots(
       dead money always reaches a layer.
     * Deriving the levels from live money alone but pooling dead chips into the
       main pot left a seat whose ENTIRE commitment is a forced post contesting the
-      whole first live layer: three ante chips took twenty-three.  Rule 2's
-      level-0 band is what answers that, and it answers it by sizing the layer at
-      the dead money rather than by cutting the live betting somewhere new.
+      whole first live layer: three ante chips took twenty-three.  Rule 2's dead
+      ladder is what answers that, and it answers it by sizing the layer at the
+      dead money rather than by cutting the live betting somewhere new.
     * Cutting at every distinct TOTAL commitment manufactured a side pot out of
       nothing but unequal dead money -- one seat's 5 ante against another's 3 dead
       blind with everybody matching the same 20 live, one pot of 88 reported as
-      80 plus a phantom 8.  Rule 1 forbids it: 8 is not a live level.
+      80 plus a phantom 8.  Rule 1 forbids it: 8 is not a live level, and the
+      amended rule 2 does not cut there either, because 5 and 3 are both under
+      the 20 cap and nothing rises.
     * Gating that on "some seat is live-short" removed the phantom only from
       hands where nobody was capped, and split two seats holding identical
       commitments across one boundary.
     * Cutting the first boundary at a short seat's TOTAL -- its live chips plus
       its OWN dead posts -- charged every opponent into the main pot up to that
       inflated level, so a seat live-short by 5 with a 5 ante was paid 5 live
-      chips by each opponent that none of them had wagered against it.  On a
-      25,000-hand differential that was 22% of all disagreements and it reported
-      settled, balanced and legal with no warning.  An opponent does not match
-      your ante.  That is why the level set is LIVE and only live.
-
-    So layer 0 is the main pot; every later layer exists because a seat still in
-    the hand did not cover the live wagering and cannot win it -- a side pot.
+      chips by each opponent that none of them had wagered against it.  An
+      opponent does not match your ante.  That is why the LIVE ladder's levels
+      are live and only live, and why the DEAD ladder caps dead money against
+      the total without ever charging an opponent's live money into it.
     """
 
     dead_total = sum(dead_posted.values(), _ZERO) + external_dead
@@ -1219,19 +1304,15 @@ def _build_pots(
     # Rule 3, second sentence: playing the hand is measured by what a seat PUT UP.
     played = tuple(name for name in contenders if put_up.get(name, _ZERO) > 0)
 
-    bands: list[dict] = []
-    if dead_total > 0:
-        bands.append(
-            {
-                "hi": _ZERO,
-                "amount": dead_total,
-                "contributors": tuple(
-                    name for name in order if dead_posted.get(name, _ZERO) > 0
-                ),
-                "eligible": played,
-            }
-        )
+    # Rule 2's cap operand. See "WHERE ``put_up`` REACHES THE CAP" above.
+    commitment: dict[str, Decimal] = {}
+    for name in order:
+        total = live_settled.get(name, _ZERO) + dead_posted.get(name, _ZERO)
+        commitment[name] = total if total > 0 else put_up.get(name, _ZERO)
 
+    bands: list[dict] = []
+
+    # --- rule 1: the LIVE ladder ------------------------------------------
     levels = sorted({amount for amount in live_settled.values() if amount > 0})
     previous = _ZERO
     for level in levels:
@@ -1244,6 +1325,8 @@ def _build_pots(
         )
         bands.append(
             {
+                "kind": "live",
+                "lo": previous,
                 "hi": level,
                 "amount": amount,
                 "contributors": contributors,
@@ -1257,100 +1340,289 @@ def _build_pots(
         )
         previous = level
 
+    # --- rule 2 (amended) + rules 3 and 4: the DEAD ladder ------------------
+    if dead_total > 0:
+        if not played:
+            # Nobody still in the hand put a chip up, so no seat can be declared
+            # the winner of the money that is there. Unchanged behaviour: refuse.
+            raise LedgerError("A pot has no eligible player.")
+        eligible_now = played
+        placed = {name: _ZERO for name in order}
+        previous_cap = _ZERO
+        # The caps strictly increase and each step strictly shrinks the eligible
+        # set, so the model needs at most one pass per seat. The bound exists so
+        # that a cap rule which does NOT increase fails loudly instead of
+        # hanging -- a mutation that breaks the cascade must not become a
+        # timeout, because a timeout is indistinguishable from a slow machine.
+        for _ in range(len(order) + 1):
+            cap = min(commitment[name] for name in eligible_now)
+            layer_dead = _ZERO
+            # Named apart from the live ladder's ``contributors`` because they are
+            # different types -- this one is accumulated -- and sharing the name
+            # made the two ladders look like one loop to a reader and to mypy.
+            dead_contributors: list[str] = []
+            for name in order:
+                own = dead_posted.get(name, _ZERO)
+                share = min(own, cap) - min(own, previous_cap)
+                if share > 0:
+                    layer_dead += share
+                    placed[name] += share
+                    dead_contributors.append(name)
+            if previous_cap == _ZERO:
+                # Externally declared dead money has no contributing seat, so
+                # rule 2's cap -- written per contributor, against that
+                # contributor's own total -- has no operand for it. It stays in
+                # the lowest layer whole and never rises.
+                layer_dead += external_dead
+            remaining = sum(
+                (dead_posted.get(name, _ZERO) - placed[name] for name in order),
+                _ZERO,
+            )
+            next_eligible = tuple(
+                name for name in contenders if commitment[name] > cap
+            )
+            if remaining > 0 and not next_eligible:
+                # Nothing above to rise into. The excess can only ever be a
+                # FOLDED seat's -- an unfolded seat's own dead money is at most
+                # its own commitment, and the cascade's last cap is the largest
+                # surviving commitment -- so this never strands a seat's own
+                # chips above it. It does let the largest surviving stack collect
+                # a folded seat's oversized ante, which is the correct poker
+                # answer and is what the disclosure below names, because the
+                # operator's rule 2 does not say where money with nowhere to
+                # rise belongs.
+                for name in order:
+                    over = dead_posted.get(name, _ZERO) - placed[name]
+                    if over > 0:
+                        layer_dead += over
+                        placed[name] = dead_posted.get(name, _ZERO)
+                        if name not in dead_contributors:
+                            dead_contributors.append(name)
+                remaining = _ZERO
+            if layer_dead > 0:
+                bands.append(
+                    {
+                        "kind": "dead",
+                        "lo": previous_cap,
+                        "hi": cap,
+                        "amount": layer_dead,
+                        "contributors": tuple(dead_contributors),
+                        # Rule 2, second sentence. At cap zero this is rule 3's
+                        # second sentence, so the ladder is uniform.
+                        "eligible": eligible_now,
+                    }
+                )
+            if remaining <= 0:
+                break
+            previous_cap = cap
+            eligible_now = next_eligible
+        else:  # pragma: no cover - unreachable while the caps increase
+            raise LedgerError(
+                "The dead-money cascade did not terminate: the layer caps are "
+                "not strictly increasing."
+            )
+
     if not bands:
         return []
 
-    # Adjacent bands with the same eligible set ARE one layer. No settlement can
-    # tell them apart, and emitting them separately would put a "Side pot" label
-    # on a layer no seat is short of. This is what merges the dead money into the
-    # first live band on the ordinary hand, and what stops a folded seat's private
-    # live level from manufacturing two layers nobody can distinguish.
+    # Layers are ordered widest eligible set first, then by lower bound, then
+    # dead before live so the dead layer carrying rule 3's wider main-pot
+    # eligibility is never displaced by a live band of equal width. Under the
+    # amendment the two ladders do not nest, so this ordering is what reproduces
+    # conventional main/side numbering wherever they do.
+    bands.sort(
+        key=lambda band: (
+            -len(band["eligible"]),
+            band["lo"],
+            0 if band["kind"] == "dead" else 1,
+            band["hi"],
+        )
+    )
+
+    # Bands with the SAME eligible set are one layer. No settlement can tell them
+    # apart, and emitting them separately would put a "Side pot" label on a layer
+    # no seat is short of. This is what collapses the ordinary hand -- where the
+    # dead layer and the first live band are contested by the same seats -- back
+    # to a single pot. Grouped rather than merged pairwise: the two ladders
+    # interleave, so two bands sharing an eligible set need not be neighbours.
     merged: list[dict] = []
+    by_eligible: dict[tuple[str, ...], dict] = {}
     for band in bands:
-        if merged and merged[-1]["eligible"] == band["eligible"]:
-            top = merged[-1]
-            top["hi"] = band["hi"]
-            top["amount"] += band["amount"]
-            top["contributors"] = tuple(
-                dict.fromkeys(top["contributors"] + band["contributors"])
-            )
+        key = band["eligible"]
+        top = by_eligible.get(key)
+        if top is None:
+            copy = dict(band)
+            by_eligible[key] = copy
+            merged.append(copy)
             continue
-        merged.append(dict(band))
+        top["lo"] = min(top["lo"], band["lo"])
+        top["hi"] = max(top["hi"], band["hi"])
+        top["amount"] += band["amount"]
+        top["contributors"] = tuple(
+            dict.fromkeys(top["contributors"] + band["contributors"])
+        )
 
     if not merged[0]["eligible"]:
-        # Nobody still in the hand put a chip up, so no seat can be declared the
-        # winner of the money that is there. Unchanged behaviour: refuse.
         raise LedgerError("A pot has no eligible player.")
 
+    # The MAIN pot is the layer every seat still contesting anything may win --
+    # the one whose eligible set contains every other layer's. That is a fact
+    # about the ladder, so it is read off the ladder.
+    #
+    # It used to be written ``"main" if index == 0 else "side"``, which is a fact
+    # about the LIST, and ``PotLayer.label`` claims in so many words to be
+    # derived "from what created it and not from its index". The two agree only
+    # while the sort above puts the widest eligible set first, and nothing
+    # checked that: a layering that emitted the ladder in any other order still
+    # labelled its first entry "Main pot" and every consumer, the settlement
+    # editor's pot numbers included, believed it. Deriving it means such a
+    # layering produces NO main pot and fails loudly instead.
+    #
+    # Every eligible set really is contained in the widest one -- a live band's
+    # is {contender : live >= level} and a dead layer's is {contender : total >
+    # cap}, and both are subsets of the seats that put a chip up -- but that is
+    # a property of the two rules rather than of the list index, and this is
+    # where it is asserted rather than assumed.
+    reach = {name for band in merged for name in band["eligible"]}
     return [
         {
             "index": index,
             "amount": band["amount"],
             "contributors": band["contributors"],
             "eligible_players": band["eligible"],
-            "cause": "main" if index == 0 else "side",
+            "cause": "main" if reach <= set(band["eligible"]) else "side",
         }
         for index, band in enumerate(merged)
     ]
 
 
-def _uncovered_forced_post_warnings(
-    pots: Sequence[dict],
+def _unruled_dead_money_warnings(
+    order: Sequence[str],
     live_settled: Mapping[str, Decimal],
     dead_posted: Mapping[str, Decimal],
+    put_up: Mapping[str, Decimal],
+    folded: set[str],
+    external_dead: Decimal,
 ) -> list[str]:
-    """Name every main-pot seat the model pays a forced post it never covered.
+    """Name the dead-money shapes the operator's rule 2 still does not decide.
 
-    THIS CHANGES NO CHIP FIGURE.  Rule 2 is the operator's, it is unconditional --
-    all dead money goes whole into the lowest layer -- and it is what worked
-    examples (a) and (d) require: in (a) the big blind's unmatched 10 ante sits in
-    a main pot the two deep seats may win, and in (d) c may win a's 5 ante and b's
-    3 dead blind having posted neither.  So the layering below does exactly what
-    it is told.
+    WHAT THIS USED TO BE, AND WHY IT IS NARROWER NOW.  The previous round refused
+    every hand in which a main-pot seat could be paid a forced post larger than
+    its own total commitment, because rule 2 was unconditional -- all dead money
+    into the lowest layer -- and nothing in the four worked examples said whether
+    a 40-chip seat should collect five opponents' 100-chip antes.  It published
+    540 and declined to call the hand study-ready.
 
-    WHAT THE FOUR EXAMPLES DO NOT DECIDE.  In every one of them the forced posts
-    are within reach of every seat that may win them: (a) and (b) the unmatched
-    post is the SHORT seat's own, (c) each opponent's ante equals the short seat's
-    whole commitment, (d) nobody is short.  Change one number -- a seat all-in for
-    less than an opponent's forced post -- and rule 2 pays it that opponent's post
-    in full.  Antes 100 each with a 40-chip stack short of its own ante gives the
-    short seat 540 where five opponents covered 40 of it apiece; a button ante of
-    200 against a one-chip all-in gives that seat 204.  Whether those are right is
-    a question about the MODEL and only the operator can answer it: capping a
-    forced post at the shortest main-pot seat's total commitment reproduces all
-    four worked examples and both of those hands, so the reading is open, and
-    reading it either way here would be this module choosing its own spec.
+    THE OPERATOR HAS RULED.  Amended rule 2 caps each contributor's dead chips at
+    the smallest TOTAL commitment among the layer's eligible seats and lifts the
+    excess into a layer eligible to the seats whose own total reached above that
+    cap.  That hand is now 240 to the short seat, which is exactly what the table
+    matched of it, and it is answered rather than refused.  So the refusal is
+    withdrawn FOR THAT FAMILY -- and only for it.  Removing the whole guard
+    because most of what it covered became decidable is how a defect returns, so
+    what stays is the residue: the two shapes where the amended rule still has
+    nothing to compare a dead chip against.
 
-    So it does not choose.  It refuses to call the hand study-ready.  The verdict
-    stays legal, balanced and settled -- the arithmetic is not in doubt -- but the
-    warning reaches ``_cross_check``, which folds ledger warnings into its issues,
-    so ``is_authoritative`` is False and the hand lands in ``needs_correction``
-    with the seat, the poster and both numbers named.  A wrong prediction that is
-    visibly rejected is a coverage limitation; the same prediction published as
-    authoritative is a release blocker.  Unattributed declared dead money is
-    deliberately NOT checked: no seat posted it, so there is no poster to name and
-    no per-opponent coverage to measure (ambiguity A5).
+    (1) DEAD MONEY WITH NOWHERE TO RISE.  Rule 2 lifts the excess "into the layer
+        above, eligible to the seats whose own total reached above that cap".
+        When no seat still in the hand has a total above the cap there is no such
+        layer, and the rule stops mid-sentence.  The excess can only ever be a
+        FOLDED seat's -- an unfolded seat's dead money is at most its own
+        commitment, and the last cap the cascade reaches is the largest surviving
+        commitment -- so nothing here strands a seat's own chips.  What it does
+        do is hand the largest surviving stack a folded seat's oversized ante.
+        That is the conventional poker answer and the layering takes it, but it
+        is a chip figure the operator's sentence does not reach, and it is the
+        one place a seat's ceiling is not simply its own total.
+
+    (2) A SEAT CONTESTING A POT IT CONTRIBUTED NOTHING TO.  Rule 3's "put ANY
+        chip up" is read BEFORE the uncalled bet came back, so a seat whose only
+        live post was returned still contests the dead money; reading it after
+        the refund would make a hand that seat won unrecordable.  Rule 2's cap is
+        written against a seat's TOTAL COMMITMENT, and for that one seat the
+        post-refund total is zero.  The layering reads the cap at the same point
+        rule 3 is read -- what the seat put up -- because reading it as zero caps
+        every layer that seat is eligible for at zero and empties the main pot.
+        That is a reading, not a ruling: the operator's sentence never has to
+        choose a measurement point because none of the five worked examples
+        contains a refund.  It reaches only hands whose whole pot is dead money
+        and exactly one seat wagered live, uncalled, so it is narrow -- and it is
+        named rather than assumed.
+
+    THE ONE ASSUMPTION DELIBERATELY NOT WARNED ABOUT.  Externally declared dead
+    money has no contributing seat, so rule 2's cap -- written per CONTRIBUTOR,
+    against that contributor's own total -- has no operand for it; it stays in
+    the lowest layer whole and a seat with a commitment of 1 may win 1000 of it.
+    That is what a real table does with an overlay, a penalty or a carried pot,
+    the amendment's stated motivation ("more than the table had matched of it")
+    does not bite when no seat put the money up, and the previous round reached
+    the same conclusion.  It is recorded here as an assumption rather than
+    disclosed per hand, because a refusal on every hand carrying declared dead
+    money would train an operator to ignore the refusals that matter.
+
+    THIS CHANGES NO CHIP FIGURE.  The verdict stays legal, balanced and settled --
+    the arithmetic is not in doubt -- but the warning reaches ``_cross_check``,
+    which folds ledger warnings into its issues, so ``is_authoritative`` is False
+    and the hand lands in ``needs_correction`` with the seats and both numbers
+    named.  A wrong prediction that is visibly rejected is a coverage limitation;
+    the same prediction published as authoritative is a release blocker.
     """
 
-    if not pots:
+    dead_total = sum(dead_posted.values(), _ZERO) + external_dead
+    if dead_total <= 0:
         return []
+    contenders = [name for name in order if name not in folded]
+    played = [name for name in contenders if put_up.get(name, _ZERO) > 0]
+    if not played:
+        return []
+
+    commitment: dict[str, Decimal] = {}
+    for name in order:
+        total = live_settled.get(name, _ZERO) + dead_posted.get(name, _ZERO)
+        commitment[name] = total if total > 0 else put_up.get(name, _ZERO)
+
     notes: list[str] = []
-    for name in pots[0]["eligible_players"]:
-        covered = live_settled.get(name, _ZERO) + dead_posted.get(name, _ZERO)
-        offenders = [
-            (post, other)
-            for other, post in dead_posted.items()
-            if other != name and post > covered
-        ]
-        if not offenders:
-            continue
-        post, other = max(offenders)
+
+    # (1) Dead money above every surviving seat's commitment.
+    ceiling = max(commitment[name] for name in played)
+    strays = sorted(
+        (
+            (dead_posted.get(name, _ZERO) - ceiling, name)
+            for name in order
+            if dead_posted.get(name, _ZERO) > ceiling
+        ),
+        reverse=True,
+    )
+    if strays:
+        excess, poster = strays[0]
+        collectors = sorted(name for name in played if commitment[name] == ceiling)
         notes.append(
-            f"Main pot pays {name!r} a forced post of {_float(post)} from "
-            f"{other!r}, but {name!r} committed only {_float(covered)} in total. "
-            "Whether an unmatched forced post is capped at what the winner "
-            "covered is not settled by the pot model; this hand is not "
-            "study-ready until it is."
+            f"{_float(excess)} chips of {poster!r}'s forced post are above every "
+            f"remaining seat's commitment, the largest of which is "
+            f"{_float(ceiling)} ({', '.join(repr(name) for name in collectors)}). "
+            "The pot model lifts capped dead money into the layer above, but "
+            "names no layer when no seat's total reaches past the cap; this hand "
+            "is not study-ready until it does. The chips above are the "
+            "conventional answer and the only recordable one -- a folded seat's "
+            "post cannot be returned and a layer no seat can win is refused -- "
+            "so nothing in the recording is wrong and no correction to it "
+            "clears this. It is the model that is silent here, and re-entering "
+            "the post as external dead money would clear the note by deleting a "
+            f"seat's {_float(dead_posted.get(poster, _ZERO))}-chip commitment "
+            "from the results."
+        )
+
+    # (2) A seat whose whole commitment came back as an uncalled bet.
+    for name in played:
+        if live_settled.get(name, _ZERO) + dead_posted.get(name, _ZERO) > 0:
+            continue
+        notes.append(
+            f"{name!r} contests the dead money having had its entire live post "
+            f"of {_float(put_up.get(name, _ZERO))} returned as an uncalled bet, "
+            "so its commitment after refunds is zero. The pot model caps dead "
+            "money at a seat's total commitment but does not say whether that is "
+            "measured before or after the refund; this hand is not study-ready "
+            "until it does."
         )
     return notes
 

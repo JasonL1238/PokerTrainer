@@ -4650,7 +4650,14 @@ def show_accounting_editor(
                 min_value=0.0,
                 value=float(settlement.dead_money),
                 step=0.5,
-                help="Only chips not represented by player actions.",
+                help=(
+                    "Only chips not represented by player actions. It joins the "
+                    "main pot whole and is never capped: a forced post is capped "
+                    "at the smallest total commitment in the layer it sits in, "
+                    "but money no seat put up has no commitment to cap it "
+                    "against, so the shortest stack at the table can win all of "
+                    "it."
+                ),
             )
             rake_rate_pct = assumption_cols[1].number_input(
                 "Rake %",
@@ -4687,12 +4694,32 @@ def show_accounting_editor(
             # Name each layer from the ledger's own record of what created it.
             # Reading "1+ are side pots" off the index told the operator that a
             # layer split off by a blind that folded for less was a side pot,
-            # which it is not.
+            # which it is not. A layer above the main pot no longer implies live
+            # wagering either: under the amended rule 2 a forced post larger than
+            # the smallest total commitment in its layer has the excess lifted
+            # into a layer of its own, which can hold nothing but dead money.
+            #
+            # The amount and the ELIGIBLE SEATS are named too, because the ladder
+            # no longer nests. An index used to imply containment -- pot 2 was
+            # contested by a subset of pot 1's seats -- so "0 main pot, 1 side
+            # pot, 2 side pot" told the operator everything about who could win
+            # what. Under the amendment a dead layer is cut on total commitment
+            # and a live band on live contribution, and two layers' eligible sets
+            # can be disjoint (a 100-chip ante against a 100-chip bet and a
+            # 40-chip all-in lays out as 40 {A,B,C}, 80 {B,C}, 60 {A}). The award
+            # editor's Pot column is a free number with no upper bound, and
+            # declaring a seat for a layer it cannot win is rejected AFTER the
+            # save, so the ordinal alone is no longer enough to fill it in.
             if accounting is not None and accounting.ledger.pots:
-                layer_names = ", ".join(
-                    f"{pot.index} {pot.label.lower()}" for pot in accounting.ledger.pots
+                layer_names = "; ".join(
+                    f"{pot.index} {pot.label.lower()} {pot.amount:g}"
+                    f" ({', '.join(pot.eligible_players)})"
+                    for pot in accounting.ledger.pots
                 )
-                st.caption(f"Awards declare winners by pot layer: {layer_names}.")
+                st.caption(
+                    "Awards declare winners by pot layer. Only the seats named "
+                    f"beside a layer may be declared its winner: {layer_names}."
+                )
             else:
                 st.caption(
                     "Awards declare winners by pot layer, numbered from 0 for the main pot."

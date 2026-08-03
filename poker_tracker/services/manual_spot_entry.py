@@ -528,8 +528,14 @@ def save_manual_spot(
         winner = next(
             player for player in saved_players if player.player_key == built.winner_key
         )
-        # Folded blind fillers split the pot into layers -- dead-money layers,
-        # not side pots -- so award every layer to the winner.
+        # Award every layer this build derives to the winner, whatever the ladder
+        # turns out to be. The blind fillers post LIVE blinds, so the layering
+        # merges the whole spot into a single main pot every seat contests and
+        # this loop runs once -- but the pot indexes are read off the draft
+        # ledger rather than assumed, so a change to the layering cannot leave a
+        # layer unawarded here. (The comment this replaces claimed the fillers
+        # produced "dead-money layers, not side pots"; they produce no extra
+        # layer at all.)
         draft_ledger = build_ledger_from_records(
             saved_players, built.actions, blinds=_SPOT_BLINDS
         )

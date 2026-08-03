@@ -1698,14 +1698,22 @@ def test_relabelling_an_ante_row_cannot_move_a_chip_at_the_product_boundary() ->
     db.close()
 
 
-def test_a_forced_post_no_seat_could_cover_is_refused_as_study_ready() -> None:
-    """Rule 2's undecided case reaches the operator instead of the study queue.
+def test_a_forced_post_no_seat_could_cover_is_capped_and_reconciles() -> None:
+    """Rule 2's amended case reaches the study queue instead of the operator.
 
-    Antes of 100 with a 40-chip stack short of its own ante: the model pays that
-    stack all five opponents' full antes, 300 chips more than any of them covered
-    of it, and the four worked examples do not decide whether that is right.
-    Nothing here changes a chip. What it changes is that the hand can no longer be
-    published as authoritative while the question is open.
+    Antes of 100 with a 40-chip stack short of its own ante. Round 19 derived one
+    main pot holding every seat's whole ante, named the ambiguity in a warning and
+    refused to publish the hand as authoritative. The operator amended rule 2:
+    each contributor's ante counts into the lowest layer only up to the smallest
+    TOTAL commitment among that layer's eligible seats, which here is btn's 40. So
+    the main pot is 120 -- btn's own 40 plus 40 of each surviving anteing seat --
+    and the rest rises into the layer only bb's 200-chip commitment reaches.
+
+    THIS TEST KEEPS ITS SUBJECT AND INVERTS ITS VERDICT, which is the point of
+    keeping it. The service must not go on refusing a hand the operator has ruled
+    on: with the awards matching the derived ladder there is no open question
+    left, so the hand reconciles and ``is_authoritative`` is True. A refusal that
+    outlives its question is indistinguishable from a broken product.
     """
     db = _make_db()
     session = db.create_session(Session(name="Short of the ante"))
@@ -1714,7 +1722,7 @@ def test_a_forced_post_no_seat_could_cover_is_refused_as_study_ready() -> None:
             session_id=session.id,
             hand_number=183,
             game_type="No-limit Hold'em",
-            pot_size=740,
+            pot_size=440,
         )
     )
     seats = (("btn", 0, 40, True), ("sb", 1, 5000, False), ("bb", 2, 5000, False))
@@ -1761,7 +1769,7 @@ def test_a_forced_post_no_seat_could_cover_is_refused_as_study_ready() -> None:
                 pot_index=0,
                 player_key="btn",
                 player_name="BTN",
-                amount=240,
+                amount=120,
                 entry_order=1,
             ),
             SettlementEntry(
@@ -1770,7 +1778,7 @@ def test_a_forced_post_no_seat_could_cover_is_refused_as_study_ready() -> None:
                 pot_index=1,
                 player_key="bb",
                 player_name="BB",
-                amount=200,
+                amount=320,
                 entry_order=2,
             ),
         ],
@@ -1778,14 +1786,170 @@ def test_a_forced_post_no_seat_could_cover_is_refused_as_study_ready() -> None:
 
     result = persist_reconciliation(db, hand.id)
 
-    # The awards declared above ARE the derived ladder, to the chip, so the only
-    # thing standing between this hand and "reconciled" is the open question.
-    assert [pot.amount for pot in result.ledger.pots] == pytest.approx([240, 200])
+    # The awards declared above ARE the derived ladder, to the chip, and the open
+    # question they were blocked on has been answered.
+    assert [pot.amount for pot in result.ledger.pots] == pytest.approx([120, 320])
     assert result.ledger.is_legal is True
     assert result.ledger.is_settled is True
     assert result.ledger.is_balanced is True
+    assert result.is_authoritative is True
+    assert result.settlement.status == "reconciled"
+    assert not any("forced post" in issue for issue in result.issues)
+    # 40 in, 120 out: btn's own post plus the 40 of each opponent's ante that a
+    # 40-chip commitment reached, and not one chip of the 60 it did not.
+    assert result.ledger.net_results["btn"] == pytest.approx(80)
+    db.close()
+
+
+def _capped_ante_hand(db: PokerDatabase, session_id: int) -> Hand:
+    """Antes of 100 with a 40-chip stack short of its own ante.
+
+    The amended rule 2's own shape: the ladder is 120 contested by (btn, bb) and
+    320 contested by bb alone, so the seat that wins the hand cannot win every
+    layer of it.
+    """
+    hand = db.create_hand(
+        Hand(
+            session_id=session_id,
+            hand_number=184,
+            game_type="No-limit Hold'em",
+            pot_size=440,
+        )
+    )
+    for key, index, stack, hero in (
+        ("btn", 0, 40, True),
+        ("sb", 1, 5000, False),
+        ("bb", 2, 5000, False),
+    ):
+        db.create_hand_player(
+            HandPlayer(
+                hand_id=hand.id,
+                player_key=key,
+                seat_index=index,
+                player_name=key.upper(),
+                starting_stack=stack,
+                is_hero=hero,
+            )
+        )
+    for key, action_type, amount in (
+        ("btn", "ante", 40.0),
+        ("sb", "ante", 100.0),
+        ("bb", "ante", 100.0),
+        ("sb", "post_blind", 100.0),
+        ("bb", "post_blind", 200.0),
+        ("sb", "fold", None),
+    ):
+        db.create_action(
+            Action(
+                hand_id=hand.id,
+                player_key=key,
+                player_name=key.upper(),
+                street="preflop",
+                action_type=action_type,
+                amount=amount,
+                amount_semantics="incremental" if amount is not None else "unknown",
+            )
+        )
+    db.upsert_hand_settlement(
+        HandSettlement(hand_id=hand.id, status="settled", small_blind=100, big_blind=200)
+    )
+    return hand
+
+
+def test_an_award_naming_an_ineligible_seat_is_not_reported_as_an_old_numbering() -> None:
+    """The message must not diagnose a cause it cannot know.
+
+    An award rejected by the reducer used to be reported with one explanation
+    asserted as the explanation: "Stored awards are numbered against the pot
+    layering in force when they were saved, and this hand no longer produces that
+    layering." That is true of a stale ORDINAL and false of the case here, where
+    the award was written against this build's own ladder seconds ago and names a
+    pot that exists -- it names a seat that cannot win it. Rule 2 as amended made
+    that the ordinary path rather than the rare one: a dead layer's eligible set
+    is cut on TOTAL commitment, so the seat that wins the hand routinely cannot
+    win the layer holding an opponent's capped ante. An operator following the
+    old sentence would go and re-number correct awards.
+
+    What the hand needs is bb, who lost, declared the winner of layer 1. So the
+    message names the layers and WHO MAY WIN EACH, and offers both causes.
+    """
+    db = _make_db()
+    session = db.create_session(Session(name="Ineligible award"))
+    hand = _capped_ante_hand(db, session.id)
+    db.replace_settlement_entries(
+        hand.id,
+        [
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=0,
+                player_key="btn",
+                player_name="BTN",
+                amount=120,
+                entry_order=1,
+            ),
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=1,
+                player_key="btn",
+                player_name="BTN",
+                amount=320,
+                entry_order=2,
+            ),
+        ],
+    )
+
+    result = reconcile_persisted_hand(db, hand.id)
+
     assert result.is_authoritative is False
-    assert result.settlement.status == "needs_correction"
-    assert any("forced post" in issue for issue in result.issues)
-    assert result.ledger.net_results["btn"] == pytest.approx(200)
+    stale = [issue for issue in result.issues if issue.startswith(STALE_AWARD_PREFIX)]
+    assert stale, "an award the reducer rejects must be reported"
+    note = stale[0]
+    # The reducer's own diagnosis survives.
+    assert "not eligible for pot 1" in note
+    # And the two facts it cannot supply: the ladder, and who may win each layer.
+    assert "2 pot layer(s)" in note
+    assert "0 main pot (btn, bb)" in note
+    assert "1 side pot (bb)" in note
+    # No single cause is asserted over the other.
+    assert "no longer produces that layering" not in note
+    assert "or a seat that is not eligible" in note
+    db.close()
+
+
+def test_declaring_the_losing_seat_for_the_layer_only_it_can_win_reconciles() -> None:
+    """The action the message points at is the one that clears the hand."""
+    db = _make_db()
+    session = db.create_session(Session(name="Ineligible award cleared"))
+    hand = _capped_ante_hand(db, session.id)
+    db.replace_settlement_entries(
+        hand.id,
+        [
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=0,
+                player_key="btn",
+                player_name="BTN",
+                amount=120,
+                entry_order=1,
+            ),
+            SettlementEntry(
+                hand_id=hand.id,
+                entry_type="award",
+                pot_index=1,
+                player_key="bb",
+                player_name="BB",
+                amount=320,
+                entry_order=2,
+            ),
+        ],
+    )
+
+    result = persist_reconciliation(db, hand.id)
+
+    assert result.settlement.status == "reconciled"
+    assert result.is_authoritative is True
+    assert result.ledger.net_results["btn"] == pytest.approx(80)
     db.close()

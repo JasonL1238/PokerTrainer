@@ -576,6 +576,20 @@ def test_a_lone_ante_is_not_refunded_as_an_uncalled_bet() -> None:
     blind that no opponent matched looked exactly like an unmatched overbet and
     was handed back. A single button ante of 5 was returned in full and the pot
     was short by the same 5 chips — money that left the table entirely.
+
+    THE SUBJECT OF THIS TEST IS THE REFUND, AND IT IS UNCHANGED: nothing comes
+    back, both contributions stand, and the gross pot is the whole 9.
+
+    WHAT MOVED, AND WHY IT PINNED THE OLD RULE. The award used to be BB winning
+    all 9. That was unconditional rule 2 -- every dead chip into the lowest layer
+    whatever anybody committed -- and the operator has amended it: each
+    contributor's dead money counts into a layer only up to the smallest TOTAL
+    commitment among that layer's eligible seats. BB committed 2 in total, so 2
+    of BTN's 5-chip ante stays in the layer BB can win and the other 3 rise into a
+    layer only BTN's own 7-chip commitment reaches. BB wins 6, which is BTN's 2
+    live chips plus 2 of the ante plus its own 2 — exactly what the table matched
+    of BB. This is worked example (e)'s shape at button-ante scale, and the old
+    figure paid BB three chips no seat had matched of it.
     """
     players = [_player("BTN"), _player("BB")]
     actions = [
@@ -584,13 +598,18 @@ def test_a_lone_ante_is_not_refunded_as_an_uncalled_bet() -> None:
         _action("BTN", "call", 2),
         _action("BB", "check"),
     ]
-    ledger = build_hand_ledger(players, actions, {0: ("BB",)})
+    unsettled = build_hand_ledger(players, actions)
+    assert [pot.amount for pot in unsettled.pots] == pytest.approx([6, 3])
+    assert unsettled.pots[0].eligible_players == ("BTN", "BB")
+    assert unsettled.pots[1].eligible_players == ("BTN",)
+
+    ledger = build_hand_ledger(players, actions, {0: ("BB",), 1: ("BTN",)})
 
     assert ledger.refunds == pytest.approx({"BTN": 0, "BB": 0})
     assert ledger.contributions == pytest.approx({"BTN": 7, "BB": 2})
     assert ledger.gross_pot == pytest.approx(9)
-    assert ledger.payouts == pytest.approx({"BTN": 0, "BB": 9})
-    assert ledger.net_results == pytest.approx({"BTN": -7, "BB": 7})
+    assert ledger.payouts == pytest.approx({"BTN": 3, "BB": 6})
+    assert ledger.net_results == pytest.approx({"BTN": -4, "BB": 4})
     assert sum(ledger.net_results.values()) == pytest.approx(0)
     assert ledger.is_balanced is True
 
@@ -901,16 +920,34 @@ def test_a_seat_whose_only_post_came_back_still_contests_the_antes() -> None:
     remaining chip can call. The blind comes back — an uncalled bet is measured
     against live money — but the ante is still a pot, and the seat that played
     for it can still be declared the winner of it.
+
+    THE SUBJECT OF THIS TEST IS UNCHANGED: the blind comes back, and ``bob`` is
+    still in the main pot's eligible set having had its only chip returned.
+
+    WHAT MOVED, AND WHY IT PINNED THE OLD RULE. This used to be one pot of 2 with
+    ``bob`` winning all of it, which is unconditional rule 2. Amended rule 2 caps
+    each contributor's dead money at the smallest total commitment among the
+    layer's eligible seats, and ``bob`` put up 1, so 1 of alice's 2-chip ante
+    stays in the pot bob may win and 1 rises into a layer only alice reaches. Bob
+    nets +1 either way -- which is also what a real table produces from the other
+    direction, by returning alice's uncalled excess instead -- but the model now
+    says so rather than paying bob a chip alice's ante never had to cover.
+
+    Because ``bob``'s commitment after the refund is zero and rule 2 does not say
+    which side of the refund its cap is read on, the hand is DISCLOSED: see
+    ``_unruled_dead_money_warnings``. That is the honest half of the reading.
     """
     players = [_player("alice", stack=2, seat=0), _player("bob", stack=1, seat=1)]
     actions = [_action("alice", "ante", 2), _action("bob", "post_blind", 1)]
 
-    ledger = build_hand_ledger(players, actions, {0: ("bob",)})
+    ledger = build_hand_ledger(players, actions, {0: ("bob",), 1: ("alice",)})
     assert ledger.refunds["bob"] == pytest.approx(1)
-    assert [pot.amount for pot in ledger.pots] == pytest.approx([2])
+    assert [pot.amount for pot in ledger.pots] == pytest.approx([1, 1])
     assert ledger.pots[0].eligible_players == ("alice", "bob")
-    assert ledger.net_results == pytest.approx({"alice": -2, "bob": 2})
+    assert ledger.pots[1].eligible_players == ("alice",)
+    assert ledger.net_results == pytest.approx({"alice": -1, "bob": 1})
     assert ledger.is_balanced is True
+    assert any("uncalled bet" in note for note in ledger.warnings)
 
 
 def test_a_pot_made_only_of_dead_money_is_the_main_pot() -> None:
@@ -989,13 +1026,23 @@ def test_a_refunded_seat_still_contests_a_layer_above_what_stayed_in() -> None:
     cut, and a rule with an exemption in it is a rule that will be applied
     inconsistently.
 
-    The amounts moved with the model. This used to derive ``[4, 97]``: the first
-    boundary sat at ``S``'s total of 1, so each of the other three was charged a
-    live chip into the layer ``S`` can win, and 10 of the 11 dead chips were
-    carried up into a layer ``S`` cannot -- an overpayment and an underpayment of
-    the same seat in the same hand, netting out to 4 where the model says 11.
-    ``S`` is owed the whole dead pool, which is its own ante plus the two dead
-    blinds, and nothing else; nobody wagered a live chip at it.
+    The amounts moved with the model, twice. Round 18 derived ``[4, 97]``: the
+    first boundary sat at ``S``'s total of 1, so each of the other three was
+    charged a live chip into the layer ``S`` can win, and 10 of the 11 dead chips
+    were carried up into a layer ``S`` cannot -- an overpayment and an
+    underpayment of the same seat in the same hand. Round 19 derived ``[11, 90]``
+    under unconditional rule 2: ``S`` is owed the whole dead pool.
+
+    ROUND 20 DERIVES ``[3, 98]``, AND THAT CHANGE IS THE OPERATOR'S AMENDMENT,
+    not a regression of what this test is for. ``S`` committed 1 chip. Amended
+    rule 2 caps each contributor's dead money at the smallest total commitment
+    among the layer's eligible seats, which is ``S``'s 1, so ``S`` collects its
+    own ante plus one chip of each dead blind: 3, exactly what the table matched
+    of it. The other 8 dead chips rise into the layer the three seats with more
+    than 1 committed contest, and that layer's eligible set is the assertion this
+    test exists for -- ``R`` is still in it, by the plain live rule, with no
+    exemption. ``[11, 90]`` paid ``S`` eight chips that no seat had matched of a
+    one-chip commitment, which is the shape worked example (e) rules on.
     """
     players = [
         _player("S", stack=1, seat=0),
@@ -1017,15 +1064,15 @@ def test_a_refunded_seat_still_contests_a_layer_above_what_stayed_in() -> None:
     ]
     layers = build_hand_ledger(players, actions).pots
 
-    assert [pot.amount for pot in layers] == pytest.approx([11, 90])
+    assert [pot.amount for pot in layers] == pytest.approx([3, 98])
     assert layers[0].eligible_players == ("S", "R", "Z", "W")
     # R has 30 of live money in the pot and the layer is cut at 30, so R is in it.
     assert layers[1].eligible_players == ("R", "Z", "W")
 
     ledger = build_hand_ledger(players, actions, {0: ("S",), 1: ("R",)})
     assert ledger.refunds["R"] == pytest.approx(70)
-    assert ledger.payouts["R"] == pytest.approx(90)
-    assert ledger.net_results == pytest.approx({"S": 10, "R": 60, "Z": -35, "W": -35})
+    assert ledger.payouts["R"] == pytest.approx(98)
+    assert ledger.net_results == pytest.approx({"S": 2, "R": 68, "Z": -35, "W": -35})
     assert ledger.is_balanced is True
     assert ledger.legality_issues == ()
 
