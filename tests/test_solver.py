@@ -2160,6 +2160,60 @@ def test_hand_invalidation_cancels_active_solve_and_blocks_late_completion(
     db.close()
 
 
+def test_worker_handed_a_cancelling_run_settles_it_without_launching(
+    tmp_path, monkeypatch
+) -> None:
+    """One compare-and-swap is the whole settlement of the entry path.
+
+    A worker can be handed a run the store already moved to ``cancelling``,
+    because a hand edit invalidates derivatives whether or not the process has
+    got going yet. It has to record the run as ``stale`` and start no solver.
+    The second assertion is why one write is enough: expecting ``cancelling``
+    means the row the store hands back is either the ``stale`` one it just wrote
+    or, on a lost race, one that is no longer ``cancelling`` -- so a retry
+    guarded on a returned ``cancelling`` can never fire. This path had no test,
+    which is how a dead retry sat next to it.
+    """
+
+    db_path = tmp_path / "cancel-at-entry.db"
+    db = PokerDatabase(db_path)
+    db.init_db()
+    session = db.create_session(Session(name="Cancel at entry"))
+    hand = db.create_hand(
+        Hand(session_id=session.id, hand_number=1, game_type="NLHE cash", table_size=6)
+    )
+    run = db.create_solver_run(
+        SolverRun(
+            hand_id=hand.id,
+            status="cancelling",
+            input_hash="cancel-at-entry",
+            pid=4242,
+        )
+    )
+
+    def refuse_launch(*args, **kwargs):
+        raise AssertionError("a run already cancelling must not start a solver")
+
+    monkeypatch.setattr("poker_tracker.solver.run_job.subprocess.Popen", refuse_launch)
+
+    run_solver_job(db, run.id)
+
+    reopened = PokerDatabase(db_path)
+    settled = reopened.fetch_solver_run(run.id)
+    assert settled.status == "stale"
+    assert settled.pid is None
+    assert settled.completed_at is not None
+    losing_cas = reopened.update_solver_run(
+        run.id,
+        expected_statuses=("cancelling",),
+        status="stale",
+        pid=None,
+        completed_at=datetime.now(UTC),
+    )
+    assert losing_cas.status != "cancelling"
+    reopened.close()
+
+
 def test_hand_edit_during_worker_launch_cannot_resurrect_run(
     tmp_path, monkeypatch
 ) -> None:

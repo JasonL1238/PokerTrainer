@@ -524,10 +524,6 @@ class PopulationSnapshot:
         return _evidence_mix(self.members)
 
     @property
-    def considered_evidence_mix(self) -> Mapping[EvidenceClass, int]:
-        return _evidence_mix(self.considered)
-
-    @property
     def result_basis_mix(self) -> Mapping[ResultBasis, int]:
         counts: Counter[ResultBasis] = Counter(
             member.result_basis for member in self.members
@@ -665,32 +661,6 @@ def select_population(
     )
 
 
-def build_population(
-    db: PokerDatabase,
-    hands: Iterable[Hand],
-    population: PopulationKey = DEFAULT_POPULATION,
-    *,
-    reconcile: Callable[[int], tuple[AccountingReconciliation | None, str | None]]
-    | None = None,
-    coaching_by_hand: Mapping[int, Sequence[CoachingResponse | HandReview]]
-    | None = None,
-    load_coaching: bool = True,
-    sessions: Iterable[Session] | None = None,
-) -> PopulationSnapshot:
-    """Convenience for a caller that needs exactly one population."""
-    return select_population(
-        build_hand_evidence(
-            db,
-            hands,
-            reconcile=reconcile,
-            coaching_by_hand=coaching_by_hand,
-            load_coaching=load_coaching,
-            sessions=sessions,
-        ),
-        population,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Coverage, sample size and metrics
 # ---------------------------------------------------------------------------
@@ -716,14 +686,6 @@ class Coverage:
     @property
     def is_complete(self) -> bool:
         return self.included == self.eligible
-
-    @property
-    def percent_of_eligible(self) -> float:
-        return 100 * self.included / self.eligible if self.eligible else 0.0
-
-    @property
-    def percent_of_considered(self) -> float:
-        return 100 * self.included / self.considered if self.considered else 0.0
 
     def statement(self) -> str:
         label = self.population_label.lower()

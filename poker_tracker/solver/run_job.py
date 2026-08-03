@@ -43,21 +43,18 @@ def run_solver_job(
         db.close()
         return
     if run.status == "cancelling":
-        completed = db.update_solver_run(
+        # The compare-and-swap below expects `cancelling`, so it returns either the
+        # `stale` row it just wrote or -- on a lost race -- a row that by that same
+        # predicate is no longer `cancelling`, and nothing moves a run back to
+        # `cancelling`. A retry guarded on a returned `cancelling` was therefore
+        # unreachable. Widening the expected statuses here would revive that guard.
+        db.update_solver_run(
             run_id,
             expected_statuses=("cancelling",),
             status="stale",
             pid=None,
             completed_at=datetime.now(UTC),
         )
-        if completed.status == "cancelling":
-            db.update_solver_run(
-                run_id,
-                expected_statuses=("cancelling",),
-                status="stale",
-                pid=None,
-                completed_at=datetime.now(UTC),
-            )
         db.close()
         return
     started = time.monotonic()

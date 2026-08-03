@@ -18,7 +18,6 @@ rather than decoration.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -289,7 +288,3 @@ def regression_summary(db: PokerDatabase, issue_id: int) -> dict[str, Any]:
             for case in cases
         ],
     }
-
-
-def serialize_regression_summary(summary: dict[str, Any]) -> str:
-    return json.dumps(summary, indent=2, sort_keys=True)

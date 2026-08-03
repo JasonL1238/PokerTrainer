@@ -212,10 +212,6 @@ class SessionRow:
     duplicate_of_session_id: int | None = None
 
     @property
-    def counted_in_totals(self) -> bool:
-        return self.duplicate_of_session_id is None
-
-    @property
     def totals_note(self) -> str:
         if self.duplicate_of_session_id is None:
             return "Counted"
