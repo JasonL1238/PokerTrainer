@@ -514,6 +514,12 @@ _RAW_COLUMN_PREDICATES = {
     # a row the reader already degrades to stale needs no write.
     ("poker_tracker/persistence/db.py", "_stale_retained_analysis"),
     ("poker_tracker/persistence/db.py", "_flag_hand_for_debugging"),
+    # The same bulk staling write, done set-wise over the population ruling 5
+    # re-derives. Same reason as _stale_retained_analysis: the UPDATE moves the
+    # COLUMN so the reader sees the rows staled, and a row the reader already
+    # degrades to stale needs no write. It runs once, inside the migration
+    # transaction, before any reader exists to consult.
+    ("poker_tracker/persistence/db.py", "_migrate_to_v20"),
     # A demotion. A value the model cannot read already degrades to
     # needs_correction, so skipping the UPDATE changes no verdict.
     ("poker_tracker/persistence/db.py", "_demote_reviewed_hand"),

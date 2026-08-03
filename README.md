@@ -180,6 +180,32 @@ forced-bet type is indistinguishable from an ordinary short shove and is not
 refused), and no existing hand was backfilled with a structure, because inferring
 one from the largest observed post is the defect itself.
 
+The **ante mode** is in that set for both reasons at once, and it is the only
+declaration that does both. It says how this hand's antes were taken — *no
+antes*, *per-player antes*, or *one consolidated table ante* (a big-blind or
+button ante) — and the two ante readings lay the same recording out differently.
+A per-player ante is capped at the shortest seat's total commitment in the layer
+it sits in and the excess rises; a consolidated table ante is table money and
+sits whole in the main pot, uncapped. Blinds 1/2 with a 2-chip big-blind ante and
+an all-in 1-chip small blind is a 5-chip main pot one way and a 4-chip main pot
+the other, and nothing in the action line tells them apart. So a hand that
+contains any ante and does not declare a mode is **refused**: `is_legal` goes
+False and the hand blocks on `ACCOUNTING_NOT_AUTHORITATIVE` until you choose the
+mode in Edit settlement. It is never inferred — one seat anting looks identical
+whether it is a big-blind ante or a late-entry seat posting its own. A hand with
+**no antes at all is never asked for a declaration**: *no antes* is not a guess
+for it, so the absent mode resolves silently and nothing blocks. (That is the
+*declaration*. A hand with no antes can still be re-derived by the amended
+external-dead-money rule shipped in the same release — see the migration note
+below.) The mode names antes only; a dead blind, a missed
+blind or a penalty post is capped under every mode, so a hand can run both rules
+at once.
+
+Externally declared **dead money** is now capped like a recorded forced post: a
+seat collects it only up to its own total commitment and the rest rises to the
+seats that committed more. It used to join the main pot whole, which paid a seat
+that had committed 2 chips as much as 312.
+
 The pot awards are in that set because on a reconstructed hand nothing observed
 them. The CV pipeline emits no settlement rows at all, so the winner of every pot
 is typed in — in the same panel, in the same save, as the rake — and it is the
@@ -367,14 +393,41 @@ debugging issue queue, v13 explicit hand completion
 reconstruction evidence, v14 video content hashes, v15 per-hand study inclusion,
 v16 the source frame behind each reconstructed action, v17 the regression that
 proves a closed issue stays closed, and v18 the tree, accuracy target and
-iteration cap a solver run was produced under, and v19 the declared blind
-structure (`hand_settlements.small_blind`, `big_blind`, `straddles`). Existing manual hands became
+iteration cap a solver run was produced under, v19 the declared blind
+structure (`hand_settlements.small_blind`, `big_blind`, `straddles`), and v20 the
+declared ante mode (`hand_settlements.ante_mode`). Existing manual hands became
 `not_applicable` at v13; existing reconstructed hands migrated conservatively to
 `uncertain` and `needs_correction` and must be re-confirmed. Existing rows remain
 intact, and the later migrations are deliberately unbackfilled: an old solver run
 reports its abstraction as unknown rather than being labelled with today's
 settings, and v19 declares no blind structure for any existing hand rather than
-guessing one from the posts it can see. Startup migrates older
+guessing one from the posts it can see. **v20 is the one migration that visibly
+demotes stored hands**: every hand containing an ante reads `ante_mode IS NULL`,
+which is ambiguous rather than defaulted, so hands that previously reconciled
+start reporting `needs_correction` with the anteing seats named. For that
+population nothing is rewritten and no figure moves — the layers shown are the
+capped reading, which is what the product derived before the column existed —
+and one ordinary settlement save clears each hand. Count it with `SELECT
+COUNT(DISTINCT hand_id) FROM actions WHERE action_type = 'ante' OR
+forced_bet_type IN ('ante','big_blind_ante')`.
+
+**v20 touches a second, separate population, and this one does move chips.** The
+same release caps operator-typed external dead money against each collecting
+seat's own commitment instead of dropping it whole into the main pot. On a
+stored hand where the declared amount exceeds the smallest commitment contesting
+the main pot, the pot count, the eligible sets and the gross all stay the same
+while the *distribution* changes — so every cross-check still passes and the
+hero result moves anyway. Those hands need no declaration and may contain no
+ante at all. The new figure is the right one, but coaching and solver output
+retained beside them was written against the old one, so v20 marks that analysis
+stale and study readiness blocks on `STALE_COACHING_EVIDENCE` until you rerun
+it. Your `review_status` is not touched and nothing is deleted — only the
+freshness flags move. The predicate is `dead_money > 0` because a schema
+migration cannot run the reducer to find the floor, so it is deliberately
+over-strict: some hands whose figures did not move ask for a coaching rerun.
+Count it with `SELECT COUNT(*) FROM hand_settlements WHERE dead_money > 0`. A
+hand in neither population is untouched in every respect. Startup
+migrates older
 databases automatically; older application versions intentionally refuse to open
 a newer database, and a version 6 export cannot be read back by an older release,
 so keep a copy of any pre-upgrade export you may need to restore. A database whose

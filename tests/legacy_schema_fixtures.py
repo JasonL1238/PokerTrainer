@@ -417,6 +417,9 @@ _SCHEMA_STEPS: dict[int, str] = {
     ALTER TABLE hand_settlements ADD COLUMN big_blind REAL;
     ALTER TABLE hand_settlements ADD COLUMN straddles TEXT NOT NULL DEFAULT '[]';
     """,
+    20: """
+    ALTER TABLE hand_settlements ADD COLUMN ante_mode TEXT;
+    """,
 }
 
 # The versions that physically changed the file. Versions 1-4 are absent because

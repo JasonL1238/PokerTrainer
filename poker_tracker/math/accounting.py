@@ -32,6 +32,9 @@ LedgerActionKind = Literal[
 ]
 
 PotLayerCause = Literal["main", "side"]
+# How this hand's antes were taken, DECLARED and never inferred. See
+# ``AnteMode`` and ``_resolve_ante_mode``.
+AnteModeName = Literal["NONE", "PER_PLAYER", "SINGLE_PAYER_TABLE_ANTE"]
 
 _COMMITMENT_KINDS = {"ante", "post_blind", "bet", "call", "raise", "all-in"}
 _BETTING_COMMITMENT_KINDS = _COMMITMENT_KINDS - {"ante"}
@@ -52,6 +55,20 @@ _LIVE_STRUCTURAL_FORCED_BETS = frozenset(
     {"small_blind", "big_blind", "straddle", "bring_in"}
 )
 _FORCED_POST_KINDS = {"ante", "post_blind"}
+# Forced-bet names that identify an ANTE: money owed to the table by the seat
+# rather than wagered against an opponent, and the ONLY pool the declared ante
+# mode governs. ``dead_blind``, missed blinds and penalty posts are deliberately
+# absent -- see ``_is_ante_post`` and rule 3's last clause, which leaves every
+# non-ante forced post on the treatment it already had.
+#
+# ``button_ante`` and ``table_ante`` are not currently spellable in
+# ``models.ForcedBetType``; they are listed so that adding either to the
+# recording vocabulary classifies it as an ante on the day it is added, rather
+# than silently dropping it into the non-ante pool where the mode cannot reach
+# it.
+_ANTE_FORCED_BET_TYPES = frozenset(
+    {"ante", "big_blind_ante", "button_ante", "table_ante"}
+)
 _FLOP_STREETS = {"flop", "turn", "river", "showdown"}
 _ZERO = Decimal("0")
 # The coarsest denomination a chopped pot may be divided at. A whole chip is the
@@ -160,6 +177,82 @@ class BlindStructure:
     small_blind: float | None
     big_blind: float
     straddles: tuple[float, ...] = ()
+
+
+class AnteMode:
+    """How this hand's antes were taken -- a DECLARATION, never an inference.
+
+    A fact about the TABLE, not about the line: the same category as
+    ``BlindStructure``, ``RakePolicy`` and ``dead_money``, supplied the same way,
+    persisted in the same row, and refused the same way when it is missing.
+
+    THE THREE MODES.
+
+    ``NONE``
+        No antes in this hand. Declaring it over a hand that contains ante posts
+        is a contradiction and is refused, because one of the two is wrong and
+        the model must not choose which.
+
+    ``PER_PLAYER``
+        Every seat -- or several seats -- antes individually. Each contributor's
+        personal ante is capped, for placement in a layer, at the smallest TOTAL
+        commitment among that layer's eligible seats, and the excess rises into a
+        layer eligible to the seats whose own totals reached above the cap. This
+        is the rule shipped last round, retained unchanged.
+
+    ``SINGLE_PAYER_TABLE_ANTE``
+        One seat posts a consolidated ante FOR THE TABLE -- a big-blind ante or a
+        button ante. That ante is TABLE MONEY: it goes whole into the main pot
+        and is never capped against a shorter blind.
+
+    WHY IT CANNOT BE INFERRED, and this is the operator's explicit ruling rather
+    than a preference. The two modes give DIFFERENT pots on the same recording.
+    Blinds 1/2, the big blind posts a 2 ante and the small blind is all-in for
+    its 1-chip blind: declared ``SINGLE_PAYER_TABLE_ANTE`` that is a 5-chip main
+    pot and the small blind nets +4; declared ``PER_PLAYER`` it is a 4-chip main
+    pot and +3. Nothing in the action line distinguishes them -- both spell "the
+    big blind put 2 chips in that nobody had to match" -- so a rule that guessed
+    from the shape of the posts would be choosing between two correct answers by
+    coin flip and publishing the result as authoritative. Inferring this is
+    precisely the class of move that produced five consecutive criticals in this
+    module.
+
+    WHAT THE MODE DOES NOT REACH, stated here because getting it wrong is the
+    dangerous implementation error:
+
+    * LIVE money -- blinds, straddles, bring-ins, bets, calls, raises -- is
+      untouched by every mode. A straddle beside a consolidated ante cuts an
+      ordinary live boundary above it and nothing interacts.
+    * DEAD BLINDS, missed blinds and penalty posts are capped in EVERY mode,
+      including ``SINGLE_PAYER_TABLE_ANTE``. Rule 3's last clause leaves non-ante
+      forced posts on their existing treatment, and this is an ANTE mode: it
+      names antes. So a ``SINGLE_PAYER_TABLE_ANTE`` hand carrying a dead blind
+      runs BOTH dead-money rules at once, on two disjoint pools. A reducer that
+      branched once on the mode and treated all dead money alike would pass every
+      worked example and then silently lose the cap on exactly those hands --
+      live 5/5/5 with a 100 consolidated ante and a 50 dead blind is main 120
+      with 45 risen, not main 165.
+    * EXTERNALLY DECLARED dead money is capped under every mode. It has no seat,
+      so it is not "one seat posts a consolidated ante", and capping is the
+      strict direction. See ``build_hand_ledger``'s ``dead_money`` note.
+    * A refunded uncalled bet is not in the pot at all, in every mode.
+    """
+
+    NONE: AnteModeName = "NONE"
+    PER_PLAYER: AnteModeName = "PER_PLAYER"
+    SINGLE_PAYER_TABLE_ANTE: AnteModeName = "SINGLE_PAYER_TABLE_ANTE"
+
+    #: Every declarable mode, in the order an operator-facing control lists them.
+    ALL: tuple[AnteModeName, ...] = (
+        "NONE",
+        "PER_PLAYER",
+        "SINGLE_PAYER_TABLE_ANTE",
+    )
+
+
+# The refusal every surface shows when a hand's antes have no declared mode.
+# One string prefix so a consumer can recognise the class without matching prose.
+UNDECLARED_ANTE_MODE_PREFIX = "This hand contains ante posts"
 
 
 @dataclass(frozen=True)
@@ -289,6 +382,7 @@ def build_hand_ledger(
     dead_money: float = 0,
     flop_seen: bool | None = None,
     blinds: BlindStructure | None = None,
+    ante_mode: str | None = None,
 ) -> HandLedger:
     """Reduce normalized completed-hand actions into pots and player results.
 
@@ -301,15 +395,32 @@ def build_hand_ledger(
     opponent can decline a forced post, and a short seat's own dead posts never
     raise the level its opponents are charged into the main pot at.  Dead money
     starts in the lowest layer and, under the operator's amended rule 2, the part
-    of a forced post above the smallest TOTAL commitment among that layer's
-    eligible seats rises into a layer of its own, eligible to the seats whose own
-    total reached past the cap.  Those two ladders do not nest in general, so the
-    eligible sets are ordered widest-first rather than chained.  See
-    ``_build_pots`` for the model in full.  Omitting winners returns a useful but
-    explicitly unsettled ledger. ``flop_seen`` is an
+    of a CAPPED forced post above the smallest TOTAL commitment among that
+    layer's eligible seats rises into a layer of its own, eligible to the seats
+    whose own total reached past the cap.  Those two ladders do not nest in
+    general, so the eligible sets are ordered widest-first rather than chained.
+    See ``_build_pots`` for the model in full.  Omitting winners returns a useful
+    but explicitly unsettled ledger. ``flop_seen`` is an
     optional completed-hand fact for histories where a board ran out without
     any postflop action (for example, a preflop all-in). When omitted, the
     ledger preserves the historic behavior of inferring it from action streets.
+
+    ``ante_mode`` is how this hand's antes were taken (see ``AnteMode``), and it
+    decides which dead chips the cap above governs.  Under ``PER_PLAYER`` and
+    ``NONE`` every dead chip is capped, which is the rule this reducer already
+    shipped.  Under ``SINGLE_PAYER_TABLE_ANTE`` the consolidated ante is TABLE
+    MONEY: it goes whole into the main pot and is never capped against a shorter
+    blind, while every non-ante forced post in the SAME hand still runs the
+    cascade.  It is a declaration in the same sense as ``blinds`` and is refused
+    the same way when a hand contains antes and does not carry one -- see
+    ``_resolve_ante_mode``, which also states exactly what a refused hand
+    derives.  A hand with no antes needs no declaration and is untouched.
+
+    ``dead_money`` is chips no seat put up -- an overlay, a carried pot, a
+    penalty returned to the table.  It is capped exactly as a recorded dead post
+    is, under whichever rule the mode selects for the capped pool, which is the
+    operator's fifth ruling.  It used to join the main pot whole and unwarned,
+    so a seat that had committed 2 chips could be paid 312 of it.
 
     ``blinds`` is the room's structural forced-bet sizes (see ``BlindStructure``).
     Preflop, the live wagering starts at the largest structural forced bet
@@ -363,7 +474,17 @@ def build_hand_ledger(
     # Measuring refunds against the total instead hands back an unmatched ante as
     # though it were an overbet, and removes it from the pot entirely.
     live_contributions = {name: _ZERO for name in player_order}
-    dead_contributions = {name: _ZERO for name in player_order}
+    # The dead pool is kept SPLIT rather than summed, because the declared ante
+    # mode governs exactly one half of it: ``ante_contributions`` is what
+    # ``SINGLE_PAYER_TABLE_ANTE`` exempts from the cap, and
+    # ``other_dead_contributions`` (dead blinds, missed blinds, penalty posts)
+    # keeps its existing capped treatment under EVERY mode. Summing them and
+    # branching once on the mode is the dangerous shortcut here: it passes every
+    # worked example and then silently loses the cap on any consolidated-ante
+    # hand that also carries a dead blind, because the exemption swallows the
+    # dead blind too.
+    ante_contributions = {name: _ZERO for name in player_order}
+    other_dead_contributions = {name: _ZERO for name in player_order}
     street_contributions = {name: _ZERO for name in player_order}
     current_street: LedgerStreet | None = None
     folded: set[str] = set()
@@ -543,8 +664,10 @@ def build_hand_ledger(
             # table: it joins the main pot whole and is never returnable.
             if is_live_bet:
                 live_contributions[action.player] += amount
+            elif _is_ante_post(action):
+                ante_contributions[action.player] += amount
             else:
-                dead_contributions[action.player] += amount
+                other_dead_contributions[action.player] += amount
             if is_live_bet:
                 street_contributions[action.player] += amount
                 new_max = max(street_contributions.values(), default=_ZERO)
@@ -628,20 +751,59 @@ def build_hand_ledger(
     settled_contributions = {
         name: live_contributions[name] - refunds[name] for name in player_order
     }
-    # The two figures decide two different questions and must stay apart.
+    # THE DECLARATION GATE. Decided over the whole recording, from the ante rows
+    # alone, so the verdict cannot depend on the order two forced rows happen to
+    # be listed in -- the same reasoning ``_unreadable_forced_posts`` records for
+    # the blind-structure refusal. A refused hand still derives every figure; it
+    # simply cannot present as legal. See ``_resolve_ante_mode``.
+    resolved_mode, ante_mode_refusals = _resolve_ante_mode(
+        ante_mode,
+        [name for name in player_order if ante_contributions[name] > 0],
+    )
+    legality_issues.extend(ante_mode_refusals)
+
+    # RULING 3, AS ONE BRANCH OF TWO LINES. The mode selects which dead chips the
+    # cap governs, and nothing else about the layering changes: the live ladder,
+    # the cascade, the eligibility rules and the abandoned-excess rule are all
+    # mode-independent. Writing the branch here rather than inside ``_build_pots``
+    # keeps the layering itself free of the mode, so there is exactly one place a
+    # future edit could leak the exemption into the wrong pool.
+    #
+    # Note what does NOT move into the uncapped pool under SINGLE_PAYER:
+    # ``other_dead_contributions`` and the external dead money. Rule 3's last
+    # clause leaves non-ante forced posts on their existing treatment, and this is
+    # an ANTE mode.
+    if resolved_mode == AnteMode.SINGLE_PAYER_TABLE_ANTE:
+        capped_dead = dict(other_dead_contributions)
+        uncapped_dead = dict(ante_contributions)
+    else:
+        capped_dead = {
+            name: ante_contributions[name] + other_dead_contributions[name]
+            for name in player_order
+        }
+        uncapped_dead = {name: _ZERO for name in player_order}
+    dead_contributions = {
+        name: ante_contributions[name] + other_dead_contributions[name]
+        for name in player_order
+    }
+
+    # The figures decide different questions and must stay apart.
     # ``settled_contributions`` is LIVE money that stuck: it is what a seat chose
     # to wager, so it is the only thing that cuts a LIVE boundary and the only
-    # thing that decides who may contest a live band. ``dead_contributions`` is
-    # owed to the table: it starts in the LOWEST layer, and under the amended
+    # thing that decides who may contest a live band. ``capped_dead`` is dead
+    # money the cap governs: it starts in the LOWEST layer, and under the amended
     # rule 2 the part of it above the smallest total commitment among that
     # layer's eligible seats rises into a layer of its own, eligible by total.
-    # ``dead`` -- the UNATTRIBUTED dead money -- has no contributor to cap it
-    # against, so it stays in the lowest layer whole and buys its declarer
-    # nothing, because no seat wagered it.
+    # ``uncapped_dead`` is the consolidated table ante, which sits whole in the
+    # main pot. ``dead`` -- the UNATTRIBUTED, operator-typed dead money -- is in
+    # the CAPPED pool under every mode, which is the operator's fifth ruling: it
+    # used to join the main pot whole and buy the shortest seat at the table the
+    # lot of it.
     raw_pots = _build_pots(
         player_order,
         settled_contributions,
-        dead_contributions,
+        capped_dead,
+        uncapped_dead,
         contributions,
         folded,
         dead,
@@ -669,8 +831,21 @@ def build_hand_ledger(
             contributions,
             folded,
             dead,
+            resolved_mode == AnteMode.SINGLE_PAYER_TABLE_ANTE,
         )
     )
+    # A hand carrying antes with no declared mode is refused, not merely warned,
+    # so the refusal above already blocks it. The pot figures published beside
+    # that refusal are derived under the capped rule; the note names it so that
+    # an operator reading the layers knows which reading they are looking at.
+    if ante_mode_refusals:
+        warnings.append(
+            "The pot layers shown are derived under the capped (PER_PLAYER) "
+            "reading of this hand's antes, which is the strict direction and "
+            "what this product derived before the ante mode existed. They are "
+            "not a decision about the mode and this hand is not study-ready "
+            "until the mode is declared."
+        )
     _validate_winners(winner_map, raw_pots, starting, folded)
 
     gross = sum((pot["amount"] for pot in raw_pots), _ZERO)
@@ -766,6 +941,7 @@ def build_ledger_from_records(
     odd_chip_order: Sequence[str] = (),
     flop_seen: bool | None = None,
     blinds: BlindStructure | None = None,
+    ante_mode: str | None = None,
 ) -> HandLedger:
     """Adapt persisted application records to the normalized ledger contract.
 
@@ -885,7 +1061,34 @@ def build_ledger_from_records(
         dead_money=dead_money,
         flop_seen=flop_seen,
         blinds=blinds,
+        ante_mode=ante_mode,
     )
+
+
+def declared_ante_mode(value: str | None) -> AnteModeName | None:
+    """The one definition of "an ante mode was declared", for every caller.
+
+    The direct analogue of ``blind_structure``, and it exists for the same
+    reason: every surface that stores, reads, neutralises or displays the
+    declaration has to agree about whether one was made, or they will disagree
+    about whether a hand is study-ready. Persisted callers pass the
+    ``hand_settlements.ante_mode`` column straight in.
+
+    An empty string is read as ABSENT rather than refused, because that is what a
+    NULL column round-tripped through a text field looks like, and "undeclared"
+    is a state the product already handles loudly. Anything else that is not a
+    known mode is refused here rather than silently dropped: dropping it would
+    turn a corrupt declaration into a missing one, and the missing one derives
+    under a different rule.
+    """
+
+    if value is None or value == "":
+        return None
+    if value not in AnteMode.ALL:
+        raise LedgerError(
+            f"Unknown ante mode {value!r}; expected one of {', '.join(AnteMode.ALL)}."
+        )
+    return value
 
 
 def blind_structure(
@@ -921,6 +1124,120 @@ def _is_forced_post(action: LedgerAction) -> bool:
     """
 
     return action.kind in _FORCED_POST_KINDS or action.forced_bet_type is not None
+
+
+def _is_ante_post(action: LedgerAction) -> bool:
+    """Whether this commitment is an ANTE -- the one pool the ante mode governs.
+
+    Decided the same way ``_is_live_structural_post`` decides its question, and
+    for the same reason: WHERE THE RECORDING NAMES THE FORCED BET, THAT NAME
+    DECIDES. A big-blind ante that took its poster's last chip is routinely
+    booked as ``all-in`` carrying ``forced_bet_type='big_blind_ante'``, and a row
+    spelled ``ante`` but typed ``dead_blind`` is a dead blind. Keying on the kind
+    alone would put the first in the non-ante pool -- where the consolidated-ante
+    exemption cannot reach it, so worked example (f) would silently revert to the
+    capped answer on every recording that spells its short ante that way.
+
+    A row the recording says nothing about falls back to its kind, which is the
+    only signal there is and is what every existing construction supplies.
+    """
+
+    if action.kind not in _COMMITMENT_KINDS:
+        return False
+    if action.forced_bet_type is not None:
+        return action.forced_bet_type in _ANTE_FORCED_BET_TYPES
+    return action.kind == "ante"
+
+
+def _resolve_ante_mode(
+    declared: str | None, ante_posters: Sequence[str]
+) -> tuple[AnteModeName, list[str]]:
+    """Validate the declared ante mode against the antes this hand contains.
+
+    Returns the mode the layering will run under and the refusals the hand must
+    carry. AMBIGUOUS HANDS ARE REFUSED, NEVER INFERRED -- the operator ruled
+    against inference explicitly.
+
+    THE THREE REFUSALS, each naming the missing declaration and the clearing
+    action, in the same register as the undeclared blind structure:
+
+    1. Antes present, no mode declared. The commonest one, and the whole of the
+       migration impact: every hand already in the store that contains an ante
+       lands here on the day the column ships.
+    2. Mode declared ``NONE`` but antes were posted. A contradiction between two
+       operator-supplied facts; the model refuses rather than deciding which of
+       them to believe.
+    3. Mode declared ``SINGLE_PAYER_TABLE_ANTE`` but two or more seats posted
+       antes. The declaration says ONE seat posts for the table. Two anteing
+       seats under that declaration is a hand mixing a consolidated ante with
+       personal ones, and no defensible answer exists: capping all of them breaks
+       worked example (f), capping none breaks (e), and splitting them requires
+       knowing which post was the consolidated one -- which is exactly the
+       inference the ruling forbids. Flagged as a coverage limitation, not
+       answered.
+
+    WHAT A REFUSED HAND DERIVES, and why it is not a fourth mode. A refusal is
+    reported as a legality issue, exactly like the undeclared blind structure:
+    the hand stays fully inspectable, every chip figure is still derived, and it
+    simply may not present as legal, reconciled or study-ready. The layering runs
+    under the CAPPED rule while the refusal stands, for two reasons. It is the
+    strict direction -- capping can only ever reduce a short seat's take, never
+    manufacture an overpayment -- and it is byte-for-byte what this reducer
+    already did before the mode existed, so a stored hand's displayed figures do
+    not move underneath the operator on the day it blocks. That is a derivation
+    the hand is blocked on, not an inferred declaration: nothing writes a mode,
+    nothing clears the refusal, and the only thing that clears it is the operator
+    declaring the mode.
+
+    A hand with no antes at all needs no declaration and is never refused.
+    ``NONE`` is not a guess for such a hand, it is the only thing it can be.
+    """
+
+    posters = sorted(dict.fromkeys(ante_posters))
+    named = ", ".join(repr(name) for name in posters)
+
+    if declared is None:
+        if not posters:
+            return AnteMode.NONE, []
+        return AnteMode.PER_PLAYER, [
+            f"{UNDECLARED_ANTE_MODE_PREFIX} ({named}) but no ante mode is "
+            "declared, so the pot model cannot say whether each ante is capped "
+            "against the shortest seat's total commitment or is a consolidated "
+            "table ante that is not. The two give different pots on the same "
+            "recording and the action line cannot tell them apart. Declare the "
+            "ante mode (NONE, PER_PLAYER or SINGLE_PAYER_TABLE_ANTE) for this "
+            "hand, alongside the blind structure and the rake policy."
+        ]
+
+    if declared not in AnteMode.ALL:
+        raise LedgerError(
+            f"Unknown ante mode {declared!r}; expected one of "
+            f"{', '.join(AnteMode.ALL)}."
+        )
+
+    if declared == AnteMode.NONE:
+        if not posters:
+            return AnteMode.NONE, []
+        return AnteMode.PER_PLAYER, [
+            f"The declared ante mode is NONE, but {named} posted an ante. One of "
+            "the two is wrong and the pot model will not choose which. Either "
+            "correct the ante rows in Edit actions, or declare the ante mode "
+            "this hand was actually dealt under (PER_PLAYER, or "
+            "SINGLE_PAYER_TABLE_ANTE for a big-blind or button ante)."
+        ]
+
+    if declared == AnteMode.SINGLE_PAYER_TABLE_ANTE and len(posters) > 1:
+        return AnteMode.PER_PLAYER, [
+            "The declared ante mode is SINGLE_PAYER_TABLE_ANTE, which means one "
+            f"seat posts a consolidated ante for the table, but {len(posters)} "
+            f"seats posted antes ({named}). A consolidated table ante and "
+            "personal antes obey different capping rules and the model will not "
+            "guess which post is which. Declare PER_PLAYER if every one of these "
+            "is a personal ante, or correct the recording in Edit actions so "
+            "that only the consolidated table ante is typed as an ante."
+        ]
+
+    return declared, []
 
 
 def _is_live_structural_post(action: LedgerAction) -> bool:
@@ -1168,43 +1485,89 @@ def _uncalled_refunds(
     return refunds
 
 
+def _layer_cap(
+    commitment: Mapping[str, Decimal], eligible: Sequence[str]
+) -> Decimal:
+    """Rule 2's cap: the SMALLEST total commitment among a layer's eligible seats.
+
+    One line, named, because it is the sentence the whole cascade turns on and
+    because reading it as the LARGEST makes every cap vacuous while leaving chip
+    conservation, eligibility and the boundary rules all intact. A rule that can
+    be silently inverted deserves a name a reader can check against the
+    specification.
+    """
+
+    return min(commitment[name] for name in eligible)
+
+
 def _build_pots(
     order: Sequence[str],
     live_settled: Mapping[str, Decimal],
-    dead_posted: Mapping[str, Decimal],
+    capped_dead: Mapping[str, Decimal],
+    uncapped_dead: Mapping[str, Decimal],
     put_up: Mapping[str, Decimal],
     folded: set[str],
     external_dead: Decimal,
 ) -> list[dict]:
-    """Lay the pot out under the operator's model, rule 2 AS AMENDED.
+    """Lay the pot out under the operator's model, rules 2 and 4 AS AMENDED.
 
-    THE MODEL, in four sentences.  Rule 2 is the only one the operator changed;
-    the other three are unchanged, and worked examples (a)-(d) must come out to
-    the chip exactly as they did before:
+    THE MODEL, in four sentences.  Rules 2 and 4 are the ones the operator has
+    changed; the other two are unchanged, and worked examples (a)-(e) must come
+    out to the chip exactly as they did before:
 
       1. Layer boundaries are cut at the distinct LIVE contribution levels,
          measured after uncalled-bet refunds have been returned.  Live money is
          what a player CHOSE to wager.  Forced posts are never live.
-      2. Dead money -- antes, big-blind antes, dead blinds and externally
-         declared dead money -- goes into the LOWEST layer, but EACH
-         CONTRIBUTOR'S dead chips count into a layer only up to the smallest
-         TOTAL commitment among that layer's eligible seats.  The excess rises
-         into the layer above, eligible to the seats whose own total reached
-         above that cap.
+      2. Dead money goes into the LOWEST layer, but EACH CONTRIBUTOR'S CAPPED
+         dead chips count into a layer only up to the smallest TOTAL commitment
+         among that layer's eligible seats.  The excess rises into the layer
+         above, eligible to the seats whose own total reached above that cap.
+         Which chips are capped is decided by the declared ante mode, ABOVE this
+         function: see ``AnteMode`` and ``build_hand_ledger``.  ``uncapped_dead``
+         is the consolidated table ante, which is table money and sits whole in
+         the main pot.
       3. A seat is eligible for a layer if its own LIVE contribution reaches that
          layer's level.  Every unfolded seat that put ANY chip up -- live or dead
          -- is eligible for the main pot.
       4. A folded seat's chips stay in the layers they reached and it is eligible
-         for none.
+         for none.  Its forced post that no surviving seat could cover is
+         ABANDONED to whoever wins the layer it stopped in.
 
-    WHAT THE AMENDMENT FIXED.  Rule 2 used to be unconditional: every dead chip
-    went whole into the lowest layer.  That paid a seat whose ENTIRE commitment
-    was smaller than an opponent's forced post more than the table had matched of
-    it -- a 60-chip seat against three 100-chip antes collected 360 where the
-    table had matched 240 of it, and a 40-chip seat against five 100-chip antes
-    collected 540.  The previous round could not resolve that from the four
-    worked examples, so it published the number and refused to call the hand
-    study-ready.  The operator has now ruled, and the cap below is that ruling.
+    WHY THE POOLS ARRIVE ALREADY SPLIT.  This function takes ``capped_dead`` and
+    ``uncapped_dead`` rather than a mode, deliberately.  The mode governs which
+    chips go in which pool and NOTHING else -- not the cascade, not eligibility,
+    not the abandoned excess -- so the branch lives in one place upstream and the
+    layering below is mode-free.  A reducer that branched on the mode down here
+    would have to decide, at every one of half a dozen sites, whether this
+    particular line is about antes or about dead money, and getting one of them
+    wrong loses the cap on a whole family silently: a SINGLE_PAYER hand carrying
+    a dead blind runs BOTH rules at once, on disjoint pools.
+
+    WHAT THE AMENDMENTS FIXED.
+
+    Rule 2 used to be unconditional: every dead chip went whole into the lowest
+    layer.  That paid a seat whose ENTIRE commitment was smaller than an
+    opponent's forced post more than the table had matched of it -- a 60-chip
+    seat against three 100-chip antes collected 360 where the table had matched
+    240 of it, and a 40-chip seat against five 100-chip antes collected 540.
+
+    Externally declared dead money was then left OUTSIDE that cap, on the
+    argument that money with no contributing seat has no operand to be capped
+    against.  It has one: the seat trying to collect it.  Uncapped, a seat that
+    committed 2 chips could be paid 312 -- settled, balanced, legal and
+    warning-free -- and it happened on 11,038 of 111,426 measured assignments.
+    The operator's fifth ruling puts it in the capped pool under every mode, and
+    ``min(external, cap)`` below is that ruling.  It is not an ante, so no mode
+    exempts it.
+
+    Rule 4 used to stop mid-sentence: the excess "rises into the layer above,
+    eligible to the seats whose own total reached above that cap", and named no
+    layer when no surviving total reached above it.  The chips went to the top
+    layer and the hand was refused as not study-ready, on 7.79% of
+    tournament-shaped hands, with -- in the refusal's own words -- no correction
+    to the recording that could clear it.  The operator has ruled: such a post
+    belongs to the pot.  A button that antes 50,000 and folds against two 20,000
+    stacks is now one settleable 90,000 pot.
 
     TWO LADDERS, BUILT INDEPENDENTLY AND THEN INTERLEAVED.
 
@@ -1251,13 +1614,26 @@ def _build_pots(
 
     WHAT EACH ARGUMENT IS.  ``live_settled`` is live money that stuck, after
     refunds: it cuts the live boundaries, sizes the live bands, and decides
-    eligibility for every live band.  ``dead_posted`` is each seat's forced posts
-    and ``external_dead`` is dead money declared for the table with no
-    contributing seat.  ``put_up`` is what a seat committed BEFORE any uncalled
-    money came back, and it answers one question: did this seat play the hand at
-    all.  A seat whose sole live post was returned -- because the only money
-    facing it was a forced post nobody had a chip left to call -- still played,
-    and still contests the pot it played for.
+    eligibility for every live band.  ``capped_dead`` is each seat's dead posts
+    that the cap governs and ``uncapped_dead`` is the consolidated table ante the
+    declared mode exempts; between them they are every dead chip a seat posted,
+    and the mode decided the split before this function was called.
+    ``external_dead`` is dead money declared for the table with no contributing
+    seat, and it is in the CAPPED pool under every mode.  ``put_up`` is what a
+    seat committed BEFORE any uncalled money came back, and it answers one
+    question: did this seat play the hand at all.  A seat whose sole live post
+    was returned -- because the only money facing it was a forced post nobody had
+    a chip left to call -- still played, and still contests the pot it played
+    for.
+
+    WHY THE UNCAPPED POOL IS SAFE, and why it cannot strand a chip.  The
+    consolidated ante enters the FIRST dead layer -- the main pot -- and its
+    poster is by construction eligible for that layer, because it put a chip up.
+    So "a seat that wins every layer it is eligible for cannot lose chips" still
+    holds for the poster: worked example (b) is exactly it, where the ante-only
+    seat wins the main pot and comes out at zero.  It is also the one thing that
+    must never be routed through the cascade: capping table money against the
+    shortest blind is the defect worked example (f) names.
 
     WHERE ``put_up`` REACHES THE CAP, AND WHY IT MUST.  Rule 2's operand is a
     seat's TOTAL COMMITMENT, which is its live money after refunds plus its own
@@ -1299,15 +1675,28 @@ def _build_pots(
       the total without ever charging an opponent's live money into it.
     """
 
-    dead_total = sum(dead_posted.values(), _ZERO) + external_dead
+    dead_total = (
+        sum(capped_dead.values(), _ZERO)
+        + sum(uncapped_dead.values(), _ZERO)
+        + external_dead
+    )
     contenders = [name for name in order if name not in folded]
     # Rule 3, second sentence: playing the hand is measured by what a seat PUT UP.
     played = tuple(name for name in contenders if put_up.get(name, _ZERO) > 0)
 
-    # Rule 2's cap operand. See "WHERE ``put_up`` REACHES THE CAP" above.
+    # Rule 2's cap operand: a seat's WHOLE commitment, both dead pools included.
+    # This is mode-INDEPENDENT and must stay so. The mode says which of a seat's
+    # chips the cap governs; it never says a seat committed fewer chips than it
+    # did, and leaving the consolidated ante out of its poster's own total would
+    # lower the cap every other contributor is measured against.
+    # See "WHERE ``put_up`` REACHES THE CAP" above.
     commitment: dict[str, Decimal] = {}
     for name in order:
-        total = live_settled.get(name, _ZERO) + dead_posted.get(name, _ZERO)
+        total = (
+            live_settled.get(name, _ZERO)
+            + capped_dead.get(name, _ZERO)
+            + uncapped_dead.get(name, _ZERO)
+        )
         commitment[name] = total if total > 0 else put_up.get(name, _ZERO)
 
     bands: list[dict] = []
@@ -1348,57 +1737,87 @@ def _build_pots(
             raise LedgerError("A pot has no eligible player.")
         eligible_now = played
         placed = {name: _ZERO for name in order}
+        placed_external = _ZERO
         previous_cap = _ZERO
+        first_layer = True
         # The caps strictly increase and each step strictly shrinks the eligible
         # set, so the model needs at most one pass per seat. The bound exists so
         # that a cap rule which does NOT increase fails loudly instead of
         # hanging -- a mutation that breaks the cascade must not become a
         # timeout, because a timeout is indistinguishable from a slow machine.
         for _ in range(len(order) + 1):
-            cap = min(commitment[name] for name in eligible_now)
+            cap = _layer_cap(commitment, eligible_now)
             layer_dead = _ZERO
             # Named apart from the live ladder's ``contributors`` because they are
             # different types -- this one is accumulated -- and sharing the name
             # made the two ladders look like one loop to a reader and to mypy.
             dead_contributors: list[str] = []
             for name in order:
-                own = dead_posted.get(name, _ZERO)
+                own = capped_dead.get(name, _ZERO)
                 share = min(own, cap) - min(own, previous_cap)
                 if share > 0:
                     layer_dead += share
                     placed[name] += share
                     dead_contributors.append(name)
-            if previous_cap == _ZERO:
-                # Externally declared dead money has no contributing seat, so
-                # rule 2's cap -- written per contributor, against that
-                # contributor's own total -- has no operand for it. It stays in
-                # the lowest layer whole and never rises.
-                layer_dead += external_dead
-            remaining = sum(
-                (dead_posted.get(name, _ZERO) - placed[name] for name in order),
-                _ZERO,
+            # RULING 5. Externally declared dead money runs the SAME cascade as a
+            # recorded dead post. It has no contributing seat, so it has no
+            # commitment of its own to be capped by -- but the operand rule 2
+            # actually uses is the COLLECTING seat's total, and that exists for
+            # every seat. Left uncapped it paid a 2-chip seat 312 chips.
+            external_share = (
+                min(external_dead, cap) - min(external_dead, previous_cap)
             )
+            if external_share > 0:
+                layer_dead += external_share
+                placed_external += external_share
+            if first_layer:
+                # RULING 3, SINGLE_PAYER_TABLE_ANTE. The consolidated ante is
+                # TABLE MONEY: it is placed whole in the first dead layer -- which
+                # is the main pot, since every unfolded seat that put a chip up is
+                # eligible for it -- and never enters the cascade at all. Under
+                # every other mode this pool is empty and the line does nothing,
+                # which is what makes rule 3's "retained" clause checkable rather
+                # than merely asserted.
+                for name in order:
+                    own = uncapped_dead.get(name, _ZERO)
+                    if own > 0:
+                        layer_dead += own
+                        if name not in dead_contributors:
+                            dead_contributors.append(name)
+            remaining = sum(
+                (capped_dead.get(name, _ZERO) - placed[name] for name in order),
+                _ZERO,
+            ) + (external_dead - placed_external)
             next_eligible = tuple(
                 name for name in contenders if commitment[name] > cap
             )
             if remaining > 0 and not next_eligible:
-                # Nothing above to rise into. The excess can only ever be a
-                # FOLDED seat's -- an unfolded seat's own dead money is at most
-                # its own commitment, and the cascade's last cap is the largest
-                # surviving commitment -- so this never strands a seat's own
-                # chips above it. It does let the largest surviving stack collect
-                # a folded seat's oversized ante, which is the correct poker
-                # answer and is what the disclosure below names, because the
-                # operator's rule 2 does not say where money with nowhere to
-                # rise belongs.
+                # RULING 4. Nothing above to rise into, so the excess is ABANDONED
+                # to whoever wins this layer. It can only ever be a FOLDED seat's
+                # post or external money -- an unfolded seat's own capped dead is
+                # at most its own commitment, and the cascade's last cap is the
+                # largest surviving commitment -- so this never strands a seat's
+                # own chips above it.
+                #
+                # This used to be the conventional poker answer published under a
+                # refusal, because the operator's rule 2 stopped mid-sentence
+                # here. The operator has now ruled that such a post belongs to the
+                # pot, so the chips are unchanged and the refusal is withdrawn --
+                # for THIS shape only. See ``_unruled_dead_money_warnings`` for
+                # what the withdrawal deliberately leaves standing.
                 for name in order:
-                    over = dead_posted.get(name, _ZERO) - placed[name]
+                    over = capped_dead.get(name, _ZERO) - placed[name]
                     if over > 0:
                         layer_dead += over
-                        placed[name] = dead_posted.get(name, _ZERO)
+                        placed[name] = capped_dead.get(name, _ZERO)
                         if name not in dead_contributors:
                             dead_contributors.append(name)
+                over_external = external_dead - placed_external
+                if over_external > 0:
+                    layer_dead += over_external
+                    placed_external = external_dead
                 remaining = _ZERO
+            first_layer = False
             if layer_dead > 0:
                 bands.append(
                     {
@@ -1503,6 +1922,7 @@ def _unruled_dead_money_warnings(
     put_up: Mapping[str, Decimal],
     folded: set[str],
     external_dead: Decimal,
+    single_payer_table_ante: bool,
 ) -> list[str]:
     """Name the dead-money shapes the operator's rule 2 still does not decide.
 
@@ -1513,27 +1933,61 @@ def _unruled_dead_money_warnings(
     a 40-chip seat should collect five opponents' 100-chip antes.  It published
     540 and declined to call the hand study-ready.
 
-    THE OPERATOR HAS RULED.  Amended rule 2 caps each contributor's dead chips at
-    the smallest TOTAL commitment among the layer's eligible seats and lifts the
-    excess into a layer eligible to the seats whose own total reached above that
-    cap.  That hand is now 240 to the short seat, which is exactly what the table
-    matched of it, and it is answered rather than refused.  So the refusal is
-    withdrawn FOR THAT FAMILY -- and only for it.  Removing the whole guard
-    because most of what it covered became decidable is how a defect returns, so
-    what stays is the residue: the two shapes where the amended rule still has
-    nothing to compare a dead chip against.
+    THE OPERATOR HAS RULED, TWICE.  Amended rule 2 caps each contributor's dead
+    chips at the smallest TOTAL commitment among the layer's eligible seats and
+    lifts the excess into a layer eligible to the seats whose own total reached
+    above that cap.  That hand is now 240 to the short seat, which is exactly what
+    the table matched of it.  Ruling 4 then answered the leftover: a forced post
+    from a seat that FOLDED, which no surviving seat could cover, belongs to the
+    pot.  So two families of refusal are withdrawn -- and only those two.
+    Removing the whole guard because most of what it covered became decidable is
+    how a defect returns wearing the fix's clothes.
 
-    (1) DEAD MONEY WITH NOWHERE TO RISE.  Rule 2 lifts the excess "into the layer
-        above, eligible to the seats whose own total reached above that cap".
-        When no seat still in the hand has a total above the cap there is no such
-        layer, and the rule stops mid-sentence.  The excess can only ever be a
-        FOLDED seat's -- an unfolded seat's dead money is at most its own
-        commitment, and the last cap the cascade reaches is the largest surviving
-        commitment -- so nothing here strands a seat's own chips.  What it does
-        do is hand the largest surviving stack a folded seat's oversized ante.
-        That is the conventional poker answer and the layering takes it, but it
-        is a chip figure the operator's sentence does not reach, and it is the
-        one place a seat's ceiling is not simply its own total.
+    WHAT SURVIVES, PRECISELY, AND WHY.
+
+    (1) EXTERNAL DEAD MONEY UNDER ``SINGLE_PAYER_TABLE_ANTE``, WHERE RULING 5
+        SELECTS TWO RULES AND NAMES NEITHER.  Ruling 5 says operator-typed dead
+        money is capped "under whichever rule the hand's ante mode selects".
+        Under ``NONE`` and ``PER_PLAYER`` the mode selects exactly one rule and
+        there is nothing to decide.  Under ``SINGLE_PAYER_TABLE_ANTE`` it selects
+        TWO -- uncapped for the consolidated ante, capped for everything else --
+        and the seven worked examples contain no external dead money at all, so
+        nothing in the acceptance set constrains the choice.
+
+        THE READING TAKEN IS CAPPED, for three reasons.  The consolidated ante is
+        by definition a recorded post by a named seat ("one seat posts a
+        consolidated ante for the table") and external money has no seat, so it
+        is not that.  Capping is the strict direction: it can only reduce a short
+        seat's take, never manufacture an overpayment.  And reading it the other
+        way makes ruling 5 a no-op on every SINGLE_PAYER hand, which cannot be
+        what a ruling written to fix 11,038 over-payments meant.
+
+        It is DISCLOSED rather than assumed, and only where it moves a chip --
+        that is, where the declared amount exceeds the smallest total commitment
+        among the seats contesting the main pot, so the two readings genuinely
+        differ.  Reversing it is a one-line change (move the external amount into
+        the uncapped pool) under which all seven worked examples still pass,
+        which is exactly why it must be ruled on rather than inherited.
+
+    (1a) WHAT IS NOT WARNED, AND WHY IT IS A COMPOSITION RATHER THAN A GUESS.
+        External dead money above EVERY surviving commitment has no layer to rise
+        into, and takes the same abandoned route a folded seat's post now takes.
+        That is not an extra assumption: ruling 5 says external money is treated
+        "exactly like recorded dead money", and ruling 4 settles recorded dead
+        money in precisely this shape.  Composing two rulings the operator wrote
+        is not the same thing as inventing a third.  There is also no alternative
+        -- the chips cannot be returned and a layer no seat can win is refused --
+        so a warning here would name no clearing action, which is the failure mode
+        the round-20 note itself recorded.
+
+        A FOLDED SEAT'S OWN POST IN THIS SHAPE NO LONGER WARNS EITHER.  That is
+        ruling 4, and worked example (g) is the case: a button that antes 50,000
+        and folds against two 20,000 stacks settles as one 90,000 pot.  The
+        layering was ALREADY producing that pot; what blocked the hand was this
+        note, whose own text admitted no correction to the recording could clear
+        it.  So the change here is a study-readiness change and not a layering
+        change, which is worth saying plainly because a fix aimed at
+        ``_build_pots`` would have been aimed at the wrong function.
 
     (2) A SEAT CONTESTING A POT IT CONTRIBUTED NOTHING TO.  Rule 3's "put ANY
         chip up" is read BEFORE the uncalled bet came back, so a seat whose only
@@ -1543,22 +1997,28 @@ def _unruled_dead_money_warnings(
         post-refund total is zero.  The layering reads the cap at the same point
         rule 3 is read -- what the seat put up -- because reading it as zero caps
         every layer that seat is eligible for at zero and empties the main pot.
-        That is a reading, not a ruling: the operator's sentence never has to
-        choose a measurement point because none of the five worked examples
+        That is a reading, not a ruling: the operator's sentences never have to
+        choose a measurement point because none of the seven worked examples
         contains a refund.  It reaches only hands whose whole pot is dead money
         and exactly one seat wagered live, uncalled, so it is narrow -- and it is
-        named rather than assumed.
+        named rather than assumed.  It is also the single class in which an
+        independent oracle written from the spec and this reducer disagree, and
+        it is warned on 100% of its occurrences, which is what makes it a
+        coverage limitation rather than a release blocker.
 
-    THE ONE ASSUMPTION DELIBERATELY NOT WARNED ABOUT.  Externally declared dead
-    money has no contributing seat, so rule 2's cap -- written per CONTRIBUTOR,
-    against that contributor's own total -- has no operand for it; it stays in
-    the lowest layer whole and a seat with a commitment of 1 may win 1000 of it.
-    That is what a real table does with an overlay, a penalty or a carried pot,
-    the amendment's stated motivation ("more than the table had matched of it")
-    does not bite when no seat put the money up, and the previous round reached
-    the same conclusion.  It is recorded here as an assumption rather than
-    disclosed per hand, because a refusal on every hand carrying declared dead
-    money would train an operator to ignore the refusals that matter.
+    (3) DEAD MONEY WITH NO UNFOLDED CONTRIBUTOR AT ALL is not warned here because
+        it is REFUSED outright, in ``_build_pots``: rule 3 makes nobody eligible
+        for the main pot, so there is no layer to award.  Ruling 4 does not reach
+        it either -- worked example (g) has two surviving seats with 20,000 each
+        -- so that refusal stands unchanged.
+
+    WHAT IS NO LONGER AN ASSUMPTION.  Externally declared dead money used to sit
+    in the lowest layer WHOLE and uncapped, so a seat with a commitment of 1 could
+    win 1000 of it, and that was recorded here as a deliberate assumption rather
+    than disclosed.  It was wrong: it produced 11,038 over-payments in 111,426
+    measured assignments.  Ruling 5 puts it in the capped pool under every mode,
+    and the note above covers only what is left -- the excess above every
+    surviving commitment.
 
     THIS CHANGES NO CHIP FIGURE.  The verdict stays legal, balanced and settled --
     the arithmetic is not in doubt -- but the warning reaches ``_cross_check``,
@@ -1583,33 +2043,32 @@ def _unruled_dead_money_warnings(
 
     notes: list[str] = []
 
-    # (1) Dead money above every surviving seat's commitment.
-    ceiling = max(commitment[name] for name in played)
-    strays = sorted(
-        (
-            (dead_posted.get(name, _ZERO) - ceiling, name)
-            for name in order
-            if dead_posted.get(name, _ZERO) > ceiling
-        ),
-        reverse=True,
-    )
-    if strays:
-        excess, poster = strays[0]
-        collectors = sorted(name for name in played if commitment[name] == ceiling)
+    # (1) External dead money on a SINGLE_PAYER hand, where the mode selects two
+    # capping rules and ruling 5 does not say which one operator-typed money
+    # falls under. Disclosed only where the two readings differ -- below the
+    # floor they place the same chips in the same layer and there is nothing to
+    # decide.
+    #
+    # A FOLDED SEAT'S POST WITH NOWHERE TO RISE, AND EXTERNAL MONEY IN THE SAME
+    # SHAPE, ARE DELIBERATELY NOT TESTED HERE ANY MORE: ruling 4 settles the
+    # first outright and composes with ruling 5's "exactly like recorded dead
+    # money" for the second. Re-testing either would keep 7.79% of
+    # tournament-shaped hands blocked on a refusal the operator withdrew.
+    floor = min(commitment[name] for name in played)
+    if single_payer_table_ante and external_dead > floor:
         notes.append(
-            f"{_float(excess)} chips of {poster!r}'s forced post are above every "
-            f"remaining seat's commitment, the largest of which is "
-            f"{_float(ceiling)} ({', '.join(repr(name) for name in collectors)}). "
-            "The pot model lifts capped dead money into the layer above, but "
-            "names no layer when no seat's total reaches past the cap; this hand "
-            "is not study-ready until it does. The chips above are the "
-            "conventional answer and the only recordable one -- a folded seat's "
-            "post cannot be returned and a layer no seat can win is refused -- "
-            "so nothing in the recording is wrong and no correction to it "
-            "clears this. It is the model that is silent here, and re-entering "
-            "the post as external dead money would clear the note by deleting a "
-            f"seat's {_float(dead_posted.get(poster, _ZERO))}-chip commitment "
-            "from the results."
+            f"{_float(external_dead)} chips are declared as external dead money "
+            "on a hand whose ante mode is SINGLE_PAYER_TABLE_ANTE, and that mode "
+            "applies two different capping rules -- the consolidated table ante "
+            "is not capped, every other dead chip is. The ruling does not say "
+            "which one money with no seat behind it falls under, and none of the "
+            "worked examples contains any. This hand is derived under the CAPPED "
+            "reading, so the declared money reaches a seat only up to that seat's "
+            f"own total commitment; the smallest among the seats contesting the "
+            f"main pot is {_float(floor)}, so the reading moves chips here. If "
+            "the declared money was meant to sit whole in the main pot like a "
+            "table ante, the ante mode or the declared amount needs correcting in "
+            "Edit settlement."
         )
 
     # (2) A seat whose whole commitment came back as an uncalled bet.

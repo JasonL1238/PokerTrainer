@@ -452,11 +452,19 @@ def test_the_application_reads_the_operators_facts_out_of_the_migrated_database(
             "notes": "Frame shows the river bet.",
         }
     ]
+    # The retained ANALYSIS TEXT survives the chain intact. Its FRESHNESS does
+    # not, and deliberately: this hand's settlement declares dead_money, so
+    # _migrate_to_v20 re-derives its pot layers under ruling 5's cap and marks
+    # everything written against the old layering as no longer current. The
+    # lesson and the response are still here, word for word -- what changed is
+    # that the product no longer presents them as describing today's figures.
     assert reconstructed["hand_reviews"] == ["lesson"]
     assert reconstructed["coaching_reviews"] == ["response"]
     assert reconstructed["solver_runs"] == [
         {
-            "status": "completed",
+            # 'completed' before the chain ran; the solver input was built from
+            # the ledger this migration re-derived. See _migrate_to_v20.
+            "status": "stale",
             "input_hash": "legacy-hash",
             "result_path": "solver/run_1/result.json",
             "exploitability_pct": 0.4,

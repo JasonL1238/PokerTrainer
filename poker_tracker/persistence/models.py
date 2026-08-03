@@ -34,6 +34,10 @@ ForcedBetType = Literal[
     "dead_blind",
     "bring_in",
 ]
+# How a hand's antes were taken. A DECLARATION about the room, in the same
+# category as the blind structure: NULL means nobody said, which the reducer
+# treats loudly rather than by guessing. See ``math.accounting.AnteMode``.
+AnteMode = Literal["NONE", "PER_PLAYER", "SINGLE_PAYER_TABLE_ANTE"]
 ReviewStatus = Literal["unreviewed", "reviewed", "needs_correction"]
 FrameReviewStatus = Literal["unreviewed", "correct", "incorrect"]
 SourceType = Literal["manual", "cv_import", "corrected_cv"]
@@ -347,6 +351,13 @@ class HandSettlement(PersistedModel):
     small_blind: float | None = Field(default=None, ge=0)
     big_blind: float | None = Field(default=None, gt=0)
     straddles: list[float] = Field(default_factory=list)
+    # NULL means "not declared", exactly as ``big_blind`` does, and it is
+    # deliberately not defaulted to ``NONE``: a hand containing antes with no
+    # declared mode is AMBIGUOUS, and defaulting it would silently answer the
+    # question the operator ruled must be refused. A hand with no antes needs no
+    # declaration and is untouched by the absence.
+    # See ``math.accounting.AnteMode``.
+    ante_mode: AnteMode | None = None
     dead_money: float = Field(default=0, ge=0)
     rake_rate: float = Field(default=0, ge=0, le=1)
     rake_cap: float | None = Field(default=None, ge=0)

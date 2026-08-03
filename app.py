@@ -4644,6 +4644,42 @@ def show_accounting_editor(
                 placeholder="e.g. 4, 8",
                 help="Comma-separated, each larger than the forced bet before it.",
             )
+            # Second, and for the same reason the blind structure is first: this
+            # is a fact about the room that the action line cannot demonstrate,
+            # and a hand containing antes is BLOCKED until it is stated. Unlike
+            # the blind structure it also moves chips -- a consolidated table
+            # ante sits whole in the main pot, a per-player ante is capped
+            # against the shortest seat -- so the same recording reconciles to
+            # two different pots depending on which of these is true.
+            ante_mode_choice = st.selectbox(
+                "Ante mode",
+                options=list(_ANTE_MODE_LABELS),
+                # A stored value this build does not know falls back to "Not
+                # declared" rather than raising out of the form. The reader
+                # already nulls an unreadable column, so this is defence in
+                # depth -- but a ValueError here would take the whole panel
+                # down, and the conservative landing place is the one that keeps
+                # the hand blocked instead of answering for the operator.
+                index=(
+                    _ANTE_MODE_VALUES.index(settlement.ante_mode)
+                    if settlement.ante_mode in _ANTE_MODE_VALUES
+                    else 0
+                ),
+                help=(
+                    "How this hand's antes were taken. 'No antes' for a hand "
+                    "with none. 'Per-player antes' when each seat antes for "
+                    "itself: each ante is capped at the smallest total "
+                    "commitment in the layer it sits in, and the excess rises. "
+                    "'One consolidated table ante' for a big-blind or button "
+                    "ante, where one seat posts for the whole table: that ante "
+                    "is table money, goes whole into the main pot, and is never "
+                    "capped against a shorter blind. A dead blind in the same "
+                    "hand is capped either way -- this setting names antes only. "
+                    "It is never guessed from the posts: one seat anting is "
+                    "equally consistent with a big-blind ante and with a "
+                    "late-entry seat posting its own."
+                ),
+            )
             assumption_cols = st.columns(4)
             dead_money = assumption_cols[0].number_input(
                 "External dead money",
@@ -4651,12 +4687,13 @@ def show_accounting_editor(
                 value=float(settlement.dead_money),
                 step=0.5,
                 help=(
-                    "Only chips not represented by player actions. It joins the "
-                    "main pot whole and is never capped: a forced post is capped "
-                    "at the smallest total commitment in the layer it sits in, "
-                    "but money no seat put up has no commitment to cap it "
-                    "against, so the shortest stack at the table can win all of "
-                    "it."
+                    "Only chips not represented by player actions -- an "
+                    "overlay, a carried pot, a penalty returned to the table. "
+                    "It is capped exactly as a recorded forced post is: a seat "
+                    "collects it only up to its own total commitment, and the "
+                    "rest rises to the seats that committed more. It used to "
+                    "join the main pot whole, which paid a seat that had "
+                    "committed 2 chips as much as 312."
                 ),
             )
             rake_rate_pct = assumption_cols[1].number_input(
@@ -4871,6 +4908,7 @@ def show_accounting_editor(
                     "small_blind": declared_small_blind,
                     "big_blind": declared_big_blind,
                     "straddles": declared_straddles,
+                    "ante_mode": _ANTE_MODE_LABELS[ante_mode_choice],
                     "dead_money": float(dead_money),
                     "rake_rate": float(rake_rate_pct) / 100,
                     "rake_cap": _optional_float(rake_cap),
@@ -11477,6 +11515,25 @@ def _optional_float(value: object) -> float | None:
     if value in (None, ""):
         return None
     return float(value)
+
+
+# The ante-mode selectbox's options, and the stored value each one means.
+#
+# "Not declared" is deliberately FIRST and is the default for a settlement that
+# has never named a mode, so opening the editor and saving without touching this
+# control cannot quietly answer the question. A hand carrying antes then keeps
+# its refusal, which is the ruling; a hand with no antes is unaffected either
+# way, because the reducer resolves an absent declaration to NONE without
+# complaint when there is nothing to be ambiguous about.
+_ANTE_MODE_LABELS: dict[str, str | None] = {
+    "Not declared": None,
+    "No antes": "NONE",
+    "Per-player antes": "PER_PLAYER",
+    "One consolidated table ante (big-blind / button ante)": (
+        "SINGLE_PAYER_TABLE_ANTE"
+    ),
+}
+_ANTE_MODE_VALUES: tuple[str | None, ...] = tuple(_ANTE_MODE_LABELS.values())
 
 
 def _parse_straddles(text: str) -> list[float]:

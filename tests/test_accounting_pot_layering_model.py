@@ -1,33 +1,45 @@
-"""The pot-layering model, stated as the five hands that define it.
+"""The pot-layering model, stated as the seven hands that define it.
 
-Adversarial round 20. ``poker_tracker.math.accounting`` produced a critical in
+Adversarial round 21. ``poker_tracker.math.accounting`` produced a critical in
 five consecutive rounds, four of them introduced by the repair to the previous
 one, and every repair was argued from a hand rather than from a rule. The
-operator fixed the rule in round 19 and AMENDED RULE 2 in round 20; these are its
-acceptance criteria:
+operator fixed the rule in round 19, AMENDED RULE 2 in round 20, and in round 21
+made the ANTE MODE an explicit declaration, made the dead-money cap
+mode-dependent, and ruled on the folded post. These are the acceptance criteria:
 
   1. Pot layer boundaries are cut at distinct LIVE contribution levels, measured
      after uncalled-bet refunds have been returned. Live money is what a player
-     CHOSE to wager. Forced posts are not live.
-  2. Dead money -- antes, dead blinds, and externally declared dead money -- goes
-     into the LOWEST layer, but EACH CONTRIBUTOR'S dead chips count into a layer
-     only up to the smallest TOTAL commitment among that layer's eligible seats.
-     The excess rises into the layer above, eligible to the seats whose own total
-     reached above that cap.
-  3. A seat is eligible for a layer if its own LIVE contribution reaches that
+     CHOSE to wager. Forced posts are not live. UNCHANGED by every ruling.
+  2. THE ANTE MODE IS AN EXPLICIT DECLARED INPUT -- NONE, PER_PLAYER, or
+     SINGLE_PAYER_TABLE_ANTE. A hand containing antes with no declared mode is
+     AMBIGUOUS and is refused, naming the declaration and the clearing action.
+     It is never inferred from the shape of the posts.
+  3. Dead money goes into the LOWEST layer, but each contributor's CAPPED dead
+     chips count into a layer only up to the smallest TOTAL commitment among that
+     layer's eligible seats; the excess rises into the layer above, eligible to
+     the seats whose own total reached past the cap. Under PER_PLAYER every ante
+     is capped (the rule shipped in round 20, RETAINED). Under
+     SINGLE_PAYER_TABLE_ANTE the consolidated ante is TABLE MONEY: it goes whole
+     into the main pot and is never capped. Dead blinds and other non-ante forced
+     posts are capped under EVERY mode -- the mode names antes only.
+  4. A seat is eligible for a layer if its own LIVE contribution reaches that
      layer's level. Every unfolded seat that put ANY chip up -- live or dead --
      is eligible for the main pot.
-  4. A folded seat's chips stay in the layers they reached and it is eligible for
-     none.
+  5. A folded seat's chips stay in the layers they reached and it is eligible for
+     none. Its forced post that no surviving seat could cover is ABANDONED to
+     whoever wins, rather than blocking the hand.
+  6. EXTERNAL dead money -- an amount the operator types -- is capped exactly
+     like a recorded dead post, under whichever rule the mode selects.
 
-The five worked examples below are the operator's, verbatim, and each must come
+The seven worked examples below are the operator's, verbatim, and each must come
 out to the chip. Two of them ((a) and (b)) were WRONG on the round-18 reducer and
 reported settled, balanced, legal and warning-free while being wrong; two of them
 ((c) and (d)) were right and are here so the repair to the first two cannot be
-paid for out of them; the fifth ((e)) is the one the amendment exists for, and
-(a)-(d) must be UNCHANGED by it -- if any of them moves, the implementation is
-wrong and not the specification. The remaining tests pin the cases the
-specification leaves to a decision, and say which decision was taken.
+paid for out of them; the fifth ((e)) is the one round 20's amendment exists for;
+(f) and (g) are what round 21's rulings move. (a)-(e) MUST BE UNCHANGED by round
+21 -- if any of them moves, the implementation is wrong and not the
+specification. The remaining tests pin the cases the specification leaves to a
+decision, and say which decision was taken.
 """
 
 from __future__ import annotations
@@ -35,6 +47,7 @@ from __future__ import annotations
 import pytest
 
 from poker_tracker.math.accounting import (
+    AnteMode,
     BlindStructure,
     LedgerAction,
     LedgerError,
@@ -42,6 +55,16 @@ from poker_tracker.math.accounting import (
     RakePolicy,
     build_hand_ledger,
 )
+
+# Rulings 2 and 3. Every ante-bearing hand below now DECLARES how its antes
+# were taken, because an undeclared mode on a hand containing antes is a
+# refusal rather than a default. Which mode each hand declares is chosen to
+# match what the hand describes -- a big-blind ante is SINGLE_PAYER, seats
+# anteing individually are PER_PLAYER -- and the chip figures asserted here
+# are UNCHANGED from before the modes existed. That is the acceptance
+# criterion: worked examples (a)-(e) must not move.
+PER_PLAYER = AnteMode.PER_PLAYER
+SINGLE_PAYER = AnteMode.SINGLE_PAYER_TABLE_ANTE
 
 
 def _player(name: str, stack: float) -> LedgerPlayer:
@@ -87,7 +110,9 @@ def _big_blind_ante_hand():
 def test_a_big_blind_ante_does_not_charge_opponents_into_the_short_blinds_layer():
     players, actions = _big_blind_ante_hand()
     structure = BlindStructure(10, 20)
-    layers = build_hand_ledger(players, actions, blinds=structure).pots
+    layers = build_hand_ledger(
+        players, actions, blinds=structure, ante_mode=SINGLE_PAYER
+    ).pots
 
     assert [pot.amount for pot in layers] == pytest.approx([58, 8])
     assert [pot.cause for pot in layers] == ["main", "side"]
@@ -97,7 +122,11 @@ def test_a_big_blind_ante_does_not_charge_opponents_into_the_short_blinds_layer(
     assert layers[1].eligible_players == ("SB", "BTN")
 
     ledger = build_hand_ledger(
-        players, actions, {0: ("BB",), 1: ("SB",)}, blinds=structure
+        players,
+        actions,
+        {0: ("BB",), 1: ("SB",)},
+        blinds=structure,
+        ante_mode=SINGLE_PAYER,
     )
     assert ledger.payouts["BB"] == pytest.approx(58)
     assert ledger.net_results == pytest.approx({"BB": 32, "SB": -12, "BTN": -20})
@@ -113,7 +142,11 @@ def test_the_big_blind_ante_hand_refuses_the_award_it_used_to_pay():
     players, actions = _big_blind_ante_hand()
     with pytest.raises(LedgerError):
         build_hand_ledger(
-            players, actions, {0: ("BB",), 1: ("BB",)}, blinds=BlindStructure(10, 20)
+            players,
+            actions,
+            {0: ("BB",), 1: ("BB",)},
+            blinds=BlindStructure(10, 20),
+            ante_mode=SINGLE_PAYER,
         )
 
 
@@ -139,18 +172,22 @@ def test_an_ante_only_seat_wins_its_own_ante_back_and_nothing_else():
     players = [_player("ao", 7), _player("X", 100), _player("Y", 100)]
     actions = [_dead("ao", 7), _live("X", "bet", 7), _live("Y", "call", 7)]
 
-    layers = build_hand_ledger(players, actions).pots
+    layers = build_hand_ledger(players, actions, ante_mode=SINGLE_PAYER).pots
     assert [pot.amount for pot in layers] == pytest.approx([7, 14])
     assert layers[0].eligible_players == ("ao", "X", "Y")
     assert layers[1].eligible_players == ("X", "Y")
 
-    ledger = build_hand_ledger(players, actions, {0: ("ao",), 1: ("X",)})
+    ledger = build_hand_ledger(
+        players, actions, {0: ("ao",), 1: ("X",)}, ante_mode=SINGLE_PAYER
+    )
     assert ledger.payouts["ao"] == pytest.approx(7)
     assert ledger.net_results == pytest.approx({"ao": 0, "X": 7, "Y": -7})
     assert ledger.is_balanced is True
 
     with pytest.raises(LedgerError):
-        build_hand_ledger(players, actions, {0: ("ao",), 1: ("ao",)})
+        build_hand_ledger(
+            players, actions, {0: ("ao",), 1: ("ao",)}, ante_mode=SINGLE_PAYER
+        )
 
 
 # --- (c) the round-3 guarantee, which must survive ----------------------------
@@ -176,12 +213,14 @@ def test_a_seat_all_in_from_its_ante_still_wins_the_antes_it_is_owed():
         _live("B", "call", 10),
     ]
 
-    layers = build_hand_ledger(players, actions).pots
+    layers = build_hand_ledger(players, actions, ante_mode=PER_PLAYER).pots
     assert [pot.amount for pot in layers] == pytest.approx([3, 20])
     assert layers[0].eligible_players == ("A", "B", "C")
     assert layers[1].eligible_players == ("A", "B")
 
-    ledger = build_hand_ledger(players, actions, {0: ("C",), 1: ("A",)})
+    ledger = build_hand_ledger(
+        players, actions, {0: ("C",), 1: ("A",)}, ante_mode=PER_PLAYER
+    )
     assert ledger.net_results == pytest.approx({"A": 9, "B": -11, "C": 2})
     assert ledger.is_balanced is True
 
@@ -209,15 +248,22 @@ def test_unequal_dead_money_is_one_pot_any_of_the_four_may_win(winner: str):
         _live("d", "call", 20),
     ]
 
-    layers = build_hand_ledger(players, actions).pots
-    assert [pot.amount for pot in layers] == pytest.approx([88])
-    assert layers[0].eligible_players == ("a", "b", "c", "d")
+    # Asserted under BOTH modes, because worked example (d) does not
+    # discriminate: PER_PLAYER caps a's 5 against the 20-chip floor (no
+    # effect) and SINGLE_PAYER exempts it (no effect). A mode that moved
+    # this hand would be reaching money the ruling does not name.
+    for mode in (PER_PLAYER, SINGLE_PAYER):
+        layers = build_hand_ledger(players, actions, ante_mode=mode).pots
+        assert [pot.amount for pot in layers] == pytest.approx([88])
+        assert layers[0].eligible_players == ("a", "b", "c", "d")
 
-    ledger = build_hand_ledger(players, actions, {0: (winner,)})
-    assert ledger.payouts[winner] == pytest.approx(88)
-    assert ledger.is_balanced is True
-    assert ledger.warnings == ()
-    assert ledger.legality_issues == ()
+        ledger = build_hand_ledger(
+            players, actions, {0: (winner,)}, ante_mode=mode
+        )
+        assert ledger.payouts[winner] == pytest.approx(88)
+        assert ledger.is_balanced is True
+        assert ledger.warnings == ()
+        assert ledger.legality_issues == ()
 
 
 # --- What the specification leaves open, and what was decided -----------------
@@ -280,8 +326,13 @@ def test_dead_money_whose_every_contributor_folded_is_refused_not_awarded():
 
     players = [_player("A", 100), _player("B", 100)]
     actions = [_dead("A", 1), _live("A", "fold", 0), _live("B", "fold", 0)]
-    with pytest.raises(LedgerError):
-        build_hand_ledger(players, actions)
+    # Refused under EVERY mode: ruling 4 abandons a folded seat's post to
+    # whoever wins the layer, and here there is no layer and no winner --
+    # rule 3 leaves nobody eligible for the main pot. Ruling 4 does not
+    # reach this shape and the refusal stands, which is deliberate.
+    for mode in (PER_PLAYER, SINGLE_PAYER, None):
+        with pytest.raises(LedgerError):
+            build_hand_ledger(players, actions, ante_mode=mode)
 
 
 def test_declared_dead_money_confers_eligibility_on_nobody_by_itself():
@@ -342,7 +393,9 @@ def test_a_seat_whose_only_live_post_was_returned_still_contests_the_dead_money(
     players = [_player("alice", 2), _player("bob", 1)]
     actions = [_dead("alice", 2), _live("bob", "post_blind", 1)]
 
-    ledger = build_hand_ledger(players, actions, {0: ("bob",), 1: ("alice",)})
+    ledger = build_hand_ledger(
+        players, actions, {0: ("bob",), 1: ("alice",)}, ante_mode=PER_PLAYER
+    )
     assert ledger.refunds["bob"] == pytest.approx(1)
     assert [pot.amount for pot in ledger.pots] == pytest.approx([1, 1])
     assert ledger.pots[0].eligible_players == ("alice", "bob")
@@ -434,7 +487,9 @@ def test_a_forced_post_is_dead_money_whatever_action_kind_carries_it(forced_bet_
     """
 
     truth = build_hand_ledger(
-        *_round3_hand(_dead("C", 1)), winners={0: ("C",), 1: ("A",)}
+        *_round3_hand(_dead("C", 1)),
+        winners={0: ("C",), 1: ("A",)},
+        ante_mode=PER_PLAYER,
     )
     relabelled = build_hand_ledger(
         *_round3_hand(
@@ -448,6 +503,7 @@ def test_a_forced_post_is_dead_money_whatever_action_kind_carries_it(forced_bet_
             )
         ),
         winners={0: ("C",), 1: ("A",)},
+        ante_mode=PER_PLAYER,
     )
 
     assert [pot.amount for pot in truth.pots] == pytest.approx([3, 20])
@@ -487,7 +543,10 @@ def test_a_dead_blind_the_recording_named_is_dead_even_with_no_post_status():
         ]
 
     explicit = build_hand_ledger(
-        players, hand(_dead("b", 3, kind="post_blind")), winners={0: ("a",)}
+        players,
+        hand(_dead("b", 3, kind="post_blind")),
+        winners={0: ("a",)},
+        ante_mode=PER_PLAYER,
     )
     named_only = build_hand_ledger(
         players,
@@ -501,6 +560,7 @@ def test_a_dead_blind_the_recording_named_is_dead_even_with_no_post_status():
             )
         ),
         winners={0: ("a",)},
+        ante_mode=PER_PLAYER,
     )
 
     # Worked example (d): one pot of 88, no phantom side pot, no legality noise.
@@ -595,13 +655,15 @@ def test_the_amendment_pays_a_short_seat_what_the_table_matched_and_no_more():
         _dead("o3", 100),
     ]
 
-    layers = build_hand_ledger(players, actions).pots
+    layers = build_hand_ledger(players, actions, ante_mode=PER_PLAYER).pots
     assert [pot.amount for pot in layers] == pytest.approx([240, 120])
     assert layers[0].eligible_players == ("short", "o1", "o2", "o3")
     assert layers[1].eligible_players == ("o1", "o2", "o3")
     assert [pot.cause for pot in layers] == ["main", "side"]
 
-    ledger = build_hand_ledger(players, actions, {0: ("short",), 1: ("o1",)})
+    ledger = build_hand_ledger(
+        players, actions, {0: ("short",), 1: ("o1",)}, ante_mode=PER_PLAYER
+    )
     assert ledger.payouts["short"] == pytest.approx(240)
     assert ledger.net_results == pytest.approx(
         {"short": 180, "o1": 20, "o2": -100, "o3": -100}
@@ -612,7 +674,9 @@ def test_the_amendment_pays_a_short_seat_what_the_table_matched_and_no_more():
 
     # And the award unconditional rule 2 allowed is now outside short's reach.
     with pytest.raises(LedgerError):
-        build_hand_ledger(players, actions, {0: ("short",), 1: ("short",)})
+        build_hand_ledger(
+            players, actions, {0: ("short",), 1: ("short",)}, ante_mode=PER_PLAYER
+        )
 
 
 def test_the_forced_post_no_main_pot_seat_could_cover_is_now_answered():
@@ -656,6 +720,7 @@ def test_the_forced_post_no_main_pot_seat_could_cover_is_now_answered():
         actions,
         winners={0: ("btn",), 1: ("bb",)},
         blinds=BlindStructure(100, 200),
+        ante_mode=PER_PLAYER,
     )
 
     assert [pot.amount for pot in ledger.pots] == pytest.approx([120, 320])
@@ -669,19 +734,25 @@ def test_the_forced_post_no_main_pot_seat_could_cover_is_now_answered():
     assert ledger.warnings == ()
 
 
-def test_the_five_worked_examples_are_answered_without_a_warning():
-    """No refusal may fire where the operator has ruled.
+def test_the_seven_worked_examples_are_answered_without_a_warning():
+    """No refusal may fire where the operator has ruled, over all SEVEN examples.
 
     (a) and (b) the unmatched post is the SHORT seat's own; (c) each opponent's
     ante equals the short seat's whole commitment; (d) nobody is short; (e) is the
-    amendment itself. A check that fired on any of them would be overriding the
-    specification instead of naming the hand it does not cover -- which is exactly
-    what the round-19 refusal would now do, since it fired on any main-pot seat
-    whose total was below another seat's forced post, and (e) is that shape.
+    capped cascade itself; (f) is the consolidated-ante exemption; (g) is the
+    folded post ruling 4 abandons to the pot. A check that fired on any of them
+    would be overriding the specification instead of naming the hand it does not
+    cover -- which is exactly what the round-19 refusal would do to (e), and what
+    the round-20 refusal would do to (g).
     """
 
     hands = [
-        (_big_blind_ante_hand(), {0: ("BB",), 1: ("SB",)}, BlindStructure(10, 20)),
+        (
+            _big_blind_ante_hand(),
+            {0: ("BB",), 1: ("SB",)},
+            BlindStructure(10, 20),
+            SINGLE_PAYER,
+        ),
         (
             (
                 [_player("ao", 7), _player("X", 100), _player("Y", 100)],
@@ -689,8 +760,9 @@ def test_the_five_worked_examples_are_answered_without_a_warning():
             ),
             {0: ("ao",), 1: ("X",)},
             None,
+            SINGLE_PAYER,
         ),
-        (_round3_hand(_dead("C", 1)), {0: ("C",), 1: ("A",)}, None),
+        (_round3_hand(_dead("C", 1)), {0: ("C",), 1: ("A",)}, None, PER_PLAYER),
         (
             (
                 [_player(name, 100) for name in ("a", "b", "c", "d")],
@@ -705,6 +777,7 @@ def test_the_five_worked_examples_are_answered_without_a_warning():
             ),
             {0: ("c",)},
             None,
+            PER_PLAYER,
         ),
         (
             (
@@ -723,36 +796,159 @@ def test_the_five_worked_examples_are_answered_without_a_warning():
             ),
             {0: ("short",), 1: ("o1",)},
             None,
+            PER_PLAYER,
+        ),
+        (
+            _worked_example_f_hand(),
+            {0: ("SB",), 1: ("BB",)},
+            BlindStructure(1, 2),
+            SINGLE_PAYER,
+        ),
+        (
+            _worked_example_g_hand(),
+            {0: ("SB",)},
+            None,
+            SINGLE_PAYER,
         ),
     ]
-    for (players, actions), winners, structure in hands:
-        ledger = build_hand_ledger(players, actions, winners=winners, blinds=structure)
+    for (players, actions), winners, structure, mode in hands:
+        ledger = build_hand_ledger(
+            players, actions, winners=winners, blinds=structure, ante_mode=mode
+        )
         assert ledger.warnings == ()
         assert ledger.legality_issues == ()
         assert ledger.is_legal is True
         assert ledger.is_balanced is True
 
 
-def test_dead_money_with_nowhere_left_to_rise_is_disclosed_not_published():
-    """What the amendment still does not settle, kept from the round-19 refusal.
+def _worked_example_f_hand():
+    """Blinds 1/2, a 2-chip big-blind ante, the small blind all-in for its blind.
+
+    A third seat is REQUIRED for the operator's stated figures: main 5 + side 2 is
+    7, while the ante plus the small blind plus the big blind is only 5. The
+    button calling the 2 makes it 7 exactly, and the pre-ruling model returns main
+    4 / side 3 with the small blind at +3, which is verbatim what the ruling
+    quotes as "today". So this is the operator's hand.
+
+    live: SB 1, BB 2, BTN 2.  ante: BB 2.
+    """
+
+    players = [_player("SB", 1), _player("BB", 4), _player("BTN", 2)]
+    actions = [
+        _live("SB", "post_blind", 1),
+        _live("BB", "post_blind", 2),
+        LedgerAction(
+            player="BB",
+            street="preflop",
+            kind="ante",
+            amount=2,
+            is_live_post=False,
+            forced_bet_type="big_blind_ante",
+        ),
+        _live("BTN", "call", 2),
+    ]
+    return players, actions
+
+
+def _worked_example_g_hand():
+    """The button antes 50,000 and folds; small and big blinds have 20,000 each."""
+
+    players = [_player("BTN", 50001), _player("SB", 20000), _player("BB", 20000)]
+    actions = [
+        LedgerAction(
+            player="BTN",
+            street="preflop",
+            kind="ante",
+            amount=50000,
+            is_live_post=False,
+            forced_bet_type="big_blind_ante",
+        ),
+        _live("SB", "all-in", 20000),
+        _live("BB", "all-in", 20000),
+        _live("BTN", "fold", 0),
+    ]
+    return players, actions
+
+
+def test_worked_example_f_a_consolidated_ante_is_never_capped_by_a_short_blind():
+    """RULING 3, and the ONE acceptance example where the two modes disagree.
+
+    Blinds 1/2, the big blind posts a 2-chip ante, the small blind is all-in for
+    its 1-chip blind, the button calls.
+
+    SINGLE_PAYER_TABLE_ANTE: the consolidated ante is TABLE MONEY. It goes whole
+    into the main pot and is not capped against the shortest seat's 1-chip total.
+        main 5 = 1 x 3 live + the whole 2-chip ante   [SB, BB, BTN]
+        side 2 = (2 - 1) x 2 live                     [BB, BTN]
+        SB wins main -> +4.
+
+    PER_PLAYER: the same ante IS capped at the smallest total among the main
+    pot's eligible seats, which is the small blind's 1, so 1 chip of it rises.
+        main 4 / side 3, SB -> +3.
+
+    Both readings are asserted, because the mode is load-bearing rather than
+    cosmetic: nothing in the action line distinguishes them, which is exactly why
+    the operator ruled that it must be declared and never inferred.
+    """
+
+    players, actions = _worked_example_f_hand()
+    structure = BlindStructure(1, 2)
+
+    table_ante = build_hand_ledger(
+        players,
+        actions,
+        {0: ("SB",), 1: ("BB",)},
+        blinds=structure,
+        ante_mode=SINGLE_PAYER,
+    )
+    assert [pot.amount for pot in table_ante.pots] == pytest.approx([5, 2])
+    assert table_ante.pots[0].eligible_players == ("SB", "BB", "BTN")
+    assert table_ante.pots[1].eligible_players == ("BB", "BTN")
+    assert table_ante.payouts["SB"] == pytest.approx(5)
+    assert table_ante.net_results["SB"] == pytest.approx(4)
+    assert table_ante.is_legal is True
+    assert table_ante.is_balanced is True
+    assert table_ante.warnings == ()
+
+    per_player = build_hand_ledger(
+        players,
+        actions,
+        {0: ("SB",), 1: ("BB",)},
+        blinds=structure,
+        ante_mode=PER_PLAYER,
+    )
+    assert [pot.amount for pot in per_player.pots] == pytest.approx([4, 3])
+    assert per_player.net_results["SB"] == pytest.approx(3)
+    assert per_player.is_legal is True
+    assert per_player.is_balanced is True
+
+    # Chip conservation is not a function of the declaration: the same 7 chips
+    # went in and the same 7 come out, whichever reading lays them out.
+    assert table_ante.gross_pot == pytest.approx(per_player.gross_pot) == 7
+
+
+def test_a_folded_seats_uncoverable_post_is_now_the_pots_and_settles_clean():
+    """RULING 4. The refusal that fired on 7.79% of tournament-shaped hands.
 
     Rule 2 lifts the capped excess "into the layer above, eligible to the seats
     whose own total reached above that cap". When NO seat still in the hand has a
-    total above the cap, there is no such layer and the sentence stops. That can
-    only happen to a FOLDED seat's post -- an unfolded seat's dead money is at
-    most its own commitment, and the cascade's last cap is the largest surviving
-    commitment -- so it never strands a seat's own chips; what it does is hand the
-    largest surviving stack a folded seat's oversized ante.
+    total above the cap there is no such layer and the sentence stops. That can
+    only happen to a FOLDED seat's post or to external money -- an unfolded
+    seat's capped dead money is at most its own commitment, and the cascade's
+    last cap is the largest surviving commitment -- so it never strands a seat's
+    own chips.
 
-    That is the conventional poker answer and the layering takes it, but the
-    operator's sentence does not reach it and it is the one place a seat's ceiling
-    is not simply its own total. So the chips are derived and the hand is named:
-    removing the whole round-19 guard because most of what it covered became
-    decidable is how a defect returns.
+    The previous round derived the conventional answer and then DECLINED TO CALL
+    THE HAND STUDY-READY, in a warning whose own text admitted that no correction
+    to the recording could clear it. The operator has ruled: such a post is
+    abandoned to whoever wins. So this hand is now legal, balanced, settled and
+    WARNING-FREE, and the chips are exactly the chips it always derived -- which
+    is worth stating plainly, because it means ruling 4 is a study-readiness
+    change and not a layering change, and a fix aimed at ``_build_pots`` would
+    have been aimed at the wrong function.
 
     ``big`` posts a 50-chip ante and folds; two 3-chip stacks are all-in for their
-    own antes. All 56 chips are in one pot the two survivors contest, 25 of them
-    apiece more than either committed.
+    own antes. All 56 chips are in one pot the two survivors contest.
     """
 
     players = [_player("big", 500), _player("s1", 3), _player("s2", 3)]
@@ -763,29 +959,174 @@ def test_dead_money_with_nowhere_left_to_rise_is_disclosed_not_published():
         _live("big", "fold", 0),
     ]
 
-    ledger = build_hand_ledger(players, actions, {0: ("s1",)})
+    ledger = build_hand_ledger(players, actions, {0: ("s1",)}, ante_mode=PER_PLAYER)
     assert [pot.amount for pot in ledger.pots] == pytest.approx([56])
     assert ledger.pots[0].eligible_players == ("s1", "s2")
     assert ledger.is_balanced is True
     assert ledger.is_legal is True
+    assert ledger.is_settled is True
+    assert ledger.warnings == ()
 
-    note = "\n".join(ledger.warnings)
-    assert "'big'" in note
-    assert "47" in note and "3" in note
-    assert "nowhere" in note or "no seat's total reaches past the cap" in note
-    # AND IT SAYS THERE IS NOTHING TO CORRECT. This refusal is unlike every other
-    # blocker in the module: it names no input the operator can change, and
-    # ``_derive_assumption_dependence`` produces nothing to attest to, because
-    # the excess is derived from the action line rather than from a declaration.
-    # An operator told only "this hand is not study-ready" goes looking for a
-    # data-entry fix, and the product accepts exactly one -- delete the ante row
-    # and re-declare the same chips as EXTERNAL dead money, which reconciles
-    # silently while erasing the poster's commitment from the results. So the
-    # note says the recording is right, that no correction clears it, and what
-    # the tempting correction would cost.
-    assert "no correction to it" in note and "clears this" in note
-    assert "external dead money" in note
-    assert "50" in note
+
+def test_worked_example_g_the_button_ante_that_folded_settles_under_both_modes():
+    """RULING 4 IS MODE-INDEPENDENT, and the two modes reach it by different routes.
+
+    Worked example (g): the button antes 50,000 and folds; the small and big
+    blinds have 20,000 each. One pot of 90,000, settleable, under both readings.
+
+    Under SINGLE_PAYER_TABLE_ANTE the consolidated ante is table money and goes
+    whole into the main pot; the abandoned-excess branch never fires. Under
+    PER_PLAYER the ante is capped at 20,000, the 30,000 remainder has no layer
+    above it to rise into -- no unfolded total exceeds 20,000 -- and ruling 4
+    abandons it into the top dead layer. Different routes, same 90,000, which is
+    what "ruling 4 does not mention modes" has to mean if it means anything.
+    """
+
+    players = [_player("BTN", 50001), _player("SB", 20000), _player("BB", 20000)]
+    actions = [
+        LedgerAction(
+            player="BTN",
+            street="preflop",
+            kind="ante",
+            amount=50000,
+            is_live_post=False,
+            forced_bet_type="big_blind_ante",
+        ),
+        _live("SB", "all-in", 20000),
+        _live("BB", "all-in", 20000),
+        _live("BTN", "fold", 0),
+    ]
+
+    for mode in (SINGLE_PAYER, PER_PLAYER):
+        ledger = build_hand_ledger(players, actions, {0: ("SB",)}, ante_mode=mode)
+        assert [pot.amount for pot in ledger.pots] == pytest.approx([90000])
+        assert ledger.pots[0].eligible_players == ("SB", "BB")
+        assert ledger.payouts["SB"] == pytest.approx(90000)
+        assert ledger.net_results["SB"] == pytest.approx(70000)
+        assert ledger.is_settled is True
+        assert ledger.is_balanced is True
+        assert ledger.is_legal is True
+        assert ledger.warnings == ()
+
+
+def test_external_dead_money_is_capped_like_a_recorded_post_under_every_mode():
+    """RULING 5, and the direction it moves the answer.
+
+    Operator-typed dead money used to join the main pot WHOLE and unwarned, so a
+    seat that had committed 2 chips could be paid 312. It is now capped exactly as
+    a recorded forced post is: a seat collects it only up to its own total
+    commitment, and the rest rises to the seats that committed more.
+
+    ``short`` commits 2 chips, two opponents commit 20 each, and 30 chips are
+    declared. The old model gave one pot of 72 that ``short`` could take entirely.
+    The capped model gives 6 (2 x 3 live) + 2 of the declared money in the main
+    pot, with the other 28 in a layer only the two deep seats reached.
+    """
+
+    players = [_player("short", 2), _player("d1", 20), _player("d2", 20)]
+    actions = [
+        _live("short", "all-in", 2),
+        _live("d1", "all-in", 20),
+        _live("d2", "all-in", 20),
+    ]
+
+    for mode in (PER_PLAYER, SINGLE_PAYER, None):
+        ledger = build_hand_ledger(
+            players, actions, {0: ("short",), 1: ("d1",)},
+            dead_money=30,
+            ante_mode=mode,
+        )
+        assert [pot.amount for pot in ledger.pots] == pytest.approx([8, 64])
+        assert ledger.pots[0].eligible_players == ("short", "d1", "d2")
+        assert ledger.pots[1].eligible_players == ("d1", "d2")
+        assert ledger.payouts["short"] == pytest.approx(8)
+        assert ledger.net_results["short"] == pytest.approx(6)
+        assert ledger.is_balanced is True
+        assert ledger.is_legal is True
+
+
+def test_external_dead_money_under_a_table_ante_discloses_the_reading_it_took():
+    """THE ONE THING RULING 5 DOES NOT DECIDE, and it is disclosed rather than assumed.
+
+    Ruling 5 caps external dead money "under whichever rule the hand's ante mode
+    selects". Under SINGLE_PAYER_TABLE_ANTE the mode selects TWO rules -- the
+    consolidated ante is uncapped, everything else is capped -- and no worked
+    example contains external dead money, so nothing in the acceptance set
+    constrains the choice. The capped reading is taken (it is the strict
+    direction, and external money has no seat so it is not "one seat posts a
+    consolidated ante"), and the hand says so instead of publishing the figure as
+    settled fact.
+
+    Disclosed only where it MOVES A CHIP. Below the smallest total commitment
+    contesting the main pot the two readings place the same chips in the same
+    layer, so there is nothing to decide and nothing to say -- an operator trained
+    to click past disclosures that mean nothing will click past the one that
+    means something.
+    """
+
+    players = [_player("BB", 12), _player("short", 2), _player("d", 20)]
+    actions = [
+        LedgerAction(
+            player="BB",
+            street="preflop",
+            kind="ante",
+            amount=10,
+            is_live_post=False,
+            forced_bet_type="big_blind_ante",
+        ),
+        _live("BB", "all-in", 2),
+        _live("short", "all-in", 2),
+        _live("d", "all-in", 20),
+    ]
+
+    def disclosures(**kwargs) -> list[str]:
+        # The standing "no declared winner" note is about settlement, not about
+        # the reading, so it is filtered out rather than asserted around.
+        return [
+            note
+            for note in build_hand_ledger(players, actions, **kwargs).warnings
+            if "external dead money" in note
+        ]
+
+    moves = disclosures(dead_money=30, ante_mode=SINGLE_PAYER)
+    assert len(moves) == 1
+    assert "SINGLE_PAYER_TABLE_ANTE" in moves[0]
+    assert "CAPPED reading" in moves[0]
+
+    # The same hand under PER_PLAYER selects one rule, so there is nothing to
+    # disclose -- and neither does a declared amount small enough that the two
+    # readings coincide.
+    assert disclosures(dead_money=30, ante_mode=PER_PLAYER) == []
+    assert disclosures(dead_money=1, ante_mode=SINGLE_PAYER) == []
+
+    # THE THRESHOLD IS THE FLOOR, AND IT IS PINNED AGAINST BEING RAISED.
+    # Above, every seat but the short one is refunded down to 2, so the hand's
+    # whole commitment is small and a threshold read as "the sum of every
+    # commitment" instead of "the smallest" would still fire on it -- a mutation
+    # that silences this disclosure on real hands survived that reading. This is
+    # the same disclosure over a REFUND-FREE table where the two thresholds are
+    # far apart: commitments 16 / 2 / 10 / 10, floor 2, sum 38, declared 30. The
+    # reading moves chips, so the hand must say so.
+    wide = [_player("BB", 16), _player("short", 2), _player("c", 10), _player("d", 10)]
+    wide_actions = [
+        LedgerAction(
+            player="BB",
+            street="preflop",
+            kind="ante",
+            amount=6,
+            is_live_post=False,
+            forced_bet_type="big_blind_ante",
+        ),
+        _live("BB", "all-in", 10),
+        _live("short", "all-in", 2),
+        _live("c", "call", 10),
+        _live("d", "call", 10),
+    ]
+    wide_ledger = build_hand_ledger(
+        wide, wide_actions, dead_money=30, ante_mode=SINGLE_PAYER
+    )
+    assert all(value == 0 for value in wide_ledger.refunds.values())
+    assert len([n for n in wide_ledger.warnings if "external dead money" in n]) == 1
 
 
 def test_the_amendment_does_not_disclose_a_hand_it_answers():
@@ -803,6 +1144,7 @@ def test_the_amendment_does_not_disclose_a_hand_it_answers():
         [_player("short", 60), _player("o1", 500), _player("o2", 500)],
         [_dead("short", 60), _dead("o1", 100), _dead("o2", 100)],
         {0: ("short",), 1: ("o1",)},
+        ante_mode=PER_PLAYER,
     )
     assert short_seat.warnings == ()
 
@@ -815,6 +1157,7 @@ def test_the_amendment_does_not_disclose_a_hand_it_answers():
             _live("C", "all-in", 16),
         ],
         {0: ("C",), 1: ("A",)},
+        ante_mode=PER_PLAYER,
     )
     assert covered.warnings == ()
 
@@ -862,6 +1205,7 @@ def test_a_partly_refunded_shove_is_capped_at_what_it_kept_not_at_what_it_bet():
             _live("carol", "all-in", 10),
         ],
         {0: ("alice",), 1: ("bob",)},
+        ante_mode=PER_PLAYER,
     )
 
     assert [pot.amount for pot in ledger.pots] == pytest.approx([50, 80])
@@ -899,6 +1243,7 @@ def test_the_main_pot_is_the_layer_everyone_can_win_and_not_the_first_one():
         [_player("A", 100), _player("B", 500), _player("C", 40)],
         [_dead("A", 100), _live("B", "bet", 100), _live("C", "all-in", 40)],
         {0: ("A",), 1: ("B",), 2: ("A",)},
+        ante_mode=PER_PLAYER,
     )
 
     assert [pot.amount for pot in ledger.pots] == pytest.approx([40, 80, 60])

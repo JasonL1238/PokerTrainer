@@ -14,6 +14,7 @@ from poker_tracker.math.accounting import (
     RakePolicy,
     blind_structure,
     build_ledger_from_records,
+    declared_ante_mode,
 )
 from poker_tracker.persistence.completion import ASSUMPTION_DEPENDENCE_PREFIX
 from poker_tracker.persistence.db import UNREADABLE_SETTLEMENT_PREFIX, PokerDatabase
@@ -202,6 +203,13 @@ class _Declaration:
     # amount to call off a short all-in forced post, so a hand that reconciles
     # only because somebody typed "5/10" is named and measured like any other.
     blinds: BlindStructure | None = None
+    # How this hand's antes were taken. A declaration in the same sense as the
+    # blind structure and neutralised the same way -- but unlike the blind
+    # structure it can move CHIPS, not only the verdict: the same recording lays
+    # out differently under SINGLE_PAYER_TABLE_ANTE and under PER_PLAYER. So a
+    # hand whose reported pot rests on somebody having typed "big-blind ante" is
+    # named and measured like any other declared input.
+    ante_mode: str | None = None
     # The winners the RECORDING leaves no choice about, used in place of the
     # declared award rows when this declaration is the withdrawn one. See
     # ``_forced_winners``: withdrawing the awards to "nobody won anything" is not
@@ -243,6 +251,7 @@ class _Declaration:
             dead_money=self.dead_money,
             awards=(),
             blinds=self.blinds,
+            ante_mode=self.ante_mode,
             forced_winners=forced,
         )
 
@@ -252,6 +261,7 @@ class _Declaration:
             dead_money=self.dead_money,
             awards=self.awards,
             blinds=self.blinds,
+            ante_mode=self.ante_mode,
         )
 
     def with_neutral_dead_money(self) -> _Declaration:
@@ -260,6 +270,7 @@ class _Declaration:
             dead_money=_NEUTRAL_DEAD_MONEY,
             awards=self.awards,
             blinds=self.blinds,
+            ante_mode=self.ante_mode,
         )
 
     def with_neutral_blinds(self) -> _Declaration:
@@ -268,6 +279,16 @@ class _Declaration:
             dead_money=self.dead_money,
             awards=self.awards,
             blinds=_NEUTRAL_BLINDS,
+            ante_mode=self.ante_mode,
+        )
+
+    def with_neutral_ante_mode(self) -> _Declaration:
+        return _Declaration(
+            rake=self.rake,
+            dead_money=self.dead_money,
+            awards=self.awards,
+            blinds=self.blinds,
+            ante_mode=_NEUTRAL_ANTE_MODE,
         )
 
     @classmethod
@@ -277,6 +298,7 @@ class _Declaration:
             dead_money=_NEUTRAL_DEAD_MONEY,
             awards=(),
             blinds=_NEUTRAL_BLINDS,
+            ante_mode=_NEUTRAL_ANTE_MODE,
             forced_winners=forced,
         )
 
@@ -286,6 +308,7 @@ class _Declaration:
             self.rake == _NEUTRAL_RAKE
             and self.dead_money == _NEUTRAL_DEAD_MONEY
             and self.blinds == _NEUTRAL_BLINDS
+            and self.ante_mode == _NEUTRAL_ANTE_MODE
             and not self.awards
         )
 
@@ -335,12 +358,19 @@ class _HandRecords:
         )
 
     @property
+    def declared_ante_mode(self) -> str | None:
+        if self.settlement is None:
+            return None
+        return declared_ante_mode(self.settlement.ante_mode)
+
+    @property
     def declaration(self) -> _Declaration:
         return _Declaration(
             rake=self.declared_rake,
             dead_money=self.declared_dead_money,
             awards=self.awards,
             blinds=self.declared_blinds,
+            ante_mode=self.declared_ante_mode,
         )
 
 
@@ -692,6 +722,7 @@ def _ledger_under_declaration(
             odd_chip_order=list(declared.odd_chip_order),
             flop_seen=records.flop_seen,
             blinds=declared.blinds,
+            ante_mode=declared.ante_mode,
         )
 
     try:
@@ -999,6 +1030,7 @@ RAKE_POLICY_INPUT = "rake_policy"
 DEAD_MONEY_INPUT = "dead_money"
 POT_AWARD_INPUT = "declared_pot_awards"
 BLIND_STRUCTURE_INPUT = "blind_structure"
+ANTE_MODE_INPUT = "ante_mode"
 # No single input alone breaks the reconciliation but the declaration as a whole
 # does -- so no half can be attested to on its own, and the set is named as one.
 JOINT_INPUT = "settlement_assumptions"
@@ -1010,6 +1042,11 @@ _NEUTRAL_DEAD_MONEY = 0.0
 # anything", which is why the awards need ``_forced_winners``. So the neutral
 # value is simply the absence of the declaration.
 _NEUTRAL_BLINDS: BlindStructure | None = None
+# Withdrawing the ante mode means nobody said how the antes were taken, which is
+# a state a recording really can be in -- it is the state every hand in the store
+# is in the day the column ships. So the neutral value is the absence of the
+# declaration, exactly as it is for the blind structure.
+_NEUTRAL_ANTE_MODE: str | None = None
 
 
 def _derive_assumption_dependence(
@@ -1054,6 +1091,19 @@ def _derive_assumption_dependence(
     its own code, which blocks the hand on its own; binding it into every OTHER
     input's code as well would lapse every stored attestation in the database
     the day this column shipped, for no reachable gain.
+
+    The ANTE MODE is input 6, and it is the one that goes furthest. Unlike the
+    blind structure it moves CHIPS: the same recording under
+    ``SINGLE_PAYER_TABLE_ANTE`` puts the consolidated ante whole into the main
+    pot, and under ``PER_PLAYER`` caps it against the shortest seat's total, so
+    the pots, the eligible sets, the payouts and the hero result can all differ.
+    Withdrawing it also restores a refusal, on any hand that contains an ante, so
+    such a hand is dependent by both halves of step 3 at once. A hand with NO
+    antes is disclosed nothing under any declared value, because the mode
+    provably reaches no chip in it -- the same exemption a rake policy that
+    provably takes nothing already gets. It is left out of
+    ``_declaration_fingerprint`` for the same reason the blind structure is: it
+    changes its own declared text and blocks on its own.
 
     The declared POT AWARDS are inputs 3 and 4 of that set, and leaving them out
     was a two-entry field list wearing a different hat. On a reconstructed hand
@@ -1157,6 +1207,12 @@ def _derive_assumption_dependence(
             _blinds_text(declared.blinds),
             _blinds_text(_NEUTRAL_BLINDS),
         ),
+        (
+            ANTE_MODE_INPUT,
+            declared.with_neutral_ante_mode(),
+            _ante_mode_text(declared.ante_mode),
+            _ante_mode_text(_NEUTRAL_ANTE_MODE),
+        ),
     ):
         if without == declared:
             # This input was never declared, so neutralising it is the baseline
@@ -1201,13 +1257,15 @@ def _derive_assumption_dependence(
                     f"rake {_rake_text(settlement)}; dead money "
                     f"{_chips_text(declared.dead_money)}; awards "
                     f"{_awards_text(declared.awards)}; blinds "
-                    f"{_blinds_text(declared.blinds)}"
+                    f"{_blinds_text(declared.blinds)}; antes "
+                    f"{_ante_mode_text(declared.ante_mode)}"
                 ),
                 neutral=(
                     f"rake {_rake_text(None)}; dead money "
                     f"{_chips_text(_NEUTRAL_DEAD_MONEY)}; awards "
                     f"{_forced_awards_text(forced)}; blinds "
-                    f"{_blinds_text(_NEUTRAL_BLINDS)}"
+                    f"{_blinds_text(_NEUTRAL_BLINDS)}; antes "
+                    f"{_ante_mode_text(_NEUTRAL_ANTE_MODE)}"
                 ),
             )
         )
@@ -1467,6 +1525,23 @@ def _blinds_text(blinds: BlindStructure | None) -> str:
     if blinds.straddles:
         text += " straddled to " + "/".join(f"{value:g}" for value in blinds.straddles)
     return text
+
+
+def _ante_mode_text(mode: str | None) -> str:
+    """The declared ante mode as the operator would say it.
+
+    Rendered from the declaration the derivation actually used, never from
+    ``hands.blinds_antes``, for the same reason ``_blinds_text`` is: that column
+    is free display text nothing validates, and an attestation must name the
+    thing the pots were laid out under.
+    """
+    if mode is None:
+        return "no declared ante mode"
+    return {
+        "NONE": "no antes",
+        "PER_PLAYER": "per-player antes",
+        "SINGLE_PAYER_TABLE_ANTE": "one consolidated table ante",
+    }.get(mode, mode)
 
 
 def _chips_text(value: float) -> str:

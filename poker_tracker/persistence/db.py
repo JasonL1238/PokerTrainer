@@ -78,7 +78,7 @@ DEFAULT_DB_PATH = os.environ.get(
     "POKER_DB_PATH",
     str(Path(__file__).resolve().parent.parent.parent / "poker_tracker.db"),
 )
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 _PROCESSING_JOB_PID_UNSET = object()
 # A migration on a real database can outlast SQLite's 5s default, and a second
 # opener must wait for it rather than failing startup with "database is locked".
@@ -1098,6 +1098,7 @@ class PokerDatabase:
                 small_blind REAL,
                 big_blind REAL,
                 straddles TEXT NOT NULL DEFAULT '[]',
+                ante_mode TEXT,
                 dead_money REAL NOT NULL DEFAULT 0,
                 rake_rate REAL NOT NULL DEFAULT 0,
                 rake_cap REAL,
@@ -3088,6 +3089,7 @@ class PokerDatabase:
                     settlement.big_blind,
                     settlement.straddles,
                 ),
+                ante_mode=settlement.ante_mode,
                 rake=RakePolicy(
                     rate=settlement.rake_rate,
                     cap=settlement.rake_cap,
@@ -3508,17 +3510,18 @@ class PokerDatabase:
         self._execute(
             """
             INSERT INTO hand_settlements (
-                hand_id, status, small_blind, big_blind, straddles,
+                hand_id, status, small_blind, big_blind, straddles, ante_mode,
                 dead_money, rake_rate, rake_cap,
                 rake_rounding_unit, no_flop_no_drop, gross_pot, rake_amount,
                 net_pot, is_balanced, warnings, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(hand_id) DO UPDATE SET
                 status = excluded.status,
                 small_blind = excluded.small_blind,
                 big_blind = excluded.big_blind,
                 straddles = excluded.straddles,
+                ante_mode = excluded.ante_mode,
                 dead_money = excluded.dead_money,
                 rake_rate = excluded.rake_rate,
                 rake_cap = excluded.rake_cap,
@@ -3537,6 +3540,7 @@ class PokerDatabase:
                 payload["small_blind"],
                 payload["big_blind"],
                 _serialize_json(payload["straddles"]),
+                payload["ante_mode"],
                 payload["dead_money"],
                 payload["rake_rate"],
                 payload["rake_cap"],
@@ -5370,6 +5374,222 @@ def _migrate_to_v19(db: PokerDatabase) -> None:
     db._ensure_column("hand_settlements", "straddles", "TEXT NOT NULL DEFAULT '[]'")
 
 
+def _migrate_to_v20(db: PokerDatabase) -> None:
+    """Record HOW this hand's antes were taken, because it changes the pots.
+
+    MIGRATION IMPACT (schema 19 -> 20)
+
+    Added:
+      - hand_settlements.ante_mode TEXT NULL
+        (one of 'NONE', 'PER_PLAYER', 'SINGLE_PAYER_TABLE_ANTE'; NULL means
+        not declared)
+
+    Forward-only and purely additive. No existing column changes type, no
+    existing row is rewritten, deleted, or re-keyed, and no file on disk is
+    touched. A hand with no ``hand_settlements`` row at all is not given one.
+
+    DELIBERATELY UNBACKFILLED, AND THIS IS THE ENTIRE POINT OF THE COLUMN.
+    Backfilling ``NONE`` would be a lie on any hand that contains an ante.
+    Backfilling ``PER_PLAYER`` -- today's arithmetic -- would assert that every
+    stored hand took its antes individually, and a big-blind ante is the
+    commonest ante structure in modern tournaments. Backfilling
+    ``SINGLE_PAYER_TABLE_ANTE`` when exactly one seat anted, which is the
+    tempting rule, is INFERENCE FROM THE SHAPE OF THE POSTS, and the operator
+    ruled against exactly that: one seat anting is equally consistent with a
+    big-blind ante and with a late-entry seat posting its own. The two give
+    different pots on the same recording -- blinds 1/2, a 2-chip big-blind ante
+    and an all-in 1-chip small blind is a 5-chip main pot one way and a 4-chip
+    main pot the other -- so a guess here is a wrong payout published as
+    authoritative, which is the failure class this module has already shipped
+    five times.
+
+    WHAT HAPPENS TO EXISTING HANDS, precisely.
+
+      * A HAND WITH NO ANTE ROWS AND NO DECLARED ``dead_money`` -- the
+        overwhelming majority, and every ordinary cash-game hand -- is
+        COMPLETELY UNTOUCHED. It reads ``ante_mode IS NULL``, the reducer
+        resolves that to ``NONE`` without a refusal because ``NONE`` is not a
+        guess for a hand that has no antes, and every figure, verdict, status
+        and readiness result is byte-identical to schema 19. There is no new
+        blocker, no new warning, and no re-save needed.
+
+      * A HAND WITH ``dead_money > 0`` IS NOT IN THAT SET, WHETHER OR NOT IT
+        CONTAINS AN ANTE, AND THAT IS WHY THIS MIGRATION WRITES ROWS AT ALL.
+        The same release carries ruling 5: operator-typed external dead money,
+        which schema 19 dropped WHOLE into the lowest layer, is now capped
+        against the collecting seat's own total commitment exactly like a
+        recorded dead post. On any stored hand where the declared amount exceeds
+        the smallest total commitment among the seats contesting the main pot,
+        THE STORED HERO RESULT MOVES on the day the build is upgraded -- the
+        gross pot, the pot count and every eligible set stay identical, so the
+        distribution changes underneath a stored award row and every existing
+        cross-check (recorded gross, recorded net, ``is_balanced``,
+        ``_validate_winners``) still passes.
+
+        Ruling 5 is the operator's and the new arithmetic is the right one; the
+        re-derivation is what an upgrade is FOR and nothing here second-guesses
+        it. What is not acceptable is the SECOND-ORDER effect: coaching and
+        solver output retained beside those hands was written against a hero
+        result this build no longer produces, and ``is_stale`` is a stored flag
+        that only the explicit correction paths set, so a change in the
+        DERIVATION RULE stales nothing. The wrong number then survives in the
+        retained text, labelled current, on a hand whose accounting reconciles
+        cleanly. So this migration calls what ``_stale_retained_analysis``
+        calls, set-wise, over that population: hand reviews, hand-level and
+        session-level coaching, and queued/running/completed solver runs stop
+        being presented as current. Study readiness then blocks on
+        STALE_COACHING_EVIDENCE, which is the visible rejection.
+
+        WHAT IT DELIBERATELY DOES NOT DO IS TOUCH ``review_status``.
+        ``_stale_retained_analysis`` exists as a separate method from
+        ``_invalidate_hand_derivatives`` precisely because those two are
+        different acts, and only the second discards an operator's own
+        confirmation. A hand carrying no retained analysis has nothing that was
+        derived under the old rule -- it simply reads correctly the next time it
+        is opened -- so demoting it would destroy a confirmation to announce a
+        change that left no artifact behind. That is also what
+        ``_migrate_to_v13``'s own fixture warns about: it seeds a reviewed,
+        complete hand specifically as a state a migration must not casually
+        knock back.
+
+        THE PREDICATE IS ``dead_money > 0``, NOT "the amount exceeds the floor",
+        because the floor is the smallest total commitment among the seats
+        contesting the main pot and SQL cannot compute it -- it needs the whole
+        action line run through the reducer, which a schema migration does not
+        have. So it is DELIBERATELY OVER-STRICT: it also stales analysis beside
+        hands whose declared amount sat under the floor and whose figures did
+        not move. Staling is the right place to spend that imprecision --
+        ``is_stale`` already means "may have been derived from something that
+        changed", and the settlement writers set it on every save without
+        checking whether the figures moved either. A rerun the operator did not
+        need is cheap; a stale hero result labelled current is the failure class
+        this module has shipped five times.
+
+        THE CLEARING ACTION is to rerun coaching, or to dismiss the staleness
+        after checking the hand. Nothing is destroyed: the settlement row, the
+        awards, the actions, the review status and the coaching text itself are
+        all untouched, and only the freshness flags move.
+
+        WHY THIS LIVES IN THE v20 STEP rather than a step of its own. Ruling 5
+        changes no schema, so it has no version of its own to hang on; every
+        database that reaches the new build's behaviour passes through exactly
+        this migration, so this is the one place that runs once per upgraded
+        file. A database already stamped 20 has already been through it.
+
+      * A HAND CONTAINING ANY ANTE POST gains one legality issue naming the
+        anteing seats and the missing declaration. ``is_legal`` goes False, the
+        reconciliation stops being authoritative, ``persist_reconciliation``
+        writes ``needs_correction``, and study readiness blocks on
+        ACCOUNTING_NOT_AUTHORITATIVE. THESE ARE HANDS THAT PREVIOUSLY
+        RECONCILED, and demoting them is the ruling, not a side effect: the
+        product was laying them out under one of two readings without recording
+        which, and the operator has ruled that an undeclared ante mode is
+        ambiguous rather than defaulted.
+
+        THE CLEARING ACTION is an ordinary settlement edit and nothing else:
+        open Edit settlement, choose the ante mode this hand was dealt under,
+        and save. It is not a data repair, it destroys nothing, and the previous
+        pot figures are still derived and still displayed while the hand is
+        blocked -- the layers shown alongside the refusal are the capped
+        (PER_PLAYER) reading, which is both the strict direction and exactly
+        what this product derived before the column existed, so nothing moves
+        underneath the operator on the day it blocks.
+
+        Declaring ``SINGLE_PAYER_TABLE_ANTE`` on such a hand CAN move its chips,
+        by design: that is the reading in which the consolidated ante is table
+        money. Because ``ante_mode`` is in ``_declared_settlement_inputs``,
+        saving a mode that differs from what was stored stales any retained
+        coaching or solver output and demotes a reviewed hand, exactly as
+        editing the blind structure or the rake policy does.
+
+      * Antes are identified the same way the rest of this module identifies
+        forced posts: an action typed ``ante``, or any action carrying a
+        ``forced_bet_type`` of ``ante`` or ``big_blind_ante``. A row spelled
+        ``ante`` but typed ``dead_blind`` is a dead blind and does not trigger
+        the refusal, because the mode is an ANTE mode.
+
+      * ``hands.blinds_antes`` is untouched and is still free display text. It
+        is not parsed, and no ante mode is read out of it -- for the same reason
+        no chip size is.
+
+    HOW MANY HANDS. Query both populations rather than guessing:
+    ``SELECT COUNT(DISTINCT hand_id) FROM actions WHERE action_type = 'ante' OR
+    forced_bet_type IN ('ante','big_blind_ante')`` asks for a declaration, and
+    ``SELECT COUNT(*) FROM hand_settlements WHERE dead_money > 0`` is re-derived
+    under ruling 5 and demoted here. A hand in neither set is untouched.
+
+    DOWNGRADE: an older build does not read a v20 database at all.
+    ``_assert_supported_schema_version`` refuses any stamp above the build's own
+    ``SCHEMA_VERSION`` with "Update the app before opening it", so the file is
+    not opened, not read, and not written. Keep the pre-migration backup
+    ``init_db`` took. ``_ensure_column`` is idempotent, so re-running the chain
+    forward is a no-op.
+
+    RE-RUNNING THE STALING is idempotent in the strict sense -- it keys on
+    ``dead_money``, which this migration never writes, and it only ever sets
+    flags that are already set -- so replaying it re-stales analysis the
+    operator may have rerun since, and nothing else. That is a weaker hazard
+    than ``_migrate_to_v13``'s replay, which discards confirmations outright,
+    and it is weaker on purpose: this step touches no ``review_status``, no
+    ``completion_status``, and no analysis TEXT. No production path replays a
+    completed migration (the chain and the version stamp share one
+    transaction) in any case.
+    """
+
+    db._ensure_column("hand_settlements", "ante_mode", "TEXT")
+
+    # RULING 5's stored population. See MIGRATION IMPACT above: these hands are
+    # re-derived by the same release, so the analysis retained beside them was
+    # written against a figure this build no longer produces.
+    _reason = (
+        "External dead money is now capped against each seat's own total "
+        "commitment; this hand's pot layers were re-derived. Re-check the "
+        "result and rerun coaching."
+    )
+    _affected = "SELECT hand_id FROM hand_settlements WHERE dead_money > 0"
+    db._execute(
+        f"""
+        UPDATE hand_reviews
+        SET is_stale = 1, stale_reason = ?
+        WHERE hand_id IN ({_affected})
+        """,
+        (_reason,),
+    )
+    db._execute(
+        f"""
+        UPDATE coaching_reviews
+        SET is_stale = 1, stale_reason = ?
+        WHERE review_type = 'hand' AND hand_id IN ({_affected})
+        """,
+        (_reason,),
+    )
+    db._execute(
+        f"""
+        UPDATE coaching_reviews
+        SET is_stale = 1,
+            stale_reason = 'A hand in this session was re-derived under the '
+                           || 'amended dead-money rule; rerun coaching.'
+        WHERE review_type = 'session'
+          AND session_id IN (
+              SELECT session_id FROM hands WHERE id IN ({_affected})
+          )
+        """
+    )
+    db._execute(
+        f"""
+        UPDATE solver_runs
+        SET status = CASE
+                WHEN status IN ('queued', 'running') THEN 'cancelling'
+                ELSE 'stale'
+            END,
+            error_message = ?
+        WHERE status IN ('queued', 'running', 'completed')
+          AND hand_id IN ({_affected})
+        """,
+        (_reason,),
+    )
+
+
 # Versioned migrations run in order and refuse databases written by newer apps.
 _MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {
     6: _migrate_to_v6,
@@ -5386,6 +5606,7 @@ _MIGRATIONS: dict[int, Callable[[PokerDatabase], None]] = {
     17: _migrate_to_v17,
     18: _migrate_to_v18,
     19: _migrate_to_v19,
+    20: _migrate_to_v20,
 }
 
 
@@ -6051,6 +6272,13 @@ def _degraded_hand_settlement(data: dict[str, Any]) -> HandSettlement:
             safe.update(declared)
     for name in (
         "status",
+        # Probed on its own, and DROPPED to NULL when it cannot be read. That is
+        # the conservative direction here and it is not obvious, so it is stated:
+        # an unreadable mode becomes an UNDECLARED mode, which on a hand carrying
+        # antes is a refusal the operator must clear, whereas keeping a
+        # half-readable value would let a mode nobody typed decide whether a
+        # consolidated ante is capped.
+        "ante_mode",
         "dead_money",
         "rake_rate",
         "rake_cap",
@@ -6151,10 +6379,17 @@ def _declared_settlement_inputs(
 ) -> dict[str, object] | None:
     """Everything one settlement row DECLARES, and nothing it derives.
 
-    The declared half is the blind structure, the rake policy and the dead
-    money: figures nothing observed, which move the net pot and the hero result
-    the coaching prompt and the solver input were built from. Changing any of
-    them invalidates those.
+    The declared half is the blind structure, the ante mode, the rake policy and
+    the dead money: figures nothing observed, which move the net pot and the hero
+    result the coaching prompt and the solver input were built from. Changing any
+    of them invalidates those.
+
+    The ANTE MODE is in for a stronger reason than the blind structure: it moves
+    CHIPS. The same recording laid out under ``SINGLE_PAYER_TABLE_ANTE`` and
+    under ``PER_PLAYER`` can give different pots, different eligible sets and a
+    different hero result -- blinds 1/2 with a 2-chip big-blind ante against an
+    all-in small blind is main 5 one way and main 4 the other. Retained analysis
+    produced under one reading is not evidence about the other.
 
     The blind structure is in even though it moves no chip figure on its own.
     It decides whether the preflop wagering can be judged at all, so it decides
@@ -6185,6 +6420,7 @@ def _declared_settlement_inputs(
             "small_blind",
             "big_blind",
             "straddles",
+            "ante_mode",
             "dead_money",
             "rake_rate",
             "rake_cap",

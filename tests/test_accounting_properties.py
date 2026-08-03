@@ -32,6 +32,8 @@ from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 
 from poker_tracker.math.accounting import (
+    UNDECLARED_ANTE_MODE_PREFIX,
+    AnteMode,
     BlindStructure,
     LedgerAction,
     LedgerError,
@@ -39,6 +41,40 @@ from poker_tracker.math.accounting import (
     RakePolicy,
     build_hand_ledger,
 )
+
+# The three declarable ante modes, named here so every property below reads the
+# specification's vocabulary rather than a string literal.
+_NO_ANTES = AnteMode.NONE
+_PER_PLAYER = AnteMode.PER_PLAYER
+_SINGLE_PAYER = AnteMode.SINGLE_PAYER_TABLE_ANTE
+# Forced-bet names that identify an ANTE -- the ONE pool the mode governs.
+# Written here from the specification sentence ("every seat antes individually" /
+# "one seat posts a consolidated ante for the table"), so this suite splits the
+# dead pool without importing the reducer's opinion of where the split falls.
+_ANTE_TYPES = frozenset({"ante", "big_blind_ante", "button_ante", "table_ante"})
+
+
+def _declarable_ante_mode(preference: str | None, ante_seats: int) -> str | None:
+    """A mode this hand can legally declare, given how many seats actually anted.
+
+    The generators draw a PREFERENCE and this resolves it, because how many seats
+    ended up anteing is not known until the hand is built: a seat too short to
+    cover its ante posts nothing, so an "everybody antes" draw can produce one
+    anteing seat or none.
+
+    ``SINGLE_PAYER_TABLE_ANTE`` means ONE seat posts for the table, so it is only
+    declarable when at most one seat anted; two or more is the ambiguous shape the
+    model refuses. ``NONE`` and "undeclared" are only declarable when nothing
+    anted. Everything the properties below assert about the CAP needs a mode that
+    resolves, so the refusals are exercised by their own tests rather than by
+    silently degrading these.
+    """
+
+    if ante_seats == 0:
+        return preference
+    if ante_seats == 1 and preference == _SINGLE_PAYER:
+        return _SINGLE_PAYER
+    return _PER_PLAYER
 
 # Whole chips keep the shove-fest hands legal without fighting float noise; the
 # ledger works in Decimal internally. ``forced_post_hand`` below draws its own
@@ -121,6 +157,18 @@ class ForcedPostHand:
     posted: dict[str, Decimal]
     wagered: dict[str, Decimal]
     folded: set[str] = field(default_factory=set)
+    # ``dead`` split the way RULING 3 splits it: ``ante`` is the pool the declared
+    # mode governs, ``other_dead`` (dead blinds, missed blinds, penalty posts) is
+    # capped under every mode. Kept apart on the generated hand for the same
+    # reason the reducer keeps them apart -- a suite that only knows the sum
+    # cannot tell a consolidated-ante hand carrying a dead blind from one without,
+    # which is the family a single mode-wide branch silently overpays.
+    ante: dict[str, Decimal] = field(default_factory=dict)
+    other_dead: dict[str, Decimal] = field(default_factory=dict)
+    # The mode this hand DECLARES. ``None`` means undeclared, which is a refusal
+    # whenever the hand contains an ante -- so the generators only produce it on
+    # hands that do not.
+    ante_mode: str | None = None
     # Dead money declared for the table with no contributing seat: a rake-back
     # promotion chip, a bad-beat drop returned to the pot. It is owed to the
     # table exactly as an ante is, so the model puts it in the lowest layer and
@@ -249,6 +297,14 @@ def forced_post_hand(draw):
     # chip as ``all-in`` carrying its forced-bet type, or as the plain kind.
     # Both spell the same event and must derive byte-identical chips.
     relabel_exhausting_posts = draw(st.booleans())
+    # The declaration this room made about its antes. Drawn as a PREFERENCE and
+    # resolved once the hand is built, because a seat too short to cover its ante
+    # posts nothing and an "everybody antes" draw can end up with one anteing
+    # seat or none. ``None`` is in the list on purpose: an undeclared mode is
+    # perfectly valid on a hand with no antes and must stay silent there.
+    ante_mode_preference = draw(
+        st.sampled_from([None, _NO_ANTES, _PER_PLAYER, _SINGLE_PAYER])
+    )
     choices = draw(
         st.lists(
             st.sampled_from(["call", "fold", "shove"]),
@@ -264,6 +320,8 @@ def forced_post_hand(draw):
     actions: list[LedgerAction] = []
     remaining = dict(zip(names, stacks, strict=True))
     dead = {name: _ZERO for name in names}
+    ante_pool = {name: _ZERO for name in names}
+    other_dead = {name: _ZERO for name in names}
     live = {name: _ZERO for name in names}
     posted = {name: _ZERO for name in names}
     wagered = {name: _ZERO for name in names}
@@ -317,6 +375,17 @@ def forced_post_hand(draw):
             street_live[name] += capped
         else:
             dead[name] += capped
+            # RULING 3's pool split, decided from what the room CALLS the post
+            # -- the same signal ``_is_live_structural_row`` reads for liveness --
+            # and never from the action kind alone, because a big-blind ante that
+            # took its poster's last chip is booked as ``all-in`` carrying its
+            # type. Classifying that row into ``other_dead`` would put it outside
+            # the consolidated-ante exemption and the suite would silently be
+            # testing the wrong pool.
+            if (forced_type or kind) in _ANTE_TYPES:
+                ante_pool[name] += capped
+            else:
+                other_dead[name] += capped
         if forced:
             posted[name] += capped
         else:
@@ -382,6 +451,12 @@ def forced_post_hand(draw):
         names=names,
         stacks=stacks,
         dead=dead,
+        ante=ante_pool,
+        other_dead=other_dead,
+        ante_mode=_declarable_ante_mode(
+            ante_mode_preference,
+            sum(1 for amount in ante_pool.values() if amount > 0),
+        ),
         live=live,
         posted=posted,
         wagered=wagered,
@@ -428,6 +503,16 @@ def capped_dead_money_hand(draw):
     The line is deliberately schematic -- every commitment is a forced post or a
     single all-in -- because what is under test here is the layering, not the
     betting grammar. ``forced_post_hand`` covers the grammar.
+
+    ROUND 21 ADDS THE CONSOLIDATED-ANTE SHAPE, and it is the one the mode-wide
+    branch dies on. When ``consolidated`` is drawn, exactly ONE seat posts an ante
+    and every other dead post in the hand is a DEAD BLIND, so the hand may declare
+    ``SINGLE_PAYER_TABLE_ANTE`` and then runs BOTH dead-money rules at once on
+    disjoint pools: the ante bypasses the cascade into the main pot while the dead
+    blinds run it and may rise. An implementation that branches once on the mode
+    and exempts all of a seat's dead money passes every worked example -- none of
+    the seven mixes a consolidated ante with a dead blind -- and overpays here.
+    Without this shape the suite could not see it.
     """
 
     chip = draw(CHIPS)
@@ -439,6 +524,11 @@ def capped_dead_money_hand(draw):
         top, mid = mid, top
     ante = chip * draw(st.sampled_from([0, 1, 2, 5, 20, 60, 100]))
     external_dead = chip * draw(st.sampled_from([0, 0, 0, 1, 4]))
+    # One seat's ante beside everybody else's dead blinds -- see the docstring.
+    consolidated = draw(st.booleans())
+    ante_mode_preference = draw(
+        st.sampled_from([_PER_PLAYER, _SINGLE_PAYER, _SINGLE_PAYER])
+    )
 
     # Seat 0 posts and wagers nothing live. Seats 1 and 2 share the top live
     # level so the uncalled-bet refund cannot flatten the ladder.
@@ -472,6 +562,8 @@ def capped_dead_money_hand(draw):
     ]
     actions: list[LedgerAction] = []
     dead = {name: _ZERO for name in names}
+    ante_pool = {name: _ZERO for name in names}
+    other_dead = {name: _ZERO for name in names}
     live = {name: _ZERO for name in names}
     posted = {name: _ZERO for name in names}
     wagered = {name: _ZERO for name in names}
@@ -479,17 +571,24 @@ def capped_dead_money_hand(draw):
 
     for index, name in enumerate(names):
         if dead_plan[index] > 0:
+            # Under ``consolidated`` only seat 0's post is an ante; every other
+            # dead post is a dead blind, which no mode exempts.
+            is_ante = index == 0 or not consolidated
             actions.append(
                 LedgerAction(
                     player=name,
                     street="preflop",
-                    kind="ante",
+                    kind="ante" if is_ante else "post_blind",
                     amount=float(dead_plan[index]),
                     is_live_post=False,
-                    forced_bet_type="ante",
+                    forced_bet_type="ante" if is_ante else "dead_blind",
                 )
             )
             dead[name] += dead_plan[index]
+            if is_ante:
+                ante_pool[name] += dead_plan[index]
+            else:
+                other_dead[name] += dead_plan[index]
             posted[name] += dead_plan[index]
     for index, name in enumerate(names):
         if live_plan[index] > 0:
@@ -531,6 +630,12 @@ def capped_dead_money_hand(draw):
         names=names,
         stacks=[dead_plan[i] + live_plan[i] for i in range(count)],
         dead=dead,
+        ante=ante_pool,
+        other_dead=other_dead,
+        ante_mode=_declarable_ante_mode(
+            ante_mode_preference,
+            sum(1 for amount in ante_pool.values() if amount > 0),
+        ),
         live=live,
         posted=posted,
         wagered=wagered,
@@ -599,6 +704,7 @@ def refunded_shove_hand(draw):
     ]
     calls = [min(amount, call_level) for amount in calls]
     calls[0] = shove
+    ante_mode_preference = draw(st.sampled_from([_PER_PLAYER, _SINGLE_PAYER]))
 
     players = [
         LedgerPlayer(
@@ -610,6 +716,8 @@ def refunded_shove_hand(draw):
     ]
     actions: list[LedgerAction] = []
     dead = {name: _ZERO for name in names}
+    ante_pool = {name: _ZERO for name in names}
+    other_dead = {name: _ZERO for name in names}
     live = {name: _ZERO for name in names}
     posted = {name: _ZERO for name in names}
     wagered = {name: _ZERO for name in names}
@@ -627,6 +735,7 @@ def refunded_shove_hand(draw):
                 )
             )
             dead[name] += antes[index]
+            ante_pool[name] += antes[index]
             posted[name] += antes[index]
     for index, name in enumerate(names):
         if calls[index] > 0:
@@ -647,6 +756,12 @@ def refunded_shove_hand(draw):
         names=names,
         stacks=[antes[i] + calls[i] for i in range(count)],
         dead=dead,
+        ante=ante_pool,
+        other_dead=other_dead,
+        ante_mode=_declarable_ante_mode(
+            ante_mode_preference,
+            sum(1 for amount in ante_pool.values() if amount > 0),
+        ),
         live=live,
         posted=posted,
         wagered=wagered,
@@ -806,25 +921,66 @@ def _refunded_to_nothing(hand, totals: dict[str, Decimal]) -> set[str]:
     }
 
 
+def _model_pools(
+    ante: dict[str, Decimal],
+    other_dead: dict[str, Decimal],
+    ante_mode: str,
+) -> tuple[dict[str, Decimal], Decimal]:
+    """Rule 3's ONE branch: which dead chips the cap governs, and which it exempts.
+
+    This is the whole of the mode-dependence, in two lines, stated from the
+    specification and not from ``accounting.build_hand_ledger``:
+
+      PER_PLAYER / NONE  capped = ante + other_dead,  uncapped pool = 0
+      SINGLE_PAYER       capped = other_dead,         uncapped pool = SUM(ante)
+
+    The second line is what makes ruling 3's "retained" clause CHECKABLE rather
+    than asserted: under the non-SINGLE_PAYER modes the uncapped pool vanishes
+    and the cap below collapses, term for term, to the one round 20 shipped.
+
+    NOTE WHAT STAYS IN ``capped`` UNDER SINGLE_PAYER: ``other_dead``, which is
+    dead blinds, missed blinds and penalty posts. The mode is an ANTE mode and
+    ruling 3's last clause leaves non-ante forced posts on their existing
+    treatment, so a consolidated-ante hand carrying a dead blind runs BOTH rules
+    at once on disjoint pools. Branching once on the mode and exempting all of a
+    seat's dead money passes every worked example and then overpays by the dead
+    blind on exactly that family.
+    """
+
+    if ante_mode == _SINGLE_PAYER:
+        capped = {name: other_dead[name] for name in other_dead}
+        return capped, _sum(ante.values())
+    capped = {name: ante[name] + other_dead[name] for name in other_dead}
+    return capped, _ZERO
+
+
 def _model_payout_cap(
     seat: str,
     live: dict[str, Decimal],
-    dead: dict[str, Decimal],
+    ante: dict[str, Decimal],
+    other_dead: dict[str, Decimal],
     folded: set[str],
     external_dead: Decimal,
+    ante_mode: str,
 ) -> Decimal:
-    """The most chips ``seat`` can collect, as a closed form over the four rules.
+    """The most chips ``seat`` can collect, as ONE closed form with ONE mode term.
 
-    It never looks at a layer. That is the whole point: the previous cap was
-    satisfied by the layering it was meant to referee.
+    It never looks at a layer. That is the whole point: the cap that missed five
+    consecutive criticals took its expectation from the reducer it was refereeing.
 
-        cap(w) = live[w]
-               + SUM over o != w of min(live[o], live[w])
-               + SUM over ALL contributors x, FOLDED INCLUDED, of
-                     min(dead[x], total[w])
-               + (the dead money above every surviving total, if w holds the
-                  largest surviving total)
-               + external dead money
+        cap(w) =  live[w]                                             (A)
+                + SUM over o != w of min(live[o], live[w])            (A)
+                + SUM over ALL contributors x, FOLDED INCLUDED, of
+                      min(capped[x], total[w])                        (B)
+                + min(external_dead, total[w])                        (B)
+                + uncapped_pool                                       (C)
+                + (the capped dead money above every surviving total,
+                   if w holds the largest surviving total)            (D)
+
+    WHAT IS COMMON AND WHAT BRANCHES. (A), (B) and (D) are mode-INDEPENDENT: no
+    ruling touches live money, (B) changes only in the MEMBERSHIP of ``capped``
+    (see ``_model_pools``), and ruling 4 does not mention modes. Only (C)
+    branches, and only on which pool the ante went into. One branch, two lines.
 
     TERM BY TERM, AND THE ERROR EACH ONE FORBIDS.
 
@@ -834,62 +990,93 @@ def _model_payout_cap(
       An opponent does not match your ante. Folding them in is exactly what turns
       240 into 540 on the operator's worked example (e), and it is what the
       shipped reducer's first boundary used to do.
-    * ``min(dead[x], total[w])``: rule 2 as amended. ``w`` is eligible for dead
+    * ``min(capped[x], total[w])``: rule 2 as amended. ``w`` is eligible for dead
       layer k exactly when total[w] exceeds layer k-1's cap; the highest such
       layer has a cap of exactly total[w], because w is itself the smallest total
-      still eligible there. So each contributor's dead money reaches w capped at
-      w's OWN total -- which is where a seat's own antes legitimately appear, as
-      its own ceiling. Worked example (a) pins that the comparison is against the
-      seat's DEAD alone and not dead-plus-live: the big blind's 16 live in the
-      layer plus its 10 ante is 26, above the 20 cap, and the whole ante still
-      stays down.
-    * the terminal term: rule 2 says the excess "rises into the layer above,
-      eligible to the seats whose own total reached above that cap", and says
-      nothing when no seat's total reaches above it. Such money can only ever be
-      a FOLDED seat's, since an unfolded seat's dead is at most its own total and
-      the last cap is the largest surviving total. It stays in the top layer,
-      which only a seat holding that largest total can win. This is the single
-      place a seat's ceiling is not simply its own total, and it is written out
-      rather than hidden -- ``_unruled_dead_money_warnings`` discloses the same
-      hand.
-    * ``external_dead``: money declared for the table has no contributing seat,
-      so rule 2's cap -- written per contributor against that contributor's own
-      total -- has no operand for it. It stays in the lowest layer whole.
+      still eligible there. So each contributor's capped dead money reaches w
+      capped at w's OWN total -- which is where a seat's own antes legitimately
+      appear, as its own ceiling. Worked example (a) pins that the comparison is
+      against the seat's DEAD alone and not dead-plus-live: the big blind's 16
+      live in the layer plus its 10 ante is 26, above the 20 cap, and the whole
+      ante still stays down.
+    * ``min(external_dead, total[w])``: RULING 5. Operator-typed dead money used
+      to be added WHOLE and unwarned, which paid a seat that had committed 2
+      chips as much as 312. It has no seat of its own to be capped by, but the
+      operand rule 2 actually uses is the COLLECTING seat's total, and that
+      exists for every seat. It is in the capped pool under every mode: it is not
+      an ante -- the consolidated ante is by definition "one seat posts", and
+      external money has no seat -- and capping is the strict direction.
+    * ``uncapped_pool``: RULING 3, and the only mode-dependent term. Under
+      SINGLE_PAYER_TABLE_ANTE the consolidated ante is table money sitting whole
+      in the main pot, which EVERY main-pot-eligible seat may win however short it
+      is, so it enters with no min() against anything. Under the other modes it
+      is zero and this line disappears.
+    * the terminal term: RULING 4. The excess "rises into the layer above,
+      eligible to the seats whose own total reached above that cap", and there is
+      no such layer when no surviving total reaches above it. Such money can only
+      ever be a FOLDED seat's post or external money, since an unfolded seat's
+      capped dead is at most its own total and the last cap is the largest
+      surviving total. It stays in the top layer, which only a seat holding that
+      largest total can win.
 
     A folded seat, or one that put nothing in, collects nothing.
     """
 
     names = list(live)
-    total = {name: live[name] + dead[name] for name in names}
+    total = {name: live[name] + ante[name] + other_dead[name] for name in names}
     if seat in folded or total[seat] <= _ZERO:
         return _ZERO
 
+    capped, uncapped_pool = _model_pools(ante, other_dead, ante_mode)
+
     own_live = live[seat]
     cap = own_live + _sum(min(live[other], own_live) for other in names if other != seat)
-    cap += _sum(min(dead[name], total[seat]) for name in names)
+    cap += _sum(min(capped[name], total[seat]) for name in names)
+    cap += min(external_dead, total[seat])
+    cap += uncapped_pool
 
     surviving = [total[name] for name in names if name not in folded and total[name] > 0]
     if surviving and total[seat] == max(surviving):
         ceiling = max(surviving)
-        cap += _sum(max(_ZERO, dead[name] - ceiling) for name in names)
-    return cap + external_dead
+        cap += _sum(max(_ZERO, capped[name] - ceiling) for name in names)
+        cap += max(_ZERO, external_dead - ceiling)
+    return cap
 
 
 def _amendment_bites(hand, live: dict[str, Decimal], totals: dict[str, Decimal]) -> bool:
-    """True when the amended rule 2 can differ from the unconditional one.
+    """True when the capped cascade can differ from the unconditional rule.
 
-    Some contributor's dead money exceeds the smallest TOTAL commitment among the
-    seats eligible for the main pot, so at least one dead chip is capped out of
-    the layer it started in. Derived from the specification sentence, not from
-    either implementation, so it can be used to say "on this family the two rules
-    coincide and the old assertions must still hold to the chip".
+    Some contributor's CAPPED dead money exceeds the smallest TOTAL commitment
+    among the seats eligible for the main pot, so at least one dead chip is capped
+    out of the layer it started in. Derived from the specification sentence, not
+    from either implementation, so it can be used to say "on this family the two
+    rules coincide and the old assertions must still hold to the chip".
+
+    TWO ROUND-21 CORRECTIONS, and both of them are the difference between a
+    property that guards something and one that fires on a hand it should have
+    skipped.
+
+    * EXTERNAL dead money is in the capped pool now (ruling 5), so it can be what
+      bites. It used to be added whole and could never rise, so leaving it out was
+      right then and is a false negative now: a hand with 4 declared chips against
+      a 1-chip floor really does open a second layer, and a property that did not
+      know it would report the phantom side pot on a legal ladder.
+    * The UNCAPPED pool -- the consolidated table ante under
+      SINGLE_PAYER_TABLE_ANTE -- can NEVER bite, however large it is. It sits
+      whole in the main pot by ruling 3. Counting it would be a false POSITIVE:
+      the property would skip hands where the phantom is still forbidden, which is
+      the direction that retires a guard silently.
     """
 
     contests = _model_main_pot_eligibility(hand)
     if not contests:
         return False
     floor = min(totals[name] for name in contests)
-    return any(hand.dead[name] > floor for name in hand.names)
+    capped, _uncapped = _model_pools(hand.ante, hand.other_dead, hand.ante_mode)
+    return (
+        any(capped[name] > floor for name in hand.names)
+        or hand.external_dead > floor
+    )
 
 
 def _live_threshold_sets(hand, live: dict[str, Decimal]) -> set[frozenset[str]]:
@@ -1002,7 +1189,7 @@ def test_every_forced_post_chip_is_in_a_pot_or_refunded(hand):
     Every chip a seat committed is either in a pot layer or handed back. Never
     both, never neither.
     """
-    ledger = build_hand_ledger(hand.players, hand.actions)
+    ledger = build_hand_ledger(hand.players, hand.actions, ante_mode=hand.ante_mode)
     contributed = _sum(ledger.contributions.values())
     refunded = _sum(ledger.refunds.values())
     assert contributed - refunded == Decimal(str(ledger.gross_pot))
@@ -1023,7 +1210,7 @@ def test_a_forced_post_is_never_returned_as_an_uncalled_bet(hand):
     never exceed the live chips the seat wagered, and the pot must always hold
     every dead chip posted into it.
     """
-    ledger = build_hand_ledger(hand.players, hand.actions)
+    ledger = build_hand_ledger(hand.players, hand.actions, ante_mode=hand.ante_mode)
     for name in hand.names:
         assert Decimal(str(ledger.refunds[name])) <= hand.live[name]
     assert Decimal(str(ledger.gross_pot)) >= _sum(hand.dead.values())
@@ -1039,14 +1226,15 @@ def test_a_seat_all_in_for_only_a_forced_post_can_still_be_declared_the_winner(h
     eligibility from live contributions alone made such a hand unrecordable, which
     is routine once a stack is at or below the ante.
     """
-    ledger = build_hand_ledger(hand.players, hand.actions)
+    ledger = build_hand_ledger(hand.players, hand.actions, ante_mode=hand.ante_mode)
     for name in hand.all_in_on_a_forced_post:
         if Decimal(str(ledger.contributions[name])) <= 0:
             continue
         eligible_layers = [pot for pot in ledger.pots if name in pot.eligible_players]
         assert eligible_layers, f"{name} has chips in the pot but can win none of it"
         settled = build_hand_ledger(
-            hand.players, hand.actions, _winner_map(ledger.pots, (name,))
+            hand.players, hand.actions, _winner_map(ledger.pots, (name,)),
+            ante_mode=hand.ante_mode,
         )
         assert settled.payouts[name] > 0
         assert _sum(settled.net_results.values()) == Decimal("0")
@@ -1070,7 +1258,7 @@ def test_every_seat_that_put_a_chip_up_contests_the_main_pot(hand):
     ``test_no_seat_is_paid_more_than_the_table_matched_of_its_own_commitment``
     is the guarantee on that side.
     """
-    ledger = build_hand_ledger(hand.players, hand.actions)
+    ledger = build_hand_ledger(hand.players, hand.actions, ante_mode=hand.ante_mode)
     assume(ledger.pots)
     for name in hand.names:
         if name in hand.folded or Decimal(str(ledger.contributions[name])) <= 0:
@@ -1083,12 +1271,13 @@ def test_every_seat_that_put_a_chip_up_contests_the_main_pot(hand):
 @given(hand=LAYERING_HANDS, policy=rake_policy())
 @SETTINGS
 def test_a_settled_forced_post_hand_conserves_chips(hand, policy):
-    unsettled = build_hand_ledger(hand.players, hand.actions, rake=policy)
+    unsettled = build_hand_ledger(hand.players, hand.actions, rake=policy, ante_mode=hand.ante_mode)
     ledger = build_hand_ledger(
         hand.players,
         hand.actions,
         _winner_map(unsettled.pots, (hand.names[0],)),
         rake=policy,
+        ante_mode=hand.ante_mode,
     )
     assume(ledger.is_settled)
     assert _sum(ledger.payouts.values()) + Decimal(str(ledger.rake)) == Decimal(
@@ -1115,13 +1304,14 @@ def test_a_chopped_forced_post_pot_conserves_every_chip(hand, policy):
     an odd chip, and that is what this pins.
     """
     everyone = tuple(hand.names)
-    unsettled = build_hand_ledger(hand.players, hand.actions, rake=policy)
+    unsettled = build_hand_ledger(hand.players, hand.actions, rake=policy, ante_mode=hand.ante_mode)
     ledger = build_hand_ledger(
         hand.players,
         hand.actions,
         _winner_map(unsettled.pots, everyone),
         rake=policy,
         odd_chip_order=everyone,
+        ante_mode=hand.ante_mode,
     )
     assume(ledger.is_settled)
     assert _sum(ledger.payouts.values()) + Decimal(str(ledger.rake)) == Decimal(
@@ -1137,6 +1327,7 @@ def test_a_chopped_forced_post_pot_conserves_every_chip(hand, policy):
         _winner_map(unsettled.pots, everyone),
         rake=policy,
         odd_chip_order=tuple(reversed(everyone)),
+        ante_mode=hand.ante_mode,
     )
     assert _sum(reversed_order.payouts.values()) == _sum(ledger.payouts.values())
 
@@ -1181,7 +1372,7 @@ def test_a_forced_post_layer_is_only_emitted_when_it_caps_somebody_out(hand):
     None of those follows from the index, and the last two do not follow from the
     ordering either.
     """
-    ledger = build_hand_ledger(hand.players, hand.actions)
+    ledger = build_hand_ledger(hand.players, hand.actions, ante_mode=hand.ante_mode)
     if not ledger.pots:
         return
     main = ledger.pots[0]
@@ -1265,7 +1456,7 @@ def test_a_seat_that_wins_every_layer_it_can_is_paid_exactly_the_model_cap(hand)
     is the assertion on that, and it is the reason this ``assume`` is not a hole.
     """
     dead_money = float(hand.external_dead)
-    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money)
+    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money, ante_mode=hand.ante_mode)
     assume(ledger.pots)
     live, _pool = _model_figures(hand, ledger)
     totals = _model_totals(hand, live)
@@ -1284,12 +1475,19 @@ def test_a_seat_that_wins_every_layer_it_can_is_paid_exactly_the_model_cap(hand)
             hand.actions,
             _winner_map(ledger.pots, (name,)),
             dead_money=dead_money,
+            ante_mode=hand.ante_mode,
         )
         if not settled.is_settled:
             continue
         paid = Decimal(str(settled.payouts[name]))
         expected = _model_payout_cap(
-            name, live, hand.dead, hand.folded, hand.external_dead
+            name,
+            live,
+            hand.ante,
+            hand.other_dead,
+            hand.folded,
+            hand.external_dead,
+            hand.ante_mode,
         )
         if name in contests_main:
             assert paid == expected, (
@@ -1321,7 +1519,7 @@ def test_no_layering_can_offer_a_seat_more_than_the_table_matched_of_it(hand):
     stated separately rather than folded into the equality above.
     """
     dead_money = float(hand.external_dead)
-    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money)
+    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money, ante_mode=hand.ante_mode)
     assume(ledger.pots)
     live, _pool = _model_figures(hand, ledger)
     totals = _model_totals(hand, live)
@@ -1333,7 +1531,13 @@ def test_no_layering_can_offer_a_seat_more_than_the_table_matched_of_it(hand):
             pot.amount for pot in ledger.pots if name in pot.eligible_players
         )
         assert reachable <= _model_payout_cap(
-            name, live, hand.dead, hand.folded, hand.external_dead
+            name,
+            live,
+            hand.ante,
+            hand.other_dead,
+            hand.folded,
+            hand.external_dead,
+            hand.ante_mode,
         ), f"{name} may be declared the winner of more than the table matched of it"
 
 
@@ -1351,7 +1555,7 @@ def test_winning_every_layer_you_are_eligible_for_never_loses_chips(hand):
     band sits above the cap) and it is wrong; this is the property that says so.
     """
     dead_money = float(hand.external_dead)
-    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money)
+    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money, ante_mode=hand.ante_mode)
     assume(ledger.pots)
     for name in hand.names:
         if name in hand.folded:
@@ -1384,7 +1588,8 @@ def test_no_declared_settlement_can_pay_a_seat_past_the_model_cap(hand, policy):
     """
     dead_money = float(hand.external_dead)
     ledger = build_hand_ledger(
-        hand.players, hand.actions, dead_money=dead_money, rake=policy
+        hand.players, hand.actions, dead_money=dead_money, rake=policy,
+        ante_mode=hand.ante_mode,
     )
     assume(ledger.pots)
     live, _pool = _model_figures(hand, ledger)
@@ -1403,12 +1608,19 @@ def test_no_declared_settlement_can_pay_a_seat_past_the_model_cap(hand, policy):
         dead_money=dead_money,
         rake=policy,
         odd_chip_order=tuple(hand.names),
+        ante_mode=hand.ante_mode,
     )
     for name in hand.names:
         paid = Decimal(str(settled.payouts[name]))
         assert paid >= _ZERO
         assert paid <= _model_payout_cap(
-            name, live, hand.dead, hand.folded, hand.external_dead
+            name,
+            live,
+            hand.ante,
+            hand.other_dead,
+            hand.folded,
+            hand.external_dead,
+            hand.ante_mode,
         ), f"{name} was paid past what the table matched of it"
 
 
@@ -1617,7 +1829,7 @@ def test_unequal_dead_money_alone_never_splits_the_pot(hand):
     merging it down into a pot a short seat could win.
     """
     dead_money = float(hand.external_dead)
-    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money)
+    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money, ante_mode=hand.ante_mode)
     assume(ledger.pots)
     settled_live, _pool = _model_figures(hand, ledger)
     totals = _model_totals(hand, settled_live)
@@ -1675,7 +1887,7 @@ def test_every_layer_boundary_is_a_cut_the_two_rules_allow(hand):
     seat that could win the one below.
     """
     dead_money = float(hand.external_dead)
-    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money)
+    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money, ante_mode=hand.ante_mode)
     assume(ledger.pots)
     live, _pool = _model_figures(hand, ledger)
     totals = _model_totals(hand, live)
@@ -1728,22 +1940,26 @@ def test_dead_money_starts_in_the_lowest_layer_and_rises_only_when_capped(hand):
     and asserting it would reject the operator's ruling. What replaces it is the
     amended sentence, in both directions:
 
-    * NOTHING RISES THAT WAS NOT CAPPED. Each contributor's dead money reaches the
-      main pot up to the smallest total commitment among the seats eligible for
-      it, so the main pot holds at least ``sum_x min(dead[x], floor)`` plus all the
-      external dead money. When the amendment does not bite this is the whole dead
+    * NOTHING RISES THAT WAS NOT CAPPED. Each contributor's CAPPED dead money
+      reaches the main pot up to the smallest total commitment among the seats
+      eligible for it, so the main pot holds at least
+      ``sum_x min(capped[x], floor) + min(external, floor)`` -- plus, under
+      SINGLE_PAYER_TABLE_ANTE, the WHOLE consolidated ante, which ruling 3 puts
+      there uncapped. When the amendment does not bite this is the whole dead
       pool, which is exactly the round-19 statement, so that guarantee is kept
       rather than dropped.
     * NOTHING RISES FURTHER THAN IT WAS CAPPED. Everything above the main pot is
-      live money above the main pot's live ceiling, plus dead money that genuinely
-      exceeded the floor -- never more.
+      live money above the main pot's live ceiling, plus CAPPED dead money that
+      genuinely exceeded the floor -- never more. The consolidated ante is not in
+      that bound at all, which is what makes ruling 3 checkable from this side:
+      let one chip of a table ante rise and the sum above the main pot exceeds it.
 
     The second bound is what catches "carry the antes up into a side pot the short
     seat cannot win", which underpaid the short seat on 58.6% of the round-19
     disagreements and was completely silent, because chip conservation still held.
     """
     dead_money = float(hand.external_dead)
-    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money)
+    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money, ante_mode=hand.ante_mode)
     assume(ledger.pots)
     live, pool = _model_figures(hand, ledger)
     totals = _model_totals(hand, live)
@@ -1752,8 +1968,11 @@ def test_dead_money_starts_in_the_lowest_layer_and_rises_only_when_capped(hand):
     assume(not _refunded_to_nothing(hand, totals))
     floor = min(totals[name] for name in contests_main)
 
+    capped, uncapped_pool = _model_pools(hand.ante, hand.other_dead, hand.ante_mode)
     stays_down = (
-        _sum(min(hand.dead[name], floor) for name in hand.names) + hand.external_dead
+        _sum(min(capped[name], floor) for name in hand.names)
+        + min(hand.external_dead, floor)
+        + uncapped_pool
     )
     assert Decimal(str(ledger.pots[0].amount)) >= stays_down, (
         "the main pot holds less dead money than the cap leaves in it, so a "
@@ -1775,7 +1994,9 @@ def test_dead_money_starts_in_the_lowest_layer_and_rises_only_when_capped(hand):
             if {name for name in contenders if live[name] >= level} == contests_main
         ]
     )
-    rises = _sum(max(_ZERO, hand.dead[name] - floor) for name in hand.names)
+    rises = _sum(max(_ZERO, capped[name] - floor) for name in hand.names) + max(
+        _ZERO, hand.external_dead - floor
+    )
     above = _sum(pot.amount for pot in ledger.pots[1:])
     assert above <= _sum(
         max(_ZERO, live[name] - ceiling) for name in hand.names
@@ -1824,7 +2045,7 @@ def test_a_seat_short_of_the_live_wager_is_paid_only_the_live_chips_it_was_match
     is run at that seed and example count to prove the hand no longer escapes it.
     """
     dead_money = float(hand.external_dead)
-    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money)
+    ledger = build_hand_ledger(hand.players, hand.actions, dead_money=dead_money, ante_mode=hand.ante_mode)
     assume(ledger.pots)
     live, _pool = _model_figures(hand, ledger)
     totals = _model_totals(hand, live)
@@ -1841,11 +2062,18 @@ def test_a_seat_short_of_the_live_wager_is_paid_only_the_live_chips_it_was_match
             hand.actions,
             _winner_map(ledger.pots, (name,)),
             dead_money=dead_money,
+            ante_mode=hand.ante_mode,
         )
         if not settled.is_settled:
             continue
         assert Decimal(str(settled.payouts[name])) <= _model_payout_cap(
-            name, live, hand.dead, hand.folded, hand.external_dead
+            name,
+            live,
+            hand.ante,
+            hand.other_dead,
+            hand.folded,
+            hand.external_dead,
+            hand.ante_mode,
         ), f"{name} stopped short of the live wager and was paid past what it was matched"
 
 
@@ -1888,13 +2116,14 @@ def test_no_blind_structure_moves_a_single_chip(hand, structure, policy):
     figure the hand already reported.
     """
     try:
-        baseline = build_hand_ledger(hand.players, hand.actions, rake=policy)
+        baseline = build_hand_ledger(hand.players, hand.actions, rake=policy, ante_mode=hand.ante_mode)
     except LedgerError:
         assume(False)
         return
     try:
         declared = build_hand_ledger(
-            hand.players, hand.actions, rake=policy, blinds=structure
+            hand.players, hand.actions, rake=policy, blinds=structure,
+            ante_mode=hand.ante_mode,
         )
     except LedgerError:
         # A structure no room could have is refused outright, which is a refusal
@@ -1921,6 +2150,91 @@ def test_no_blind_structure_moves_a_single_chip(hand, structure, policy):
     ]
 
 
+@given(
+    hand=LAYERING_HANDS,
+    mode=st.sampled_from([None, _NO_ANTES, _PER_PLAYER, _SINGLE_PAYER]),
+)
+@SETTINGS
+def test_no_ante_mode_declaration_can_create_or_destroy_a_chip(hand, mode):
+    """The declaration decides WHERE chips sit. It can never decide HOW MANY.
+
+    Every seat's contributions, every refund, the gross pot and chip conservation
+    are properties of the ACTION LINE, and no declaration touches them: the mode
+    only chooses which pool the cap governs, and both pools are placed in full
+    either way. So a mode may move a boundary and may move a payout, and must
+    never move the total.
+
+    This is the guarantee that makes the migration safe to reason about. Every
+    hand in the store is about to be re-derived under a declaration it did not
+    have, and this property is what says the re-derivation cannot lose or invent
+    a chip -- which no amount of examining the seven worked examples could
+    establish, because none of them is a hand whose declaration is in doubt.
+
+    Swept over the UNDECLARED value too, deliberately. A refused hand still
+    derives every figure, and the figures it publishes beside the refusal have to
+    conserve chips like any other, or an operator inspecting a blocked hand is
+    reading a pot that does not add up.
+    """
+
+    baseline = build_hand_ledger(hand.players, hand.actions, ante_mode=hand.ante_mode)
+    try:
+        other = build_hand_ledger(hand.players, hand.actions, ante_mode=mode)
+    except LedgerError:
+        # A declaration this hand cannot carry is refused outright, which is a
+        # refusal to derive rather than a different derivation.
+        assume(False)
+        return
+
+    assert other.contributions == baseline.contributions
+    assert other.refunds == baseline.refunds
+    assert other.gross_pot == baseline.gross_pot
+    assert other.rake == baseline.rake
+    assert other.net_pot == baseline.net_pot
+    assert other.folded_players == baseline.folded_players
+    # And the layers, however they are cut, still hold every chip that went in.
+    assert _sum(pot.amount for pot in other.pots) == _sum(
+        pot.amount for pot in baseline.pots
+    )
+
+
+@given(hand=LAYERING_HANDS)
+@SETTINGS
+def test_a_hand_with_antes_is_refused_under_every_undeclared_reading(hand):
+    """RULING 2 as a property, over the whole generated family.
+
+    Two directions, and both have to hold or the gate is worthless:
+
+    * a hand containing ANY ante and carrying no declaration is refused, and the
+      refusal names the anteing seats and the clearing action;
+    * a hand containing NO ante is silent under an absent declaration, because
+      ``NONE`` is not a guess for it.
+
+    Stated over the generators rather than over an example, because the shapes
+    that matter are the ones nobody wrote down: an ante whose poster was too
+    short to cover it, an ante spelled as an all-in with its forced-bet type, a
+    hand whose only dead money is a dead blind.
+    """
+
+    ledger = build_hand_ledger(hand.players, hand.actions)
+    refusals = [
+        note
+        for note in ledger.legality_issues
+        if note.startswith(UNDECLARED_ANTE_MODE_PREFIX)
+    ]
+    anteing = sorted(name for name in hand.names if hand.ante[name] > _ZERO)
+
+    if anteing:
+        assert refusals, "a hand containing antes must refuse an absent declaration"
+        assert ledger.is_legal is False
+        for name in anteing:
+            assert repr(name) in refusals[0], "the refusal must name the anteing seats"
+        assert "Declare the ante mode" in refusals[0]
+    else:
+        assert not refusals, (
+            "a hand with no antes must not be asked for an ante declaration"
+        )
+
+
 @given(hand=forced_post_hand())
 @SETTINGS
 def test_an_unreadable_forced_post_is_never_silently_accepted(hand):
@@ -1931,7 +2245,7 @@ def test_an_unreadable_forced_post_is_never_silently_accepted(hand):
     say so. The complaint names the seat and the clearing action, and
     ``is_legal`` goes False so no surface can present the hand as reconciled.
     """
-    ledger = build_hand_ledger(hand.players, hand.actions)
+    ledger = build_hand_ledger(hand.players, hand.actions, ante_mode=hand.ante_mode)
     complaints = [
         issue
         for issue in ledger.legality_issues
@@ -1954,7 +2268,7 @@ def test_declaring_the_structure_that_was_dealt_answers_the_complaint(hand):
     honest operator could not clear, which is a worse failure than the one it
     replaced.
     """
-    ledger = build_hand_ledger(hand.players, hand.actions, blinds=hand.blinds)
+    ledger = build_hand_ledger(hand.players, hand.actions, blinds=hand.blinds, ante_mode=hand.ante_mode)
     assert not [
         issue
         for issue in ledger.legality_issues
@@ -1970,7 +2284,7 @@ def test_a_declared_structure_never_lowers_the_amount_to_call(hand):
     That direction is what stops the input becoming the next free parameter: no
     value an operator types can excuse a call the recording proves was short.
     """
-    baseline = build_hand_ledger(hand.players, hand.actions)
-    declared = build_hand_ledger(hand.players, hand.actions, blinds=hand.blinds)
+    baseline = build_hand_ledger(hand.players, hand.actions, ante_mode=hand.ante_mode)
+    declared = build_hand_ledger(hand.players, hand.actions, blinds=hand.blinds, ante_mode=hand.ante_mode)
     for before, after in zip(baseline.snapshots, declared.snapshots, strict=True):
         assert after.to_call_before >= before.to_call_before - 1e-9

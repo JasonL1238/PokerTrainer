@@ -37,6 +37,11 @@ _BLIND_AMOUNTS = {"SB": 0.5, "BB": 1.0}
 # The same numbers this module posts, handed to the ledger as the structure so
 # the draft ledger and the persisted settlement cannot disagree about them.
 _SPOT_BLINDS = blind_structure(_BLIND_AMOUNTS["SB"], _BLIND_AMOUNTS["BB"])
+# A manual spot posts blinds and nothing else -- there is no ante row anywhere in
+# this builder -- so the ante mode is a fact this path knows rather than one it
+# has to ask for. Declared for the same reason the blinds are: it records what
+# this code did.
+_SPOT_ANTE_MODE = "NONE"
 _POSTFLOP_ACTIONS = {"fold", "check", "call", "bet", "raise", "all-in"}
 _POSTFLOP_STREETS = ("flop", "turn", "river")
 _STREET_ALIASES = {
@@ -537,7 +542,10 @@ def save_manual_spot(
         # produced "dead-money layers, not side pots"; they produce no extra
         # layer at all.)
         draft_ledger = build_ledger_from_records(
-            saved_players, built.actions, blinds=_SPOT_BLINDS
+            saved_players,
+            built.actions,
+            blinds=_SPOT_BLINDS,
+            ante_mode=_SPOT_ANTE_MODE,
         )
         pot_indexes = [pot.index for pot in draft_ledger.pots] or [0]
         db.upsert_hand_settlement(
@@ -551,6 +559,14 @@ def save_manual_spot(
                 # of the trap the ledger's blind structure exists to close.
                 small_blind=_BLIND_AMOUNTS["SB"],
                 big_blind=_BLIND_AMOUNTS["BB"],
+                # Same argument one category over: this builder emits the forced
+                # posts itself and it emits no ante row at all, so declaring
+                # ``NONE`` records what this path DID rather than guessing at a
+                # room. Leaving it undeclared would derive identically -- an
+                # absent mode is only ambiguous on a hand that contains antes --
+                # but it would leave a blank in the editor beside a hand whose
+                # ante structure this code knows for certain.
+                ante_mode=_SPOT_ANTE_MODE,
             )
         )
         db.replace_settlement_entries(

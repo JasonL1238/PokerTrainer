@@ -966,7 +966,12 @@ def _phantom_dead_money_hand(db: PokerDatabase, session_id: int) -> Hand:
                 is_live_post=live_post,
             )
         )
-    db.upsert_hand_settlement(HandSettlement(hand_id=hand.id, status="settled"))
+    # PER_PLAYER: 'a' antes for itself. Declared because an undeclared mode on a
+    # hand containing antes is a refusal, and PER_PLAYER because the ruling
+    # RETAINS that layering unchanged -- so the 88-chip pot below must not move.
+    db.upsert_hand_settlement(
+        HandSettlement(hand_id=hand.id, status="settled", ante_mode="PER_PLAYER")
+    )
     return hand
 
 
@@ -1632,7 +1637,11 @@ def _short_ante_hand(db: PokerDatabase, session_id: int, c_row: tuple) -> Hand:
         )
     db.upsert_hand_settlement(
         HandSettlement(
-            hand_id=hand.id, status="settled", small_blind=5, big_blind=10
+            hand_id=hand.id,
+            status="settled",
+            small_blind=5,
+            big_blind=10,
+            ante_mode="PER_PLAYER",
         )
     )
     return hand
@@ -1758,7 +1767,13 @@ def test_a_forced_post_no_seat_could_cover_is_capped_and_reconciles() -> None:
             )
         )
     db.upsert_hand_settlement(
-        HandSettlement(hand_id=hand.id, status="settled", small_blind=100, big_blind=200)
+        HandSettlement(
+            hand_id=hand.id,
+            status="settled",
+            small_blind=100,
+            big_blind=200,
+            ante_mode="PER_PLAYER",
+        )
     )
     db.replace_settlement_entries(
         hand.id,
@@ -1851,7 +1866,13 @@ def _capped_ante_hand(db: PokerDatabase, session_id: int) -> Hand:
             )
         )
     db.upsert_hand_settlement(
-        HandSettlement(hand_id=hand.id, status="settled", small_blind=100, big_blind=200)
+        HandSettlement(
+            hand_id=hand.id,
+            status="settled",
+            small_blind=100,
+            big_blind=200,
+            ante_mode="PER_PLAYER",
+        )
     )
     return hand
 

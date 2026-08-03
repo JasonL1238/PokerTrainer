@@ -72,7 +72,7 @@ As of August 2, 2026, the repository contains:
   Insights, Import, and Settings, with every published figure carrying a declared
   population, a denominator, a coverage figure and an evidence class (manual / CV
   draft / corrected CV / reviewed) rather than a bare rate;
-- SQLite persistence at **schema 19** for sessions, hands, players, actions,
+- SQLite persistence at **schema 20** for sessions, hands, players, actions,
   settlements, coaching, corrections, issues, videos and their content hashes,
   processing jobs, extracted frames, per-action source-frame provenance, ROI
   profiles, review evidence, range profiles, solver runs and the parameters they
@@ -493,13 +493,46 @@ cards, supported table/layout evidence, authoritative reconciled accounting, no
 open debugging issue, no unresolved source warning, no stale retained coaching or
 solver result being represented as current, and explicit user confirmation.
 
-The migration chain has since run past 13 and is now at **schema 19**: 14 adds
+The migration chain has since run past 13 and is now at **schema 20**: 14 adds
 video content hashes, 15 per-hand study inclusion, 16 per-action source-frame
 provenance, 17 the `regression_cases` table, 18 `solver_runs.run_parameters`, 19
 the declared blind structure (`hand_settlements.small_blind`, `big_blind`,
-`straddles`). Every one is additive, and 19 is deliberately unbackfilled: a big
-blind inferred from the largest observed post is exactly the defect it exists to
-end. JSON export is at **version 6** and imports accept 1
+`straddles`), 20 the declared ante mode (`hand_settlements.ante_mode`). Every one
+is additive, and 19 and 20 are deliberately unbackfilled: a big blind inferred
+from the largest observed post is exactly the defect 19 exists to end, and an
+ante mode inferred from one seat having anted is exactly the defect 20 exists to
+end.
+
+**Schema 20 is the first migration that visibly demotes hands that previously
+reconciled**, and that is the ruling rather than a side effect. Every stored hand
+containing an ante reads `ante_mode IS NULL`, which is ambiguous rather than
+defaulted, so it gains one legality issue naming the anteing seats, `is_legal`
+goes False, `persist_reconciliation` writes `needs_correction`, and study
+readiness blocks on `ACCOUNTING_NOT_AUTHORITATIVE`. No row is rewritten and no
+chip figure moves: the layers published beside the refusal are the capped
+(PER_PLAYER) reading, which is the strict direction and byte-for-byte what the
+product derived before the column existed. The clearing action is one ordinary
+settlement save. **Hands with no ante rows are never asked for a declaration** —
+`NONE` is not a guess for them, so the absent declaration resolves silently.
+Count what will block with `SELECT COUNT(DISTINCT hand_id) FROM actions WHERE
+action_type = 'ante' OR forced_bet_type IN ('ante','big_blind_ante')`.
+**v20 reaches a second population, for a different reason, and this one does
+move chips.** Ruling 5 ships in the same release and caps operator-typed
+external dead money against each collecting seat's own commitment; a stored hand
+whose declared amount exceeds the smallest commitment contesting the main pot
+keeps its gross, its pot count and its eligible sets while the distribution — and
+therefore the hero result — changes, so no existing cross-check can see it. Such
+a hand may contain no ante and asks for no declaration. The new figure is the
+correct one, so the migration does not touch the settlement, the awards or
+`review_status`; what it does is mark the coaching and solver output retained
+beside those hands stale, because that analysis was written against a result
+this build no longer produces and `is_stale` is a stored flag that a change in
+the derivation rule otherwise never sets. Study readiness then blocks on
+`STALE_COACHING_EVIDENCE`. The predicate is `dead_money > 0`, deliberately
+over-strict because a schema migration cannot run the reducer to find the floor;
+count it with `SELECT COUNT(*) FROM hand_settlements WHERE dead_money > 0`. A
+hand in neither population is untouched in every respect.
+JSON export is at **version 6** and imports accept 1
 through 6.
 
 The migration rules that Phase 1 established and every later migration inherits:
@@ -647,20 +680,44 @@ The other standing rules in this area:
 - **No pot may be raked past its own size.** Each share is capped at its own pot
   and the rounding leftover is offered to the layers in order, each taking only
   what it still has room for.
-- **A pot layer is cut at a LIVE contribution level and nowhere else**, and once
-  cut it applies to every seat by that seat's own live contribution. All dead
-  money — antes, dead blinds, declared dead money — goes whole into the lowest
-  layer: nobody can decline a forced post, so unequal dead money never opens a
-  layer, and a short seat's own forced posts never raise the level its opponents
-  are charged into the main pot at. Being all-in does not open a layer either, if
-  the all-in covered the wager. Cutting at a seat's TOTAL commitment instead was
-  the round-19 critical: a seat live-short behind an ante was paid live chips no
-  opponent had wagered against it, and the hand reported settled, balanced and
-  legal with no warning. The model is written down in
+- **A pot layer is cut at a LIVE contribution level or at a dead-money cap, and
+  nowhere else.** Live boundaries are cut at live contribution levels after
+  refunds, and apply to every seat by that seat's own live contribution: nobody
+  can decline a forced post, so unequal dead money never opens a live layer, and
+  a short seat's own forced posts never raise the level its opponents are charged
+  into the main pot at. Cutting at a seat's TOTAL commitment instead was the
+  round-19 critical: a seat live-short behind an ante was paid live chips no
+  opponent had wagered against it, settled, balanced and legal with no warning.
+  Dead money starts in the lowest layer and the part of it above the smallest
+  TOTAL commitment among that layer's eligible seats rises into a layer of its
+  own, eligible by total. The model is written down in
   `poker_tracker/math/accounting.py::_build_pots`, its acceptance criteria are
   `tests/test_accounting_pot_layering_model.py`, and the history is in
   `cv_lab/notes/17_release_adversarial_rounds.md`. The honest verdict on the
   module is still not-yet-caught rather than correct.
+- **WHICH dead chips that cap governs is a DECLARED input, never inferred.** The
+  ante mode (`hand_settlements.ante_mode`) is one of `NONE`, `PER_PLAYER` or
+  `SINGLE_PAYER_TABLE_ANTE`. Under `PER_PLAYER` every ante is capped, which is
+  the rule shipped in round 20 and is retained unchanged. Under
+  `SINGLE_PAYER_TABLE_ANTE` the consolidated ante is table money: it goes whole
+  into the main pot and is never capped against a shorter blind. The two give
+  different pots on the same recording — blinds 1/2 with a 2-chip big-blind ante
+  and an all-in 1-chip small blind is main 5 one way and main 4 the other — and
+  nothing in the action line tells them apart, so a hand containing any ante with
+  no declared mode is refused rather than defaulted. The mode names ANTES only: a
+  dead blind, missed blind or penalty post is capped under every mode, so one
+  hand can run both rules at once on disjoint pools.
+- **Externally declared dead money is capped exactly like a recorded forced
+  post**, under whichever rule the mode selects for the capped pool. It used to
+  join the main pot whole and unwarned, which paid a seat that had committed 2
+  chips as much as 312.
+- **A folded seat's forced post that no surviving seat could cover belongs to the
+  pot.** It no longer blocks the hand; a button that antes 50,000 and folds
+  against two 20,000 stacks settles as one 90,000 pot. The layering already
+  produced that pot, so this is a study-readiness change and not a layering
+  change. What still refuses is the shape the rulings do not reach: dead money
+  with no unfolded contributor at all, where rule 3 leaves nobody eligible for
+  the main pot and there is no layer to award.
 - **What is dead is decided by what the row IS, not by the kind that carries it.**
   A forced post which took its poster's last chip is routinely booked as `all-in`
   with `actions.forced_bet_type` / `actions.is_live_post` carrying the truth, and
@@ -766,7 +823,7 @@ are checked against stubs of their imports. `app.py`, `persistence/db.py`,
 Widening it is Phase 0 hygiene, not a Phase 1 gate, and it must not be reported
 as whole-repository type coverage.
 
-A fresh database initialises at schema 19. The suite claims `POKER_DB_PATH` and
+A fresh database initialises at schema 20. The suite claims `POKER_DB_PATH` and
 `POKER_DATA_DIR` before its first `poker_tracker` import, so no test reaches any
 operator root; `data/backups` and `poker_tracker.db` are byte-identical across a
 full run. Loading a plugin from inside the `poker_tracker` package with `-p`

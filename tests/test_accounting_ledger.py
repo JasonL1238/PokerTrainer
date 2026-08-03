@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from poker_tracker.math.accounting import (
+    AnteMode,
     BlindStructure,
     LedgerAction,
     LedgerError,
@@ -11,6 +12,15 @@ from poker_tracker.math.accounting import (
     blind_structure,
     build_hand_ledger,
 )
+
+# Every ante-bearing hand below takes an ante from each anteing seat
+# individually, which is exactly what PER_PLAYER names. It is DECLARED rather
+# than left absent because an undeclared mode on a hand containing antes is a
+# refusal, and it is declared as PER_PLAYER because the operator's ruling says
+# that mode's layering is RETAINED unchanged -- so every chip figure asserted in
+# this file must still come out exactly as it did. If one of them moves, the
+# implementation is wrong and not the assertion.
+PER_PLAYER = AnteMode.PER_PLAYER
 
 
 def _player(name: str, stack: float = 100, seat: int | None = None) -> LedgerPlayer:
@@ -812,7 +822,7 @@ def test_a_seat_all_in_for_its_ante_cannot_win_the_live_betting_it_never_covered
         _action("A", "check", street="flop"),
         _action("B", "check", street="flop"),
     ]
-    layers = build_hand_ledger(players, actions).pots
+    layers = build_hand_ledger(players, actions, ante_mode=PER_PLAYER).pots
 
     # Three chips C contested, twenty it did not.
     assert [pot.amount for pot in layers] == pytest.approx([3, 20])
@@ -820,7 +830,9 @@ def test_a_seat_all_in_for_its_ante_cannot_win_the_live_betting_it_never_covered
     assert layers[0].eligible_players == ("A", "B", "C")
     assert layers[1].eligible_players == ("A", "B")
 
-    ledger = build_hand_ledger(players, actions, {0: ("C",), 1: ("A",)})
+    ledger = build_hand_ledger(
+        players, actions, {0: ("C",), 1: ("A",)}, ante_mode=PER_PLAYER
+    )
     assert ledger.payouts["C"] == pytest.approx(3)
     assert ledger.net_results == pytest.approx({"A": 9, "B": -11, "C": 2})
     assert ledger.is_balanced is True
@@ -830,7 +842,9 @@ def test_a_seat_all_in_for_its_ante_cannot_win_the_live_betting_it_never_covered
     # The award that used to reconcile -- C taking the whole 23 -- is now refused
     # rather than being accepted as the derived truth.
     with pytest.raises(LedgerError):
-        build_hand_ledger(players, actions, {0: ("C",), 1: ("C",)})
+        build_hand_ledger(
+            players, actions, {0: ("C",), 1: ("C",)}, ante_mode=PER_PLAYER
+        )
 
 
 def test_a_seat_all_in_for_a_dead_blind_is_capped_the_same_way() -> None:
@@ -1062,14 +1076,16 @@ def test_a_refunded_seat_still_contests_a_layer_above_what_stayed_in() -> None:
         _action("Z", "all-in", 30),
         _action("W", "all-in", 30),
     ]
-    layers = build_hand_ledger(players, actions).pots
+    layers = build_hand_ledger(players, actions, ante_mode=PER_PLAYER).pots
 
     assert [pot.amount for pot in layers] == pytest.approx([3, 98])
     assert layers[0].eligible_players == ("S", "R", "Z", "W")
     # R has 30 of live money in the pot and the layer is cut at 30, so R is in it.
     assert layers[1].eligible_players == ("R", "Z", "W")
 
-    ledger = build_hand_ledger(players, actions, {0: ("S",), 1: ("R",)})
+    ledger = build_hand_ledger(
+        players, actions, {0: ("S",), 1: ("R",)}, ante_mode=PER_PLAYER
+    )
     assert ledger.refunds["R"] == pytest.approx(70)
     assert ledger.payouts["R"] == pytest.approx(98)
     assert ledger.net_results == pytest.approx({"S": 2, "R": 68, "Z": -35, "W": -35})
@@ -1140,7 +1156,7 @@ def test_unequal_dead_money_with_nobody_all_in_is_one_pot() -> None:
         _action("c", "call", 20),
         _action("d", "call", 20),
     ]
-    layers = build_hand_ledger(players, actions).pots
+    layers = build_hand_ledger(players, actions, ante_mode=PER_PLAYER).pots
 
     assert [pot.amount for pot in layers] == pytest.approx([88])
     assert [pot.cause for pot in layers] == ["main"]
@@ -1148,7 +1164,9 @@ def test_unequal_dead_money_with_nobody_all_in_is_one_pot() -> None:
 
     # The truthful declaration -- the seat that owed no dead money wins the hand
     # -- is now recordable, and it is the one the hand actually produces.
-    ledger = build_hand_ledger(players, actions, {0: ("c",)})
+    ledger = build_hand_ledger(
+        players, actions, {0: ("c",)}, ante_mode=PER_PLAYER
+    )
     assert ledger.payouts["c"] == pytest.approx(88)
     assert ledger.net_results == pytest.approx({"a": -25, "b": -23, "c": 68, "d": -20})
     assert ledger.is_balanced is True
@@ -1381,7 +1399,7 @@ def test_a_short_all_in_does_not_bring_the_phantom_side_pot_back() -> None:
         _action("d", "call", 20),
         _action("e", "all-in", 16),
     ]
-    layers = build_hand_ledger(players, actions).pots
+    layers = build_hand_ledger(players, actions, ante_mode=PER_PLAYER).pots
 
     assert [pot.amount for pot in layers] == pytest.approx([92, 16])
     assert [pot.cause for pot in layers] == ["main", "side"]
@@ -1391,7 +1409,9 @@ def test_a_short_all_in_does_not_bring_the_phantom_side_pot_back() -> None:
     assert layers[1].eligible_players == ("a", "b", "c", "d")
 
     # e wins the hand: it takes everything it covered and nothing above it.
-    ledger = build_hand_ledger(players, actions, {0: ("e",), 1: ("a",)})
+    ledger = build_hand_ledger(
+        players, actions, {0: ("e",), 1: ("a",)}, ante_mode=PER_PLAYER
+    )
     assert ledger.payouts["e"] == pytest.approx(92)
     assert ledger.net_results["e"] == pytest.approx(72)
     assert ledger.is_balanced is True
@@ -1975,7 +1995,9 @@ def test_a_short_ante_is_not_a_live_forced_bet_whatever_kind_carries_it() -> Non
         LedgerAction("C", "preflop", "post_blind", 10),
         LedgerAction("B", "preflop", "call", 5),
     ]
-    ledger = build_hand_ledger(players, actions, winners={0: ("B",), 1: ("B",)})
+    ledger = build_hand_ledger(
+        players, actions, winners={0: ("B",), 1: ("B",)}, ante_mode=PER_PLAYER
+    )
 
     assert not any(
         "Declare the blind structure" in issue for issue in ledger.legality_issues
