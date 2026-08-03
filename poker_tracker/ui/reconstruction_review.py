@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -148,6 +148,13 @@ class ValidationFrameContext:
     # "recording starts mid-hand" claims stay honest for recordings that
     # open on a lobby. None falls back to 0.0.
     recording_start_s: float | None = None
+    # The saved hand's own seat for each player_key. Frame-level claims are
+    # keyed by seat, and resolving that seat by matching the row's CURRENT
+    # name and position back into the frozen timeline roster is a guess: the
+    # player editor rewrites both fields onto every one of that seat's rows,
+    # so one correction can make the row's position name a DIFFERENT timeline
+    # seat. This is the stored answer, and it survives every rename.
+    seat_by_player_key: dict[str, int] = field(default_factory=dict)
 
 ISSUE_GUIDANCE: dict[str, tuple[str, str]] = {
     "Cards / board": (

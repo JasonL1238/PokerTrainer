@@ -1,6 +1,9 @@
-# 17 — Whole-product adversarial rounds 1–3: the record
+# 17 — Whole-product adversarial rounds 1–6: the record
 
-Recorded 2026-08-02.
+Recorded 2026-08-02 for rounds 1 through 3 and round 5. Rounds 4 and 6, and the
+coverage re-run inside round 5, were added on 2026-08-03 when they were moved out
+of `PLAN.md`; until then the plan's own status table was their only record, which
+is the gap this file exists to close.
 
 `16_phase1_adversarial_rounds.md` records the fifteen rounds run against Phase 1
 alone. This note records the rounds run against the *whole product* under
@@ -278,6 +281,49 @@ The counter is 0 of the required 2 and every round to date has found a critical.
 
 ---
 
+## Round 4 — two criticals inside the blind-structure repair
+
+Repairs: `b58b7e3`.
+
+Round 3 closed with the ledger deriving the amount to call from the largest
+observed contribution. Blinds 5/10 with the big blind all-in for 4 made the small
+blind's 5 the largest post anybody could see, so a truthful call of 10 was
+reported illegal, the operator obeyed the message, entered 5, and the hand
+reconciled with a 14-chip pot where the truth is 24. The product's own error
+routed them there. The repair made the structure a declared input — a fact about
+the room the action line cannot demonstrate, like the rake policy and the dead
+money — floored the preflop amount to call at the largest structural forced bet,
+and refused an undeclared structure rather than inferring one.
+
+Both criticals were in that repair rather than in what it replaced.
+
+**Shortness was judged at the instant a row was reduced** rather than against the
+seat's final commitment, so moving an ante below a blind flipped `is_legal` with
+identical chips: a seat's ante recorded below its own blind silently turned a
+blocked hand into a reconciled one, around a pot 10 chips short.
+
+**A transposed structure reached disk through `model_copy`**, which skips
+validators, and the degraded reader then probed the columns one at a time and
+kept the smaller half — a floor of 5 covering a big blind all-in for 4. The
+salvage produced a structure that was *valid*, and whose floor covered the very
+post the declaration existed to expose.
+
+A third finding is real and only partly repaired, and is stated in `PLAN.md` as a
+limit rather than as a guarantee: the refusal keys on action kind, so a short
+blind booked as an `all-in` escapes it entirely. The CV spine books any seat whose
+stack reads zero as a plain all-in and drops the markers that would identify the
+post as forced, so on that path no reducer-level rule can tell a short blind from
+an ordinary short shove. Changing the spine's classification is a corpus change
+against a spine at zero errors per hand, so the limit is documented where it is
+claimed.
+
+The evidence that the declaration moves no chips is worth keeping: 20,000 hands
+built under both builds differ in nothing but `is_legal` — 1,755 demotions and no
+promotions — under any structure, valid or absurd. That is what made the schema 19
+migration safe.
+
+---
+
 ## Round 5 — the live-level pot model
 
 The operator replaced the layering rule outright: boundaries are cut at distinct
@@ -371,3 +417,183 @@ hand-written test covers it). And `_model_payout_cap` encodes rule 2 as written,
 so it actively REJECTS the capped alternative above — it is evidence that the
 code matches the model, never that the model is right. That distinction is the
 whole reason this module has produced five consecutive criticals.
+
+### The coverage re-run on `bc597c5`
+
+Repairs: `cdb0e65`, `1f8f01d`.
+
+The round was re-run against the frozen tree at `bc597c5` with a different
+mandate: cover the half of the product the accounting-focused rounds had left
+alone. It is counted inside round 5 rather than as a round of its own because it
+attacked the same candidate. It found a critical and four highs, none of them in
+the pot model, and all five were independently reproduced before repair.
+
+- **The coaching grounding check was written, tested, and never called by the
+  product.** Its only non-test caller was the offline evaluator; `app.py` never
+  imported the module. A provider's answer went from the network into storage with
+  no comparison against the prompt that produced it, under a green banner
+  confirming the outgoing *prompt* was safe — which an operator reads as "this
+  answer was checked" — and then promoted the hand to reviewed. A coach could
+  invent a card that was never dealt and the hand would be marked studied. The
+  check moved into the one constructor that turns provider text into a persistable
+  row, so a future caller inherits it rather than having to remember it. A rejected
+  answer is kept verbatim and marked stale.
+- **Container mode certified coverage it had not executed.** The docker argv
+  hard-codes the fixture gate while the coverage statement was derived from the
+  *requested* mode, so a container run claimed video decoding with the pinned
+  weights and end-to-end reconstruction of every corpus recording having done
+  neither. This is the third instance of one pattern — the gate once reported zero
+  errors on a run that measured nothing, and the perf harness once reported
+  untaken measurements as zero — so certification is computed from a record of the
+  stages that actually ran.
+- **Retention would delete live CV timelines.** No database column names one, so
+  retention called them orphans from the moment they were written, while the
+  recovery drill and the backup inventory both know a missing timeline permanently
+  blocks every later import for that job, and nothing deletes a `processing_jobs`
+  row.
+- **The schema-20 migration staled the wrong population.** It keyed on the
+  declared external dead-money column while the rule change that moves chips
+  applies to *recorded* posts, so hands with a recorded dead blind or an ante
+  republished a different hero result under text written about the old one.
+- **A `forced_bet_type` on a `call` row exempted it from the legality check that
+  reads `to_call`.** Tagging an ordinary call a straddle turned an illegal action
+  line clean, and tagging it a dead blind moved chips as well.
+
+The repair to that last one carried its own defect and `1f8f01d` reverses it. The
+ruling had been that the label decides what a row is; that reading let a label
+take a row *out* of the pool its kind puts it in. Tagging the only ante row a
+straddle, a big blind or a dead blind emptied the ante pool, which switched off
+the undeclared-ante-mode refusal and turned a hand the product exists to refuse
+into one it accepted, with no chip moving to make it visible — reachable by one
+mis-click on a selectbox drawn beside every row. The rule now is that the kind
+decides what a row is and the label may only refine which forced post it is;
+where the two disagree the hand is refused and derives byte-identically to the
+same row with the field cleared. Seven of the fifty-six kind/label pairs are newly
+refused. The migration docstring asserting the old reading was corrected — its own
+query already counted by kind, so the prose had been contradicting the SQL beside
+it.
+
+One hole was left open and named in the tests so it could not drift: a live blind
+typed as a *dead* blind still silenced the structure refusal and moved chips,
+where no blind structure is declared — which is every hand migrated from schema
+19. Round 6 closed it by treating the forced-bet name and the post status as two
+statements of one fact, so a row where they disagree is reported rather than
+resolved. See round 6 below.
+
+Ten lesser findings from the same pass were triaged as disclosure-only. Each was
+re-reproduced against `cdb0e65` before being recorded, and each is a code defect
+rather than a documentation one; what was done about them was documentation, which
+is not closing them. All ten — `B2` through `B5` and `A2-3` through `A2-9` — are
+still open and are listed in `PLAN.md` under "Known open items", which is where an
+open finding belongs. Round 6 closed none of them.
+
+---
+
+## Round 6 — the product's claims about itself outrunning what it checks
+
+Repairs: landed in the round-6 repair pass; see the working tree and the commits
+that follow `1f8f01d`.
+
+Six findings, four confirmed as high. None was in code an earlier round had
+already repaired, and five of the six were in surfaces no earlier round had
+examined at all. That is the useful thing about this round: after five rounds
+spent almost entirely inside pot accounting and the release gate's reporting, the
+defects moved to wherever nobody had looked, and they shared a shape.
+
+The shape is a surface asserting something about itself that it does not check.
+Every one of them passes the suite while saying something false on screen or in a
+report.
+
+- **`poker_tracker/validation/corpus.py` — the locked-test seal was a
+  declaration.** The corpus report answers "has the locked test been used for
+  tuning" from `used_for_tuning`, a boolean each case sets about itself, and
+  `split_integrity` compared *normalized logical names* between splits. The
+  manifest already carries a SHA-256 for every recording and the check never
+  looked at it, so the same recording copied into development under a second
+  filename left the seal reading clean. Repaired by comparing digests as well as
+  names, requiring a declared digest for every locked case under
+  `--require-recordings`, and naming in the report what content equality cannot
+  answer — a re-encoded or trimmed copy of a locked recording, and adjacent
+  segments captured from the same session — so a clean seal reads as the narrow
+  finding it is.
+- **`cv_lab/scripts/pipeline/run_two_model_pipeline.py::_sample_times` — the
+  emitted series was shifted, and its docstring called it the honest record.**
+  Seeking to `t` returns the first frame at or after `t`, which on a
+  variable-rate screen recording can be seconds later; the sampler stamped that
+  picture with `t`, which moves it backwards in time and closes the hole it came
+  out of. The spine measures `prior_gap_s` as the difference between consecutive
+  state times, so a pair straddling a real unobserved stretch reported as one
+  ordinary interval apart, which disarms every refusal keyed on coverage —
+  `mid_hand_coverage_gap`, the roster-shrink and continuous-presence refusals —
+  and a hand nobody watched exports as complete. This is the one finding of the
+  six in a surface an earlier round had touched: `d835ad6` bounded the same
+  sampler and wrote the docstring that was wrong.
+- **`poker_tracker/ui/frame_extraction.py` — the same shift on the diagnostic
+  frame path**, in the stored `timestamp_seconds` and in the filename. Found
+  beside it: a failed `cv2.imwrite` was counted as an extracted frame, so a row
+  pointed at a file that is not there and read downstream as a frame the run had
+  kept.
+- **`poker_tracker/math/icm.py::icm_risk_premium` — a metric asserted without the
+  input it needs.** It computed Hero's equity after *deleting* the risked chips
+  from the table. ICM equity is a function of stack shares, so removing the chips
+  shrinks the denominator and inflates Hero's post-loss share: on
+  `[5000, 3000, 2000]` paying `[50, 30, 20]` it returned 1.57 where every outcome
+  the tournament can produce lies between 2.73 and 2.96. The premium genuinely
+  depends on which opponent wins the chips, which is the input the single number
+  did not have. It transfers the chips now, defaults to the largest single-winner
+  premium (conservative, and a figure some real outcome produces, which an average
+  is not), and exposes the per-opponent span. Two limits are stated rather than
+  modelled: a multiway split can cost Hero more than any single winner, and an
+  opponent shorter than the risked amount describes a run of pots rather than one
+  confrontation.
+- **`poker_tracker/math/equity.py` — the method claim and the sampler's
+  termination.** The class docstring said postflop uses exact enumeration; multiway
+  is Monte-Carlo at every street. And multiway sampling rejects deals that reuse a
+  card, so a range set card removal makes undealable had no bound on how long it
+  would try. It works to an attempt budget now and returns `no_valid_combos` with
+  a reason instead of an equity figure.
+- **`app.py` — a blocker naming a clearing action the product would not draw.**
+  Every control that clears a trust blocker is hosted by
+  `render_validation_edit_and_approve`, whose other caller hangs off a completed
+  reconstruction job whose timeline is still on disk. A manually entered hand, or
+  a reconstructed one whose recording was later deleted, therefore read blockers
+  naming a screen no page in the product offered — including the ante-mode
+  refusal that schema 20 raises on migrated hands. A route from the hand itself
+  now reaches the same workspace. This is the sixth distinct way the standing rule
+  "a blocker never names an action the product cannot perform" has been broken,
+  and the fifth and sixth were both cases where the guard test passes because the
+  named control *is drawn* somewhere.
+
+Three more repairs landed in the same pass, each found while attacking the ground
+around one of the six.
+
+- **A hole in the forced-post refusal, and only the half of it that shows.** A
+  live blind typed as a *dead*
+  blind — by the row's post status, or by naming it `dead_blind` — silenced the
+  blind-structure refusal and moved chips where no structure is declared, which is
+  every hand migrated from schema 19. A big blind all-in for 4 with blinds
+  undeclared is refused and lays out 12/2; one selectbox on the row the warning
+  names, in the panel that warning auto-opens, moved 8 chips of a 14-chip pot and
+  presented the hand as study-ready with zero blockers. The name and the status
+  are two statements of one fact, so a row where they disagree is reported rather
+  than resolved. That is `1f8f01d`'s rule for the kind-versus-label axis, extended
+  to the liveness axis. It closes only what a contradiction reveals: a row that
+  marks the post dead by ONE field and leaves the other unstated says nothing that
+  can be checked, and still moves the same chips into the same wrong layers with
+  no blocker raised. `PLAN.md` item 6 carries it.
+- **A cancelled reconstruction left its partial artifacts on disk.** Cancellation
+  sends SIGTERM to the worker's process group and CPython's default disposition
+  exits without unwinding, so the `finally` that `_discard_partial_artifacts`
+  names in its own docstring never ran on that path: a partial timeline and one
+  JPEG per sampled second survived. Best effort by design — two seconds before
+  SIGKILL is ample for the unlink and not a guarantee.
+- **`ensure_hand_imported` accepted a non-completed job's timeline.** The gate
+  lived in `app.py`, which filters the review surface to completed jobs, while the
+  recovery scans and the draft path call the service directly. A timeline covering
+  part of a recording reads exactly like a whole one.
+
+What the round says about the guard tests is the same thing the accounting rounds
+said about the accounting gates: they are not independent of the code they check.
+A test that asserts a named control exists cannot see that no path reaches it. A
+report field derived from the mode string cannot see that the mode did less. A
+docstring is not a check at all.

@@ -133,13 +133,18 @@ def _is_forced_row(action: LedgerAction) -> bool:
 
 
 def _is_live_structural_row(action: LedgerAction) -> bool:
+    # An unstated post status (``None``) reads as live, which is the spec
+    # sentence "a forced post is live only when it is one of the structural bets"
+    # plus the field's own documented default. Writing ``bool(...)`` here would
+    # read an unstated status as DEAD and quietly disagree with every recording
+    # that leaves the selectbox alone.
     if action.kind not in _POST_CAPABLE_KINDS or action.kind == "ante":
         return False
+    if action.is_live_post is False:
+        return False
     if action.forced_bet_type is not None:
-        return action.forced_bet_type in _LIVE_STRUCTURAL_TYPES and bool(
-            action.is_live_post
-        )
-    return action.kind == "post_blind" and bool(action.is_live_post)
+        return action.forced_bet_type in _LIVE_STRUCTURAL_TYPES
+    return action.kind == "post_blind"
 
 
 @dataclass(frozen=True)
@@ -338,7 +343,7 @@ def forced_post_hand(draw):
     street_live = {name: _ZERO for name in names}
     folded: set[str] = set()
 
-    def commit(name, amount, kind, *, is_live_post=True, forced, forced_type=None):
+    def commit(name, amount, kind, *, is_live_post=None, forced, forced_type=None):
         """Put in as much of ``amount`` as the seat still has, or nothing.
 
         ``forced_type`` is what the room CALLS this post. When it is given and
@@ -354,6 +359,12 @@ def forced_post_hand(draw):
         chosen live money. Liveness is decided here from the spec sentence
         instead: a forced post is live only when it is one of the STRUCTURAL bets
         that set the wager level, whatever kind carries it.
+
+        ``is_live_post`` is the tri-state the recording carries: None where the
+        room said nothing, which reads as live. It defaults to None here rather
+        than True because a STATED status is checked against the forced-bet name
+        beside it, so a generator that stated one on every row would be emitting
+        a claim no real recording makes and would be sweeping the wrong shape.
         """
 
         capped = min(amount, remaining[name])
@@ -378,7 +389,8 @@ def forced_post_hand(draw):
         )
         remaining[name] -= capped
         is_live_money = not forced or (
-            forced_type in {"small_blind", "big_blind", "straddle"} and is_live_post
+            forced_type in {"small_blind", "big_blind", "straddle"}
+            and is_live_post is not False
         )
         if is_live_money:
             live[name] += capped

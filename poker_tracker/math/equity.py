@@ -29,11 +29,21 @@ except ImportError:  # pragma: no cover - exercised only when the dependency is 
 
 
 # Preflop equity is estimated with a *seeded* Monte-Carlo so results are exact-reproducible
-# across runs (deterministic, per the CV-lab discipline). Postflop is exact enumeration.
+# across runs (deterministic, per the CV-lab discipline). Heads-up postflop is exact
+# enumeration; multiway is sampled on every street.
 MONTE_CARLO_ITERATIONS = 100_000
 MONTE_CARLO_SEED = 1_234_567
 EXACT_CONFIDENCE = 0.95
 MONTE_CARLO_CONFIDENCE = 0.85
+
+# Multiway sampling draws each villain's combo independently and rejects deals
+# that reuse a card, and some range sets can never produce a legal deal at all
+# (two ranges that card removal reduces to the same single combo, say). The
+# sampler therefore works to a budget rather than spinning: MIN_ATTEMPTS also
+# doubles as the point at which a set that has yet to yield one legal deal is
+# treated as unsamplable, since such a set cannot fill the sample budget either.
+MULTIWAY_ATTEMPT_FACTOR = 50
+MULTIWAY_MIN_ATTEMPTS = 5_000
 
 
 class EquityResult(BaseModel):
@@ -72,8 +82,9 @@ class EquityCalculator(Protocol):
 class Eval7EquityCalculator:
     """Real equity engine backed by eval7 (hand evaluator + range parser).
 
-    Postflop (a known flop/turn/river) uses exact enumeration; preflop uses a
-    seeded Monte-Carlo so the result is reproducible run to run. Card removal is
+    Heads-up postflop (a known flop/turn/river) uses exact enumeration; heads-up
+    preflop and every multiway spot use a seeded Monte-Carlo so the result is
+    reproducible run to run. Card removal is
     applied so villain combos never reuse Hero or board cards. This computes
     Hero-vs-range hot/cold equity, not solver strategy, and reports the method
     and confidence it actually used.
@@ -213,7 +224,21 @@ class Eval7EquityCalculator:
                 )
             villain_combos.append(combos)
 
-        equity, std_error = self._monte_carlo_multiway(hero, board, villain_combos)
+        sampled = self._monte_carlo_multiway(hero, board, villain_combos)
+        if sampled is None:
+            return self._result(
+                hero,
+                board,
+                " | ".join(labels),
+                equity=None,
+                method="no_valid_combos",
+                confidence=0.0,
+                notes=(
+                    "These villain ranges cannot be dealt at the same time often enough "
+                    "to sample: card removal leaves them competing for the same cards."
+                ),
+            )
+        equity, std_error = sampled
         return self._result(
             hero,
             board,
@@ -281,7 +306,8 @@ class Eval7EquityCalculator:
 
     def _monte_carlo_multiway(
         self, hero: list[Card], board: list[Card], villain_combos: list[list]
-    ) -> tuple[float, float]:
+    ) -> tuple[float, float] | None:
+        """Sample pot shares, or None when the ranges cannot be dealt together."""
         rng = random.Random(self.seed)
         hero_e = [eval7.Card(str(card)) for card in hero]
         board_e = [eval7.Card(str(card)) for card in board]
@@ -291,7 +317,12 @@ class Eval7EquityCalculator:
         stats = _RunningEquity()
         samplers = [_WeightedComboSampler(combos) for combos in villain_combos]
         iterations = 0
+        attempts = 0
+        budget = max(MULTIWAY_MIN_ATTEMPTS, self.iterations * MULTIWAY_ATTEMPT_FACTOR)
         while iterations < self.iterations:
+            if attempts >= budget or (attempts >= MULTIWAY_MIN_ATTEMPTS and iterations == 0):
+                return None
+            attempts += 1
             # Rejection sampling: draw one combo per villain, retry the whole
             # deal if two villains claim the same card.
             used = set(dead)

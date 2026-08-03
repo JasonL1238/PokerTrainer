@@ -721,3 +721,37 @@ def _mark_frames_correct(
                 status="correct",
             )
         )
+
+
+@pytest.mark.parametrize("status", ["queued", "running", "cancelling", "cancelled", "failed"])
+def test_only_a_completed_job_can_have_its_timeline_imported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    """The job-status gate belongs here, not only on the review screen.
+
+    Cancelling a reconstruction signals the worker, so its cleanup can be
+    skipped and a timeline written moments before the cancel can survive under
+    a row that never completed. app.py filters the review surface to completed
+    jobs, but this module is reachable without it -- the recovery scans and the
+    draft path call in directly -- so an unfinished run's partial reading of the
+    recording could land in the study database with nothing saying so.
+    """
+
+    db = _make_db(tmp_path)
+    job_id, session_id, _ = _seed_job(
+        db, tmp_path, _four_hand_timeline(), monkeypatch=monkeypatch
+    )
+    _mark_frames_correct(db, job_id, (2, "b"))
+    db.update_processing_job(job_id, status=status)
+
+    for mode in ("auto", "draft"):
+        result = ensure_hand_imported(db, job_id, 2, mode=mode, data_dir=tmp_path)
+        assert result.status == "blocked", mode
+        assert status in result.message
+        assert db.fetch_hands_by_session(session_id) == []
+
+    db.update_processing_job(job_id, status="completed")
+    assert ensure_hand_imported(db, job_id, 2, mode="auto", data_dir=tmp_path).status == (
+        "imported"
+    )
+    db.close()

@@ -40,6 +40,13 @@ ImportMode = Literal["auto", "draft"]
 # Survives notes/tag edits: lives in completion_evidence.extra via dump/parse.
 CV_TIMELINE_IDENTITY_KEY = "cv_timeline_identity"
 
+# The only job status whose timeline is a finished reading of the recording.
+# The gate used to live entirely in app.py, which filters the review surface to
+# completed jobs; this module is reachable without it -- the recovery scans and
+# the draft path call in directly -- and a cancelled worker's artifacts can
+# survive on disk, because the process is signalled rather than asked to stop.
+COMPLETED_JOB_STATUS = "completed"
+
 
 @dataclass(frozen=True)
 class ImportGateResult:
@@ -264,6 +271,18 @@ def ensure_hand_imported(
     if job is None:
         return HandImportResult(
             status="blocked", reasons=("processing job not found",), message="Job not found."
+        )
+    if job.status != COMPLETED_JOB_STATUS:
+        return HandImportResult(
+            status="blocked",
+            reasons=(f"reconstruction job is {job.status}, not completed",),
+            message=(
+                f"Reconstruction job #{job_id} is {job.status}. Only a completed "
+                "run's timeline may be imported: a run that was cancelled, "
+                "failed or is still writing can leave a timeline on disk that "
+                "covers part of the recording and reads exactly like a whole "
+                "one. Run the reconstruction again and import from that job."
+            ),
         )
     video = db.fetch_video(job.video_id)
     if video is None or video.session_id is None:

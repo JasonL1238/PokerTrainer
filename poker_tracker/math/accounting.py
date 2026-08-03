@@ -49,8 +49,9 @@ _NON_COMMITMENT_KINDS = {"fold", "check", "show", "win"}
 # forced post". A recording that books a blind which took its poster's last chip
 # as ``all-in`` describes the same event, and keying only on ``post_blind`` let
 # exactly that recording escape the refusal below -- the reported defect, one
-# relabel away. Where a recording states the forced-bet type, that statement is
-# what is read.
+# relabel away. Where a recording states the forced-bet type and the rest of the
+# row does not deny it, that statement is what is read; where the row denies it,
+# see ``_forced_bet_row_conflict``.
 _LIVE_STRUCTURAL_FORCED_BETS = frozenset(
     {"small_blind", "big_blind", "straddle", "bring_in"}
 )
@@ -101,11 +102,40 @@ _BLIND_FORCED_BET_TYPES = _LIVE_STRUCTURAL_FORCED_BETS | {"dead_blind"}
 #
 # ``all-in`` is deliberately absent rather than mapped to everything. That kind
 # names no species at all -- it says the poster ran out of chips -- so there the
-# label is the only signal there is and every name is readable on it.
+# label is the only signal the KIND leaves standing and no name contradicts it.
+# The row's post status can still contradict one; this table answers only the
+# kind-versus-label question.
 _KIND_FORCED_BET_TYPES: dict[str, frozenset[str]] = {
     "ante": _ANTE_FORCED_BET_TYPES,
     "post_blind": _BLIND_FORCED_BET_TYPES,
 }
+# The forced-bet names that are DEAD money: owed to the table, answering no
+# wager level. Every name is either live-structural or dead, which is what makes
+# the liveness check below total rather than a list of special cases.
+_DEAD_FORCED_BET_TYPES = _ANTE_FORCED_BET_TYPES | {"dead_blind"}
+# Whether each forced-bet name IS a live post, by definition of the name. A
+# ``big_blind`` is live and a ``dead_blind`` is dead however the separate
+# post-status field is filled in, so the two fields are not independent: a row
+# carrying both is stating the same fact twice and they can disagree.
+#
+# That disagreement was the second knob on the reported defect. A big blind
+# all-in for 4 with blinds undeclared is refused as an unreadable forced post
+# and lays out 12/2; setting the row's ``Post status`` to dead -- one selectbox
+# on the same row of the same panel, with the panel auto-opened by the very
+# warning that names the row -- silenced the refusal, moved 8 chips of a
+# 14-chip pot, and presented the hand as study-ready with zero blockers. Naming
+# the row ``dead_blind`` instead reaches the same place by the other selectbox.
+# Neither is answerable and both are reportable, which is the rule commit
+# 1f8f01d established for the kind-versus-label axis and this table extends to
+# the liveness axis.
+_LABEL_IS_LIVE_POST: dict[str, bool] = {
+    **{name: True for name in _LIVE_STRUCTURAL_FORCED_BETS},
+    **{name: False for name in _DEAD_FORCED_BET_TYPES},
+}
+# The two ways one row can contradict itself, which read differently to an
+# operator and therefore get different sentences.
+_FORCED_BET_KIND_CONFLICT = "kind"
+_FORCED_BET_STATUS_CONFLICT = "status"
 _FLOP_STREETS = {"flop", "turn", "river", "showdown"}
 _ZERO = Decimal("0")
 # The coarsest denomination a chopped pot may be divided at. A whole chip is the
@@ -160,7 +190,15 @@ class LedgerAction:
     street: LedgerStreet
     kind: LedgerActionKind
     amount: float = 0
-    is_live_post: bool = True
+    # What the recording says this post's STATUS was, when it says anything:
+    # True for a live post, False for a dead one, None for "the recording said
+    # nothing". The three states are kept apart all the way to the reducer
+    # because collapsing None into True here made an unspecified status
+    # indistinguishable from a stated one, and the liveness contradiction below
+    # can only be raised against a status the operator actually stated. An
+    # unstated status reads as live everywhere, which is what the collapsed
+    # field already did, so no existing construction moves a chip.
+    is_live_post: bool | None = None
     # What the recording says this commitment WAS, when it says anything: one of
     # ``models.ForcedBetType`` or None. It is not a second copy of ``kind`` --
     # a recording is free to book a forced post that took its poster's last chip
@@ -478,21 +516,32 @@ def build_hand_ledger(
     nothing about a structure it does not need, so it is untouched.
 
     THE SCOPE OF THAT REFUSAL, STATED HONESTLY.  It reaches a forced post the
-    RECORDING IDENTIFIES as one -- by ``kind == "post_blind"``, or by a
-    ``forced_bet_type`` naming a live structural bet on a row booked as
-    ``all-in``, which is the only other kind a post can be written under (see
-    ``_is_live_structural_post`` and ``_FORCED_POST_CAPABLE_KINDS``).  A
-    ``bet``, ``call`` or ``raise`` carrying such a type is a contradictory
-    recording rather than a post: it is derived from its kind and refused, and
-    the refusal is what ``_mislabelled_forced_bet`` writes.  A recording that
-    books a short blind as a plain ``all-in`` and states no forced-bet type has
-    said nothing that distinguishes it from an ordinary short shove, and nothing here
-    can tell them apart; such a hand still derives ``to_call`` from the observed
-    maximum and is NOT refused.  The CV reconstruction spine emits exactly that
-    shape for a seat whose stack reads zero, so this refusal does not cover
-    every reconstructed hand.  Declaring the structure covers those hands
-    correctly -- the floor is applied whatever the kinds are -- but the operator
-    is not prompted to.
+    RECORDING IDENTIFIES as one and does not mark dead -- by
+    ``kind == "post_blind"``, or by a ``forced_bet_type`` naming a live
+    structural bet on a row booked as ``all-in``, which is the only other kind a
+    post can be written under (see ``_is_live_structural_post`` and
+    ``_FORCED_POST_CAPABLE_KINDS``).  A ``bet``, ``call`` or ``raise`` carrying
+    such a type is a contradictory recording rather than a post: it is derived
+    from its kind and refused, and the refusal is what
+    ``_forced_bet_row_conflict`` writes.  A recording that books a short blind as
+    a plain ``all-in`` and states no forced-bet type has said nothing that
+    distinguishes it from an ordinary short shove, and nothing here can tell them
+    apart; such a hand still derives ``to_call`` from the observed maximum and is
+    NOT refused.  The CV reconstruction spine emits exactly that shape for a seat
+    whose stack reads zero, so this refusal does not cover every reconstructed
+    hand.  Declaring the structure covers those hands correctly -- the floor is
+    applied whatever the kinds are -- but the operator is not prompted to.
+
+    WHAT A RECORDING CAN STILL SAY TO PUT A POST OUT OF SCOPE, stated because it
+    is the sharp edge here.  A blind that is NAMED dead -- ``forced_bet_type``
+    ``dead_blind``, or a post status of dead -- answers no wager level, so this
+    refusal genuinely does not reach it and the chips are owed to the table.
+    Where the row states BOTH of those fields and they disagree, the recording is
+    refused for the contradiction and the post stays in scope; that is
+    ``_forced_bet_row_conflict``.  Where the row states only ONE of them, there
+    is nothing on the row to check it against, and a live blind an operator has
+    marked dead is believed.  That is a single unfalsifiable claim rather than a
+    contradiction, and no rule in this module can see it.
     """
 
     player_order, starting = _validate_players(players)
@@ -698,8 +747,37 @@ def build_hand_ledger(
             )
         # Outside the ``structure_unreadable`` guard with the stack check above,
         # and for the same reason: it reads no wager level, only the row's own
-        # two fields.
-        if _mislabelled_forced_bet(action):
+        # three fields.
+        row_conflict = _forced_bet_row_conflict(action)
+        if row_conflict == _FORCED_BET_STATUS_CONFLICT:
+            stated = "live" if action.is_live_post else "dead"
+            # Whichever field named the opposing liveness is the one to quote
+            # back, so the sentence points at both halves of the contradiction.
+            if action.forced_bet_type in _LABEL_IS_LIVE_POST:
+                named_by = f"typed as a {action.forced_bet_type!r} forced post"
+                named = "live" if _LABEL_IS_LIVE_POST[action.forced_bet_type] else "dead"
+                remedy = (
+                    "It is derived as though neither field were set. Either "
+                    "correct the forced post field or correct Post status in "
+                    "Edit actions."
+                )
+            else:
+                named_by = f"booked as {action.kind!r}"
+                named = "dead"
+                remedy = (
+                    f"It is derived from its kind, as an ordinary {action.kind}. "
+                    "Either correct the action kind or correct Post status in "
+                    "Edit actions."
+                )
+            legality_issues.append(
+                f"{action_label}: this row is {named_by}, which is {named} "
+                f"money, but its post status says {stated}. A live forced post "
+                "sets what every other seat owes and a dead one is owed to the "
+                "table, so the two fields state opposite things about the same "
+                "chips and they lay out into different pots. The pot model will "
+                "not choose which one the recording meant. " + remedy
+            )
+        elif row_conflict == _FORCED_BET_KIND_CONFLICT:
             preamble = (
                 f"{action_label}: this row is booked as {action.kind!r} but "
                 f"typed as a {action.forced_bet_type!r} forced post."
@@ -778,7 +856,11 @@ def build_hand_ledger(
                 "forced post does not demonstrate the structural size it was "
                 "paying, so the amount every other seat owes cannot be read off "
                 "this hand. Declare the blind structure (small blind, big blind, "
-                "any straddle) for this hand."
+                "any straddle) for this hand. Marking the post dead -- with "
+                "Forced post or with Post status -- silences this sentence "
+                "without answering it and moves chips out of the pot every "
+                "other seat was answering, so do that only if the post really "
+                "was a dead one."
             )
 
         pot_after = dead + sum(contributions.values(), _ZERO)
@@ -1103,8 +1185,12 @@ def build_ledger_from_records(
                 street=action.street,
                 kind=kind,
                 amount=_float(amount),
+                # Carried verbatim, None included. ``None`` is what an
+                # unspecified ``Post status`` and a NULL column both look like,
+                # and it is not the same fact as a stated ``live`` -- only a
+                # stated one can contradict the forced-bet name beside it.
                 is_live_post=(
-                    True
+                    None
                     if getattr(action, "is_live_post", None) is None
                     else bool(action.is_live_post)
                 ),
@@ -1186,52 +1272,131 @@ def blind_structure(
     )
 
 
+def _named_post_liveness(action: LedgerAction) -> bool | None:
+    """Whether the row NAMES itself live or dead, ignoring its post status.
+
+    A forced-bet name carries a liveness: ``big_blind`` is a live structural bet
+    and ``dead_blind`` and every ante are money owed to the table. A KIND carries
+    one only for ``ante``, which is dead by definition. ``post_blind`` names the
+    species and not the liveness -- a blind is legitimately either -- and
+    ``all-in`` names neither, so both return None and the post status stands
+    alone and unchallenged there.
+
+    Returns None where nothing on the row names a liveness, which is the only
+    honest answer and the one that raises nothing. Read against the label
+    DIRECTLY rather than through ``_readable_forced_bet_type``, because that
+    function asks this one and the two would otherwise chase each other; the
+    caller has already settled the kind-versus-label question before asking.
+    """
+
+    if action.forced_bet_type in _LABEL_IS_LIVE_POST:
+        return _LABEL_IS_LIVE_POST[action.forced_bet_type]
+    if action.kind == "ante":
+        return False
+    return None
+
+
+def _forced_bet_row_conflict(action: LedgerAction) -> str | None:
+    """Which of the row's own fields contradict each other, or None.
+
+    THE ONE PLACE a row is judged self-contradictory. Three operator-supplied
+    facts sit on one row of the hand editor -- the action ``kind``, the "Forced
+    post" name, and the "Post status" -- and each pair of them can state
+    incompatible things about the same chips. Commit 1f8f01d ruled that such a
+    pair is REFUSED rather than silently resolved, and applied the ruling to the
+    kind-versus-label pair only. This applies it to the liveness pair as well,
+    which is the axis the reported defect walked through.
+
+    ``_FORCED_BET_KIND_CONFLICT`` -- the kind and the label name different
+    events. A kind that can never be a forced post (``bet``, ``call``, ``raise``,
+    and the kinds that commit nothing) can carry no forced-bet name at all, and a
+    kind that IS a forced post has already named its species, so a name from the
+    other species is not a refinement: an ``ante`` typed ``straddle`` and a
+    ``post_blind`` typed ``ante`` each state two incompatible things.
+
+    ``_FORCED_BET_STATUS_CONFLICT`` -- the row's stated post status disagrees
+    with the liveness the row already named. ``big_blind`` marked dead and
+    ``dead_blind`` marked live are the same contradiction from opposite ends, and
+    both reach the same place: a live structural post stops being one, the
+    blind-structure refusal it raised goes quiet, and the chips move from the
+    pool that answers the wager level to the pool owed to the table.
+
+    ONLY A STATED STATUS CAN CONFLICT. ``is_live_post`` is None when the
+    recording said nothing, and an unstated status contradicts nothing -- it
+    reads as live because that is what it has always read as. This is why the
+    field is carried as a tri-state rather than collapsed at the boundary.
+    """
+
+    if action.forced_bet_type is not None:
+        if action.kind not in _FORCED_POST_CAPABLE_KINDS:
+            return _FORCED_BET_KIND_CONFLICT
+        allowed = _KIND_FORCED_BET_TYPES.get(action.kind)
+        if allowed is not None and action.forced_bet_type not in allowed:
+            return _FORCED_BET_KIND_CONFLICT
+    named = _named_post_liveness(action)
+    if (
+        action.is_live_post is not None
+        and named is not None
+        and bool(action.is_live_post) is not named
+    ):
+        return _FORCED_BET_STATUS_CONFLICT
+    return None
+
+
 def _readable_forced_bet_type(action: LedgerAction) -> str | None:
-    """The row's forced-bet label, or None where the label contradicts the kind.
+    """The row's forced-bet label, or None where the row contradicts itself.
 
     THE ONE PLACE the label is turned into something the rest of the module may
     read, so that every pool -- forced, live-structural, ante -- reaches the same
     verdict about the same row and no single predicate can be talked out of its
     kind on its own.
 
-    Two things make a label unreadable. A kind that can never be a forced post
-    (``bet``, ``call``, ``raise``, and the kinds that commit nothing) carries no
-    readable label at all. And a kind that IS a forced post already names its
-    species, so a label naming the other species is not a refinement of it: an
-    ``ante`` typed ``straddle`` and a ``post_blind`` typed ``ante`` each state two
-    incompatible things about one row.
-
-    Unreadable means the row derives exactly as it would with the field cleared,
-    which is the strict direction and the one that cannot be steered. The label
-    is not thrown away silently -- ``_mislabelled_forced_bet`` is the same
-    predicate read the other way round, and refuses the hand.
+    Unreadable means the row derives exactly as it would with the contradicting
+    fields unstated, which is the strict direction and the one that cannot be
+    steered. The label is not thrown away silently --
+    ``_forced_bet_row_conflict`` is the same reading turned the other way round,
+    and the reducer refuses the hand on it.
     """
 
     if action.forced_bet_type is None:
         return None
-    if action.kind not in _FORCED_POST_CAPABLE_KINDS:
-        return None
-    allowed = _KIND_FORCED_BET_TYPES.get(action.kind)
-    if allowed is not None and action.forced_bet_type not in allowed:
+    if _forced_bet_row_conflict(action) is not None:
         return None
     return action.forced_bet_type
 
 
+def _reads_as_live_post(action: LedgerAction) -> bool:
+    """Whether the row's post status leaves it live, for the pools that ask.
+
+    An unstated status reads as live, which is what the field's old ``True``
+    default already did. A status that CONTRADICTS the liveness the row named is
+    one of the two facts in the contradiction, so it is set aside with the label
+    and the row falls back to the unstated reading -- otherwise the operator
+    could still take a refusal off a row by adding a second field that disagrees
+    with the first, which is the whole exposure being closed here.
+    """
+
+    if _forced_bet_row_conflict(action) == _FORCED_BET_STATUS_CONFLICT:
+        return True
+    return action.is_live_post is not False
+
+
 def _mislabelled_forced_bet(action: LedgerAction) -> bool:
-    """Whether this row names a forced bet its own kind says it cannot be.
+    """Whether this row carries a forced-bet name the rest of the row denies.
 
     Two operator-supplied facts that contradict each other. The hand editor
-    offers the "Forced post" selectbox on EVERY action row, so ``call`` typed
-    ``big_blind``, ``fold`` typed ``ante`` and ``ante`` typed ``dead_blind`` are
-    each one mis-click away, and an importer can write the same pairs.
+    offers the "Forced post" and "Post status" selectboxes on EVERY action row,
+    so ``call`` typed ``big_blind``, ``fold`` typed ``ante``, ``ante`` typed
+    ``dead_blind`` and ``big_blind`` marked dead are each one mis-click away, and
+    an importer can write the same pairs.
 
     The reducer derives such a row from its KIND, which is the strict direction
-    and is byte-identical to the row with the field cleared, and then refuses the
-    hand. It does not pick the other reading and it does not stay quiet: the two
-    readings are different events -- one is chips the seat chose to wager and the
-    other is chips the room required, or one is money owed to the table and the
-    other is a wager the table must answer -- and they give different pots.
-    Choosing between two operator-supplied facts is exactly what
+    and is byte-identical to the row with the contradicting fields unstated, and
+    then refuses the hand. It does not pick the other reading and it does not
+    stay quiet: the two readings are different events -- one is chips the seat
+    chose to wager and the other is chips the room required, or one is money owed
+    to the table and the other is a wager the table must answer -- and they give
+    different pots. Choosing between two operator-supplied facts is exactly what
     ``_resolve_ante_mode`` refuses to do for the ante mode, for the same reason.
 
     The cross-species half of this is what stops the kind rule from opening a new
@@ -1240,6 +1405,11 @@ def _mislabelled_forced_bet(action: LedgerAction) -> bool:
     ``post_blind`` typed ``ante`` -- which used to raise the undeclared-ante-mode
     refusal by joining the ante pool -- would go quiet the moment its kind stopped
     letting it in. Neither row is answerable; both are reportable.
+
+    A row whose only contradiction is between its KIND and its post status --
+    an ``ante`` marked live, which carries no name at all -- is not covered here,
+    because there is no name to call mislabelled. ``_forced_bet_row_conflict`` is
+    what the reducer reads, and it reports that row too.
     """
 
     return (
@@ -1408,14 +1578,20 @@ def _is_live_structural_post(action: LedgerAction) -> bool:
     ``all-in``). Requiring the kind alone is what let the second shape past.
 
     WHERE THE RECORDING NAMES THE FORCED BET, THAT NAME DECIDES.  A row spelled
-    ``post_blind`` and typed ``dead_blind`` is a dead post whether or not anybody
-    filled in the separate post-status field, and the status field defaults to
-    live (see ``build_ledger_from_records``).  Reading the kind first meant the
-    two operator-facing selectboxes in the hand editor could disagree and the
-    silent default won: a dead blind the operator had named as such was counted
-    as chosen live money.  ``ante`` is never structural whatever type is carried,
-    because an ante sets no wager level -- that is what
+    ``post_blind`` and typed ``dead_blind`` is a dead post, and a
+    ``post_blind`` typed ``big_blind`` is a live one, whatever order the
+    predicate happens to ask its questions in.  ``ante`` is never structural
+    whatever type is carried, because an ante sets no wager level -- that is what
     ``_LIVE_STRUCTURAL_FORCED_BETS`` exists to say.
+
+    THE NAME AND THE POST STATUS ARE THE SAME FACT STATED TWICE, so they are not
+    combined here, they are RECONCILED first.  The two operator-facing
+    selectboxes in the hand editor can disagree, and this predicate used to
+    resolve the disagreement silently by ANDing them: a live big blind marked
+    dead simply stopped being structural, which took the blind-structure refusal
+    off a hand that needed it and moved its chips into the pool owed to the
+    table.  ``_forced_bet_row_conflict`` now refuses that row instead, and
+    ``_reads_as_live_post`` is what this reads in place of the raw field.
 
     Like every other reader of the name, this one asks the KIND first: a
     ``bet``, ``call`` or ``raise`` answers a wager level and can never be the
@@ -1429,10 +1605,12 @@ def _is_live_structural_post(action: LedgerAction) -> bool:
 
     if action.kind not in _FORCED_POST_CAPABLE_KINDS or action.kind == "ante":
         return False
+    if not _reads_as_live_post(action):
+        return False
     readable = _readable_forced_bet_type(action)
     if readable is not None:
-        return readable in _LIVE_STRUCTURAL_FORCED_BETS and bool(action.is_live_post)
-    return action.kind == "post_blind" and bool(action.is_live_post)
+        return readable in _LIVE_STRUCTURAL_FORCED_BETS
+    return action.kind == "post_blind"
 
 
 def _is_live_money(action: LedgerAction) -> bool:

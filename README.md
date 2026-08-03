@@ -135,14 +135,30 @@ and set it in the Linux container.
 When a reconstruction stops on its timeout, the job says which limit it hit,
 which variable sets that limit, and that its partial timeline and review frames
 were discarded — a killed run leaves nothing behind that could be mistaken for a
-result. Only a completed job keeps its review frames, because the export and the
-validated hands point at them.
+result. Cancelling does the same: cancellation signals the worker rather than
+asking it to stop, so its cleanup had to be made to run on that path too. It is
+best effort, because the worker is given two seconds before it is killed
+outright. Only a completed job keeps its review frames, because the export and the
+validated hands point at them — and only a completed job's timeline can be
+imported, since a timeline covering part of a recording reads exactly like a whole
+one.
 
 Sampling is bounded by what the decoder actually has. A run never samples past
 the end of a recording and never emits one decoded frame under two timestamps, so
 a short clip cannot produce a long timeline out of repeated stills, and a
 recording whose duration cannot be determined is probed or fails rather than
 being treated as a day long.
+
+**Each sampled state carries the timestamp of the frame that was actually
+decoded, not the time the sampler asked for.** Screen recordings are
+variable-rate: nothing is encoded while the screen is still, so seeking to a
+moment can return a frame seconds later. Stamping that picture with the requested
+time would close the gap it came out of, and the gaps are what every
+coverage-based refusal reads — a stretch nobody watched has to stay visible as a
+stretch nobody watched, or a hand reconstructed across it looks complete. The same
+rule governs the diagnostic frames extracted from the Import page: each row and
+filename records where the frame actually sits, and a frame whose file could not
+be written is reported as an error rather than recorded as extracted.
 
 Corrections are written transactionally to SQLite. Editing hand facts, players,
 or actions changes CV imports to `corrected_cv`, records the original and
@@ -179,6 +195,22 @@ post the recording *identifies* as forced (a reconstructed all-in that carries n
 forced-bet type is indistinguishable from an ordinary short shove and is not
 refused), and no existing hand was backfilled with a structure, because inferring
 one from the largest observed post is the defect itself.
+
+Relabelling the row gets past it *partly*, which is worth saying plainly because
+both of the fields involved are selectboxes on the row the refusal names. A
+blind's `Forced post` name and its `Post status` are two statements of the same
+fact — a `big_blind` is live and a `dead_blind` is dead — so a row where they
+**disagree** is reported, not resolved in either direction. Marking a short big
+blind dead used to silence the refusal and move 8 chips of a 14-chip pot, on a
+hand with no declared structure, which is every hand migrated from schema 19.
+
+What that does not reach: a row that marks the post dead by only ONE of the two
+fields, leaving the other unspecified, states nothing the product can check it
+against, so it is believed. The refusal goes quiet and the same 8 chips move.
+Treat a dead marking on a preflop forced post as a claim you are making, not a
+setting you are correcting — declare the blind structure instead, which is the
+fact the refusal is actually asking for. `PLAN.md` carries this as a known open
+item.
 
 The **ante mode** is in that set for both reasons at once, and it is the only
 declaration that does both. It says how this hand's antes were taken — *no
@@ -313,8 +345,9 @@ the seat, the poster and both numbers named, so it can never be published as
 authoritative while the question is open. If the editor shows you a pot
 you cannot explain from the action line, that is worth reporting rather than
 declaring around: the honest verdict on this part of the ledger is *not yet
-caught* rather than *correct*, and five separate adversarial rounds have found
-criticals in it.
+caught* rather than *correct*. Four consecutive adversarial rounds found criticals
+in it — nine in all — and in three of those rounds the critical was introduced by
+the repair to the one before.
 
 What you type in `Chip unit` **does** change derived payouts, because rounding the
 rake changes the net pot every payout is drawn from. On an 80-chip pot at a
@@ -440,9 +473,14 @@ because the surfaces disagree about it:
   or Chip stacks*. The blocker itself names the ante mode, the anteing seats and
   the three choices; that text is only rendered in the accounting panel. Open the
   hand's accounting panel to see what to declare.
-- **A manually-entered hand with no linked recording has no route to the
-  settlement editor.** The editor lives inside the CV reconstruction validation
-  flow, and Import shows only "No videos linked yet" for such a hand.
+- **A hand with no linked recording reaches the editors from the hand itself.**
+  Every control that clears a trust blocker — cards, players, actions, the blind
+  and ante declarations, settlement assumptions, source warnings and debugging
+  issues — lives inside the reconstruction validation workspace, which used to be
+  reachable only from a completed CV job whose timeline was still on disk. A hand
+  you typed in, or a reconstructed one whose recording you later deleted, showed
+  "No videos linked yet" and no way to declare anything. **Fix hand #N on Import**
+  now opens the same workspace from the hand, without frame evidence beside it.
 
 Count the ante population with `SELECT
 COUNT(DISTINCT hand_id) FROM actions WHERE action_type = 'ante' OR
@@ -695,6 +733,17 @@ decoded video, loaded the pinned weights, reconstructed the recordings and
 scored the result. `fixture` mode does none of the first three. `container` mode
 runs the *fixture* gate inside the image, so it certifies that the image
 reproduces the host's verdict, not that the product reconstructs video.
+
+The corpus check that runs first answers a separate question: whether the locked
+test split is still sealed. It used to answer it from `used_for_tuning`, a flag
+each case sets about itself, and to compare split membership by filename — so the
+same recording copied into the development split under a second name left the seal
+reading clean. It compares the manifest's SHA-256 digests now, and a locked case
+must declare one when recordings are being verified. Read a clean seal as the
+narrow finding it is: content equality cannot see a re-encoded or trimmed copy of
+a locked recording, nor an adjacent segment captured from the same session, and
+the report names both. Keeping the split honest is still a discipline; the check
+is a floor under it.
 
 The committed corpus currently exits `2`: Phase 2 has produced no answer keys,
 so no accuracy claim can be evaluated. CI asserts that it still fails closed, so

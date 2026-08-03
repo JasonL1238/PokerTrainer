@@ -428,6 +428,20 @@ def _case_prediction_path(manifest_path: Path, case: dict[str, Any]) -> Path | N
     return sibling if sibling.is_file() else None
 
 
+def _case_was_actually_scored(report: dict[str, Any]) -> bool:
+    """Whether this case's evaluation scored a hand, which is the act itself.
+
+    Artifacts that would not read and an answer key with no hand in it both come
+    back with zero ``hands_scored``, and only the first was excluded here. The
+    aggregate already refuses to publish a count drawn from nothing --
+    ``measured`` is ``hands > 0`` -- so counting the second as scored put
+    ``SCORE_TIMELINES`` in the certification summary of a report that says
+    ``measured: false`` a few keys below it. The case still counts as failed;
+    what is withheld is the claim to have performed the scoring.
+    """
+    return int(report.get("hands_scored") or 0) > 0
+
+
 def _score_case(
     manifest_path: Path,
     case: dict[str, Any],
@@ -499,7 +513,7 @@ def _run_fixture_predictions(manifest_path: Path) -> dict[str, Any]:
             failed += 1
             continue
         report = _score_case(manifest_path, case, prediction_path)
-        if str(report.get("fail_closed") or "").startswith("unreadable_artifacts"):
+        if not _case_was_actually_scored(report):
             failed += 1
             case_reports.append(report)
             continue
@@ -522,8 +536,9 @@ def _run_fixture_predictions(manifest_path: Path) -> dict[str, Any]:
         "cases_scored": scored,
         "cases_failed": failed,
         "cases": case_reports,
-        # Scoring is claimed only when a case was actually scored; a run that
-        # found no readable prediction performed no act at all.
+        # Scoring is claimed only where a hand was actually scored; a run whose
+        # prediction would not read, or whose answer key held nothing to score
+        # against, performed no act at all.
         "executed": [cert.SCORE_TIMELINES] if scored else [],
     }
 
@@ -695,7 +710,7 @@ def _run_full_reconstruction(
         report["duration_s"] = duration_s
         report["duration_source"] = duration_source
         report["elapsed_s"] = elapsed
-        if str(report.get("fail_closed") or "").startswith("unreadable_artifacts"):
+        if not _case_was_actually_scored(report):
             failed += 1
             case_reports.append(report)
             continue

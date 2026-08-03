@@ -5,6 +5,9 @@ selection, reproducibility of the seeded preflop path, card removal, and the
 `unknown`-range honesty (equity=None). eval7 is a declared dependency, so these
 run unconditionally; the import is guarded only to skip cleanly if it is absent.
 """
+import signal
+from contextlib import contextmanager
+
 import pytest
 
 from poker_tracker.math.equity import (
@@ -13,6 +16,22 @@ from poker_tracker.math.equity import (
     Eval7EquityCalculator,
     get_equity_calculator,
 )
+
+
+@contextmanager
+def _time_limit(seconds: float):
+    """Fail a test that hangs instead of letting it wedge the suite."""
+
+    def _expire(signum, frame):
+        raise TimeoutError(f"call did not return within {seconds}s")
+
+    previous = signal.signal(signal.SIGALRM, _expire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
 
 pytestmark = pytest.mark.skipif(not _HAS_EVAL7, reason="eval7 not installed")
 
@@ -166,6 +185,31 @@ def test_multiway_equity_is_reproducible_and_below_heads_up():
     second = calc.calculate_equity_multiway("Ah Kh", "", ["standard", "loose"])
     assert first.equity == second.equity  # seeded → deterministic
     assert first.equity < heads_up  # a second live range always costs pot share
+
+
+def test_multiway_undealable_ranges_are_rejected_not_spun_on():
+    # Hero holds two aces, so card removal leaves each villain "AA" range with
+    # the single combo AhAs. No legal deal exists, and the rejection sampler
+    # used to retry forever rather than say so.
+    calc = Eval7EquityCalculator(iterations=2_000)
+    with _time_limit(30):
+        result = calc.calculate_equity_multiway("Ac Ad", "", ["AA", "AA"])
+    assert result.equity is None
+    assert result.method == "no_valid_combos"
+    assert result.confidence == 0.0
+    assert result.samples is None
+
+
+def test_multiway_clashing_but_dealable_ranges_still_sample_fully():
+    # Two "AA" villains share four aces: only one deal in six avoids a clash.
+    # The attempt budget must not turn a legal-if-rare spot into a refusal, and
+    # the reported sample count must be the count actually taken.
+    calc = Eval7EquityCalculator(iterations=3_000)
+    with _time_limit(60):
+        result = calc.calculate_equity_multiway("2c 3d", "", ["AA", "AA"])
+    assert result.method == "monte_carlo_multiway"
+    assert result.equity is not None
+    assert result.samples == 3_000
 
 
 def test_multiway_requires_two_ranges_and_honest_unknown():

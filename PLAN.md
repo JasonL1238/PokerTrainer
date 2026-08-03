@@ -17,7 +17,8 @@ argument behind each repair, and the regression that pins it — lives in
 `cv_lab/notes/17_release_adversarial_rounds.md` (the whole-product rounds). Those
 notes are chronological and later findings supersede earlier ones; nothing in
 them is a claim about what is true today. A finding that is still open appears
-here, as an open item, in the phase that owns it.
+here twice: once in "Known open items", which is the complete register in priority
+order, and once in the phase that owns it, with the argument.
 
 Every status line in this file is written to be falsifiable. Where a claim has
 not been executed — an image nobody has built, a solver nobody has run, a
@@ -66,7 +67,7 @@ user explicitly requests it later.
 
 ## Verified implementation baseline
 
-As of August 2, 2026, the repository contains:
+As of August 3, 2026, the repository contains:
 
 - a seven-workflow Streamlit application: Overview, Sessions, Hands, Study,
   Insights, Import, and Settings, with every published figure carrying a declared
@@ -119,10 +120,11 @@ As of August 2, 2026, the repository contains:
   detection and coverage, a dependency inventory/SBOM, and CI;
 - authenticated local/container operation, a non-root Docker runtime, pinned CV
   dependencies, healthchecks, and a container verification script;
-- **3066 passing tests with 6 skips** and no failures at the latest inventory
+- **3066 passing tests with 6 skips** and no failures **as measured at commit
+  `ba3cb2d`, which is six commits and one repair pass behind the current tree**
   (see "Verification record" under Phase 1, which is the authoritative count and
   which this bullet must be updated to match), with Ruff and the configured MyPy
-  target green.
+  target green in that same run.
 
 These checks establish a strong component baseline. They do not prove that real
 recordings reconstruct reliably across a representative held-out set, and several
@@ -184,28 +186,308 @@ and passed, not that its code is written. A phase whose code is complete and
 whose gate has never been evaluated is **not** met, and is not counted toward the
 release claim.
 
+Two facts govern every row and neither is softened anywhere in this file. **The
+release stopping rule requires two consecutive clean adversarial rounds. Six
+rounds have run, every one of them found confirmed blocking defects, and the
+counter is 0.** And **no adjudicated answer key exists for any recording**, which
+holds Phases 3, 5, 6 and 7 shut no matter how much code they contain.
+
 | Phase | Implementation | Exit gate | What the gate is waiting on |
 | --- | --- | --- | --- |
 | 0 Baseline freeze | done | not met | the migrated-historical-database walkthrough |
 | 1 Completion & readiness | done | bullets satisfied, phase **uncertified** | two consecutive clean adversarial rounds; counter 0 of 2 |
-| 2 Validation corpus | **blocked** | not met | the operator's annotation pass — no adjudicated answer key exists for any recording |
+| 2 Validation corpus | **blocked** | not met | the operator's annotation pass — no adjudicated answer key exists for any recording. It blocks the exit gates of Phases 3, 5, 6 and 7 |
 | 3 Release-gate framework | done | not met | Phase 2; the framework cannot return 0 without truth |
 | 4 Ingestion & job execution | done | met for everything testable locally, minus one open contract | the retention CLI's exit codes and `--json` document are wrong for a setup failure |
 | 5 CV/OCR pipeline | repairs measured | **not evaluated** | Phase 2 |
 | 6 Correction & regression loop | done | not met | Phase 2 (the locked acceptance set) |
-| 7 Authoritative accounting | done; verdict **not-yet-caught** | not met | Phase 2; a critical in each of four consecutive rounds |
-| 8 TexasSolver certification | bounded, honest, retained | **not met** | a real binary to certify against; AGPL licensing |
+| 7 Authoritative accounting | done; verdict **not-yet-caught** | not met | Phase 2; a critical in each of rounds 2 through 5, and round 6 found another — a live blind marked dead silenced the blind-structure refusal and moved 8 chips of a 14-chip pot. Its two-fact form is closed; the one-fact form is open (item 6) |
+| 8 TexasSolver certification | bounded, honest, retained | **not met** | the solver has never been run against a real TexasSolver binary; the AGPL licensing gate is unresolved and blocks publishing any image |
 | 9 Coaching | grounding enforced at the write boundary | not met | the detector covers cards and solver figures only — an invented pot or action still stores as current; live-provider evaluation is opt-in and unrun |
-| 10 Product workflows | seven surfaces done | **not met** | three open round-5 disclosure defects (Insights' admission sentence, the Study checklist dropping blocker detail, a deleted recording drawn as current fact); narrow-width rendering and contrast are unmeasured |
+| 10 Product workflows | seven surfaces done | **not met** | three open round-5 disclosure defects (Insights' admission sentence, the Study checklist dropping blocker detail, a deleted recording drawn as current fact); narrow-width rendering and contrast ratios are unverified — `AppTest` has no viewport and nothing computes a contrast ratio |
 | 11 Persistence & recovery | done | not met | the completeness comparison is inert, so `RECOVERED` cannot mean "the complete history came back"; and the drill has only run against synthetic histories |
 | 12 Security & privacy | done | not met | AGPL (`ultralytics`) blocks publishing an image; two open round-5 redaction findings (over-redaction destroying facts, unredacted coaching provider errors) |
-| 13 Performance & containers | code done | **not met** | the image has never been built on either architecture |
-| 14 Testing & quality | done | not met | the one-hour representative-session gate has never run |
+| 13 Performance & containers | code done | **not met** | both container criticals are fixed and the image has never been built on any architecture — there is no Docker daemon on this machine |
+| 14 Testing & quality | done | not met | the one-hour representative-session gate has never been run |
 | 15 Documentation | runbooks written | not met | a release that can pass, which requires Phase 2 |
 
 **Phase 2 is the critical path.** It is blocked on the operator's annotation
 pass, which is human work no code can substitute for, and it holds the exit gates
 of Phases 3, 5, 6 and 7 shut regardless of how much code those phases contain.
+
+**Two surfaces remain adversarially unexamined after six rounds**, and no round
+may be allowed to count until both have been assigned:
+`poker_tracker/ui/reconstruction_review.py` (about 1,700 lines — issue
+attribution, and what a correction fastens to) and
+`poker_tracker/math/analytics.py` (about 1,170 lines — the population and
+theme-aggregation machinery that decides what every number on Insights counts).
+The argument is under "Where the adversarial gate stands".
+
+## Known open items, in priority order
+
+Everything six adversarial rounds found that is still open, plus the gates nobody
+has executed. This is the register: if an item is not here and not in the phase
+section that owns it, it has been lost. Each line says where it lives and what it
+is waiting on. The `A2-*` and `B*` identifiers are round 5's coverage re-run,
+retained so this list and `cv_lab/notes/17_release_adversarial_rounds.md` name the
+same finding. Items 24 through 30 came out of round 6's repairs rather than its
+findings and have not been triaged against the exit gates.
+
+Two of these can admit a wrong figure without saying so, and they are the same
+missing fact from opposite ends: a forced post the recording does not identify as
+one escapes the refusal built to catch it (item 5), and a forced post the
+recording marks dead with nothing to check that mark against is believed
+(item 6). Both need the recording to carry the forced-post identity rather than a
+further rule in the ledger. The rest fail loudly when acted on, disclose badly beside
+a blocker that is already firing, or mislead an unattended caller rather than the
+operator reading the screen — and the two whose consequence is a green verdict
+over an unproven run are first for that reason.
+
+**A green verdict over a run that did not prove it**
+
+1. **A release-gate report cannot be tied to the run that produced it** (A2-6,
+   `poker_tracker/release_gate/report.py`).
+   `write_report` targets a fixed path outside any `try`, carries no timestamp and
+   no run identity, so a run that cannot write its report exits 1 and leaves the
+   previous run's `ok: true` sitting where CI reads next. Phase 3.
+2. **The recovery drill's completeness comparison is inert, and the verdict is
+   inverted against the evidence** (A2-3, `poker_tracker/maintenance/recovery.py`
+   and `persistence/backup_inventory.py`). `build_inventory` writes no counts, so
+   `RECOVERED` means "it restored and reads back", not "the complete history came
+   back" — and a snapshot carrying *no* inventory produces the weaker verdict.
+   Phase 11.
+
+**Rulings only the operator can make**
+
+3. **An unmatched forced post larger than a main-pot seat's whole commitment.**
+   Rule 2 pays that seat the post in full; capping it reproduces all four worked
+   examples and both counterexamples. The ledger changes no chip, warns, and
+   refuses the hand as study-ready until this is settled. Phase 7.
+4. **A release-blocking issue cannot be closed from the product (B2).**
+   `promote_issue_to_regression` has no production caller, so seven of the nine
+   offered issue categories are closable only from a Python REPL. Whether to
+   surface the promotion, and how much fail-before/pass-after evidence an operator
+   may record from the UI, is a product ruling. Phase 1.
+
+**Refusals with a hole in them**
+
+5. **The blind-structure refusal reaches only a post the recording identifies as
+   forced.** The CV spine books any zero-stack seat as a plain `all-in` and drops
+   the markers, so a short blind on that path is indistinguishable from an ordinary
+   short shove and is not refused. Closing it is a CV-corpus change. Phase 7.
+6. **One dead-marking field on a forced post is believed, because nothing on the
+   row can check it** (`poker_tracker/math/accounting.py`). The round-6 repair
+   closed the form that states TWO contradicting facts — a `big_blind` marked
+   dead, a `dead_blind` marked live — by refusing the pair. A row that states only
+   ONE of them (`forced_bet_type='dead_blind'` with the post status left
+   unspecified, or a `dead` post status with the "Forced post" box empty) is a
+   single unfalsifiable claim, so it still silences the blind-structure refusal
+   and still moves the chips. Verified after the repair: blinds undeclared, big
+   blind all-in for 4, everyone else in for 5 — the honest reading refuses and
+   lays out 12/2 with the short seat winning 8; one dead-marking field lays out
+   4/10, pays the short seat 0, and presents the hand as study-ready with zero
+   blockers and no warning. This is the second item in this list that can admit a
+   wrong figure without saying so. Closing it needs the recording to carry the
+   forced-post identity — see item 5, which is the same missing fact from the
+   other end — rather than a further rule inside the ledger. Phase 7.
+7. **The grounding check covers cards and solver figures only.** An invented pot
+   size, an invented action, or a bare "loses 4.2 BB" that does not name EV is
+   stored as current analysis. Moving the check to the write boundary closed the
+   reach gap and left the coverage gap where it was. Phase 9.
+8. **`completion_evidence.layout_supported` is inert, not conservative.** Nothing
+   compares a recording against a registry of certified geometries, and every hand
+   in both committed fixtures exports `True`, so `UNSUPPORTED_TABLE_LAYOUT` fires
+   on none of them. Phases 2 and 5.
+
+**Surfaces that say something true of the general case and false for one
+population**
+
+9. **Insights admits a hand to "Confirmed hands" on `review_status` while telling
+   the reader the promotion guard cleared it** (B3,
+   `poker_tracker/math/analytics.py`). The v20 migration deliberately leaves
+   `review_status` alone, so an ante hand reviewed before the upgrade stays
+   `reviewed` while its ledger now refuses. Phase 10.
+10. **The Study checklist renders a blocker's headline and discards its detail and
+   clearing action (B4, `app.py::study_fix_groups`).** The ante-mode population is
+   told "the chip ledger does not reconcile" and pointed at the action line, while
+   the blocker object names the anteing seats and says to open Edit settlement.
+   The loss is in the renderer. Phase 10.
+11. **A deleted recording is drawn with its duration, resolution and size as
+    current fact** (B5, `app.py::show_video_metadata`), with **Run CV
+    reconstruction** enabled. Pressing it fails truthfully; only the health audit
+    notices, and only when run. Phase 10.
+
+**Contracts that mislead an unattended caller**
+
+12. **The retention CLI's exit codes and `--json` document are wrong for a setup
+    failure** (A2-5, `poker_tracker/maintenance/retention_cli.py`). An unopenable
+    database or unusable `--data-dir` exits `1` — the code reserved for "a
+    deletion was attempted and it failed" — and writes a zero-byte document.
+    Phase 4.
+13. **`validate_import_payload` does not hold its stated property (A2-7,
+    `poker_tracker/persistence/import_export.py`).** An
+    integer past SQLite's 64-bit range passes pydantic and raises `OverflowError`
+    from inside the write pass; it is not a `ValueError`, so the import surface
+    renders a traceback. The transaction does roll back. Phase 11.
+
+**Redaction**
+
+14. **`redact_structure` destroys facts (A2-8, `poker_tracker/safety/redaction.py`).** A bare `auth` alternative matched
+    as a substring replaces `is_authoritative`, `authoritative_source`, `author`,
+    `authored_at` and `unauthorized_edit` with `"<redacted>"`. Latent: no payload
+    the product currently serializes carries such a key. Phase 12.
+15. **Coaching provider failures render `str(exc)` unredacted at seven sites in
+    `app.py`**, while the health-check and diagnostics surfaces route the same
+    class of text through `safe_error_message`. An unguarded path rather than a
+    demonstrated leak. Phase 12.
+
+**Measured by nobody**
+
+16. **Narrow-width rendering and contrast ratios are unverified.** `AppTest` has no
+    viewport and nothing in this repository computes a contrast ratio; the theme
+    tokens were chosen by eye. Both need a real browser: a headless render at fixed
+    widths, and a computed ratio per token pair against WCAG thresholds. Phase 10.
+17. **The one-hour representative-session gate has never been run.** The harness
+    supports it (`--require-session-check`, exit 4); no run has been made, so the
+    Local runtime row of the hard-gate table has no value. Phase 14.
+18. **No image has ever been built, on either architecture.** No Docker daemon
+    exists on this machine. Both container criticals are repaired and unproven.
+    Phase 13.
+19. **The solver has never been run against a real TexasSolver binary.** Every
+    functional and resource gate in Phase 8 is verified against fakes and injected
+    failures. Phase 8.
+20. **The AGPL licensing gate is unresolved and blocks publishing any image**, base
+    or solver-enabled, because `ultralytics` is AGPL-3.0 and the reconstruction
+    pipeline depends on it. Not a code change. Phases 8 and 12.
+21. **A populated historical operator database has never been migrated against this
+    build.** The repository's own `poker_tracker.db` is at schema 18 against code
+    at 20 and holds one session and two hands, both `needs_correction` and both
+    `cv_import` — enough to migrate, nowhere near a season of play, and it has not
+    been migrated. Phase 0.
+22. **No adjudicated answer key exists for any recording**, so no accuracy,
+    completion, boundary, accounting or safe-rejection threshold has a value.
+    Phase 2, and the critical path for the whole release.
+
+**Recorded, low, and not release-blocking**
+
+23. `export_hand` emits no `solver_runs`, so a round trip discards every solver run
+    and clears `STALE_SOLVER_EVIDENCE`. An imported settlement's `status` is taken
+    from the payload rather than re-derived. A pre-v5 payload has only its declared
+    `source_type` for provenance. ROI calibration previews are not reproducible from
+    their inputs. The Solver tab echoes the `TEXAS_SOLVER_PATH` it could not find.
+    Phase 1's "Known open gaps" holds the full list with the reasoning for each.
+
+**Opened by the round-6 repairs, or disclosed by them and never triaged**
+
+Each of these was named in a repair's own account of what it did not close, or
+found while verifying one. None had a line in this register before. They are
+listed together because they share a provenance, not a severity.
+
+24. **The hand library cannot find a hand the ledger refuses** (B6, `app.py`). The
+    Flags facet offers *Open issue*, *Stale analysis* and *Neither*, and
+    `hand_evidence_badges` has no state for "the ledger refuses this hand", so
+    after the v20 migration a refused hand sits under *Neither* with no badge.
+    Nothing asserts it reconciled — the facet is labelled *Neither*, not *Clean* —
+    so this is a discoverability gap, not a false claim. Doing it correctly costs a
+    ledger build per rendered row, because `_resolve_hands_for_display` skips
+    reconciliation for exactly the hands that have no stored settlement. Phase 10.
+25. **Nineteen unchecked `cv2.imwrite` calls in `cv_lab/`, two of which record
+    what they did not write.** `cv_lab/scripts/training/sweep_and_flag_weak_cards.py`
+    appends a manifest entry (line 145) and a weak-card labeling-queue entry
+    (line 158) regardless of whether the JPEG was written, so the queue can name a
+    file that is not there. The same unchecked shape with no manifest consequence
+    is in `select_keyframes.py`, `evaluate_yolo_cards.py`, `extract_frames.py`,
+    `extract_window.py`, `make_yolo_card_dataset.py`, `stage_model1_review_frames.py`,
+    `extract_gallery_frames.py`, `harvest_cards.py`, `read_hero.py` and
+    `run_two_model_timeline.py`. The product path was repaired; these were not.
+    Phase 5.
+26. **The sampler can emit a frame whose true timestamp is past `--end`**
+    (`cv_lab/scripts/pipeline/run_two_model_pipeline.py`). A deliberate consequence
+    of stamping frames with their own presentation time: the last request inside the
+    window can resolve to a picture recorded after it. The frame is a real
+    observation and the resulting gap is visible, which is the safer direction — but
+    `--end` is no longer a bound on the returned series and no test pins the new
+    behaviour. The release gate passes `--end duration_s`, so it cannot bite there.
+    Phase 5.
+27. **A frame's stored time can silently be the requested one.**
+    `poker_tracker/ui/frame_extraction.py::_observed_timestamp` falls back to the
+    seek target when the capture backend reports no usable position, and nothing on
+    the summary distinguishes an observed timestamp from a requested one. Same
+    silence as the defect it repairs, at a much smaller scale. Phase 5.
+28. **A row whose player has no seat loses its frame explanations rather than
+    getting a wrong one** (`app.py::_seat_index_for_action`). Seat resolution now
+    reads the saved hand's `player_key → seat_index`, which is empty for a player
+    the editor accepted as "Seat: Unknown"; the legacy fallback then refuses an
+    off-roster identity instead of guessing. Safe, and a coverage loss nothing says
+    out loud. Phase 10.
+29. **The corpus report quotes hand counts drawn from answer keys that failed
+    structural validation** (`poker_tracker/validation/corpus.py`).
+    `stats["completed_hands"]` and `stats["partial_hands"]` accumulate before the
+    key is rejected. The run is `ok: false` with the issues listed, so nothing ships
+    on it, but the numbers are not withheld the way `release_gate` withholds an
+    unmeasured aggregate. Related: a `runtime_class=fixture` case is still exempt
+    from declaring a digest under `--require-recordings`, so a fixture holding a copy
+    of a locked recording has no digest to collide with — the report names those
+    cases under `locked_seal.compared_cases_without_digest`. Phase 2.
+30. **`icm_risk_premium` refuses `risk_amount == stacks[hero_index]`**, which is
+    Hero's own all-in — the most common question the screen is asked. It is a
+    validation choice, not a defect, but the tool offers no answer for it and says
+    nothing about why. Related and smaller: `EXACT_CONFIDENCE = 0.95` labels
+    exactly-enumerated equities with a "confidence" derived from nothing. Phase 10.
+
+**Fixed in the round-6 repair pass**
+
+Recorded here so a later reader can tell what moved. The list is what round 6
+repaired, not a claim that round 6 found nothing else.
+
+The first five were confirmed after the fact by a verification pass that
+reproduced each one against its pre-repair code with its own harness rather than
+the repair's tests: the locked seal, the sampler timestamps, the ICM premium and
+the forced-post contradiction matrix all failed before and pass after. The rest
+carry the repair's own evidence only.
+
+- The locked-test seal is compared by content, not only by declared name, and the
+  report states what content equality cannot answer.
+- The CV sampler and the diagnostic frame writer stamp a frame with its own
+  presentation timestamp, so an unobserved stretch stays visible to the refusals
+  that read gaps. A frame whose write failed is no longer recorded as extracted.
+- `icm_risk_premium` transfers the risked chips to a winner instead of deleting
+  them from the table, and exposes the per-opponent span. The ICM screen renders
+  that span rather than its worst end under prose calling it *the* prize equity
+  lost, and says a multiway split can cost more than the span's top.
+- Multiway equity is labelled Monte-Carlo, and a range set card removal makes
+  undealable returns `no_valid_combos` with a reason instead of an equity figure.
+- A manually entered hand, or a reconstructed hand whose recording was deleted,
+  can reach the controls its readiness blockers name.
+- **A forced post whose two dead/live fields contradict each other is refused.** A
+  live blind typed as a *dead* blind, by the row's post status or by its
+  forced-bet name, silenced the blind-structure refusal and moved chips on a hand
+  with no declared structure — which is every hand migrated from schema 19. One
+  selectbox on the row the warning names turned a refused hand into a study-ready
+  one that paid 8 chips of a 14-chip pot wrong. A name and a post status that
+  contradict each other are now reported rather than resolved, the same rule
+  `1f8f01d` set for the kind-versus-label axis. **This is not the last hole in the
+  refusal**: the repair can only see a contradiction, so a row that states one
+  dead-marking field and nothing to check it against still moves the same chips.
+  That is item 6 and it ships open.
+- **A cancelled reconstruction discards its partial artifacts.** SIGTERM exits
+  CPython without unwinding, so the `finally` that
+  `_discard_partial_artifacts` documents itself as running never ran on the
+  cancel path: a cancelled run left its partial timeline and one JPEG per sampled
+  second on disk. Best effort by design — the two-second grace before SIGKILL is
+  ample and not a guarantee.
+- **Only a completed job's timeline may be imported.** The gate lived in `app.py`,
+  which filters the review surface to completed jobs, while
+  `ensure_hand_imported` is reachable without it. A timeline covering part of a
+  recording reads exactly like a whole one.
+- **The release gate no longer claims it scored timelines when it scored no
+  hand.** `_run_fixture_predictions` and the full-video loop excluded only the
+  case whose artifacts would not read, so a case whose answer key held nothing to
+  score against still counted toward `cases_scored` and stamped
+  `SCORE_TIMELINES` into the certification summary of a report printing
+  `measured: false` a few keys below. The verdict was already a failure; what was
+  false was the claim to have performed the act. Found and repaired during the
+  verification pass, not by the repair pass.
 
 # Completion program
 
@@ -262,7 +544,7 @@ items that are still open.
 
 These fifteen rounds are **phase-scoped and numbered separately** from the
 whole-product rounds under "Where the adversarial gate stands", which are at
-round 3. Both counters are 0 and neither substitutes for the other: passing this
+round 6. Both counters are 0 and neither substitutes for the other: passing this
 phase's certification would not satisfy the release stopping rule, which is the
 whole-product one.
 
@@ -323,12 +605,24 @@ than on the pair. `ACCOUNTING_ASSUMPTION_DEPENDENT` is scoped by
 `requires_user_confirmation`, which delegates to it. See "Who must attest".
 
 **A blocker never names an action the product cannot perform.** This is a
-standing rule, not an aspiration, and it has been violated in at least five
-distinct ways over the fifteen rounds — a named panel that is not drawn, a
-deletion no control performed, a re-import that appends instead of replacing, a
-discard writer that did not exist, and a promotion no control performs. Every
+standing rule, not an aspiration, and it has been violated in at least six
+distinct ways — a named panel that is not drawn, a deletion no control performed,
+a re-import that appends instead of replacing, a discard writer that did not
+exist, a promotion no control performs, and a workspace with no route to it. Every
 clearing action must name a control that exists on a page the operator can reach,
 and adding a blocker means checking that.
+
+The sixth is round 6's, and it is the same lesson as the fifth from the other
+side. Every control that clears a trust blocker — cards, players, actions, the
+blind and ante declarations, settlement assumptions, source warnings and debugging
+issues — is hosted by `render_validation_edit_and_approve`, whose other caller
+hangs off a completed reconstruction job whose timeline is still on disk. A
+manually entered hand, or a reconstructed one whose recording was later deleted,
+read blockers naming a screen the product would not draw for it — including the
+ante-mode refusal that schema 20 raises across the migrated ante population.
+Repaired in the round-6 pass by a route from the hand itself into the same
+workspace. The guard test passed throughout, because the control it looks for is
+drawn on the other path.
 
 The fifth is the one that shows why the existing guard is not sufficient.
 `test_every_control_a_clearing_action_names_exists_in_the_app` proves the named
@@ -733,7 +1027,16 @@ The other standing rules in this area:
   reported the call illegal unlabelled and legal the moment the row carried a
   label, and a `dead_blind` label on that call moved a chip out of the pot as
   well. A label on a kind that cannot be a post is now derived from the kind and
-  reported as a legality issue rather than resolved in either direction.
+  reported as a legality issue rather than resolved in either direction. The
+  mirror also holds and is refused the same way: a label that names a *different*
+  forced post from the one the kind names — tagging the only ante row a straddle,
+  a big blind or a dead blind — emptied the ante pool and switched off the
+  undeclared-ante-mode refusal, so a hand the product exists to refuse was
+  accepted with no chip moving to make it visible. Seven of the fifty-six
+  kind/label pairs are refused, each two operator facts that cannot both be true.
+  The mirror on the liveness axis is refused the same way: a forced-bet name and
+  a post status are two statements of one fact, and a row where they disagree is
+  reported rather than resolved.
 - **WHICH dead chips that cap governs is a DECLARED input, never inferred.** The
   ante mode (`hand_settlements.ante_mode`) is one of `NONE`, `PER_PLAYER` or
   `SINGLE_PAYER_TABLE_ANTE`. Under `PER_PLAYER` every ante is capped, which is
@@ -833,6 +1136,14 @@ stopping rule, not on these two.
 Taken on 2026-08-02 against the tree at commit `ba3cb2d`, macOS 24.6.0
 (darwin/arm64), Python 3.13.5, OpenCV 4.11, NumPy 2.2.6. Re-derived from a fresh
 run, not carried forward.
+
+**This record is stale and must not be read as a statement about the current
+tree.** Six commits and one repair pass have landed since `ba3cb2d` — the
+live-level pot model, the ante-mode declaration, the coaching grounding
+enforcement, the forced-post kind/label rule, and the round-6 repairs — and no
+full-suite run has been taken since. The counts below describe `ba3cb2d`.
+Refreshing it means re-running the four commands against the candidate commit and
+replacing the table, not adjusting the numbers.
 
 | Command | Result |
 | --- | --- |
@@ -1095,6 +1406,19 @@ The corpus must include:
 - Every truth record passes structural, card-uniqueness, action-legality, and
   arithmetic validation.
 - The locked test has never been used for tuning.
+
+**What the last bullet can and cannot be checked by.** Round 6 found the corpus
+report answering it from `used_for_tuning`, a boolean each case sets about itself,
+while `split_integrity` compared normalized logical *names* between splits and
+never touched the SHA-256 the manifest already carries for every recording — so
+the same recording copied into development under a second filename left the seal
+reading clean. Digests are compared now, a locked case must declare one under
+`--require-recordings`, and `stats["locked_seal"]` says whether bytes were read or
+only declarations compared. Content equality is still all a digest can answer: a
+re-encoded, trimmed or re-rendered copy of a locked recording, and adjacent
+segments captured from the same source session, are named in the report as what
+the seal does not cover. Read a clean seal as that narrow finding. The rule itself
+is a discipline, and the check is a floor under it.
 
 ## Phase 3 — Create the executable release-gate framework
 
@@ -1432,6 +1756,21 @@ Newly discovered release blockers, none of them closed:
 
 ### Frame selection and video decoding
 
+**A sampled frame carries its own timestamp, not the one it was asked for.** This
+is a rule the rest of the pipeline depends on and round 6 found it broken in both
+implementations. Seeking to `t` returns the first frame at or after `t`, and on a
+variable-rate screen recording — nothing is encoded while the screen is still —
+that frame can be seconds later. Stamping it with `t` moves the picture backwards
+and closes the unobserved stretch it came out of, so the spine's `prior_gap_s`
+reads a pair straddling a real hole as one ordinary interval apart, and every
+refusal keyed on coverage (`mid_hand_coverage_gap`, the roster-shrink and
+continuous-presence refusals) stops firing on exactly the recordings it exists
+for: a hand nobody watched exports as complete. Repaired in the round-6 pass in
+`cv_lab/scripts/pipeline/run_two_model_pipeline.py::_sample_times` and in
+`poker_tracker/ui/frame_extraction.py`, where the same shift was stored in
+`extracted_frames.timestamp_seconds` and in the filename, and where a failed
+`cv2.imwrite` was counted as an extracted frame.
+
 - Validate timestamps and decoding monotonicity.
 - Ensure first/last relevant frames are not lost to interval rounding.
 - Use coarse screen classification plus change detection to retain deal,
@@ -1685,9 +2024,18 @@ pot boundary that paid a seat live chips no opponent had wagered against it.
 **Repairs in this module keep producing the next critical**: `3c3144e`'s own
 message calls itself "the third critical in this module and the second introduced
 by a repair to the previous one", and rounds 4 and 5 each found their critical
-inside the repair that had just landed. Rounds 1, 2, 3 and 5 are written up with
-their sweeps in `cv_lab/notes/17_release_adversarial_rounds.md`; round 4 is
-recorded only in the table under "Where the adversarial gate stands".
+inside the repair that had just landed. The pattern outlived the round: `1f8f01d`
+reverses the ruling made by the commit before it, because reading the forced-bet label
+as the thing that decides what a row is let one mis-click on a selectbox empty the
+ante pool and switch off the undeclared-ante-mode refusal, turning a hand the
+product exists to refuse into one it accepted with no chip moving to make it
+visible. Every round is written up with its sweeps in
+`cv_lab/notes/17_release_adversarial_rounds.md`.
+
+**Round 6 found no defect in this module.** That is one round and not a verdict.
+It is also not a round that attacked the module: five of its six findings were in
+surfaces nobody had examined, and the accounting sweeps were not re-run. The
+honest status is unchanged — not-yet-caught rather than correct.
 
 One round-4 finding is only PARTLY repaired and is stated here as a
 limit rather than a guarantee: the refusal reaches a forced post the recording
@@ -1700,13 +2048,29 @@ refused. Declaring the structure derives such a hand correctly; the product does
 not ask for it. Closing that needs the spine to keep the forced-post identity,
 which is a CV-corpus change, not an accounting one.
 
-The coverage pass on `bc597c5` added one more, a high rather than a critical and
+The coverage re-run on `bc597c5` added one more, a high rather than a critical and
 repaired in `cdb0e65`: `_is_forced_post` returned true for **any** row carrying a
 `forced_bet_type`, including a `call`. Labelling an ordinary short call a
 straddle, a big blind or a bring-in exempted it from the one legality test that
 reads `to_call`, turning an illegal action line into a clean one; labelling it a
 dead blind also moved chips. A row's kind now decides whether it is a forced
-post, and the label only says which one.
+post, and the label only says which one — which is `1f8f01d`'s rule, and the
+reverse of `cdb0e65`'s. Seven of the fifty-six kind/label pairs are refused
+outright, each of them two operator facts that cannot both be true, and a refused
+hand derives byte-identically to the same row with the field cleared.
+
+That rule had one hole and round 6 closed it. A *live* blind typed as a **dead**
+blind — by the row's post status, or by naming it `dead_blind` — silenced the
+blind-structure refusal and moved chips, on a hand with no declared structure,
+which is every hand migrated from schema 19. A big blind all-in for 4 with blinds
+undeclared is refused and lays out 12/2; one selectbox on the row the warning
+itself names, in the panel that warning auto-opens, moved 8 chips of a 14-chip pot
+and presented the hand as study-ready with zero blockers. A forced-bet name and a
+post status are two statements of one fact, so where they disagree the row is
+reported rather than resolved, which is the rule `1f8f01d` set for the
+kind-versus-label axis extended to the liveness axis. An all-in keeps its label as
+the only signal its kind leaves standing, because a post that took its poster's
+last chip is booked by the kind it ended in rather than the one it was.
 
 Every one of them passed `is_balanced`, `is_legal` and the declared-award
 cross-check, reached the narrowest population the product has, and printed a
@@ -1946,8 +2310,8 @@ lands the bullet must not be read as satisfied.
 narrow-width rendering and contrast are UNVERIFIED; three round-5 disclosure
 defects are open.**
 
-The three open ones are B3, B4 and B5 in the table under "Where the adversarial
-gate stands". All three are surfaces that say something true of the general case
+The three open ones are B3, B4 and B5 under "Known open items". All three are
+surfaces that say something true of the general case
 and false, or silent, for one population: Insights admitting a hand on
 `review_status` while telling the reader the promotion guard cleared it; the
 Study checklist rendering a blocker's headline and discarding the detail and
@@ -1990,6 +2354,12 @@ What landed:
   called the shared badge builder without the inputs the library passed it, so a
   hand read "open issue, stale" in one place and clean in the other, and neither
   screen looked wrong on its own.
+- **The controls a readiness blocker names are reachable from the hand**, not only
+  from a reconstruction job whose timeline is still on disk. A manually entered
+  hand, or a reconstructed one whose recording was later deleted, used to read
+  blockers pointing at a workspace the product would not draw for it — the ante
+  mode among them, which is the population schema 20 blocks. Repaired in the
+  round-6 pass.
 
 **What is unverified, and must not be reported as passing:**
 
@@ -2468,6 +2838,19 @@ What landed:
   under two timestamps, and an unknown duration is probed or fails the case: it is
   missing information, not a day.
 
+**Two figures in the math layer had no suite that could reach them**, and round 6
+found both. `icm_risk_premium` computed Hero's equity after *deleting* the risked
+chips from the table; ICM equity is a function of stack shares, so removing them
+shrinks the denominator and inflates Hero's post-loss share, and the function
+returned a premium below every outcome the tournament can produce — 1.57 on
+`[5000, 3000, 2000]` paying `[50, 30, 20]` where the real answer lies between 2.73
+and 2.96. The metric depends on which opponent wins the chips and was asserted
+without that input; it transfers them now and exposes the per-opponent span. And
+multiway equity sampling rejects deals that reuse a card, with no bound on a range
+set card removal makes undealable, under a class docstring claiming postflop uses
+exact enumeration. Both are unit-test territory, and the unit tests asserted the
+implementations back to themselves.
+
 **What has not happened.** "Verify a representative full session completes within
 one hour on the supported local reference machine" has never been executed. The
 harness supports it (`--require-session-check`, exit 4) and no run has been made,
@@ -2552,9 +2935,15 @@ release evidence archive requires a release that can pass, which requires Phase
 2.
 
 `cv_lab/notes/` holds the chronological research and adversarial record,
-including the Phase 1 rounds (`16`) and the whole-product rounds (`17`) that used
-to live inline in this file. Findings there are history: they explain decisions
-and are not claims about what is true today.
+including the Phase 1 rounds (`16`) and all six whole-product rounds (`17`) that
+used to live inline in this file. Rounds 4 and 6 and the round-5 coverage re-run
+were written up there on 2026-08-03; before that this file's status table was
+their only record, which was a gap in the research log rather than in the repairs.
+Findings there are history: they explain decisions and are not claims about what
+is true today. Anything from those rounds that is still open is in "Known open
+items" in this file, which is the register — a finding that is in the notes and
+not in that list has been closed, and if it has not been closed, the list is
+wrong.
 
 
 ### README
@@ -2609,8 +2998,10 @@ and are not claims about what is true today.
 
 The release command must fail if any mandatory gate below fails.
 
-**As of August 2, 2026 exactly one row below has been evaluated: Component
-quality.** Everything from Corpus down either has no value because Phase 2 has
+**As of August 3, 2026 exactly one row below has ever been evaluated: Component
+quality — and that evaluation is six commits and one repair pass old, taken at
+`ba3cb2d`.**
+Everything from Corpus down either has no value because Phase 2 has
 produced no answer key, or has never been executed on this machine — the
 container rows because no Docker daemon exists here, the Solver row because no
 binary exists here, the Local runtime row because the one-hour representative
@@ -2742,106 +3133,90 @@ Spawn a second fresh agent with instructions to:
 
 ## Where the adversarial gate stands
 
-**Five whole-product rounds have run. Every one of them found criticals. The
-clean-round counter is 0 of the required 2.**
+**Six whole-product rounds have run. Every one of them found confirmed blocking
+defects. The clean-round counter is 0 of the required 2, and it has never
+reached 1.**
 
-| Round | Repairs carried by | What it found |
+The round-by-round record — what each round found, the argument behind each
+repair, and the regression that pins it — is in
+`cv_lab/notes/17_release_adversarial_rounds.md`. It is history. What stays here
+is the count, what the count means, and the two surfaces a round has still never
+touched.
+
+| Round | Repairs carried by | Verdict |
 | --- | --- | --- |
-| 1 | `88e24b6` | Container mode read its verdict from a report it could not prove it produced, and was not executing the image's code at all. Plus nine reporting defects that made a run say less than it appeared to. |
-| 2 | `e8c0e49`, `ed0f403` | Two criticals in pot accounting, both introduced by this program's own repair to the previous defect. Plus retention deleting regression fixtures, and redaction that made a quoted secret strictly *more* exposed than an unquoted one. |
-| 3 | `3c3144e`, `5e1cec8`, `ba3cb2d` | Three more criticals in the same module: a forced-post-only seat contesting a whole live layer, a stale award raising out of the reconciler, and unequal dead money manufacturing a side pot nobody was all-in for. |
-| 4 | `b58b7e3` | Two criticals in the blind-structure repair itself: the short-post refusal was decided at the instant the blind row was reduced, so moving a seat's ante below its blind silently turned a blocked hand into a reconciled one; and a transposed structure written through `model_copy` (which skips validators) was salvaged by the reader into a smaller *valid* structure, whose floor then covered the very post it was declared to expose. A third finding — the refusal never reaches a forced post the recording does not identify as one, which is every short blind the CV spine emits — is real, is only partly repaired, and is now stated as a limit rather than a guarantee. |
-| 5 | `af370cf`, `370fa3f`, `bc597c5` | One critical in the same module, again in the repair to the previous defect: the live/dead money classifier still keyed on `action_type` alone, so a forced post booked as `all-in` with its `forced_bet_type` recorded — the shape the hand editor and the CV spine both produce — was counted as chosen live money. Under the new live-level model that opened a boundary and paid a seat live chips no opponent had wagered against it, settled, balanced, legal and warning-free. Two further findings are real, reproduced, and **not** repaired: they are consequences of rule 2 of the operator's pot model, not deviations from it, and they need an operator ruling rather than a fifth in-session model rewrite. They are refused as study-ready in the meantime. |
+| 1 | `88e24b6` | Critical: the release gate could not be trusted to describe its own run. |
+| 2 | `e8c0e49`, `ed0f403` | Two criticals in pot accounting, both introduced by this program's own repair to the previous defect. |
+| 3 | `3c3144e`, `5e1cec8`, `ba3cb2d` | Three more criticals in the same module. |
+| 4 | `b58b7e3` | Two criticals inside the blind-structure repair itself. |
+| 5 | `af370cf`, `370fa3f`, `bc597c5`, then `cdb0e65`, `1f8f01d` for the coverage re-run | One critical in the repair to the previous defect, then a critical and four highs in the half of the product the accounting rounds had left alone. |
+| 6 | the round-6 repair pass | Four confirmed highs, most of them outside pot accounting — and one more inside it, found while attacking the ground around them. |
 
-`cv_lab/notes/17_release_adversarial_rounds.md` carries rounds 1, 2, 3 and 5 in
-detail. Round 4 and the coverage pass below have never been written up there —
-this table and the phase sections are their only record, which is a gap in the
-research log rather than in the repairs.
+**Round 6 changed where the defects are.** Four confirmed highs, none of them in
+code an earlier round had already repaired, and five of the round's six findings
+were in surfaces no earlier round had examined at all: the corpus seal, the CV
+sampler's timestamps, the diagnostic frame writer, the ICM risk premium, the
+multiway equity sampler, and the route to the controls a readiness blocker names.
 
-### The coverage pass on `bc597c5`, and what it leaves unexamined
-
-The last round was re-run against the frozen tree at `bc597c5` with a different
-mandate: cover the half of the product the accounting-focused rounds had left
-alone. It found a critical and four highs, none of them in the pot model —
-coaching responses stored and rendered with no runtime grounding check under a
-green *prompt* safety banner; a v20 staling predicate keyed on the declared
-external dead-money column while the rule change reaches recorded dead posts
-too; a `forced_bet_type` on a `call` row exempting it from the legality check
-that reads `to_call`; container-mode certification derived from the mode string
-rather than from what executed; and retention deleting live CV timelines it has
-no reference source for. All five were independently reproduced, and all five
-are repaired in `cdb0e65`.
-
-**Ten lesser findings from the same pass were triaged as disclosure-only and are
-still open.** Every one was re-reproduced against `cdb0e65` before being listed
-here — none is carried forward on the earlier round's word — and each is a code
-defect, not a documentation one. What has been done about them is documentation:
-each is now stated where an operator or a reader of this plan would look, on the
-rule that a surface which overstates what works is worse than one that says
-nothing. Listing them is not closing them.
-
-| ID | Where | What is still true |
-| --- | --- | --- |
-| B2 | `app.py` | Seven of nine offered issue categories are release-blocking, and nothing in the product promotes an issue to a regression. Detailed above under Phase 1. |
-| B3 | `poker_tracker/math/analytics.py:386` | Insights' "Confirmed hands" population says it admits only hands "the promotion guard only allows once every readiness blocker is clear". The v20 migration deliberately leaves `review_status` alone, so an ante hand reviewed before the upgrade stays `reviewed` while its ledger now refuses — admitted to the population, summed into the headline, and contradicted by the same page's own "Not study-ready" tile. |
-| B4 | `app.py:796` (`study_fix_groups`) | The Study checklist renders `blocker.reason` and a per-category destination and discards `blocker.detail` and `blocker.clearing_action`. The readiness panel renders both. So the ante-mode population is told "the chip ledger does not reconcile" and pointed at the action line, while the blocker object it was built from names the anteing seats and says to open Edit settlement. The loss is in the renderer, not in the blocker. |
-| B5 | `app.py:9902` (`show_video_metadata`) | Nothing on the Import or Sessions card checks that `videos.stored_path` still exists, so a deleted recording is drawn with its duration, resolution and size as current fact with **Run CV reconstruction** enabled. Pressing it fails truthfully; the health audit reports the missing file, but only when run. |
-| A2-3 | `poker_tracker/maintenance/recovery.py:448`, `backup_inventory.py:155` | The completeness comparison is inert, and the verdict is inverted against the evidence. Detailed under Phase 11. |
-| A2-5 | `poker_tracker/maintenance/retention_cli.py` | Setup failures exit `1` — the code the module docstring reserves for "a deletion was attempted and it failed" — and write a zero-byte document under `--json`. Reproduced: `--db <a directory>` and `--data-dir /dev/null/nope` both do it. Disclosed in `README.md`. |
-| A2-6 | `poker_tracker/release_gate/report.py:18` | A run that cannot write its report exits `1` and leaves the previous run's verdict at the fixed path, with no timestamp and no host-run identity to detect it. Reproduced on `cdb0e65`: run 2 raised `PermissionError`, exited 1, and the file still read `ok: true, exit_code: 0`. Detailed under Phase 3. |
-| A2-7 | `poker_tracker/persistence/import_export.py:171` | `validate_import_payload` claims every check lives there, but an integer past SQLite's 64-bit range (`hand_number = 10**30`) passes pydantic and raises `OverflowError` from inside the write pass. It is not a `ValueError`, and `app.py:8755` catches `(ValidationError, KeyError, ValueError)`, so the import surface renders a traceback. The transaction does roll back. |
-| A2-8 | `poker_tracker/safety/redaction.py:158` | `_SENSITIVE_ENV_NAMES` matches the bare alternative `auth` as a substring of a key, so `redact_structure` replaces `is_authoritative`, `authoritative_source`, `author`, `authored_at` and `unauthorized_edit` with `"<redacted>"`. Verified still true. Latent: no payload the product currently serializes carries such a key. |
-| A2-9 | `app.py` (7 sites) | Coaching provider failures render `str(exc)` with no redaction, while the health-check and diagnostics surfaces route the same class of text through `safe_error_message`. No offline-reachable failure echoes a key, so this is an unguarded path rather than a demonstrated leak. Disclosed in `README.md`. |
-
-None of these admits a wrong figure to the study database silently: B3 and B4 are
-disclosure failures beside a blocker that is already firing, B5 and A2-7 fail
-loudly when acted on, A2-8 destroys a fact rather than inventing one, and A2-3,
-A2-5 and A2-6 mislead an unattended *caller* rather than the operator reading the
-screen. A2-3 and A2-6 are the two whose consequence is a green verdict over an
-unproven run, and they are the two to close first.
+They shared a shape, and it is now the dominant defect class in this repository:
+**the product's own claims about itself outrunning what it verifies.** A corpus
+report answering "was the locked test used for tuning" from a boolean each case
+declares about itself, while the manifest holds a digest of every recording it
+never compares. A tournament metric asserted without the input the answer depends
+on. A docstring calling an emitted frame series the honest record while the series
+is shifted, which closes the coverage gaps every downstream refusal reads. Each
+one passes the suite while saying something false on screen, because a docstring
+is not a check, a report field derived from the requested mode cannot see that the
+mode did less, and a test asserting a named control is drawn cannot see that no
+path reaches it.
 
 **Two surfaces have still never been adversarially examined, and one of them
-decides releases.** `poker_tracker/release_gate/evaluate.py` — `_score_hand`,
-the per-fact comparison, the hand matching and merge logic, and the completion
-confusion matrix — has been read for its fail-closed entry branches and nothing
-else. It is the engine that decides whether the CV pipeline is accurate enough
-to ship, so an over-crediting scoring rule there produces a green certification
-over a bad pipeline with nothing downstream to contradict it, and the round that
-proved the certification *wrapper* overclaims never touched the scorer inside
-it. `poker_tracker/persistence/backup.py` — four independent five-slot
-rotations, `_rotate`, `classify_snapshot`, `_remove_sidecars`, `_remove_inventory`
-and `backups_dir_for` — has been read and not attacked, and two independent
-analysts in the same round read its snapshot routing two different ways.
+decides what every number on Insights counts.**
 
-Both must be assigned explicitly before a round is allowed to count. A clean
-verdict over an unattacked scoring engine would repeat the failure that produced
-this table, in a corner nobody was looking at.
+- `poker_tracker/ui/reconstruction_review.py` (about 1,700 lines) — the issue
+  attribution: which hand, frame, action and source warning an operator's report
+  is fastened to, and what a correction there invalidates. It is the surface the
+  whole correction loop passes through, and the only part of it any round has read
+  is the seat and action resolvers — which is where round 6 immediately found a
+  row whose frame evidence came from another seat and which was told to delete a
+  sound line. The issue *content*, the retirement rules that let a live accusation
+  go quiet, and the badge ranking that decides which claim is hidden behind
+  "+N more" have never been attacked.
+- `poker_tracker/math/analytics.py` (about 1,170 lines) — population selection,
+  exclusion accounting, coverage arithmetic, evidence and result-basis mixes, and
+  the theme aggregation behind the study-theme counts. Every figure Insights
+  publishes is decided here. An over-admitting population rule or a denominator
+  that counts the wrong set produces a confident wrong number with a declared
+  population beside it, which is exactly the presentation this phase added to make
+  such a number trustworthy.
 
-**This is the counter the release stopping rule reads.** Phase 1 ran its own
-fifteen-round, phase-scoped series (`cv_lab/notes/16_phase1_adversarial_rounds.md`),
-numbered separately, also at 0 of 2. Neither counter substitutes for the other,
-and neither has ever reached 1.
+Both must be assigned explicitly before a round is allowed to count. Round 6 is
+the argument for it: five of its six findings were in surfaces nobody had looked
+at, and a clean verdict over an unattacked surface repeats the failure that
+produced this table in a corner nobody was watching.
 
 Two things about this record matter more than the count:
 
-1. **The accounting module has produced a critical in every round since it was
-   first attacked — rounds 2, 3, 4 and 5, four consecutive — and in rounds 2, 4
-   and 5 the critical was introduced by the repair to the one before.** Round 1
-   found no accounting defect because round 1 attacked the release gate; the
-   count above is the ledger's, not the product's. Round 2's eligibility
-   override was added to stop a short-stacked hand
-   being unrecordable, and it turned a loud refusal into a quiet elevenfold
-   overpayment — the worse of the two failures. A repair in this module is not
-   evidence that the module is now correct.
+1. **The accounting module produced a critical in every round from 2 through 5 —
+   four consecutive — and in rounds 2, 4 and 5 the critical was introduced by the
+   repair to the one before.** Round 1 found no accounting defect because round 1
+   attacked the release gate. Round 6 found one more, and it was not in the round's
+   own list: a live blind marked dead silenced the blind-structure refusal on any
+   hand with no declared structure, which is every hand migrated from schema 19.
+   The module's honest status is still not-yet-caught rather than correct, its most
+   recent repair (`1f8f01d`) reverses the ruling made by the commit before it, and
+   the round-6 repair could only close the form of the defect that states two
+   contradicting facts — the one-fact form still moves chips and is item 6. A
+   repair in this module is not evidence that the module is now correct.
 2. **Every one of these criticals passed every gate the product has.** Chips were
    conserved, so the hand balanced; no legality rule looks at eligibility, so it
    was legal; the declared-award cross-check compares the operator's award against
-   the product's own derived payout, so agreeing with the wrong number on screen
-   is what made it reconcile. The gates are not independent of the code they are
-   checking, and that is why the stopping rule is two consecutive clean rounds
-   with fresh agents rather than a green suite.
+   the product's own derived payout, so agreeing with the wrong number on screen is
+   what made it reconcile. The gates are not independent of the code they are
+   checking, and that is why the stopping rule is two consecutive clean rounds with
+   fresh agents rather than a green suite.
 
-Round 6 is the first round eligible to count, once no further change lands.
+Round 7 is the first round eligible to count, once no further change lands.
 Repairs land *before* the next round starts, and any code, schema, dependency or
 release-configuration change between two rounds resets the counter.
 # Final local/private-beta acceptance sequence

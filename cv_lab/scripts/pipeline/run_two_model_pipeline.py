@@ -113,7 +113,19 @@ def _detect_regions(model, img, *, conf: float, imgsz: int, iou: float, device: 
 
 def _sample_times(container, stream, start: float, end: float, interval: float,
                   stats: dict | None = None):
-    """Yield (t_seconds, bgr_image) sampled every `interval`s via seek.
+    """Yield (t_seconds, bgr_image) for frames sampled every `interval`s via seek.
+
+    ``t_seconds`` is the emitted frame's own presentation timestamp, not the
+    time the sampler asked for. Seeking to t returns the first frame at or after
+    t, which on a variable-rate recording can be seconds later; stamping that
+    picture with t moves it backwards in time and closes the hole it came out
+    of. The spine measures ``prior_gap_s`` as the difference between consecutive
+    state times, so a series shifted this way reports the pair straddling a real
+    unobserved stretch as one ordinary interval apart. That silently disarms
+    every refusal keyed on coverage -- ``mid_hand_coverage_gap``, the
+    roster-shrink and continuous-presence refusals -- and a hand nobody watched
+    exports as complete. Reporting the true timestamp leaves the hole visible,
+    which is what the downstream refusals are there to read.
 
     Sampling stops at the end of the decodable stream, not at ``end``. Past the
     last frame the decoder has nothing left to return, and the loop below used
@@ -129,10 +141,7 @@ def _sample_times(container, stream, start: float, end: float, interval: float,
     is two real observations, while one decoded frame answering two sample times
     is one observation reported twice. Variable-rate screen recordings emit no
     frame at all while the screen is static, so on those the gap between
-    consecutive frames can exceed the sampling interval. The skipped times leave
-    a gap in the emitted series, which is the honest record -- nothing was
-    observed at those times -- and the spine already reads gaps as unobserved
-    stretches rather than as continuity.
+    consecutive frames can exceed the sampling interval.
 
     ``stats`` collects what the sampler did: how many times were requested, how
     many frames were emitted, how many requested times were answered by an
@@ -150,12 +159,13 @@ def _sample_times(container, stream, start: float, end: float, interval: float,
         counts["requested"] += 1
         container.seek(int(t / stream.time_base), stream=stream)
         frame = None
-        reached_t = False
+        observed_t = None
         for frame in container.decode(stream):
-            if float(frame.pts * stream.time_base) >= t:
-                reached_t = True
+            candidate = float(frame.pts * stream.time_base)
+            if candidate >= t:
+                observed_t = candidate
                 break
-        if frame is None or not reached_t:
+        if frame is None or observed_t is None:
             # No frame at or after t: the stream ends before this sample time.
             counts["ended_at"] = t
             return
@@ -165,7 +175,7 @@ def _sample_times(container, stream, start: float, end: float, interval: float,
             continue
         last_pts = frame.pts
         counts["emitted"] += 1
-        yield t, frame.to_ndarray(format="bgr24")
+        yield observed_t, frame.to_ndarray(format="bgr24")
         t += interval
 
 

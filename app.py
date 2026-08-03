@@ -18,6 +18,7 @@ from poker_tracker.coaching.coaching_prompts import (
     build_hand_review_prompt,
     build_session_review_prompt,
 )
+from poker_tracker.coaching.grounding import UNGROUNDED_STALE_PREFIX
 from poker_tracker.coaching.hand_history import format_hand_history
 from poker_tracker.coaching.llm_providers import (
     LLMProviderError,
@@ -67,7 +68,7 @@ from poker_tracker.math.ev import (
     semi_bluff_break_even_fold_frequency,
     semi_bluff_ev,
 )
-from poker_tracker.math.icm import icm_equities, icm_risk_premium
+from poker_tracker.math.icm import icm_equities, icm_risk_premium_range
 from poker_tracker.math.pot_odds import (
     break_even_bluff_frequency,
     format_percentage,
@@ -2194,7 +2195,7 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
             f"Hand #{forced_hand.hand_number} is not approved for study yet. "
             "Finish editing and validation on Import — Study is study-only."
         )
-        _offer_frame_validation_link(db, forced_hand)
+        _offer_frame_validation_link(db, forced_hand, offer_repair=True)
         show_study_inclusion_controls(db, forced_hand, force_open=True)
         _render_leave_forced_study_hand(forced_hand, hand_session)
         return
@@ -2253,7 +2254,7 @@ def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
             "This approved hand picked up new trust blockers. "
             "Return to Import validation to edit or resolve issues."
         )
-        _offer_frame_validation_link(db, hand)
+        _offer_frame_validation_link(db, hand, offer_repair=True)
     render_study_hand_navigation(ordered, hand, hand_session)
 
     with st.container(key="study_workspace"):
@@ -3720,6 +3721,33 @@ def show_correction_history(
             st.caption(f"Changed evidence · {', '.join(changed) or 'new/deleted row'}")
 
 
+def _no_current_coaching_detail(stale_reviews: list) -> str:
+    """Why there is no current review, read off the row rather than assumed.
+
+    ``is_stale`` carries two causes and the writer records which one on
+    ``stale_reason``. This line used to name a hand change unconditionally, so a
+    review rejected by its own grounding check -- nothing about the hand
+    changed -- sent the operator looking for a correction to undo, while the
+    readiness blocker on the same page said the opposite.
+    """
+
+    if not stale_reviews:
+        return "Generate a post-session review below."
+    governing = max(stale_reviews, key=lambda review: review.created_at)
+    recorded = (governing.stale_reason or "").strip()
+    if recorded.startswith(UNGROUNDED_STALE_PREFIX):
+        return (
+            "The saved review asserted facts its own prompt does not support "
+            "and was rejected. Rerun the provider; no correction is needed."
+        )
+    if recorded:
+        return "The saved review is stale because the hand or its session changed."
+    return (
+        "The saved review is marked not current and does not record what made "
+        "it stale. Rerun the provider."
+    )
+
+
 def show_study_coach_review(
     db: PokerDatabase,
     session: Session,
@@ -3744,11 +3772,7 @@ def show_study_coach_review(
     else:
         empty_state(
             "No current coaching review",
-            (
-                "The saved review is stale because the hand changed."
-                if stale_reviews
-                else "Generate a post-session review below."
-            ),
+            _no_current_coaching_detail(stale_reviews),
         )
     if stale_reviews:
         st.warning(
@@ -3844,11 +3868,17 @@ def show_study_coach_review(
         # the ledger IS legal and balanced, which is why a dependence could be
         # measured at all, and the action the operator needs is in a different
         # panel from the one this sentence used to send them to.
+        #
+        # The destination is named as it is reached, and offered as a button
+        # below: there is no "Summary" tab anywhere in Study, so the sentence
+        # that used to name one sent the operator looking for a screen the
+        # product does not have.
         st.warning(
             "Coaching is disabled until you confirm the declared settlement "
-            "assumptions this hand's reconciliation rests on, in Summary → "
-            "Accounting reconciliation."
+            "assumptions this hand's reconciliation rests on, on Import under "
+            "Other fixes → Accounting reconciliation."
         )
+        _offer_hand_repair_link(db, hand, key_suffix="_study_coach")
     elif not is_authoritative:
         st.warning(
             "Reconcile a legal, balanced ledger before generating coaching from this hand."
@@ -5375,6 +5405,11 @@ def show_import_workspace(db: PokerDatabase, session: Session | None) -> None:
                 "Pick a session below, or create one with a played date before importing.",
             )
             create_session_form(db, form_key="create_import_session")
+            return
+        # A hand pinned for repair replaces the recording panel rather than
+        # sitting beside it: both hosts draw the same editors under the same
+        # widget keys, so rendering both is a duplicate-key crash.
+        if render_pinned_hand_repair(db, session):
             return
         show_video_processing(db, session)
 
@@ -7734,24 +7769,48 @@ def _seat_index_for_action(
     action: Action,
     frame_context: ValidationFrameContext,
 ) -> int | None:
-    """Seat number for a saved row, via the timeline hand's player list.
+    """Seat number for a saved row: the stored seat first, then the timeline.
 
-    Player name is the stronger key, so it is resolved across every player
-    before falling back to position — otherwise an earlier player's matching
-    position outranks a later player's matching name.
+    Every frame-level claim on a row -- whether the seat held cards, whose bet
+    box was refused, whether the stack reads post-action, and the one message
+    that instructs a DELETE -- is computed against this seat. Getting it wrong
+    does not degrade the explanation, it points the operator at a different
+    seat's frame evidence under this row's heading.
+
+    The saved hand's own ``player_key -> seat_index`` is consulted first
+    because it is a stored fact rather than a match. Matching the row's
+    CURRENT name and position back into the frozen timeline roster is a guess,
+    and one the product can make wrong in a single form submission:
+    ``update_hand_player`` rewrites the new name AND position onto every one of
+    that seat's action rows, so renaming a seat and correcting its position
+    together leaves rows whose name matches no timeline player and whose
+    position names a DIFFERENT timeline seat.
+
+    The timeline fallback stays for rows saved before seats were stored, and
+    now refuses an ambiguous roster instead of taking the first match, which is
+    the rule every other resolver in this module already follows.
     """
 
+    stored_seat = frame_context.seat_by_player_key.get(action.player_key or "")
+    if stored_seat is not None:
+        return int(stored_seat)
     players = frame_context.timeline_hand.get("players") or []
-    for player in players:
-        name = str(player.get("player_name") or "")
-        if action.player_name and name and name == action.player_name:
-            seat = player.get("seat")
-            return None if seat is None else int(seat)
-    for player in players:
-        position = str(player.get("position") or "")
-        if action.position and position and position == action.position:
-            seat = player.get("seat")
-            return None if seat is None else int(seat)
+
+    def _unique_seat(key: str, value: str) -> int | None:
+        seats = {
+            int(player["seat"])
+            for player in players
+            if str(player.get(key) or "") == value and player.get("seat") is not None
+        }
+        return next(iter(seats)) if len(seats) == 1 else None
+
+    if action.player_name:
+        # A name the roster does not know means this row's identity has been
+        # rewritten, and position is a role rather than an identity: falling
+        # through to it is what let a re-seated row answer to another seat.
+        return _unique_seat("player_name", action.player_name)
+    if action.position:
+        return _unique_seat("position", action.position)
     return None
 
 
@@ -9304,6 +9363,44 @@ def show_outs_tool() -> None:
     )
 
 
+def _icm_risk_premium_readout(
+    stacks: list[float],
+    payouts: list[float],
+    hero_index: int,
+    risk_amount: float,
+) -> tuple[str, str]:
+    """The risk premium as the span it is, plus what the span does not bound.
+
+    The cost of losing the chips genuinely depends on which opponent takes them,
+    so a single figure under prose reading "prize equity lost" states one of
+    several answers as though it were the only one. The screen has room for the
+    span and for who sits at each end, so it shows them.
+
+    The span covers single winners only. Chips split between several opponents
+    -- a multiway all-in with side pots -- can cost Hero more than its top end,
+    so the help says so rather than letting two numbers read as bounds.
+    """
+    span = icm_risk_premium_range(stacks, payouts, hero_index, risk_amount)
+    cheapest = min(span.by_opponent, key=lambda seat: (span.by_opponent[seat], seat))
+    dearest = max(span.by_opponent, key=lambda seat: (span.by_opponent[seat], -seat))
+    if f"{span.low:.2f}" == f"{span.high:.2f}":
+        value = f"{span.high:.2f}"
+        detail = "Every opponent costs Hero the same here."
+    else:
+        value = f"{span.low:.2f} – {span.high:.2f}"
+        detail = (
+            f"Cheapest if player {cheapest + 1} wins the chips, "
+            f"dearest if player {dearest + 1} does."
+        )
+    help_text = (
+        "Prize equity Hero loses, by which opponent wins the chips. "
+        f"{detail} Compare against the prize equity gained by winning the same "
+        "pot — the gap is the ICM risk premium. Chips split between several "
+        "opponents can cost more than the top of this range."
+    )
+    return value, help_text
+
+
 def show_icm_tool() -> None:
     st.caption(
         "Malmuth-Harville ICM: converts tournament chip stacks into prize equity. "
@@ -9345,15 +9442,10 @@ def show_icm_tool() -> None:
         step=100.0,
     )
     if risk_amount > 0 and risk_amount < max_risk:
-        premium = icm_risk_premium(stacks, payouts, int(hero_seat) - 1, risk_amount)
-        st.metric(
-            "ICM cost of losing those chips",
-            f"{premium:.2f}",
-            help=(
-                "Prize equity lost if Hero loses this many chips. Compare against the prize "
-                "equity gained by winning the same pot — the gap is the ICM risk premium."
-            ),
+        value, help_text = _icm_risk_premium_readout(
+            stacks, payouts, int(hero_seat) - 1, risk_amount
         )
+        st.metric("ICM cost of losing those chips", value, help=help_text)
 
 
 def show_coach_review(db: PokerDatabase, session: Session) -> None:
@@ -9446,10 +9538,11 @@ def show_hand_coach_review(
     if unattested_assumption_dependence(hand, accounting):
         st.warning(
             "Coaching is disabled until you confirm the declared settlement "
-            "assumptions this hand's reconciliation rests on, in Study → Summary "
-            "→ Accounting reconciliation. Until then its pot, rake, and hero "
-            "result are not established by the recording."
+            "assumptions this hand's reconciliation rests on, on Import under "
+            "Other fixes → Accounting reconciliation. Until then its pot, rake, "
+            "and hero result are not established by the recording."
         )
+        _offer_hand_repair_link(db, hand, key_suffix="_settings_coach")
     elif accounting is None or not accounting.is_authoritative:
         st.warning(
             "Coaching is disabled until the completed hand has a legal, balanced reconciliation."
@@ -10081,8 +10174,115 @@ def _show_live_cv_job_status(db: PokerDatabase, video_id: int) -> None:
     st.caption("Updating automatically — you can leave this page open.")
 
 
-def _offer_frame_validation_link(db: PokerDatabase, hand: Hand) -> None:
-    """Study can jump to Import frame review without hunting the sidebar path."""
+HAND_REPAIR_STATE_KEY = "import_repair_hand_id"
+
+
+def open_hand_repair_workspace(hand: Hand) -> None:
+    """Pin Import to one hand's repair surface and go there.
+
+    Every control that clears a trust blocker -- cards, players, actions, the
+    blind and ante declarations, settlement assumptions, source warnings and
+    debugging issues -- is hosted by ``render_validation_edit_and_approve``,
+    whose only other caller hangs off a completed reconstruction job whose
+    timeline is still on disk. A manually entered hand, or a reconstructed one
+    whose recording was later deleted, therefore read blockers naming actions
+    no screen in the product offered. This route reaches the same workspace
+    from the hand alone.
+    """
+
+    if hand.id is None:
+        return
+    if hand.session_id is not None:
+        _activate_session(hand.session_id)
+    st.session_state[HAND_REPAIR_STATE_KEY] = hand.id
+    navigate_to(Page.IMPORT)
+
+
+def _offer_hand_repair_link(
+    db: PokerDatabase,
+    hand: Hand,
+    *,
+    key_suffix: str = "",
+) -> None:
+    """The button that makes a refusal's clearing action reachable from it.
+
+    ``key_suffix`` because one screen can carry more than one refusal that this
+    same button clears -- a readiness blocker at the top and an unconfirmed
+    settlement assumption inside the coach tab -- and two Streamlit buttons
+    sharing a key is a crash, not a duplicate.
+    """
+
+    if hand.id is None:
+        return
+    if st.button(
+        f"Fix hand #{hand.hand_number} on Import",
+        key=f"open_hand_repair_{hand.id}{key_suffix}",
+        width="stretch",
+        help=(
+            "Cards, players, actions, blind and ante declarations, settlement "
+            "assumptions, source warnings and debugging issues for this hand."
+        ),
+    ):
+        open_hand_repair_workspace(hand)
+        st.rerun()
+
+
+def render_pinned_hand_repair(db: PokerDatabase, session: Session) -> bool:
+    """Draw the pinned hand's repair workspace, or report that there is none.
+
+    Returns whether it drew, because the caller must not also render the
+    per-video reconstruction review: that surface hosts the same editors under
+    the same Streamlit keys, and two hosts in one render is a duplicate-key
+    crash rather than a second copy.
+    """
+
+    hand_id = st.session_state.get(HAND_REPAIR_STATE_KEY)
+    if not isinstance(hand_id, int):
+        return False
+    hand = db.fetch_hand(hand_id)
+    if hand is None:
+        st.session_state.pop(HAND_REPAIR_STATE_KEY, None)
+        st.warning(
+            "The hand you opened for repair no longer exists. "
+            "Showing this session's recordings instead."
+        )
+        return False
+    if session.id is not None and hand.session_id != session.id:
+        # Switching sessions in the sidebar is how an operator leaves this
+        # surface, so it releases the pin rather than dragging a foreign
+        # session's hand under this session's heading.
+        st.session_state.pop(HAND_REPAIR_STATE_KEY, None)
+        return False
+    st.markdown(f"### Repairing hand #{hand.hand_number}")
+    st.caption(
+        "Opened from this hand rather than from a recording, so no frame "
+        "evidence is shown here. Everything that clears a trust check is below."
+    )
+    if st.button(
+        "Back to recordings",
+        key=f"leave_hand_repair_{hand.id}",
+        width="stretch",
+    ):
+        st.session_state.pop(HAND_REPAIR_STATE_KEY, None)
+        st.rerun()
+    render_validation_edit_and_approve(
+        db, hand, frames_validated=False, frame_context=None
+    )
+    return True
+
+
+def _offer_frame_validation_link(
+    db: PokerDatabase,
+    hand: Hand,
+    *,
+    offer_repair: bool = False,
+) -> None:
+    """Study can jump to Import frame review without hunting the sidebar path.
+
+    ``offer_repair`` adds the hand-scoped repair route beside the frame link.
+    Callers that are already inside that workspace leave it off, because a
+    button back to the surface drawing it is not a way out of anything.
+    """
     if hand.session_id is None:
         return
     videos = db.fetch_videos(session_id=hand.session_id)
@@ -10090,6 +10290,10 @@ def _offer_frame_validation_link(db: PokerDatabase, hand: Hand) -> None:
         st.caption(
             "Frame validation lives on Import once a recording is attached to this session."
         )
+        # No recording means no reconstruction review, which used to mean no
+        # host for the editors either. The repair route does not need one.
+        if offer_repair:
+            _offer_hand_repair_link(db, hand)
         return
     job_id = job_id_from_hand_notes(hand.notes)
     preferred = videos[0]
@@ -10141,6 +10345,12 @@ def _offer_frame_validation_link(db: PokerDatabase, hand: Hand) -> None:
         navigate_to(Page.IMPORT)
         flash("Opened Import frame validation. Progress is already saved per job.")
         st.rerun()
+    # A recording existing is not the same as a reconstruction review existing:
+    # the editors only appear there once a completed job's timeline is still on
+    # disk and still names this hand. The repair route is offered either way so
+    # the blocker's clearing action is reachable from the blocker.
+    if offer_repair:
+        _offer_hand_repair_link(db, hand)
 
 
 def _choose_frame_review_job(db: PokerDatabase, video_id: int, completed_jobs: list):
@@ -10278,6 +10488,31 @@ def _render_import_rollback_point(db: PokerDatabase, job_id: int) -> None:
         "No hand from this job has been imported yet. A database snapshot is "
         "written before the first one lands, and the import is refused if it "
         "cannot be written."
+    )
+
+
+def draft_review_caption(db: PokerDatabase, hand: Hand) -> str:
+    """The one-line status above the frame viewer, computed rather than read.
+
+    "Approved for Study." used to come from ``review_status`` alone, so a hand
+    marked reviewed that later picked up a blocker -- the ordinary state after
+    the v20 migration, and after any edit that raises one -- was captioned
+    approved at the top of the very screen whose fix panel listed the blockers
+    below it. Both statements now come from the same readiness composition, at
+    the cost of one extra reconciliation for the single open hand.
+    """
+
+    if hand.review_status != "reviewed":
+        return "Draft ready — edit beside frames; finish with no open issues for Study."
+    accounting, accounting_error = _reconcile_cached(db, hand.id, None)
+    readiness = hand_study_readiness(
+        db, hand, accounting, accounting_error, user_confirmed=True
+    )
+    if readiness.is_ready:
+        return "Approved for Study."
+    return (
+        f"Marked reviewed, but {len(readiness.blockers)} trust check(s) are "
+        "failing — held out of Study until they clear."
     )
 
 
@@ -10543,12 +10778,7 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
                 related_job_ids=related_jobs,
             )
         if db_hand is not None:
-            if db_hand.review_status == "reviewed":
-                st.caption("Approved for Study.")
-            else:
-                st.caption(
-                    "Draft ready — edit beside frames; finish with no open issues for Study."
-                )
+            st.caption(draft_review_caption(db, db_hand))
             # Layout profile, its supported flag and the model versions, on the
             # screen where the operator is deciding whether to believe this hand.
             # Every one of these fields was recorded by the pipeline and rendered
@@ -10765,6 +10995,11 @@ def show_reconstruction_evidence_review(db: PokerDatabase, job) -> None:
                     ),
                     default=None,
                 ),
+                seat_by_player_key={
+                    player.player_key: player.seat_index
+                    for player in db.fetch_players_by_hand(db_hand.id)
+                    if player.player_key and player.seat_index is not None
+                },
             ),
         )
 
@@ -11071,9 +11306,20 @@ def show_legacy_frame_extraction(db: PokerDatabase, video: VideoRecord) -> None:
     show_frame_preview(frames)
 
     with st.expander("Danger zone: delete this video"):
+        # "Hands and sessions are unaffected" was true of the rows and false of
+        # everything the operator would notice: the reconstruction jobs cascade,
+        # and with them the frame verdicts saved against them and the evidence
+        # review that explains why each row was read the way it was. The hands
+        # survive with their provenance pointing at files that no longer exist.
         st.warning(
-            "Removes the stored video file, all extracted frames, and job history. "
-            "Hands and sessions are unaffected. This cannot be undone."
+            f"Deleting **{video.original_filename}** removes the stored file, "
+            "every extracted frame, this recording's reconstruction jobs, and "
+            "the frame verdicts you saved against them. Hands and sessions "
+            "imported from it are kept, but they lose their frame evidence and "
+            "the reconstruction review that shows it — repair them with "
+            "\"Fix hand #N on Import\", offered from Study and from the hand's "
+            "blockers, which opens the same editors without a recording. "
+            "No rollback snapshot is written; this cannot be undone."
         )
         confirm_video = st.checkbox(
             "I understand this permanently deletes the video and its files.",

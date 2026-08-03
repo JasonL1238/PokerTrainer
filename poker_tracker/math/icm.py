@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-# Malmuth-Harville is factorial in paid places; cap field size to keep the
-# recursion tractable.
+from dataclasses import dataclass
+
+# The Malmuth-Harville recursion memoizes on the set of surviving players, so it
+# costs O(2^n * n); cap the field size to keep that tractable.
 _MAX_PLAYERS = 10
 
 
@@ -40,29 +42,125 @@ def icm_equities(stacks: list[float], payouts: list[float]) -> list[float]:
     return [result.get(i, 0.0) for i in range(n)]
 
 
+@dataclass(frozen=True)
+class IcmRiskPremiumRange:
+    """Hero's risk premium across the opponents who could win the risked chips.
+
+    `by_opponent` maps each opponent's index in `stacks` to the premium Hero
+    pays if that opponent wins the chips; `low` and `high` are the smallest and
+    largest of those. The span is over single winners only - see
+    `icm_risk_premium` for what that does and does not cover.
+    """
+
+    low: float
+    high: float
+    by_opponent: dict[int, float]
+
+
+def icm_risk_premium_by_opponent(
+    stacks: list[float],
+    payouts: list[float],
+    hero_index: int,
+    risk_amount: float,
+) -> dict[int, float]:
+    """Return the premium Hero pays for each opponent who could win the chips."""
+    _validate_risk(stacks, payouts, hero_index, risk_amount)
+    current = icm_equities(stacks, payouts)[hero_index]
+    return {
+        opponent: current - _equity_after_transfer(
+            stacks, payouts, hero_index, risk_amount, opponent
+        )
+        for opponent in range(len(stacks))
+        if opponent != hero_index
+    }
+
+
+def icm_risk_premium_range(
+    stacks: list[float],
+    payouts: list[float],
+    hero_index: int,
+    risk_amount: float,
+) -> IcmRiskPremiumRange:
+    """Return the low/high risk premium over the opponent who wins the chips.
+
+    The answer genuinely depends on who Hero pays, so this is the shape callers
+    should display when they can show more than one number.
+    """
+    by_opponent = icm_risk_premium_by_opponent(stacks, payouts, hero_index, risk_amount)
+    return IcmRiskPremiumRange(
+        low=min(by_opponent.values()),
+        high=max(by_opponent.values()),
+        by_opponent=by_opponent,
+    )
+
+
 def icm_risk_premium(
     stacks: list[float],
     payouts: list[float],
     hero_index: int,
     risk_amount: float,
+    *,
+    winner_index: int | None = None,
 ) -> float:
-    """Return the $EV cost of Hero losing `risk_amount` chips.
+    """Return the $EV cost to Hero of losing `risk_amount` chips.
 
-    Formula: icm_equities(current)[hero] minus Hero's equity after reducing
-    Hero's stack by `risk_amount` (the lost chips are removed from play, e.g.
-    shipped to an opponent covered elsewhere in the analysis).
+    Chips are conserved: what Hero loses is added to the opponent who wins it.
+    ICM equity is a function of stack *shares*, so deleting the risked chips
+    from the table instead shrinks the denominator and inflates Hero's
+    post-loss share. That formulation reports a premium below every outcome the
+    tournament can produce - on [5000, 3000, 2000] paying [50, 30, 20] it
+    returns 1.57 when the real answer is between 2.73 and 2.96 - so "you cannot
+    know which opponent won the chips" is the reason it is wrong, not a defence
+    of it.
+
+    Which opponent wins the chips does change the answer, so with
+    `winner_index` this is exact for that opponent, and without it the largest
+    single-winner premium is returned. That default is deliberate: it is
+    conservative for a risk decision, and it is a premium some real outcome
+    produces, which an average over opponents would not be. Callers that can
+    render a span should use `icm_risk_premium_range`.
+
+    Two things this does not model, both of which can move the true premium
+    outside the single-winner span. Hero's chips may be split between several
+    opponents in a multiway all-in, and a split can cost Hero more than any
+    single winner would. An opponent shorter than `risk_amount` cannot win all
+    of it in one pot, so their entry describes a run of pots rather than one
+    confrontation.
     """
+    by_opponent = icm_risk_premium_by_opponent(stacks, payouts, hero_index, risk_amount)
+    if winner_index is None:
+        return max(by_opponent.values())
+    if winner_index not in by_opponent:
+        raise ValueError("winner_index must be an opponent's index into stacks.")
+    return by_opponent[winner_index]
+
+
+def _equity_after_transfer(
+    stacks: list[float],
+    payouts: list[float],
+    hero_index: int,
+    risk_amount: float,
+    winner_index: int,
+) -> float:
+    moved = list(stacks)
+    moved[hero_index] -= risk_amount
+    moved[winner_index] += risk_amount
+    return icm_equities(moved, payouts)[hero_index]
+
+
+def _validate_risk(
+    stacks: list[float],
+    payouts: list[float],
+    hero_index: int,
+    risk_amount: float,
+) -> None:
+    _validate_stacks_and_payouts(stacks, payouts)
     if hero_index < 0 or hero_index >= len(stacks):
         raise ValueError("hero_index must be a valid index into stacks.")
     if risk_amount <= 0:
         raise ValueError("risk_amount must be positive.")
     if risk_amount >= stacks[hero_index]:
         raise ValueError("risk_amount must be less than the hero stack.")
-    current = icm_equities(stacks, payouts)[hero_index]
-    reduced_stacks = list(stacks)
-    reduced_stacks[hero_index] -= risk_amount
-    reduced = icm_equities(reduced_stacks, payouts)[hero_index]
-    return current - reduced
 
 
 def _validate_stacks_and_payouts(stacks: list[float], payouts: list[float]) -> None:

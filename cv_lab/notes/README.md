@@ -41,10 +41,14 @@ the current plan and this directory holds the history:
   regression inventory round by round, and the gaps as they stood when round 15
   closed. It ends with an explicit list of its own statements that later work has
   superseded.
-- `17` is the whole-product record: rounds 1 through 3 of the two-agent release
-  loop. Round 1 broke the release gate's own reporting; rounds 2 and 3 each
-  landed criticals in pot accounting, and in both cases at least one was
-  introduced by the repair to the round before.
+- `17` is the whole-product record: rounds 1 through 6 of the two-agent release
+  loop. Round 1 broke the release gate's own reporting; rounds 2 through 5 each
+  landed criticals in pot accounting, and in rounds 2, 4 and 5 the critical was
+  introduced by the repair to the round before. Round 6 found no accounting
+  defect and instead found six surfaces asserting something about themselves they
+  did not check — a corpus seal read off a declaration, a frame series shifted
+  under a docstring calling it honest, a tournament metric computed without the
+  input it needs, and a blocker naming a screen nothing draws.
 
 Status and TODO statements in an earlier finding are historical and may be
 completed or superseded by a later finding. Use the repository root `PLAN.md`

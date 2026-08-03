@@ -53,9 +53,41 @@ def _validation_root() -> Path | None:
 
 
 def _normalize_logical_name(logical_name: str) -> str:
-    """Collapse ``.`` / redundant separators so split-integrity cannot be aliased."""
+    """Comparison key for a recording path: ``.``/redundant separators collapsed,
+    then case folded because the vault may sit on a case-insensitive filesystem
+    where ``Locked/Sealed.mov`` and ``locked/sealed.mov`` are one file.
+
+    Path text is only half of a recording's identity. Two unrelated paths can
+    hold the same bytes, so split integrity compares declared digests as well;
+    this key alone cannot carry the seal.
+    """
     normalized = Path(os.path.normpath(logical_name))
-    return normalized.as_posix()
+    return normalized.as_posix().casefold()
+
+
+def _group_by_identity(
+    recordings: list[dict[str, Any]], field: str
+) -> dict[str, list[dict[str, Any]]]:
+    """Group recording entries by one identity field, ignoring absent values.
+
+    A null digest is the absence of an identity claim, not an identity shared
+    with every other null, so those entries are left out of the grouping.
+    """
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for entry in recordings:
+        value = entry.get(field)
+        if isinstance(value, str) and value:
+            groups.setdefault(value, []).append(entry)
+    return groups
+
+
+# Content equality is what a digest can answer. These are the ways one recording
+# can reach two splits without the digests colliding, named in the report so a
+# reader treats a clean seal as the narrow finding it is.
+SEAL_DOES_NOT_COVER: tuple[str, ...] = (
+    "re-encoded, trimmed, or otherwise re-rendered copies of a locked recording",
+    "near-duplicate or adjacent segments captured from the same source session",
+)
 
 
 def check_corpus(
@@ -70,9 +102,12 @@ def check_corpus(
     required coverage tags. Keep it true for release; tests may disable it when
     checking schema plumbing on a tiny fixture corpus.
 
-    ``require_recording_files`` verifies SHA-256 of raw videos under
-    ``POKER_VALIDATION_ROOT``. Public CI leaves this false; local release runs
-    set it true.
+    ``require_recording_files`` verifies SHA-256 of the release-scored raw videos
+    under ``POKER_VALIDATION_ROOT`` (plumbing fixtures are skipped) and demands a
+    declared digest for every locked_test case, since the seal is checked by
+    content. Public CI leaves this false; local release runs set it true. With it
+    false the split checks compare what the manifest declares, and
+    ``stats["locked_seal"]`` says so rather than implying the bytes were read.
     """
     result = CorpusCheckResult(ok=True, exit_code=EXIT_OK)
     manifest_path = manifest_path.resolve()
@@ -161,11 +196,11 @@ def check_corpus(
     covered_tags: set[str] = set()
     seen_case_ids: set[str] = set()
     locked_used_for_tuning = False
-    recording_names_by_split: dict[str, set[str]] = {
-        "development": set(),
-        "validation": set(),
-        "locked_test": set(),
-    }
+    # One entry per case that declared a usable recording identity. Split
+    # integrity is decided from this list rather than from per-split name sets,
+    # because a recording is identified by its content and its path alike.
+    recordings: list[dict[str, Any]] = []
+    file_verified_case_ids: set[str] = set()
 
     for index, case in enumerate(cases):
         path = f"cases[{index}]"
@@ -204,7 +239,10 @@ def check_corpus(
             counts_toward_release = False
 
         split = case.get("split")
-        if split not in VALID_SPLITS:
+        # The isinstance guard is load-bearing: an unhashable value here (a list,
+        # say) makes the set test raise, and the gate would die with a traceback
+        # instead of reporting the malformed manifest as setup-invalid.
+        if not isinstance(split, str) or split not in VALID_SPLITS:
             result.fail(f"{path}.split", f"invalid split {split!r}", setup=True)
         elif counts_toward_release:
             split_counts[str(split)] += 1
@@ -245,6 +283,7 @@ def check_corpus(
             result.fail(f"{path}.recording", "recording object is required", setup=True)
             recording = {}
         logical_name = recording.get("logical_name")
+        normalized_name: str | None = None
         if not isinstance(logical_name, str) or not logical_name.strip():
             result.fail(
                 f"{path}.recording.logical_name",
@@ -267,10 +306,10 @@ def check_corpus(
                     "(no absolute paths or '..' segments)",
                     setup=True,
                 )
-            elif split in recording_names_by_split:
-                recording_names_by_split[str(split)].add(normalized_name)
+                normalized_name = None
 
         expected_sha = recording.get("sha256")
+        declared_digest: str | None = None
         if expected_sha is not None and (
             not isinstance(expected_sha, str) or len(expected_sha) != 64
         ):
@@ -279,13 +318,42 @@ def check_corpus(
                 "sha256 must be a 64-char hex digest or null",
                 setup=True,
             )
-        if require_recording_files and counts_toward_release:
-            if not isinstance(expected_sha, str) or len(expected_sha) != 64:
-                result.fail(
-                    f"{path}.recording.sha256",
-                    "recording.sha256 is required when --require-recordings is set",
-                    setup=True,
-                )
+        elif isinstance(expected_sha, str):
+            declared_digest = expected_sha.lower()
+        # A locked_test case needs a digest even when it is not release-scored:
+        # the seal is checked by content, and a locked recording with no declared
+        # content can only ever be compared by path.
+        digest_required = require_recording_files and (
+            counts_toward_release or split == "locked_test"
+        )
+        if digest_required and declared_digest is None:
+            seal_note = (
+                "; the locked_test seal is checked by content"
+                if split == "locked_test"
+                else ""
+            )
+            result.fail(
+                f"{path}.recording.sha256",
+                "recording.sha256 is required when --require-recordings is set"
+                + seal_note,
+                setup=True,
+            )
+
+        has_identity = bool(normalized_name or declared_digest)
+        if has_identity and isinstance(split, str) and split in VALID_SPLITS:
+            recordings.append(
+                {
+                    "case_id": str(case_id),
+                    "split": split,
+                    "logical_name": (
+                        logical_name if isinstance(logical_name, str) else None
+                    ),
+                    "name_key": normalized_name,
+                    "sha256": declared_digest,
+                    "counts_toward_release": bool(counts_toward_release),
+                    "used_for_tuning": tuning_flag,
+                }
+            )
 
         if (
             require_recording_files
@@ -311,17 +379,18 @@ def check_corpus(
                     f"recording file missing under validation root: {logical_name}",
                     setup=True,
                 )
-            elif (
-                video_path is not None
-                and isinstance(expected_sha, str)
-                and len(expected_sha) == 64
-            ):
+            elif video_path is not None and declared_digest is not None:
                 actual = sha256_file(video_path)
-                if actual != expected_sha.lower():
+                if actual != declared_digest:
                     result.fail(
                         f"{path}.recording.sha256",
                         f"recording hash mismatch for {logical_name}",
                     )
+                else:
+                    # Only these cases have had their declared digest confirmed
+                    # against bytes; the seal report distinguishes them from
+                    # cases whose digest is merely asserted by the manifest.
+                    file_verified_case_ids.add(str(case_id))
 
         truth_relpath = case.get("truth_relpath")
         if not isinstance(truth_relpath, str) or not truth_relpath.strip():
@@ -424,15 +493,99 @@ def check_corpus(
                 setup=True,
             )
 
-    leaked = recording_names_by_split["locked_test"] & (
-        recording_names_by_split["development"] | recording_names_by_split["validation"]
+    # PLAN.md splits by whole recording, so one recording reaching two splits is
+    # a breach whichever splits they are; when locked_test is one of them it is
+    # the seal itself. Path and digest are checked separately because either can
+    # be the only identity a manifest offers.
+    collisions: list[dict[str, Any]] = []
+    for kind in ("name_key", "sha256"):
+        for value, entries in sorted(_group_by_identity(recordings, kind).items()):
+            splits = sorted({entry["split"] for entry in entries})
+            case_ids = sorted({entry["case_id"] for entry in entries})
+            label = "logical_name" if kind == "name_key" else "sha256"
+            if len(splits) > 1:
+                collisions.append(
+                    {
+                        "identity": label,
+                        "value": value,
+                        "splits": splits,
+                        "case_ids": case_ids,
+                        "locked": "locked_test" in splits,
+                    }
+                )
+                if "locked_test" in splits:
+                    others = [s for s in splits if s != "locked_test"]
+                    result.fail(
+                        "split_integrity",
+                        f"locked_test seal broken: {label} shared with "
+                        + "/".join(others)
+                        + " (cases "
+                        + ", ".join(case_ids)
+                        + ")",
+                    )
+                    # development and validation ARE the tuning pool. A locked
+                    # recording found there was tuned against unless every case
+                    # holding it denies it outright; an undeclared flag is not a
+                    # denial, so it counts against the seal.
+                    if any(
+                        entry["used_for_tuning"] is not False
+                        for entry in entries
+                        if entry["split"] != "locked_test"
+                    ):
+                        locked_used_for_tuning = True
+                else:
+                    result.fail(
+                        "split_integrity",
+                        f"{label} shared across "
+                        + "/".join(splits)
+                        + " (cases "
+                        + ", ".join(case_ids)
+                        + "); split by whole recording",
+                    )
+            elif (
+                len(case_ids) > 1
+                and sum(1 for entry in entries if entry["counts_toward_release"]) > 1
+            ):
+                # Two scored cases over one recording inflate the session count,
+                # which is the number the release floors are checked against.
+                result.fail(
+                    "recording_uniqueness",
+                    f"{label} claimed by more than one release-scored case (cases "
+                    + ", ".join(case_ids)
+                    + "); each scored session must be a distinct recording",
+                    setup=True,
+                )
+
+    locked_entries = [e for e in recordings if e["split"] == "locked_test"]
+    locked_without_digest = sorted(
+        e["case_id"] for e in locked_entries if e["sha256"] is None
     )
-    if leaked:
-        result.fail(
-            "split_integrity",
-            "locked_test recordings also appear in development/validation: "
-            + ", ".join(sorted(leaked)),
-        )
+    breached = locked_used_for_tuning or any(c["locked"] for c in collisions)
+    # False with zero locked cases too: a check with no subject certifies
+    # nothing, and must not read as one that ran and found nothing wrong.
+    checked_by_content = bool(locked_entries) and not locked_without_digest
+    locked_seal = {
+        "locked_cases": len(locked_entries),
+        "checked_by_content": checked_by_content,
+        "digests_verified_against_files": bool(locked_entries)
+        and all(e["case_id"] in file_verified_case_ids for e in locked_entries),
+        "locked_cases_without_digest": locked_without_digest,
+        # A locked digest can only collide with a digest something else declared.
+        # Cases that declare none were compared by path alone, and the seal is
+        # exactly that much weaker for them.
+        "compared_cases_without_digest": sorted(
+            e["case_id"]
+            for e in recordings
+            if e["split"] != "locked_test" and e["sha256"] is None
+        ),
+        "cross_split_collisions": collisions,
+        # Tri-state on purpose. A corpus with no locked cases, or with locked
+        # cases nobody gave a digest, has a seal that could not be checked by
+        # content; ``true`` there would be a pass nobody earned. Only a breach
+        # actually found reads as false.
+        "intact": False if breached else (True if checked_by_content else None),
+        "does_not_cover": list(SEAL_DOES_NOT_COVER),
+    }
 
     missing_tags = [tag for tag in required_tags if tag not in covered_tags]
     result.stats = {
@@ -447,6 +600,20 @@ def check_corpus(
         "missing_coverage_tags": missing_tags,
         "minimums": minimums,
         "locked_used_for_tuning": locked_used_for_tuning,
+        # The digests the split checks ran on, carried into the report so a later
+        # reader can redo the intersection instead of trusting the flag above.
+        "recordings": [
+            {
+                "case_id": entry["case_id"],
+                "split": entry["split"],
+                "logical_name": entry["logical_name"],
+                "sha256": entry["sha256"],
+                "digest_verified": entry["case_id"] in file_verified_case_ids,
+                "counts_toward_release": entry["counts_toward_release"],
+            }
+            for entry in sorted(recordings, key=lambda e: (e["split"], e["case_id"]))
+        ],
+        "locked_seal": locked_seal,
     }
 
     if require_release_minimums:

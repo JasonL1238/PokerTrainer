@@ -13,6 +13,13 @@ exactly what a real idle table looks like.
 A wrong prediction that is visibly rejected is a coverage limitation. Repeated
 frames presented as distinct observations are not rejected by anything, so they
 are the other kind.
+
+The same shape reaches the times themselves. Every emitted frame used to be
+stamped with the time the sampler asked for rather than the time the picture was
+taken, so on a recording that encodes nothing while the screen is still, the
+frame seek returned from 10s was filed at 4s. The spine reads coverage as the
+difference between consecutive state times, and the shift moves the hole onto a
+stretch that was in fact observed.
 """
 
 from __future__ import annotations
@@ -84,10 +91,46 @@ def clip_3s(tmp_path: Path) -> Path:
     return path
 
 
+def _write_clip_at(path: Path, pts_list: list[int], rate) -> Path:
+    """A clip whose pictures sit at exactly ``pts_list`` on a 1s time base."""
+    container = av.open(str(path), mode="w")
+    stream = container.add_stream("mpeg4", rate=rate)
+    stream.width = stream.height = 64
+    stream.pix_fmt = "yuv420p"
+    stream.time_base = Fraction(1, 1)
+    for index, pts in enumerate(pts_list):
+        frame = av.VideoFrame.from_ndarray(_frame_image(index), format="rgb24")
+        frame.pts = pts
+        frame.time_base = Fraction(1, 1)
+        for packet in stream.encode(frame):
+            container.mux(packet)
+    for packet in stream.encode():
+        container.mux(packet)
+    container.close()
+    return path
+
+
 @pytest.fixture
 def clip_sparse(tmp_path: Path) -> Path:
     """5 frames, one every 2 seconds -- a screen recording of a static screen."""
     return _write_clip(tmp_path / "sparse.mp4", frames=5, gap_pts=2, rate=Fraction(1, 2))
+
+
+@pytest.fixture
+def clip_with_a_hole(tmp_path: Path) -> Path:
+    """A variable-rate recording: 4 frames a second apart, then nothing for 7s."""
+    return _write_clip_at(tmp_path / "hole.mp4", [0, 1, 2, 3, 10, 11, 12], rate=1)
+
+
+def _true_times_by_digest(path: Path) -> dict[str, float]:
+    """Decode the whole clip: sha256 of each picture -> its own timestamp."""
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        return {
+            hashlib.sha256(frame.to_ndarray(format="bgr24").tobytes()).hexdigest():
+                float(frame.pts * stream.time_base)
+            for frame in container.decode(stream)
+        }
 
 
 def _sample(path: Path, *, start: float, end: float, interval: float):
@@ -132,13 +175,20 @@ def test_one_decoded_frame_is_never_emitted_under_two_timestamps(clip_sparse):
     """A recording with a 2s gap between frames, sampled every 1s. Half the
     sample times resolve to a frame that was already emitted; emitting it again
     would report one observation as two, and the duplicates would then debounce
-    each other into a confirmed reading."""
+    each other into a confirmed reading.
+
+    This expected series used to read ``[0.0, 1.0, 3.0, 5.0, 7.0]``, which
+    pinned the frames as arriving one second before they did: the picture at 2s
+    answered the request made at 1s and was stamped 1.0. Every emitted frame is
+    stamped with its own timestamp, so the series is the frames' own 2s spacing.
+    """
     times, digests, stats = _sample(clip_sparse, start=0.0, end=9.0, interval=1.0)
 
     assert len(set(digests)) == len(digests) == 5
     assert stats["duplicate_times"] == 4
     assert stats["emitted"] == 5
-    assert times == [0.0, 1.0, 3.0, 5.0, 7.0]
+    assert times == [0.0, 2.0, 4.0, 6.0, 8.0]
+    assert times == [_true_times_by_digest(clip_sparse)[d] for d in digests]
 
 
 def test_a_sample_time_before_the_first_frame_does_not_stop_the_run(clip_3s):
@@ -148,6 +198,40 @@ def test_a_sample_time_before_the_first_frame_does_not_stop_the_run(clip_3s):
 
     assert times == [0.0, 0.1, 0.2]
     assert len(set(digests)) == 3
+
+
+def test_every_emitted_frame_carries_its_own_timestamp_not_the_requested_one(
+    clip_with_a_hole,
+):
+    """Joining each emitted picture back to its true presentation timestamp.
+
+    Seeking to 4s on this clip returns the picture taken at 10s, because nothing
+    was recorded in between. Stamping it 4.0 moved it six seconds back and
+    closed the hole it came out of.
+    """
+    times, digests, _stats = _sample(clip_with_a_hole, start=0.0, end=12.0, interval=1.0)
+    true_times = _true_times_by_digest(clip_with_a_hole)
+
+    assert [true_times[digest] for digest in digests] == times
+    assert times == [0.0, 1.0, 2.0, 3.0, 10.0, 11.0, 12.0]
+
+
+def test_the_unobserved_stretch_survives_as_a_gap_between_consecutive_states(
+    clip_with_a_hole,
+):
+    """The spine reads coverage as the difference between consecutive state
+    times, so the gap has to fall between the right two states, not merely
+    exist. Nothing was recorded between 3s and 10s. Labelling by request time
+    still produced one 7-second gap, but between 4s and 11s -- a stretch that
+    was in fact observed -- while the states covering 3s to 10s, which nobody
+    watched, read as one ordinary interval apart."""
+    times, _digests, _stats = _sample(
+        clip_with_a_hole, start=0.0, end=12.0, interval=1.0
+    )
+
+    unobserved = [(a, b) for a, b in zip(times, times[1:], strict=False) if b - a > 1.0]
+
+    assert unobserved == [(3.0, 10.0)]
 
 
 # --------------------------------------------------------------------------- #

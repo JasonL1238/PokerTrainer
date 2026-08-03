@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -124,13 +125,19 @@ def extract_frames_for_video(
                     f"Skipped duplicate frame {frame_index}",
                 )
                 continue
-            image_path = output_dir / f"frame_{frame_index:06d}_{int(timestamp * 1000):010d}ms.jpg"
-            cv2.imwrite(str(image_path), frame)
+            observed = _observed_timestamp(capture, frame_index, timestamp)
+            image_path = output_dir / f"frame_{frame_index:06d}_{int(observed * 1000):010d}ms.jpg"
+            # A write that failed and was counted anyway leaves a row pointing at
+            # a file that is not there, which reads downstream as an extracted
+            # frame rather than as a frame the run did not keep.
+            if not cv2.imwrite(str(image_path), frame):
+                errors.append(f"Could not write frame at {observed:.2f}s to {image_path}")
+                continue
             db.create_extracted_frame(
                 ExtractedFrame(
                     video_id=video_id,
                     job_id=job.id,
-                    timestamp_seconds=timestamp,
+                    timestamp_seconds=observed,
                     frame_index=frame_index,
                     image_path=str(image_path),
                 )
@@ -192,6 +199,31 @@ def select_representative_frames(frames: list[ExtractedFrame], limit: int = 12) 
     step = (len(frames) - 1) / (limit - 1)
     indexes = [round(index * step) for index in range(limit)]
     return [frames[index] for index in indexes]
+
+
+def _observed_timestamp(capture, frame_index: int, requested: float) -> float:
+    """Where the frame just read actually sits, falling back to what was asked for.
+
+    Seeking to a position returns the first frame at or after it, and on a
+    variable-rate screen recording that frame can be seconds later: nothing is
+    encoded while the screen is still. Storing it under the requested time moves
+    the picture backwards and closes the unobserved stretch it came out of, so a
+    span nobody watched reads as covered.
+
+    The decoder reports the position of the frame it returned, but a backend
+    with no timestamps reports zero for every frame. A frame past the first
+    cannot sit at zero, so that answer is not usable and the requested time --
+    which is at least what the seek asked the recording for -- stands instead.
+    """
+    try:
+        position_ms = float(capture.get(cv2.CAP_PROP_POS_MSEC))
+    except (TypeError, ValueError):
+        return requested
+    if not math.isfinite(position_ms) or position_ms < 0:
+        return requested
+    if position_ms == 0.0 and frame_index > 0:
+        return requested
+    return position_ms / 1000.0
 
 
 def _target_timestamps(

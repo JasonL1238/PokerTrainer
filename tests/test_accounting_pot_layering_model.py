@@ -522,8 +522,9 @@ def test_a_forced_post_is_dead_money_whatever_action_kind_carries_it(forced_bet_
 def test_a_dead_blind_the_recording_named_is_dead_even_with_no_post_status():
     """The two operator-facing fields cannot disagree with the silent default.
 
-    ``is_live_post`` defaults to True when a recording says nothing, and the hand
-    editor exposes "Forced post" and "Post status" as separate selectboxes. A row
+    ``is_live_post`` is None when a recording says nothing and an unstated status
+    reads as live, and the hand editor exposes "Forced post" and "Post status" as
+    separate selectboxes. A row
     spelled ``post_blind`` and typed ``dead_blind`` with the status left
     unspecified was therefore read as a live wager, which under the live-level
     model manufactured a live level out of a dead blind. Where the recording

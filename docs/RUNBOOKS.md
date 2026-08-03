@@ -125,6 +125,15 @@ Rules that are not negotiable:
 - Answer keys are committed; recordings are not. The manifest carries the hash
   of both so a silent edit to either is detectable.
 
+The seal check compares recording digests across splits, not only filenames, and
+`--require-recordings` makes it read the bytes; without that flag it compares what
+the manifest declares and `stats["locked_seal"]` says so. What a digest cannot
+answer is named in the report and is your responsibility: a re-encoded, trimmed or
+re-rendered copy of a locked recording, and a near-duplicate or adjacent segment
+captured from the same source session, are the same material to a model and
+different bytes to the check. Assign a whole session to one split and never split
+a session across two.
+
 To re-hash an edited answer key:
 
 ```bash

@@ -10,9 +10,13 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import FrameType
+from typing import Any
 
 from cv_lab.scripts.pipeline.export_yolo_card_hands_for_app import export_timeline
 from poker_tracker.maintenance.data_health import verify_snapshot
@@ -122,11 +126,74 @@ def _pipeline_device() -> str:
     return "cpu"
 
 
+_SignalHandler = Callable[[int, FrameType | None], Any] | int | signal.Handlers | None
+
+
 class JobCancelled(Exception):
     """Raised when the operator cancels an active reconstruction job."""
 
 
+def _raise_job_cancelled(signum: int, _frame: object) -> None:
+    raise JobCancelled(f"Stopped by signal {signum}.")
+
+
+@contextmanager
+def _cleanup_on_termination_signal() -> Iterator[None]:
+    """Turn SIGTERM/SIGINT into an exception so the cleanup in ``finally`` runs.
+
+    Cancelling a reconstruction sends SIGTERM to this worker's process group,
+    and CPython's default disposition for SIGTERM exits the interpreter without
+    unwinding. That skipped the one path ``_discard_partial_artifacts`` names in
+    its own docstring: a cancelled run left its partial timeline and one JPEG
+    per sampled second behind. Raising instead reaches the existing cancelled
+    branch and the existing ``finally``.
+
+    Best effort by design. ``cancel_processing_job`` allows two seconds before
+    SIGKILL, which is ample for the unlink and the tree removal but is not a
+    guarantee, and a signal handler can only be installed from the main thread
+    of the main interpreter -- the suite calls ``run_job`` in-process and is
+    left on the default disposition.
+    """
+
+    previous: dict[signal.Signals, _SignalHandler] = {}
+    for number in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous[number] = signal.signal(number, _raise_job_cancelled)
+        except (ValueError, OSError):
+            continue
+    try:
+        yield
+    finally:
+        for restored, handler in previous.items():
+            try:
+                signal.signal(restored, handler)
+            except (ValueError, OSError):
+                pass
+
+
 def run_job(
+    *,
+    job_id: int,
+    video_path: Path,
+    session_name: str,
+    db_path: Path,
+    target_session_id: int | None = None,
+    timeout_seconds: int | None = None,
+) -> int:
+    """Run one reconstruction, cleaning up after itself even when signalled."""
+
+    with _cleanup_on_termination_signal():
+        return _run_job(
+            job_id=job_id,
+            video_path=video_path,
+            session_name=session_name,
+            db_path=db_path,
+            target_session_id=target_session_id,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+def _run_job(
     *,
     job_id: int,
     video_path: Path,
@@ -191,7 +258,21 @@ def run_job(
         )
         require_playable_video(path)
         _heartbeat(db, job_id, 3, "Loading reconstruction models")
-        end_seconds = video.duration_seconds if video.duration_seconds else 86_400
+        # The window this run asks for, and whether it came from the recording
+        # at all. When ingest could not measure a duration the bound is a
+        # 24-hour ceiling, which is not the recording's length and must never be
+        # reported as though it were.
+        duration_measured = bool(video.duration_seconds)
+        end_seconds = video.duration_seconds if duration_measured else 86_400
+        window_note = (
+            f"sampling window requested 0–{end_seconds:g}s at 1s"
+            if duration_measured
+            else (
+                "sampling window requested 0–86400s at 1s because this "
+                "recording's duration was never measured, so the window is a "
+                "ceiling rather than the recording's length"
+            )
+        )
         command = [
             sys.executable,
             str(PIPELINE_SCRIPT),
@@ -255,10 +336,17 @@ def run_job(
             exported_count = int(
                 payload.get("cv_import_summary", {}).get("exported_hands", 0) or 0
             )
+            # The window is stated on the row because no other artifact carried
+            # it: the timeline summary, the export summary and this message all
+            # reported the same fields for a run that read the whole recording
+            # and one that read part of it. It says what was REQUESTED -- the
+            # sampler's own record of where it actually stopped is printed to
+            # the worker's log and is not readable from here, and a coverage
+            # claim this code cannot check is the thing it must not make.
             message = (
                 f"Ready for validation; {exported_count} hands exported for "
                 f"session #{destination.id} — add each when validated or as a "
-                f"draft; {backup_note}"
+                f"draft; {window_note}; {backup_note}"
             )
             current = db.fetch_processing_job(job_id)
             if current is not None and current.status in {"cancelling", "cancelled"}:
