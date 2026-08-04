@@ -955,14 +955,20 @@ def test_frequency_bars_render_the_denominator_they_are_a_share_of() -> None:
     assert 'aria-label="Big Pot: 1 of 400"' in large
 
 
-def test_the_three_history_deletions_snapshot_through_one_helper() -> None:
+def test_the_history_deletions_snapshot_through_one_helper() -> None:
     """One writer for rollback points, and one call site per deletion that uses it.
 
-    Scoped to what it actually covers: the three deletions that remove study
-    history a person produced — a session, a hand, an ROI calibration. Narrower
-    deletions in app.py (an action, a solver run, a solver range) are corrections
-    within a hand rather than removals of the hand, and are deliberately not in
-    this set; a future decision to cover them belongs in the list below.
+    Scoped to what it actually covers: the four deletions that remove study
+    history a person produced — a session, a hand, a recording, an ROI
+    calibration. Narrower deletions in app.py (an action, a solver run, a solver
+    range) are corrections within a hand rather than removals of the hand, and are
+    deliberately not in this set; a future decision to cover them belongs in the
+    list below.
+
+    ``db.delete_video(`` joined the list when the session's recording panel began
+    offering a delete. Before that there was one control, on Import, and it wrote
+    no snapshot at all — so the second caller is what forced the rule to be
+    honoured rather than merely stated.
 
     A source scan rather than a behavioural test, because the risk is a NEW
     control that forgets the snapshot and no behavioural test can fail for a
@@ -970,8 +976,37 @@ def test_the_three_history_deletions_snapshot_through_one_helper() -> None:
     """
     source = Path(APP_PATH).read_text(encoding="utf-8")
     assert source.count("def snapshot_before_destructive(") == 1
-    for writer in ("db.delete_session(", "db.delete_roi_profile(", "db.delete_hand("):
+    for writer in (
+        "db.delete_session(",
+        "db.delete_roi_profile(",
+        "db.delete_hand(",
+        "db.delete_video(",
+    ):
         assert source.count(writer) == 1, f"{writer} has more than one call site"
-    # Each of the three carries its own scoped snapshot request.
-    for marker in ("session{session.id}", "hand{hand_id}", "roi{profile.id}"):
+    # Each of the four carries its own scoped snapshot request.
+    for marker in (
+        "session{session.id}",
+        "hand{hand_id}",
+        "roi{profile.id}",
+        "video{video_id}",
+    ):
         assert f'scope=f"{marker}"' in source
+
+
+def test_no_hand_is_deleted_without_a_snapshot_in_hand() -> None:
+    """The batch delete must not become a way to reach db.delete_hand unsnapshotted.
+
+    Splitting the per-hand writer so a batch could take ONE snapshot moved
+    ``db.delete_hand`` behind a private helper. The call-site count above still
+    passes either way, so it can no longer be what guarantees a rollback point
+    exists — the helper's required ``snapshot`` keyword is, and this pins it.
+    """
+    source = Path(APP_PATH).read_text(encoding="utf-8")
+    assert source.count("def _remove_hand_and_artifacts(") == 1
+    signature = source.split("def _remove_hand_and_artifacts(")[1].split(")")[0]
+    assert "*, snapshot: Path" in signature, signature
+    # Every caller passes one; none may construct the helper's work itself.
+    assert source.count("_remove_hand_and_artifacts(") == 3, (
+        "expected the definition and exactly two callers: the single-hand writer "
+        "and the batch writer"
+    )

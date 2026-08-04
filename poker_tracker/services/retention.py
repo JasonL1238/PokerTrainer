@@ -16,8 +16,20 @@ Most references are a column -- ``PokerDatabase.ARTIFACT_PATH_COLUMNS`` -- but
 two artifact classes are addressed by convention instead, and asking only the
 columns deleted both. A completed reconstruction job's timeline has no column
 anywhere; it is found from the job id, and losing it hard-blocks every remaining
-validated-hand import for that job with no way to rebuild it, because nothing in
-the product deletes a ``processing_jobs`` row, so the expectation is permanent.
+validated-hand import for that job with no way to rebuild it, so for as long as
+the job row exists the expectation is permanent.
+
+That qualifier is load-bearing and was once absent: this said "nothing in the
+product deletes a ``processing_jobs`` row". Deleting a recording does, by cascade,
+and it always has -- which means the timeline is discovered by a query
+(``status = 'completed'``) whose row the same operation removes. Left to
+retention, such a timeline is not expired but *undiscoverable*: an orphan no audit
+reports and no operator can name. That is why deleting a recording removes its
+jobs' artifacts eagerly, in ``poker_tracker.ui.cv_artifacts``, rather than leaving
+them to age out here. Retention still owns ``frames/cv_job_<id>/``, because only
+retention can tell a frame a surviving hand's ``actions.source_image`` names from
+one nothing references.
+
 The frames that timeline's states name have no column either until the operator
 reviews one, which means asking the columns expired exactly the frames still
 waiting to be reviewed. Both are read through

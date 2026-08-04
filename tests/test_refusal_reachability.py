@@ -233,9 +233,16 @@ def test_the_video_delete_warning_states_what_it_actually_removes(
     assert "frame verdicts" in warnings, warnings
     assert "reconstruction jobs" in warnings, warnings
     assert "Hands and sessions are unaffected." not in warnings, warnings
-    # It also has to say the delete has no rollback point, unlike its two
-    # siblings, which snapshot the database before they run.
-    assert "No rollback snapshot" in warnings, warnings
+    # This delete now snapshots, like its siblings, so "No rollback snapshot is
+    # written" would be the false sentence. What it must still not do is inherit
+    # their promise: a snapshot copies the DATABASE, and this deletion's whole
+    # payload is files. Restoring it returns the rows and none of the recording,
+    # so the warning has to separate the two rather than say "a snapshot is
+    # written first" and stop, which is what the siblings can afford to say.
+    assert "No rollback snapshot" not in warnings, warnings
+    assert "snapshot is written first" in warnings, warnings
+    assert "rows can be brought back" in warnings, warnings
+    assert "the recording and its frames cannot" in warnings, warnings
 
 
 def _child_worker_script(

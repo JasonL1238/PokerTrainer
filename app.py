@@ -4,8 +4,8 @@ import hashlib
 import json
 import shutil
 import sqlite3
-from collections.abc import Callable, Container, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Callable, Container, Iterable, Iterator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import date
 from html import escape
@@ -68,7 +68,6 @@ from poker_tracker.math.ev import (
     semi_bluff_break_even_fold_frequency,
     semi_bluff_ev,
 )
-from poker_tracker.math.icm import icm_equities, icm_risk_premium_range
 from poker_tracker.math.pot_odds import (
     break_even_bluff_frequency,
     format_percentage,
@@ -82,13 +81,9 @@ from poker_tracker.math.pot_odds import (
 from poker_tracker.math.preflop_ranges import available_ranges
 from poker_tracker.math.ranges import RANGE_LABELS, estimate_villain_range_label, range_notation
 from poker_tracker.math.study_math import (
-    REALIZATION_FACTOR_GUIDE,
     bluff_to_value_ratio,
     geometric_bet_fraction,
     optimal_bluff_fraction,
-    outs_to_equity_exact,
-    outs_to_equity_rule,
-    realized_equity,
 )
 from poker_tracker.persistence.backup import (
     SNAPSHOT_CLASSES,
@@ -216,11 +211,25 @@ from poker_tracker.ui.components import (
     trust_badge,
     workflow_step,
 )
+from poker_tracker.ui.cv_artifacts import remove_cv_job_artifacts
 from poker_tracker.ui.cv_jobs import (
     CVJobAlreadyRunningError,
     cancel_processing_job,
     reconcile_stuck_jobs,
     start_cv_job,
+)
+
+# Re-exported, not just imported: the Math review tab calls these, and
+# tests/test_icm_tool_readout.py reaches `app._icm_risk_premium_readout` and
+# `app.show_icm_tool` through the module. Moving them out of app.py must not move
+# them out of `app`'s namespace.
+from poker_tracker.ui.equity_tools import (  # noqa: F401
+    _cached_multiway_equity,
+    _icm_risk_premium_readout,
+    show_equity_realization_tool,
+    show_icm_tool,
+    show_multiway_equity_tool,
+    show_outs_tool,
 )
 from poker_tracker.ui.frame_extraction import (
     delete_extracted_frames,
@@ -362,12 +371,6 @@ def _cached_equity(hero_cards: str, board_cards: str, range_label: str):
     return get_equity_calculator().calculate_equity(hero_cards, board_cards, range_label)
 
 
-@st.cache_data(show_spinner=False)
-def _cached_multiway_equity(hero_cards: str, board_cards: str, villain_ranges: tuple[str, ...]):
-    calculator = get_equity_calculator()
-    return calculator.calculate_equity_multiway(hero_cards, board_cards, list(villain_ranges))
-
-
 def flash(message: str) -> None:
     """Queue a confirmation that survives the st.rerun() after a state change."""
     st.session_state["_flash"] = message
@@ -464,8 +467,15 @@ def hand_study_readiness(
     accounting_error: str | None,
     *,
     user_confirmed: bool = False,
+    hand_issues: list[HandIssue] | None = None,
 ) -> StudyReadiness:
-    """Fetch the evidence readiness composes for a surface that does not already hold it."""
+    """Fetch the evidence readiness composes for a surface that does not already hold it.
+
+    ``hand_issues`` is the one piece a caller often does hold, because the same
+    surfaces that render the issue list also ask whether the hand is ready. Passing
+    it in skips a query that returns exactly what the caller just read; leaving it
+    ``None`` keeps the fetch-everything behaviour every other caller relies on.
+    """
 
     if hand.id is None:
         return evaluate_study_readiness(
@@ -478,7 +488,9 @@ def hand_study_readiness(
         hand,
         accounting=accounting,
         accounting_error=accounting_error,
-        hand_issues=db.fetch_hand_issues(hand_id=hand.id),
+        hand_issues=(
+            db.fetch_hand_issues(hand_id=hand.id) if hand_issues is None else hand_issues
+        ),
         coaching_reviews=db.fetch_coaching_reviews_by_hand(hand.id),
         # Legacy hand_reviews rows are staled by the same correction path and are
         # still rendered in the Hands workspace, so they are retained coaching
@@ -665,6 +677,42 @@ def guarded_update_hand_status(
             st.error(str(exc))
         return False
     return True
+
+
+def save_generated_hand_coaching(
+    db: PokerDatabase,
+    session: Session,
+    hand: Hand,
+    readiness: StudyReadiness,
+    *,
+    provider: str,
+    prompt: str,
+    raw_response: str,
+    label: str,
+) -> CoachingResponse:
+    """Build one hand's coaching answer and persist it, in that order.
+
+    The three surfaces that generate hand coaching -- the corrected-hand rerun, the
+    solver-grounded rerun, and the provider panel -- each spelled this call out
+    identically apart from the label. Sharing it means a fourth cannot pair the
+    right prompt with the wrong ``review_type`` or forget to pass ``hand_id``,
+    which is what decides whether the answer is checked against the prompt that
+    produced it.
+    """
+    return save_hand_coaching(
+        db,
+        hand,
+        readiness,
+        build_coaching_response(
+            provider=provider,
+            prompt=prompt,
+            raw_response=raw_response,
+            review_type="hand",
+            hand_id=hand.id,
+            session_id=session.id,
+        ),
+        label=label,
+    )
 
 
 def save_hand_coaching(
@@ -1180,24 +1228,35 @@ def _accounting_or_error(
     return _reconcile_cached(db, hand.id, cache)
 
 
-def _format_persisted_hand_history(db: PokerDatabase, session: Session, hand: Hand) -> str:
-    if hand.id is None:
-        return format_hand_history(session, hand, [], [])
-    actions = db.fetch_actions_by_hand(hand.id)
-    players = db.fetch_players_by_hand(hand.id)
-    try:
-        accounting = reconcile_persisted_hand(db, hand.id)
-        error = None
-    except LedgerError as exc:
-        accounting = None
-        error = str(exc)
+def hand_history_text(
+    session: Session,
+    hand: Hand,
+    actions: list[Action],
+    players: list[HandPlayer],
+    accounting: AccountingReconciliation | None,
+    accounting_error: str | None,
+) -> str:
+    """One hand's history, assembled from data the caller already holds.
+
+    Three surfaces render this text -- Study's raw-history expander, the Math
+    review panel, and the persisted-history helper below -- and each open-coded
+    the same three derived arguments. That mattered more than the line count:
+    ``accounting_authoritative`` is what tells the reader (and the coach, through
+    the same formatter) whether the money in the history is established fact or a
+    working assumption, so a fourth surface that assembled the call slightly
+    differently would present an assumption as settled.
+
+    Takes the already-fetched actions, players and reconciliation rather than a
+    hand id on purpose: every caller has them, and re-deriving them here would add
+    three queries and a reconciliation per render.
+    """
     return format_hand_history(
         session,
         hand,
         actions,
         players,
         ledger=None if accounting is None else accounting.ledger,
-        accounting_issues=_accounting_prompt_issues(accounting, error),
+        accounting_issues=_accounting_prompt_issues(accounting, accounting_error),
         accounting_authoritative=_accounting_is_established(hand, accounting),
     )
 
@@ -2587,14 +2646,8 @@ def render_study_replay(
         render_action_timeline(actions)
     with st.expander("Show raw hand history"):
         st.code(
-            format_hand_history(
-                session,
-                hand,
-                actions,
-                players,
-                ledger=None if accounting is None else accounting.ledger,
-                accounting_issues=_accounting_prompt_issues(accounting, accounting_error),
-                accounting_authoritative=_accounting_is_established(hand, accounting),
+            hand_history_text(
+                session, hand, actions, players, accounting, accounting_error
             ),
             language="text",
         )
@@ -2904,6 +2957,9 @@ def render_validation_edit_and_approve(
         accounting,
         accounting_error,
         user_confirmed=True,
+        # Already fetched two lines up; readiness would otherwise re-run the same
+        # query and get the same rows.
+        hand_issues=hand_issues,
     )
     open_issues = [issue for issue in hand_issues if issue.status == "open"]
     issue_targets: list[FrameIssueTarget] = []
@@ -3923,18 +3979,14 @@ def show_study_coach_review(
                 validate_solver_coaching_response(raw_response, solver_evidence)
             # The coaching is kept either way; only the promotion is gated. flash()
             # is used so the outcome survives the rerun below.
-            save_hand_coaching(
+            save_generated_hand_coaching(
                 db,
+                session,
                 hand,
                 readiness,
-                build_coaching_response(
-                    provider=provider,
-                    prompt=prompt,
-                    raw_response=raw_response,
-                    review_type="hand",
-                    hand_id=hand.id,
-                    session_id=session.id,
-                ),
+                provider=provider,
+                prompt=prompt,
+                raw_response=raw_response,
                 label="corrected-hand coaching review",
             )
             st.rerun()
@@ -4412,18 +4464,14 @@ def _show_solver_runs(
                 raw_response = provider.generate_hand_review(prompt)
             validate_solver_coaching_response(raw_response, evidence)
             # The explanation is kept either way; only the promotion is gated.
-            save_hand_coaching(
+            save_generated_hand_coaching(
                 db,
+                session,
                 hand,
                 readiness,
-                build_coaching_response(
-                    provider=provider,
-                    prompt=prompt,
-                    raw_response=raw_response,
-                    review_type="hand",
-                    hand_id=hand.id,
-                    session_id=session.id,
-                ),
+                provider=provider,
+                prompt=prompt,
+                raw_response=raw_response,
                 label="solver-grounded coaching review",
             )
             st.rerun()
@@ -5912,6 +5960,77 @@ def snapshot_recovery_note(snapshot: Path) -> str:
     )
 
 
+# Solver runs and CV jobs use the same three live lifecycle statuses, and both
+# have to be stopped before the row they belong to can be deleted. Named once
+# because it was spelled as a set literal at each deletion, and a deletion that
+# forgets one of the three races a worker instead of refusing it.
+_LIVE_WORK_STATUSES = frozenset({"queued", "running", "cancelling"})
+
+
+def video_snapshot_recovery_note(snapshot: Path) -> str:
+    """What a recording's snapshot can and cannot bring back.
+
+    Deliberately not ``snapshot_recovery_note``. A snapshot copies the database
+    and nothing else, so for a session or a hand -- neither of which deletes a
+    file -- "restore this and it comes back" is simply true. A recording's entire
+    payload IS files, so reusing that sentence would promise an undo that does
+    not exist: restoring returns the rows, including the job history and the
+    frame verdicts saved against it, pointing at a recording that is gone.
+    """
+    return (
+        f"A database snapshot was written to {safe_path_label(snapshot)} first. "
+        "Restoring it brings back this recording's rows — its jobs and the frame "
+        "verdicts saved against them — but not the recording itself, its timeline, "
+        "or its extracted frames, because a snapshot copies the database only. "
+        "Settings → Storage & health lists it and explains how to restore it."
+    )
+
+
+def _stop_and_clear_solver_runs(db: PokerDatabase, hand_id: int) -> str | None:
+    """Stop every live solver run for one hand and delete its artifacts.
+
+    Returns a refusal message if a run will not stop, ``None`` on success. One
+    definition because three deletions need it -- one hand, a batch of hands, and
+    a whole session -- and the session path used to open-code its own copy of the
+    same loop. Removing the artifacts is irreversible, so every caller must
+    already hold a rollback snapshot by the time this runs.
+    """
+    for run in db.fetch_solver_runs_by_hand(hand_id):
+        if run.status in _LIVE_WORK_STATUSES:
+            cancelled = cancel_solver_run(db, run.id)
+            if cancelled.status == "cancelling":
+                return (
+                    "The active solver could not be stopped yet. "
+                    "Try deleting again after it exits."
+                )
+        remove_solver_run_artifacts(run)
+    return None
+
+
+def _remove_hand_and_artifacts(
+    db: PokerDatabase, hand_id: int, *, snapshot: Path
+) -> str | None:
+    """Delete one hand's solver artifacts and rows against an existing rollback point.
+
+    ``snapshot`` is a required keyword and is genuinely read, not decorative:
+    this is the only path to ``db.delete_hand``, and moving the rollback point
+    into its signature is what keeps "a delete button added later is recoverable"
+    a property of the code rather than of whoever writes the next caller. A
+    source-text test can only count call sites; it cannot see that one of them
+    forgot to snapshot first. Verifying the file is really on disk can.
+    """
+    if not snapshot.is_file():
+        return (
+            "The rollback snapshot for this deletion is no longer on disk, "
+            "so nothing was deleted."
+        )
+    error = _stop_and_clear_solver_runs(db, hand_id)
+    if error is not None:
+        return error
+    db.delete_hand(hand_id)
+    return None
+
+
 def delete_hand_and_artifacts(
     db: PokerDatabase, hand_id: int
 ) -> tuple[str | None, Path | None]:
@@ -5919,11 +6038,11 @@ def delete_hand_and_artifacts(
 
     Returns ``(error, snapshot)``. An error message instead of deleting when an
     active solver cannot be stopped yet, or when no rollback point could be
-    written. This is the writer behind every 'Delete hand' control, and it
-    exists because ``NEW_RECONSTRUCTION_STEPS`` names the deletion as part of its
-    clearing action: an import ADDS the rebuilt hands beside the existing ones,
-    so the superseded copy must be deletable from the session's hand list or the
-    blocker names an action the product cannot perform.
+    written. This is the writer behind every single-hand 'Delete hand' control,
+    and it exists because ``NEW_RECONSTRUCTION_STEPS`` names the deletion as part
+    of its clearing action: an import ADDS the rebuilt hands beside the existing
+    ones, so the superseded copy must be deletable from the session's hand list
+    or the blocker names an action the product cannot perform.
 
     The snapshot is taken here rather than at each control, so a delete button
     added later is recoverable by construction. It is taken BEFORE the solver
@@ -5934,18 +6053,169 @@ def delete_hand_and_artifacts(
     )
     if snapshot is None:
         return snapshot_error, None
-    for run in db.fetch_solver_runs_by_hand(hand_id):
-        if run.status in {"queued", "running", "cancelling"}:
-            cancelled = cancel_solver_run(db, run.id)
-            if cancelled.status == "cancelling":
-                return (
-                    "The active solver could not be stopped yet. "
-                    "Try deleting again after it exits.",
-                    snapshot,
-                )
-        remove_solver_run_artifacts(run)
-    db.delete_hand(hand_id)
+    return _remove_hand_and_artifacts(db, hand_id, snapshot=snapshot), snapshot
+
+
+def delete_hands_and_artifacts(
+    db: PokerDatabase, hand_ids: Iterable[int], *, session_id: int
+) -> tuple[list[int], list[tuple[int, str]], Path | None]:
+    """Delete several hands of one session under a SINGLE rollback point.
+
+    Returns ``(deleted ids, [(hand id, why it survived)], snapshot)``.
+
+    One snapshot for the batch rather than one per hand, which is what the
+    per-hand writer would give if it were called in a loop. That is not a
+    weakening of the rule in ``snapshot_before_destructive``: that rule forbids
+    reusing one snapshot across two SEPARATE deletions, because they are two
+    different states to roll back to. A batch is one deletion with one pre-state,
+    and the session danger zone already works this way. It is also strictly safer
+    here than the loop would be -- ``predelete`` keeps a fixed number of
+    snapshots, so N per-hand copies would evict every other rollback point in the
+    pool, including the one from a session delete minutes earlier.
+
+    A hand that cannot be deleted does not abort the batch. The snapshot covers
+    all of them equally, so stopping halfway would leave the operator with a
+    partial delete AND no report of which hands were refused; every hand is
+    attempted and the survivors are named.
+    """
+    ordered = list(dict.fromkeys(hand_ids))
+    if not ordered:
+        return [], [], None
+    snapshot, snapshot_error = snapshot_before_destructive(
+        db, scope=f"session{session_id}hands", what=f"these {len(ordered)} hands"
+    )
+    if snapshot is None:
+        message = snapshot_error or "No rollback snapshot could be written."
+        return [], [(hand_id, message) for hand_id in ordered], None
+    deleted: list[int] = []
+    failures: list[tuple[int, str]] = []
+    for hand_id in ordered:
+        error = _remove_hand_and_artifacts(db, hand_id, snapshot=snapshot)
+        if error is None:
+            deleted.append(hand_id)
+        else:
+            failures.append((hand_id, error))
+    return deleted, failures, snapshot
+
+
+def delete_video_and_artifacts(
+    db: PokerDatabase, video_id: int
+) -> tuple[str | None, Path | None]:
+    """Delete one recording, its files, and every artifact its jobs own.
+
+    Returns ``(error, snapshot)``. The single writer behind every 'Delete
+    recording' control, so the two places that offer one -- the session's
+    recording list and the legacy frame-extraction panel on Import -- cannot
+    disagree about what a deletion removes.
+
+    Three things this has to get right that a bare ``db.delete_video`` does not:
+
+    A job's artifacts are keyed by JOB id and live in three directories no column
+    names, so nothing cascades to them; ``remove_cv_job_artifacts`` removes them
+    eagerly, because deleting the ``processing_jobs`` row is precisely what makes
+    them undiscoverable to retention afterwards. It deliberately spares
+    ``frames/cv_job_<id>/``, which surviving hands' ``actions.source_image``
+    still points at.
+
+    A live job is refused rather than raced. A job still in its launch window has
+    no recorded pid, so cancelling it reports success while terminating nothing
+    and the detached worker keeps writing frames and a timeline for a recording
+    whose rows are gone -- and on POSIX its open descriptor on the unlinked file
+    lets it finish. A live job without a pid is therefore treated as
+    indeterminate and the delete is refused.
+
+    The snapshot is taken before the cancellation, matching the hand writer, so
+    the rollback point holds the job rows as they were rather than as this
+    deletion left them.
+    """
+    video = db.fetch_video(video_id)
+    if video is None:
+        return "That recording is no longer in the library.", None
+    snapshot, snapshot_error = snapshot_before_destructive(
+        db, scope=f"video{video_id}", what="this recording"
+    )
+    if snapshot is None:
+        return snapshot_error, None
+    jobs = db.fetch_jobs_by_video(video_id)
+    for job in jobs:
+        if job.id is None or job.status not in _LIVE_WORK_STATUSES:
+            continue
+        if job.pid is None:
+            return (
+                "A job for this recording is still starting up, so it cannot be "
+                "stopped safely yet. Try deleting again in a few seconds.",
+                snapshot,
+            )
+        if cancel_processing_job(db, job.id).status in _LIVE_WORK_STATUSES:
+            return (
+                "The active job for this recording could not be stopped yet. "
+                "Try deleting again after it exits.",
+                snapshot,
+            )
+    for job in jobs:
+        if job.id is not None:
+            remove_cv_job_artifacts(job.id)
+    delete_extracted_frames(db, video_id)
+    db.delete_video(video_id)
+    with suppress(OSError):
+        Path(video.stored_path).unlink(missing_ok=True)
     return None, snapshot
+
+
+def render_video_danger_zone(
+    db: PokerDatabase, video: VideoRecord, *, key_prefix: str
+) -> None:
+    """The delete-this-recording control, mounted wherever a recording is listed.
+
+    One definition of the control AND of its warning, because two panels offer it
+    now: the session's recording list, where an operator actually looks for it,
+    and the legacy frame-extraction panel on Import, where it used to be the only
+    copy -- two collapsed layers deep behind "Advanced diagnostics". A second
+    hand-written warning is how one surface ends up describing a smaller deletion
+    than the one it performs, and this particular warning has already been
+    corrected once for saying "Hands and sessions are unaffected".
+
+    ``key_prefix`` is required rather than defaulted: both mounts can render the
+    same recording, and a shared widget key would let a confirmation ticked on
+    one page arm the delete button on the other.
+    """
+    if video.id is None:
+        return
+    with st.expander("Danger zone: delete this recording"):
+        # "Hands and sessions are unaffected" was true of the rows and false of
+        # everything the operator would notice: the reconstruction jobs cascade,
+        # and with them the frame verdicts saved against them and the evidence
+        # review that explains why each row was read the way it was. The hands
+        # survive with their provenance pointing at files that no longer exist.
+        st.warning(
+            f"Deleting **{video.original_filename}** removes the stored file, "
+            "every extracted frame, this recording's reconstruction jobs, the "
+            "timeline and export those jobs produced, and the frame verdicts you "
+            "saved against them. Hands and sessions imported from it are kept, but "
+            "they lose their frame evidence and the reconstruction review that "
+            "shows it — repair them with \"Fix hand #N on Import\", offered from "
+            "Study and from the hand's blockers, which opens the same editors "
+            "without a recording. A database snapshot is written first, so the "
+            "rows can be brought back; the recording and its frames cannot."
+        )
+        confirm_video = st.checkbox(
+            "I understand this permanently deletes the recording and its files.",
+            key=f"{key_prefix}_confirm_delete_video_{video.id}",
+        )
+        if st.button(
+            "Delete recording",
+            key=f"{key_prefix}_delete_video_{video.id}",
+            disabled=not confirm_video,
+        ):
+            error, snapshot = delete_video_and_artifacts(db, video.id)
+            if error:
+                st.error(error)
+                return
+            message = f"Deleted recording {video.original_filename}."
+            if snapshot is not None:
+                message = f"{message} {video_snapshot_recovery_note(snapshot)}"
+            flash(message)
+            st.rerun()
 
 
 def hand_evidence_badges(
@@ -6172,6 +6442,74 @@ def render_hand_results(
                         st.rerun()
 
 
+def _render_bulk_hand_delete(
+    db: PokerDatabase, session: Session, selected: list[Hand]
+) -> None:
+    """Delete every hand matching the browser's current filters, under one snapshot.
+
+    The selection IS the filter result rather than a second list widget, for two
+    reasons. The browser paginates at fifteen rows, so a widget listing every hand
+    in the session would offer rows the page is not showing -- the same "one
+    surface states less than another" defect the comment beside
+    ``render_hand_results`` exists to prevent. And a keyed multiselect outlives
+    the rerun a delete triggers: Streamlit stores the selection as formatted label
+    strings and re-appends any it can no longer resolve, so the next click would
+    hand the writer ghost entries for deleted hands, or match a stale label onto a
+    different surviving hand.
+
+    The confirmation is keyed on a nonce bumped after every attempt. A
+    session-scoped confirm box, unlike the per-row ones, is still on screen once
+    the delete finishes, and a box that stays ticked leaves the next batch one
+    click away.
+    """
+    if session.id is None or not selected:
+        return
+    deletable = [hand.id for hand in selected if hand.id is not None]
+    if not deletable:
+        return
+    numbers = {hand.id: hand.hand_number for hand in selected if hand.id is not None}
+    nonce_key = f"session_bulk_delete_nonce_{session.id}"
+    nonce = st.session_state.get(nonce_key, 0)
+    count = len(deletable)
+    noun = "hand" if count == 1 else "hands"
+    with st.expander(f"Delete the {count} {noun} matching these filters"):
+        st.warning(
+            f"This deletes {count} {noun} — "
+            + ", ".join(f"#{numbers[hand_id]}" for hand_id in deletable)
+            + " — with their actions, players, settlement, reviews, issues and "
+            "solver runs. One database snapshot is written for the whole batch "
+            "before anything is removed; nothing else in the product will bring "
+            "the rows back."
+        )
+        st.caption(
+            "Change the filters above to change what this deletes. To take hands "
+            "out of study without deleting them, mark them Non-study on each row "
+            "instead — that is reversible, and study readiness reports it."
+        )
+        confirm = st.checkbox(
+            f"I understand this permanently deletes {count} {noun} and all related rows.",
+            key=f"session_bulk_delete_confirm_{session.id}_{nonce}",
+        )
+        if st.button(
+            f"Delete {count} {noun}",
+            key=f"session_bulk_delete_{session.id}_{nonce}",
+            disabled=not confirm,
+        ):
+            deleted, failures, snapshot = delete_hands_and_artifacts(
+                db, deletable, session_id=session.id
+            )
+            st.session_state[nonce_key] = nonce + 1
+            if deleted:
+                message = f"Deleted {len(deleted)} of {count} {noun}."
+                if snapshot is not None:
+                    message = f"{message} {snapshot_recovery_note(snapshot)}"
+                flash(message)
+            for hand_id, reason in failures:
+                st.error(f"Hand #{numbers.get(hand_id, hand_id)} was not deleted: {reason}")
+            if not failures:
+                st.rerun()
+
+
 def show_session_hand_browser(db: PokerDatabase, session: Session) -> None:
     if session.id is None:
         return
@@ -6228,6 +6566,7 @@ def show_session_hand_browser(db: PokerDatabase, session: Session) -> None:
                 open_issue_counts=issue_counts,
                 stale_hand_ids=db.fetch_stale_review_hand_ids() & hand_ids,
             )
+            _render_bulk_hand_delete(db, session, filtered)
         else:
             st.caption("No hands match those filters.")
 
@@ -6318,6 +6657,28 @@ def _save_video_upload(
             st.error(f"Could not save video: {exc}")
 
 
+def _session_hands_from_video(
+    db: PokerDatabase, session: Session, video_id: int
+) -> list[Hand]:
+    """Hands in this session whose facts were read from this recording.
+
+    Resolved through the same ``cv_timeline_identity`` -> job chain
+    ``hand_source_recording`` uses, but from the recording's side and with the
+    job ids fetched once, so listing a session's recordings does not cost a query
+    per hand per recording.
+    """
+    if session.id is None:
+        return []
+    job_ids = {job.id for job in db.fetch_jobs_by_video(video_id) if job.id is not None}
+    if not job_ids:
+        return []
+    return [
+        hand
+        for hand in db.fetch_hands_by_session(session.id)
+        if _cv_timeline_identity(hand)[0] in job_ids
+    ]
+
+
 def show_session_videos(db: PokerDatabase, session: Session) -> None:
     if session.id is None:
         return
@@ -6353,12 +6714,46 @@ def show_session_videos(db: PokerDatabase, session: Session) -> None:
                 st.session_state["video_context_id"] = video.id
                 navigate_to(Page.IMPORT)
                 st.rerun()
+            if action.button(
+                "Remove",
+                key=f"detach_video_{video.id}_from_{session.id}",
+                width="stretch",
+                help="Unlink this recording from the session. The file is kept.",
+            ):
+                db.update_video_session(video.id, None)
+                flash(
+                    f"Removed {video.original_filename} from {session.name}. "
+                    "It is now unassigned, and \"Attach a video already in the "
+                    "library\" below puts it back."
+                )
+                st.rerun()
+            # Reconstruction reads the destination session off the recording, so
+            # an unlinked recording cannot be imported until it is attached
+            # somewhere. Said here rather than only after the fact, because the
+            # button beside it is one click and the blocker it produces surfaces
+            # a page away.
+            if _session_hands_from_video(db, session, video.id):
+                st.caption(
+                    "Hands in this session were reconstructed from this recording. "
+                    "Removing it keeps them, but importing more hands from it needs "
+                    "it linked to a session again."
+                )
+            render_video_danger_zone(db, video, key_prefix=f"session_{session.id}")
 
     with st.expander("Add another video", expanded=not videos):
         _save_video_upload(db, session, key_prefix=f"session_{session.id}_video")
 
-    other_videos = [video for video in db.fetch_videos() if video.session_id != session.id]
-    if other_videos:
+    library = [video for video in db.fetch_videos() if video.session_id != session.id]
+    # Unassigned recordings are never truncated. They used to share one
+    # fifteen-row window with every other session's recordings, ordered newest
+    # first, so a recording removed from a session could fall off the end of the
+    # only list that can attach it -- and because both the delete control and the
+    # Import page reach a recording THROUGH a session, falling off that list left
+    # it neither attachable nor deletable, with its file still on disk. A
+    # deliberate removal must not be the step that strands one.
+    unassigned = [video for video in library if video.session_id is None]
+    from_other_sessions = [video for video in library if video.session_id is not None]
+    if library:
         with st.expander("Attach a video already in the library"):
             st.caption(
                 "Unassigned videos can be attached; videos from another session are moved here."
@@ -6366,7 +6761,7 @@ def show_session_videos(db: PokerDatabase, session: Session) -> None:
             session_names = {
                 item.id: item.name for item in db.fetch_sessions() if item.id is not None
             }
-            for video in other_videos[:15]:
+            for video in [*unassigned, *from_other_sessions[:15]]:
                 if video.id is None:
                     continue
                 detail, action = st.columns([5, 1])
@@ -6384,6 +6779,10 @@ def show_session_videos(db: PokerDatabase, session: Session) -> None:
                     db.update_video_session(video.id, session.id)
                     flash(f"Attached {video.original_filename} to {session.name}.")
                     st.rerun()
+                if video.session_id is None:
+                    # The only delete control an unassigned recording has: every
+                    # other one is reached through the session it belongs to.
+                    render_video_danger_zone(db, video, key_prefix="unassigned")
 
 
 def create_session_form(
@@ -6870,17 +7269,15 @@ def _render_session_danger_zone(
                 st.error(snapshot_error or "No rollback snapshot could be written.")
                 return
             for session_hand in db.fetch_hands_by_session(session.id):
-                if session_hand.id is not None:
-                    for run in db.fetch_solver_runs_by_hand(session_hand.id):
-                        if run.status in {"queued", "running", "cancelling"}:
-                            cancelled = cancel_solver_run(db, run.id)
-                            if cancelled.status == "cancelling":
-                                st.error(
-                                    "The active solver could not be stopped yet. "
-                                    "Try deleting again after it exits."
-                                )
-                                return
-                        remove_solver_run_artifacts(run)
+                if session_hand.id is None:
+                    continue
+                # Same stop-and-clear rule the hand deletions use. It was a
+                # third open-coded copy of the loop until the batch writer
+                # needed it too.
+                solver_error = _stop_and_clear_solver_runs(db, session_hand.id)
+                if solver_error is not None:
+                    st.error(solver_error)
+                    return
             db.delete_session(session.id)
             flash(f"Session '{session.name}' deleted. {snapshot_recovery_note(snapshot)}")
             st.rerun()
@@ -7283,13 +7680,21 @@ def show_saved_hands(db: PokerDatabase, session: Session) -> None:
             f"{'unknown' if hand.hero_bb_won is None else f'{hand.hero_bb_won:+g} BB'} "
             f"[{hand.review_status}]"
         ):
-            st.code(
-                _format_persisted_hand_history(db, session, hand),
-                language="text",
-            )
-
+            # Reconciled before the history rather than after it. This used to
+            # render through a helper that re-fetched the actions and players this
+            # loop just read and reconciled OUTSIDE the page's cache -- then the
+            # cached reconciliation ran four lines later anyway. Ten hands a page
+            # meant twenty redundant queries and ten duplicate reconciliations,
+            # and a reconciliation is two ledger builds on any hand that declares
+            # a settlement policy.
             accounting, accounting_error = _reconcile_cached(
                 db, hand.id, accounting_cache
+            )
+            st.code(
+                hand_history_text(
+                    session, hand, actions, players, accounting, accounting_error
+                ),
+                language="text",
             )
             readiness = hand_study_readiness(
                 db,
@@ -8850,14 +9255,8 @@ def show_math_review(db: PokerDatabase, session: Session) -> None:
 
     with st.expander("Completed-hand history", expanded=False):
         st.code(
-            format_hand_history(
-                session,
-                hand,
-                actions,
-                players,
-                ledger=None if accounting is None else accounting.ledger,
-                accounting_issues=_accounting_prompt_issues(accounting, accounting_error),
-                accounting_authoritative=_accounting_is_established(hand, accounting),
+            hand_history_text(
+                session, hand, actions, players, accounting, accounting_error
             ),
             language="text",
         )
@@ -9270,184 +9669,6 @@ def _render_metric_rows(
             column.metric(label, value, help=help_text)
 
 
-def show_equity_realization_tool(equity_result) -> None:
-    st.caption(
-        "Raw equity assumes every hand reaches showdown. Out of position or with a capped "
-        "range, Hero realizes less of it. Factors are study heuristics, not solver output."
-    )
-    if equity_result is None or equity_result.equity is None:
-        st.info("Compute Hero equity vs a range above to estimate realized equity.")
-        return
-    scenario = st.selectbox(
-        "Realization scenario",
-        options=list(REALIZATION_FACTOR_GUIDE.keys()),
-        format_func=lambda key: key.replace("_", " "),
-    )
-    factor = REALIZATION_FACTOR_GUIDE[scenario]
-    realized = realized_equity(equity_result.equity, factor)
-    raw_col, factor_col, realized_col = st.columns(3)
-    raw_col.metric("Raw equity", format_percentage(equity_result.equity))
-    factor_col.metric("Realization factor", f"{factor:.2f}×")
-    realized_col.metric("Realized equity (est.)", format_percentage(realized))
-
-
-def show_multiway_equity_tool(hand: Hand, range_label: str, range_display: str) -> None:
-    st.caption(
-        "Pot-share equity vs two or more ranges. Villain 1 uses the range selected above; "
-        "add at least one more villain. Multiway pots need stronger hands to continue."
-    )
-    if not hand.hero_cards:
-        st.info("This hand has no Hero cards recorded.")
-        return
-    second = st.text_input(
-        "Villain 2 range", value="standard", help="A range label or standard notation."
-    )
-    third = st.text_input("Villain 3 range (optional)", value="")
-    villain_ranges = [range_label, second.strip(), *([third.strip()] if third.strip() else [])]
-    if not second.strip():
-        st.info("Enter a Villain 2 range to compute multiway equity.")
-        return
-    try:
-        with st.spinner("Computing multiway pot share..."):
-            result = _cached_multiway_equity(
-                hand.hero_cards, hand.board_cards, tuple(villain_ranges)
-            )
-    except (RuntimeError, ValueError) as exc:
-        st.error(str(exc))
-        return
-    if result.equity is None:
-        st.warning(f"Could not compute: {result.notes}")
-        return
-    share_col, fair_col = st.columns(2)
-    help_text = result.notes
-    if result.std_error:
-        low, high = (
-            max(0.0, result.equity - 1.96 * result.std_error),
-            min(1.0, result.equity + 1.96 * result.std_error),
-        )
-        help_text += f" 95% CI: {format_percentage(low)}–{format_percentage(high)}."
-    share_col.metric(
-        f"Hero pot share ({len(villain_ranges) + 1}-way)",
-        format_percentage(result.equity),
-        help=help_text,
-    )
-    fair_col.metric(
-        "Fair share",
-        format_percentage(1 / (len(villain_ranges) + 1)),
-        help="An equal split of the pot. Above this, Hero is profiting from the multiway pot.",
-    )
-    st.caption(f"Villain 1: {range_display} · ranges: {result.villain_range_label}")
-
-
-def show_outs_tool() -> None:
-    st.caption("Draw equity from counted outs — the rule of 2 and 4 next to the exact odds.")
-    outs = st.number_input("Outs", min_value=0, max_value=20, value=9, step=1)
-    street = st.radio(
-        "Cards to come",
-        options=["Flop → river (2 cards)", "Turn → river (1 card)"],
-        horizontal=True,
-    )
-    streets_to_come = 2 if street.startswith("Flop") else 1
-    unseen = 47 if streets_to_come == 2 else 46
-    if outs == 0:
-        st.info("Count Hero's outs to estimate draw equity.")
-        return
-    rule = outs_to_equity_rule(int(outs), streets_to_come)
-    exact = outs_to_equity_exact(int(outs), unseen, streets_to_come)
-    rule_col, exact_col = st.columns(2)
-    rule_col.metric("Rule of 2 and 4", format_percentage(min(rule, 1.0)))
-    exact_col.metric(
-        "Exact",
-        format_percentage(exact),
-        help=f"{outs} outs among {unseen} unseen cards, {streets_to_come} card(s) to come.",
-    )
-
-
-def _icm_risk_premium_readout(
-    stacks: list[float],
-    payouts: list[float],
-    hero_index: int,
-    risk_amount: float,
-) -> tuple[str, str]:
-    """The risk premium as the span it is, plus what the span does not bound.
-
-    The cost of losing the chips genuinely depends on which opponent takes them,
-    so a single figure under prose reading "prize equity lost" states one of
-    several answers as though it were the only one. The screen has room for the
-    span and for who sits at each end, so it shows them.
-
-    The span covers single winners only. Chips split between several opponents
-    -- a multiway all-in with side pots -- can cost Hero more than its top end,
-    so the help says so rather than letting two numbers read as bounds.
-    """
-    span = icm_risk_premium_range(stacks, payouts, hero_index, risk_amount)
-    cheapest = min(span.by_opponent, key=lambda seat: (span.by_opponent[seat], seat))
-    dearest = max(span.by_opponent, key=lambda seat: (span.by_opponent[seat], -seat))
-    if f"{span.low:.2f}" == f"{span.high:.2f}":
-        value = f"{span.high:.2f}"
-        detail = "Every opponent costs Hero the same here."
-    else:
-        value = f"{span.low:.2f} – {span.high:.2f}"
-        detail = (
-            f"Cheapest if player {cheapest + 1} wins the chips, "
-            f"dearest if player {dearest + 1} does."
-        )
-    help_text = (
-        "Prize equity Hero loses, by which opponent wins the chips. "
-        f"{detail} Compare against the prize equity gained by winning the same "
-        "pot — the gap is the ICM risk premium. Chips split between several "
-        "opponents can cost more than the top of this range."
-    )
-    return value, help_text
-
-
-def show_icm_tool() -> None:
-    st.caption(
-        "Malmuth-Harville ICM: converts tournament chip stacks into prize equity. "
-        "Chips lost hurt more than chips won help — the risk premium quantifies that."
-    )
-    stacks_text = st.text_input("Stacks (comma-separated chips)", value="5000, 3000, 2000")
-    payouts_text = st.text_input("Payouts (comma-separated, best first)", value="50, 30, 20")
-    try:
-        stacks = [float(part) for part in stacks_text.split(",") if part.strip()]
-        payouts = [float(part) for part in payouts_text.split(",") if part.strip()]
-        equities = icm_equities(stacks, payouts)
-    except ValueError as exc:
-        st.error(f"Could not compute ICM: {exc}")
-        return
-    st.dataframe(
-        [
-            {
-                "Player": index + 1,
-                "Stack": f"{stack:g}",
-                "Chip share": format_percentage(stack / sum(stacks)),
-                "ICM equity": f"{equity:.2f}",
-                "Prize share": format_percentage(equity / sum(payouts)),
-            }
-            for index, (stack, equity) in enumerate(zip(stacks, equities, strict=True))
-        ],
-        hide_index=True,
-        width="stretch",
-    )
-    hero_col, risk_col = st.columns(2)
-    hero_seat = hero_col.number_input(
-        "Hero player #", min_value=1, max_value=len(stacks), value=1, step=1
-    )
-    max_risk = stacks[int(hero_seat) - 1]
-    risk_amount = risk_col.number_input(
-        "Chips at risk",
-        min_value=0.0,
-        max_value=float(max_risk),
-        value=min(1000.0, max_risk / 2),
-        step=100.0,
-    )
-    if risk_amount > 0 and risk_amount < max_risk:
-        value, help_text = _icm_risk_premium_readout(
-            stacks, payouts, int(hero_seat) - 1, risk_amount
-        )
-        st.metric("ICM cost of losing those chips", value, help=help_text)
-
-
 def show_coach_review(db: PokerDatabase, session: Session) -> None:
     if session.id is None:
         return
@@ -9482,7 +9703,12 @@ def show_coach_review(db: PokerDatabase, session: Session) -> None:
             db, session, hands, provider, coaching_mode, accounting_cache
         )
     else:
-        show_session_coach_review(db, session, hands, provider, coaching_mode)
+        # The same cache the Hand tab gets. Both tabs summarise the same hands, so
+        # a reconciliation the page has already paid for should not be paid again
+        # because the operator switched scope.
+        show_session_coach_review(
+            db, session, hands, provider, coaching_mode, accounting_cache
+        )
 
 
 def show_hand_coach_review(
@@ -9511,14 +9737,8 @@ def show_hand_coach_review(
     actions = db.fetch_actions_by_hand(hand.id)
     players = db.fetch_players_by_hand(hand.id)
     accounting, accounting_error = _reconcile_cached(db, hand.id, accounting_cache)
-    history = format_hand_history(
-        session,
-        hand,
-        actions,
-        players,
-        ledger=None if accounting is None else accounting.ledger,
-        accounting_issues=_accounting_prompt_issues(accounting, accounting_error),
-        accounting_authoritative=_accounting_is_established(hand, accounting),
+    history = hand_history_text(
+        session, hand, actions, players, accounting, accounting_error
     )
     st.code(history, language="text")
 
@@ -9602,18 +9822,14 @@ def show_hand_coach_review(
             with st.spinner("Generating hand review..."):
                 raw_response = provider.generate_hand_review(prompt)
             # The review is kept either way; only the promotion is gated.
-            save_hand_coaching(
+            save_generated_hand_coaching(
                 db,
+                session,
                 hand,
                 readiness,
-                build_coaching_response(
-                    provider=provider,
-                    prompt=prompt,
-                    raw_response=raw_response,
-                    review_type="hand",
-                    hand_id=hand.id,
-                    session_id=session.id,
-                ),
+                provider=provider,
+                prompt=prompt,
+                raw_response=raw_response,
                 label="provider review",
             )
             st.rerun()
@@ -9629,6 +9845,7 @@ def show_session_coach_review(
     hands: list[Hand],
     provider,
     coaching_mode: str,
+    accounting_cache: AccountingCache | None = None,
 ) -> None:
     study_hands = [
         hand
@@ -9644,8 +9861,17 @@ def show_session_coach_review(
         return
     stats = compute_session_stats(db, session.id, hands=study_hands)
     selected_hands = select_session_review_hands(study_hands)
+    # Reconciled through the page's cache. Each of these histories used to
+    # reconcile from scratch, so a session review of eight hands paid eight full
+    # reconciliations that the Hand tab beside it had already cached.
     histories = [
-        _format_persisted_hand_history(db, session, hand)
+        hand_history_text(
+            session,
+            hand,
+            db.fetch_actions_by_hand(hand.id),
+            db.fetch_players_by_hand(hand.id),
+            *_reconcile_cached(db, hand.id, accounting_cache),
+        )
         for hand in selected_hands
         if hand.id is not None
     ]
@@ -11305,32 +11531,7 @@ def show_legacy_frame_extraction(db: PokerDatabase, video: VideoRecord) -> None:
         st.rerun()
     show_frame_preview(frames)
 
-    with st.expander("Danger zone: delete this video"):
-        # "Hands and sessions are unaffected" was true of the rows and false of
-        # everything the operator would notice: the reconstruction jobs cascade,
-        # and with them the frame verdicts saved against them and the evidence
-        # review that explains why each row was read the way it was. The hands
-        # survive with their provenance pointing at files that no longer exist.
-        st.warning(
-            f"Deleting **{video.original_filename}** removes the stored file, "
-            "every extracted frame, this recording's reconstruction jobs, and "
-            "the frame verdicts you saved against them. Hands and sessions "
-            "imported from it are kept, but they lose their frame evidence and "
-            "the reconstruction review that shows it — repair them with "
-            "\"Fix hand #N on Import\", offered from Study and from the hand's "
-            "blockers, which opens the same editors without a recording. "
-            "No rollback snapshot is written; this cannot be undone."
-        )
-        confirm_video = st.checkbox(
-            "I understand this permanently deletes the video and its files.",
-            key=f"confirm_delete_video_{video.id}",
-        )
-        if st.button("Delete video", key=f"delete_video_{video.id}", disabled=not confirm_video):
-            delete_extracted_frames(db, video.id)  # frame files first; rows would cascade anyway
-            db.delete_video(video.id)
-            Path(video.stored_path).unlink(missing_ok=True)
-            flash(f"Deleted video {video.original_filename}.")
-            st.rerun()
+    render_video_danger_zone(db, video, key_prefix="legacy_frames")
 
 
 def _safe_image(path: str, caption: str | None = None) -> None:

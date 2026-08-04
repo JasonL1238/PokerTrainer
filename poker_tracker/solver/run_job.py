@@ -30,6 +30,34 @@ from poker_tracker.solver.texassolver import (
 TERMINATION_GRACE_SECONDS = 5.0
 
 
+# Asked by both the pre-flight check and the failure handler; two copies that
+# drifted would let the handler overwrite a finished run's outcome.
+_TERMINAL_STATUSES = frozenset({"cancelled", "stale", "failed", "completed"})
+
+
+def _settle_cancellation(db: PokerDatabase, run_id: int) -> None:
+    """Agree that a requested cancellation has been honoured.
+
+    The compare-and-swap expects ``cancelling``, so it returns either the ``stale``
+    row it just wrote or -- on a lost race -- a row that by that same predicate is
+    no longer ``cancelling``, and nothing moves a run back to ``cancelling``. A
+    retry guarded on a returned ``cancelling`` was therefore unreachable. Widening
+    the expected statuses here would revive that dead guard.
+
+    Four paths reach this: the pre-flight check, the ownership claim, the poll
+    loop, and the failure handler. Each has already stopped its child process by
+    the time it arrives, so settling the row is all that is left -- which is why
+    they can share one writer rather than four copies of the same CAS.
+    """
+    db.update_solver_run(
+        run_id,
+        expected_statuses=("cancelling",),
+        status="stale",
+        pid=None,
+        completed_at=datetime.now(UTC),
+    )
+
+
 def run_solver_job(
     db: PokerDatabase,
     run_id: int,
@@ -39,22 +67,11 @@ def run_solver_job(
     run = db.fetch_solver_run(run_id)
     if run is None:
         raise ValueError("Solver run not found.")
-    if run.status in {"cancelled", "stale", "failed", "completed"}:
+    if run.status in _TERMINAL_STATUSES:
         db.close()
         return
     if run.status == "cancelling":
-        # The compare-and-swap below expects `cancelling`, so it returns either the
-        # `stale` row it just wrote or -- on a lost race -- a row that by that same
-        # predicate is no longer `cancelling`, and nothing moves a run back to
-        # `cancelling`. A retry guarded on a returned `cancelling` was therefore
-        # unreachable. Widening the expected statuses here would revive that guard.
-        db.update_solver_run(
-            run_id,
-            expected_statuses=("cancelling",),
-            status="stale",
-            pid=None,
-            completed_at=datetime.now(UTC),
-        )
+        _settle_cancellation(db, run_id)
         db.close()
         return
     started = time.monotonic()
@@ -127,13 +144,7 @@ def run_solver_job(
             if claimed.status != "running" or claimed.pid != owner_pid:
                 _terminate_solver_child(process)
                 if claimed.status == "cancelling":
-                    db.update_solver_run(
-                        run_id,
-                        expected_statuses=("cancelling",),
-                        status="stale",
-                        pid=None,
-                        completed_at=datetime.now(UTC),
-                    )
+                    _settle_cancellation(db, run_id)
                 return
             deadline = started + timeout_seconds
             while process.poll() is None:
@@ -157,13 +168,7 @@ def run_solver_job(
                 if current.status != "running":
                     _terminate_solver_child(process)
                     if current.status == "cancelling":
-                        db.update_solver_run(
-                            run_id,
-                            expected_statuses=("cancelling",),
-                            status="stale",
-                            pid=None,
-                            completed_at=datetime.now(UTC),
-                        )
+                        _settle_cancellation(db, run_id)
                     return
                 db.update_solver_run(
                     run_id,
@@ -203,15 +208,9 @@ def run_solver_job(
         if current is None:
             return
         if current.status == "cancelling":
-            db.update_solver_run(
-                run_id,
-                expected_statuses=("cancelling",),
-                status="stale",
-                pid=None,
-                completed_at=datetime.now(UTC),
-            )
+            _settle_cancellation(db, run_id)
             return
-        if current.status in {"cancelled", "stale", "failed", "completed"}:
+        if current.status in _TERMINAL_STATUSES:
             return
         if current.status in {"queued", "running"}:
             db.update_solver_run(
