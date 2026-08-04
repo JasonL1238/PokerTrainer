@@ -243,6 +243,11 @@ def test_the_video_delete_warning_states_what_it_actually_removes(
     assert "snapshot is written first" in warnings, warnings
     assert "rows can be brought back" in warnings, warnings
     assert "the recording and its frames cannot" in warnings, warnings
+    # The hands now go with the recording, so the warning that once promised they
+    # were kept has to say the opposite -- and has to say which hands are spared,
+    # because "every hand" would be false of a manually entered one.
+    assert "hand reconstructed from this recording is deleted too" in warnings, warnings
+    assert "entered by hand are not touched" in warnings, warnings
 
 
 def _child_worker_script(

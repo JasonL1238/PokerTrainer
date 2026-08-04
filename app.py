@@ -6054,6 +6054,35 @@ def delete_hands_and_artifacts(
     return deleted, failures, snapshot
 
 
+def hands_reconstructed_from_video(
+    db: PokerDatabase, video_id: int, *, session_id: int | None = None
+) -> list[Hand]:
+    """Hands whose facts were read from this recording.
+
+    Resolved through the same ``cv_timeline_identity`` -> job chain
+    ``hand_source_recording`` uses, but from the recording's side, with the job ids
+    fetched once rather than a query per hand.
+
+    ``session_id`` narrows the scan to one session, which is one indexed query and
+    is all the recording list needs to caption a row. Without it every hand is
+    scanned, because a hand records its originating job inside its completion
+    evidence and no column indexes that -- so the unscoped form is for the delete
+    path, which runs once per operator action, and not for anything that renders.
+
+    A manually entered hand has no timeline identity and is never returned, which
+    is what keeps a manual hand out of a recording's deletion.
+    """
+    job_ids = {job.id for job in db.fetch_jobs_by_video(video_id) if job.id is not None}
+    if not job_ids:
+        return []
+    candidates = (
+        db.fetch_hands_by_session(session_id)
+        if session_id is not None
+        else db.fetch_all_hands()
+    )
+    return [hand for hand in candidates if _cv_timeline_identity(hand)[0] in job_ids]
+
+
 def delete_video_and_artifacts(
     db: PokerDatabase, video_id: int
 ) -> tuple[str | None, Path | None]:
@@ -6080,8 +6109,16 @@ def delete_video_and_artifacts(
     lets it finish. A live job without a pid is therefore treated as
     indeterminate and the delete is refused.
 
-    The snapshot is taken before the cancellation, matching the hand writer, so
-    the rollback point holds the job rows as they were rather than as this
+    The hands reconstructed from the recording are deleted with it. They are NOT
+    kept as they were originally: a hand whose facts were read from a file that no
+    longer exists cannot be re-checked against anything, and leaving it behind
+    produced a row that still counted toward a session's results while its evidence
+    was unreachable. A manually entered hand has no originating job, so it is never
+    in this set, and a hand that cannot be deleted keeps the recording alive rather
+    than being orphaned.
+
+    The snapshot is taken before any of it, matching the hand writer, so the
+    rollback point holds the hands and the job rows as they were rather than as this
     deletion left them.
     """
     video = db.fetch_video(video_id)
@@ -6108,6 +6145,27 @@ def delete_video_and_artifacts(
                 "Try deleting again after it exits.",
                 snapshot,
             )
+    # The hands go with the recording, and they go FIRST -- while the job rows are
+    # still here to resolve them, because db.delete_video cascades those rows away
+    # and the identity chain runs hand -> job -> video.
+    survivors: list[str] = []
+    for hand in hands_reconstructed_from_video(db, video_id):
+        if hand.id is None:
+            continue
+        hand_error = _remove_hand_and_artifacts(db, hand.id, snapshot=snapshot)
+        if hand_error is not None:
+            survivors.append(f"#{hand.hand_number} ({hand_error})")
+    if survivors:
+        # The recording is kept when any of its hands is. Removing it now would
+        # leave exactly the state this cascade exists to prevent: a hand whose
+        # facts came from a file that is gone, with no recording left to re-read.
+        # The snapshot covers the hands already removed, so one rollback undoes the
+        # whole attempt rather than half of it.
+        return (
+            "The recording was kept because these hands could not be deleted: "
+            + "; ".join(survivors),
+            snapshot,
+        )
     for job in jobs:
         if job.id is not None:
             remove_cv_job_artifacts(job.id)
@@ -6138,26 +6196,42 @@ def render_video_danger_zone(
     if video.id is None:
         return
     with st.expander("Danger zone: delete this recording"):
-        # "Hands and sessions are unaffected" was true of the rows and false of
-        # everything the operator would notice: the reconstruction jobs cascade,
-        # and with them the frame verdicts saved against them and the evidence
-        # review that explains why each row was read the way it was. The hands
-        # survive with their provenance pointing at files that no longer exist.
+        # This warning has been wrong twice, in opposite directions, which is why
+        # it is stated once and shared. It first claimed "Hands and sessions are
+        # unaffected" -- true of the rows and false of the frame verdicts and the
+        # evidence review that cascade. It then said the hands were kept, which was
+        # accurate only until the hands began going with the recording.
         st.warning(
             f"Deleting **{video.original_filename}** removes the stored file, "
             "every extracted frame, this recording's reconstruction jobs, the "
             "timeline and export those jobs produced, and the frame verdicts you "
-            "saved against them. Hands and sessions imported from it are kept, but "
-            "they lose their frame evidence and the reconstruction review that "
-            "shows it — repair them with \"Fix hand #N on Import\", offered from "
-            "Study and from the hand's blockers, which opens the same editors "
-            "without a recording. A database snapshot is written first, so the "
-            "rows can be brought back; the recording and its frames cannot."
+            "saved against them. **Every hand reconstructed from this recording is "
+            "deleted too**, with its actions, players, settlement, reviews, issues "
+            "and solver runs — a hand read from a file that no longer exists cannot "
+            "be checked against anything. Hands you entered by hand are not touched, "
+            "and neither is the session itself. A database snapshot is written "
+            "first, so the rows can be brought back; the recording and its frames "
+            "cannot."
         )
         confirm_video = st.checkbox(
-            "I understand this permanently deletes the recording and its files.",
+            "I understand this permanently deletes the recording, its files, and "
+            "every hand reconstructed from it.",
             key=f"{key_prefix}_confirm_delete_video_{video.id}",
         )
+        if confirm_video:
+            # Counted only once the operator has committed, because resolving it
+            # scans every hand: a recording's originating job is stored inside a
+            # hand's completion evidence and no column indexes it.
+            doomed = hands_reconstructed_from_video(db, video.id)
+            st.caption(
+                f"This will delete {len(doomed)} reconstructed hand"
+                f"{'' if len(doomed) == 1 else 's'}"
+                + (
+                    ": " + ", ".join(f"#{hand.hand_number}" for hand in doomed)
+                    if doomed
+                    else " — no hand in the library came from this recording."
+                )
+            )
         if st.button(
             "Delete recording",
             key=f"{key_prefix}_delete_video_{video.id}",
@@ -6613,28 +6687,6 @@ def _save_video_upload(
             st.error(f"Could not save video: {exc}")
 
 
-def _session_hands_from_video(
-    db: PokerDatabase, session: Session, video_id: int
-) -> list[Hand]:
-    """Hands in this session whose facts were read from this recording.
-
-    Resolved through the same ``cv_timeline_identity`` -> job chain
-    ``hand_source_recording`` uses, but from the recording's side and with the
-    job ids fetched once, so listing a session's recordings does not cost a query
-    per hand per recording.
-    """
-    if session.id is None:
-        return []
-    job_ids = {job.id for job in db.fetch_jobs_by_video(video_id) if job.id is not None}
-    if not job_ids:
-        return []
-    return [
-        hand
-        for hand in db.fetch_hands_by_session(session.id)
-        if _cv_timeline_identity(hand)[0] in job_ids
-    ]
-
-
 def show_session_videos(db: PokerDatabase, session: Session) -> None:
     if session.id is None:
         return
@@ -6688,7 +6740,7 @@ def show_session_videos(db: PokerDatabase, session: Session) -> None:
             # somewhere. Said here rather than only after the fact, because the
             # button beside it is one click and the blocker it produces surfaces
             # a page away.
-            if _session_hands_from_video(db, session, video.id):
+            if hands_reconstructed_from_video(db, video.id, session_id=session.id):
                 st.caption(
                     "Hands in this session were reconstructed from this recording. "
                     "Removing it keeps them, but importing more hands from it needs "

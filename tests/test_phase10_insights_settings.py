@@ -1005,8 +1005,14 @@ def test_no_hand_is_deleted_without_a_snapshot_in_hand() -> None:
     assert source.count("def _remove_hand_and_artifacts(") == 1
     signature = source.split("def _remove_hand_and_artifacts(")[1].split(")")[0]
     assert "*, snapshot: Path" in signature, signature
-    # Every caller passes one; none may construct the helper's work itself.
-    assert source.count("_remove_hand_and_artifacts(") == 3, (
-        "expected the definition and exactly two callers: the single-hand writer "
-        "and the batch writer"
+    # Every caller passes one; none may construct the helper's work itself. Three
+    # now: the single-hand writer, the batch writer, and the recording deletion,
+    # which takes the hands reconstructed from a recording with it.
+    assert source.count("_remove_hand_and_artifacts(") == 4, (
+        "expected the definition and exactly three callers: the single-hand "
+        "writer, the batch writer, and delete_video_and_artifacts"
     )
+    # The count above cannot tell whether a caller passed a real rollback point,
+    # so pin that every one of them names the keyword.
+    assert source.count("_remove_hand_and_artifacts(db, hand.id, snapshot=snapshot)") == 1
+    assert source.count("_remove_hand_and_artifacts(db, hand_id, snapshot=snapshot)") == 2

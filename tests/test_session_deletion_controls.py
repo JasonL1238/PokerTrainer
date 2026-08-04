@@ -32,6 +32,7 @@ from poker_tracker.persistence.models import (
     Session,
     VideoRecord,
 )
+from poker_tracker.services.validated_hand_import import CV_TIMELINE_IDENTITY_KEY
 from poker_tracker.ui.cv_artifacts import cv_job_artifact_paths
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
@@ -48,7 +49,20 @@ def _video(session_id: int | None, name: str, stored: Path) -> VideoRecord:
     )
 
 
-def _hand(session_id: int, number: int) -> Hand:
+def _hand(session_id: int, number: int, *, from_job: int | None = None) -> Hand:
+    """One hand, optionally stamped as reconstructed from ``from_job``.
+
+    The stamp is the real one -- ``cv_timeline_identity`` inside completion
+    evidence -- because that is the only link from a hand back to its recording;
+    no column holds it. A hand without it is a manual entry as far as every
+    resolver is concerned.
+    """
+    evidence: dict = {}
+    if from_job is not None:
+        evidence[CV_TIMELINE_IDENTITY_KEY] = {
+            "job_id": from_job,
+            "timeline_hand_number": number,
+        }
     return Hand(
         session_id=session_id,
         hand_number=number,
@@ -57,7 +71,8 @@ def _hand(session_id: int, number: int) -> Hand:
         hero_position="BTN",
         hero_cards="Ah Qs",
         pot_size=20,
-        source_type="cv_import",
+        source_type="cv_import" if from_job is not None else "manual",
+        completion_evidence=evidence,
     )
 
 
@@ -214,16 +229,18 @@ def test_deleting_a_recording_snapshots_and_removes_its_job_artifacts(
     db.close()
 
 
-def test_deleting_a_recording_spares_the_frames_surviving_hands_point_at(
+def test_deleting_a_recording_leaves_the_frame_directory_to_retention(
     tmp_path: Path,
 ) -> None:
-    """``actions.source_image`` points into ``frames/cv_job_<id>/``.
+    """``frames/cv_job_<id>/`` is retention's to expire, not this writer's to remove.
 
-    Hands imported from a recording outlive the recording on purpose, so that
-    directory holds evidence they still reference. Deleting it would be the one
-    thing retention forbids at any age: removing a file the product still expects.
-    Retention owns that folder because only it can tell a referenced frame from an
-    unreferenced one.
+    ``actions.source_image`` points into that directory, and retention is the only
+    thing that can tell a frame some row still names from one nothing references --
+    including frames belonging to a job whose hands were edited or moved rather than
+    reconstructed. Removing the directory here would be the one thing retention
+    forbids at any age: deleting a file the product still expects. Now that a
+    recording's hands go with it the directory usually falls unreferenced, which is
+    exactly the state retention's window exists to handle.
     """
     db = PokerDatabase(str(tmp_path / "spare-frames.sqlite3"))
     db.init_db()
@@ -313,6 +330,110 @@ def test_a_recording_whose_job_is_still_starting_up_is_refused(
     assert snapshot is not None, "the refusal still reports the point it snapshotted"
     assert db.fetch_video(video.id) is not None, "raced a worker that was still launching"
     assert stored.is_file()
+    db.close()
+
+
+def test_deleting_a_recording_deletes_the_hands_reconstructed_from_it(
+    tmp_path: Path,
+) -> None:
+    """A hand read from a file that no longer exists cannot be checked against anything.
+
+    Leaving it behind produced a row that still counted toward the session's
+    results while the evidence behind it was unreachable, so the hands go with the
+    recording. What must NOT go is a hand the operator typed in: it has no
+    originating job, and its facts never depended on the recording.
+    """
+    path = tmp_path / "cascade.sqlite3"
+    db = PokerDatabase(str(path))
+    db.init_db()
+    session = db.create_session(Session(name="Cascade"))
+    assert session.id is not None
+    video = db.create_video(
+        _video(session.id, "cascade.mp4", tmp_path / "videos" / "cascade.mp4")
+    )
+    assert video.id is not None
+    job = db.create_processing_job(
+        ProcessingJob(job_type="cv_reconstruction", status="completed", video_id=video.id)
+    )
+    assert job.id is not None
+
+    reconstructed = [db.create_hand(_hand(session.id, n, from_job=job.id)) for n in (1, 2)]
+    typed_by_hand = db.create_hand(_hand(session.id, 3))
+    # A second recording's hand must survive: the scan is unscoped by session, so
+    # a bug here would take the whole library with it.
+    other_video = db.create_video(
+        _video(session.id, "other.mp4", tmp_path / "videos" / "other.mp4")
+    )
+    other_job = db.create_processing_job(
+        ProcessingJob(
+            job_type="cv_reconstruction", status="completed", video_id=other_video.id
+        )
+    )
+    assert other_job.id is not None
+    from_other = db.create_hand(_hand(session.id, 4, from_job=other_job.id))
+
+    error, snapshot = app_module.delete_video_and_artifacts(db, video.id)
+
+    assert error is None, error
+    assert snapshot is not None
+    for hand in reconstructed:
+        assert hand.id is not None
+        assert db.fetch_hand(hand.id) is None, f"hand #{hand.hand_number} outlived its recording"
+    assert typed_by_hand.id is not None
+    assert db.fetch_hand(typed_by_hand.id) is not None, "deleted a manually entered hand"
+    assert from_other.id is not None
+    assert db.fetch_hand(from_other.id) is not None, "deleted another recording's hand"
+    assert db.fetch_session(session.id) is not None, "the session itself is not deleted"
+
+    # One rollback point holds the hands as well as the recording's rows.
+    restored = sqlite3.connect(str(snapshot))
+    try:
+        assert restored.execute(
+            "SELECT COUNT(*) FROM hands WHERE session_id = ?", (session.id,)
+        ).fetchone()[0] == 4
+    finally:
+        restored.close()
+    db.close()
+
+
+def test_a_recording_is_kept_when_one_of_its_hands_will_not_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Half a cascade is the state the cascade exists to prevent.
+
+    If the recording went while one of its hands stayed, that hand would be exactly
+    the orphan this behaviour was added to stop -- so the recording survives and the
+    operator is told which hand held it up.
+    """
+    db = PokerDatabase(str(tmp_path / "stubborn.sqlite3"))
+    db.init_db()
+    session = db.create_session(Session(name="Stubborn"))
+    assert session.id is not None
+    stored = tmp_path / "videos" / "stubborn.mp4"
+    video = db.create_video(_video(session.id, "stubborn.mp4", stored))
+    assert video.id is not None
+    job = db.create_processing_job(
+        ProcessingJob(job_type="cv_reconstruction", status="completed", video_id=video.id)
+    )
+    assert job.id is not None
+    hand = db.create_hand(_hand(session.id, 1, from_job=job.id))
+    assert hand.id is not None
+
+    monkeypatch.setattr(
+        app_module,
+        "_stop_and_clear_solver_runs",
+        lambda *_args: "The active solver could not be stopped yet.",
+    )
+
+    error, snapshot = app_module.delete_video_and_artifacts(db, video.id)
+
+    assert error is not None
+    assert "recording was kept" in error, error
+    assert "#1" in error, error
+    assert snapshot is not None
+    assert db.fetch_video(video.id) is not None, "recording went while its hand stayed"
+    assert stored.is_file()
+    assert db.fetch_hand(hand.id) is not None
     db.close()
 
 
