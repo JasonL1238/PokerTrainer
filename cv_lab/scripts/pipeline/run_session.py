@@ -211,12 +211,6 @@ def reconstruct(hand):
     }
 
 
-def min_stk_during(hand, seat_i):
-    vals = [seat["stack"] for s in hand for seat in (s.get("seats") or [])
-            if seat["seat"] == seat_i and seat["stack"] is not None]
-    return min(vals) if vals else 0.0
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stride", type=int, default=30)

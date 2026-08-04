@@ -202,10 +202,6 @@ def next_matching(
     )
 
 
-def next_undecided(connection: sqlite3.Connection, priority_ids: Iterable[str] = ()) -> str | None:
-    return next_matching(connection, "undecided", priority_ids)
-
-
 def seek(
     connection: sqlite3.Connection,
     current_id: str | None,

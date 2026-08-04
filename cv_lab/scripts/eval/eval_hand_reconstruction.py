@@ -53,10 +53,6 @@ def _canon_action(atype: str) -> str:
     return {"all_in": "all-in"}.get(atype, atype)
 
 
-def _action_key(a: dict[str, Any]) -> tuple:
-    return (a["street"], int(a["seat"]), _canon_action(str(a["action_type" if "action_type" in a else "action"])))
-
-
 def _types_compatible(gt: str, pred: str) -> bool:
     """all-in is a size statement, not a distinct move: it matches bet/raise/call."""
     gt, pred = _canon_action(gt), _canon_action(pred)

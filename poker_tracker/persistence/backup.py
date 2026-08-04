@@ -243,14 +243,6 @@ def find_snapshots(
     return sorted(matched, key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
 
 
-def classify_snapshot(name: str) -> SnapshotClass | None:
-    """The pool a filename belongs to, or None when this product did not write it."""
-    for snapshot_class in SNAPSHOT_CLASSES:
-        if snapshot_class.name.match(name):
-            return snapshot_class
-    return None
-
-
 def resolve_artifact_path(
     stored_path: str, database_path: Path, data_dir: Path
 ) -> Path:

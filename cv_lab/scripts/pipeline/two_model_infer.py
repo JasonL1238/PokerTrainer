@@ -45,15 +45,6 @@ if not DEFAULT_REGION_WEIGHTS.exists():
 CARD_CROP_PAD = 0.12
 
 
-def _pad_box(x1, y1, x2, y2, w, h, pad):
-    bw, bh = x2 - x1, y2 - y1
-    xi0 = max(int(round(x1 - bw * pad)), 0)
-    yi0 = max(int(round(y1 - bh * pad)), 0)
-    xi1 = min(int(round(x2 + bw * pad)), w)
-    yi1 = min(int(round(y2 + bh * pad)), h)
-    return xi0, yi0, xi1, yi1
-
-
 class RegionDetector:
     """Lazy-loaded 8-class region detector (Model 1)."""
 
