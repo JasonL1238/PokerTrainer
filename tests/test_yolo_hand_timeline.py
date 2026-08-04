@@ -55,18 +55,23 @@ RIVER = TURN + ["Jc"]
 
 def _frame(time_s, *, board, s0, s4, pot=None, pill0=None, pill4=None, active=4):
     dets = _hero_cards() + _board(board)
-    dets.append(_det("card_back", 0.50, 0.14))          # villain dealt in (seat 4)
-    dets.append(_det("dealer_button", 0.50, 0.14))      # dealer = seat 4
+    # Seated boxes sit on their own class's anchor table: seat attribution is
+    # anchored with a rejection radius, so a box parked on another class's
+    # position (the old avatar centroid) would be refused, exactly as a
+    # misplaced box on a real frame should be.
+    dets.append(_det("card_back", *rd.SEAT_ANCHORS_BY_CLASS["card_back"][4]))
+    dets.append(_det("dealer_button", *rd.SEAT_ANCHORS_BY_CLASS["dealer_button"][4]))
     # stack_text doubles as the table-anchor constellation; only seats 0 and 4
     # carry a readable amount.
     dets.extend(_stack_anchors({0: s0, 4: s4}))
     if pot is not None:
         dets.append(_det("pot_text", 0.50, 0.32, pot))
     if pill0 is not None:
-        dets.append(_det("action_pill", 0.50, 0.80, pill0))
+        dets.append(_det("action_pill", *rd.SEAT_ANCHORS_BY_CLASS["action_pill"][0], pill0))
     if pill4 is not None:
-        dets.append(_det("action_pill", 0.50, 0.20, pill4))
-    dets.append(_det("active_turn_indicator", *rd.SEAT_CENTROIDS[active]))
+        dets.append(_det("action_pill", *rd.SEAT_ANCHORS_BY_CLASS["action_pill"][4], pill4))
+    dets.append(_det("active_turn_indicator",
+                     *rd.SEAT_ANCHORS_BY_CLASS["active_turn_indicator"][active]))
     return {"image": f"f{time_s}.jpg", "time_s": time_s, "width": W, "height": H, "detections": dets}
 
 
@@ -166,6 +171,126 @@ def test_mid_hand_start_keeps_pre_capture_folders_in_button_position_ring():
     assert not {
         action["seat"] for action in hand["actions"]
     } & {1, 3, 4}, "pre-capture folders stay positional but receive no invented actions"
+
+
+def test_a_sitting_out_seat_is_never_recruited_from_its_stack_hud():
+    """A stack HUD proves a seat is OCCUPIED, not that it is in the hand. On
+    the 2026-08-03 session the hero sat out ('Waiting' badge, no cards all
+    session) but showed a stable stack, so the mid-hand-open recruitment made
+    them the small blind of every hand and shifted every position by one. The
+    session-level dealt-cards set is the cap: a seat never dealt cards anywhere
+    in the session cannot be in any hand's roster, while pre-capture folders
+    (dealt in neighbouring hands) still recruit exactly as before."""
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import (
+        _player_seats,
+        reconstruct,
+    )
+
+    states, _events = _states_from(_hand_fixture())
+    for state in states:
+        state["dealer_seat"] = 4
+        state["stacks"].update({1: 194.6, 2: 140.7, 3: 181.1,
+                                5: 191.3, 6: 183.0, 7: 321.2})
+    states[0]["dealt_in"] = [2, 5, 6, 7]
+    states[0]["pills"] = {2: "call", 5: "call", 6: "raise", 7: "call"}
+    states[0]["bets"] = {2: 2.0, 5: 2.0, 6: 10.0, 7: 2.0}
+    for state in states:
+        # Sitting out: hero zone empty all hand, no card back, no pill -- the
+        # stack HUD is the only trace of seat 0.
+        state["hero_cards"] = []
+        state["dealt_in"] = [s for s in state["dealt_in"] if s != 0]
+        state["pills"] = {s: p for s, p in state["pills"].items() if s != 0}
+        state["bets"].pop(0, None)
+
+    # Without the session cap the hero's stable stack recruits seat 0.
+    assert 0 in _player_seats(states, 4)
+    # With it, only seats dealt cards somewhere in the session qualify.
+    dealt = {1, 2, 3, 4, 5, 6, 7}
+    assert 0 not in _player_seats(states, 4, session_dealt_seats=dealt)
+
+    hand = reconstruct(states, 1, session_dealt_seats=dealt)
+    seats = {player["seat"] for player in hand["players"]}
+    assert 0 not in seats
+    assert not any(player["is_hero"] for player in hand["players"])
+    # Positions walk the ring over the seven real players; nothing is shifted
+    # by a phantom hero between the button and the small blind.
+    by_seat = {p["seat"]: p for p in hand["players"]}
+    assert by_seat[4]["position"] == "BTN"
+    assert by_seat[5]["position"] == "SB"
+    assert by_seat[6]["position"] == "BB"
+
+
+def test_observed_forced_posts_reads_the_chain_and_refuses_touched_opens():
+    """The forced-post structure is OBSERVED off the deal-open state, never
+    assumed: standing bets on the chain clockwise of the button, nondecreasing,
+    each straddle at least doubling the post before it. Anything showing action
+    already happened -- a board, a non-POST pill, money beyond the chain, a
+    refused read -- makes the open unobservable (None), and the session vote
+    decides from the hands whose opens were seen."""
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import (
+        _observed_forced_posts,
+    )
+
+    all_seats = tuple(range(8))
+
+    def open_state(bets, pills=None, board=(), dealt=all_seats, unknown=None):
+        return {"board_cards": list(board), "dealt_in": list(dealt),
+                "bets": bets, "bets_unknown": unknown or {}, "pills": pills or {}}
+
+    players = list(range(8))
+    # Dealer 0: chain reads seat 1 (SB), 2 (BB), 3 (straddle). The green POST
+    # pill on the straddler is tolerated -- it is the post, not an action.
+    straddled = open_state({1: 0.5, 2: 1.0, 3: 2.0}, pills={3: "bet_or_call"})
+    assert _observed_forced_posts([straddled], players, 0) == (0.5, 1.0, 2.0)
+
+    plain = open_state({1: 0.5, 2: 1.0})
+    assert _observed_forced_posts([plain], players, 0) == (0.5, 1.0)
+
+    # A pill on a non-posting seat means someone already acted.
+    acted = open_state({1: 0.5, 2: 1.0}, pills={5: "fold"})
+    assert _observed_forced_posts([acted], players, 0) is None
+
+    # A third bet that does not double the BB is not a straddle; standing
+    # money beyond the chain means an action, so the open proves nothing.
+    minraise = open_state({1: 0.5, 2: 1.0, 3: 1.5})
+    assert _observed_forced_posts([minraise], players, 0) is None
+
+    # A refused read on a chain seat cannot certify the chain.
+    refused = open_state({1: 0.5, 2: 1.0}, unknown={3: "no_digit_run"})
+    assert _observed_forced_posts([refused], players, 0) is None
+
+    # A board showing = mid-hand capture, not an open.
+    midhand = open_state({1: 0.5, 2: 1.0}, board=("Ah", "Kd", "2c"))
+    assert _observed_forced_posts([midhand], players, 0) is None
+
+
+def test_preflop_order_opens_left_of_the_last_forced_post():
+    """With a straddle the preflop action opens left of the STRADDLE, not left
+    of the big blind -- the operator's own review note on the 2026-08-03
+    session ('UTG folds. not UTG+1 bc hes the straddle'). Position names gain
+    an ST slot and everything after it shifts one seat."""
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import (
+        _positions,
+        _street_seat_order,
+    )
+
+    straddled = _positions(list(range(8)), 0, n_straddles=1)
+    assert straddled[1] == "SB"
+    assert straddled[2] == "BB"
+    assert straddled[3] == "ST"
+    assert straddled[4] == "UTG"
+    order = _street_seat_order(straddled, "preflop")
+    assert order[0] == 4          # UTG, left of the straddle
+    assert order[-1] == 3         # the straddler acts last preflop
+
+    plain = _positions(list(range(8)), 0)
+    assert plain[3] == "UTG"
+    assert _street_seat_order(plain, "preflop")[0] == 3
+
+    # The straddle count is capped by the ring: 3-handed there is no seat
+    # left to straddle, and positions fall back to the plain names.
+    three = _positions([0, 1, 2], 0, n_straddles=1)
+    assert set(three.values()) == {"BTN", "SB", "BB"}
 
 
 def test_spine_derives_action_sizes_from_stack_deltas():
@@ -324,25 +449,42 @@ def test_settlement_finds_the_real_sweep_with_corrected_pots():
     assert pots[-1] == 240.9
 
 
-def test_debounce_pot_rejects_a_collapse_that_reads_exactly_one():
-    """The floor was `pot < 1.0 <= accepted`, strict on both sides -- and the
-    post-sweep blind pot reads EXACTLY 1.0, so it slipped straight through the
-    rule written to catch it."""
-    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import _debounce_pot
+def test_the_next_deals_blind_pot_never_reaches_the_hands_pot_series():
+    """The invariant the old collapse-carry protected, now owned by
+    segmentation and the tail trim: a post-sweep blind pot (which reads EXACTLY
+    1.0 -- one big blind) must not corrupt the hand's pot series. The carry
+    itself is gone because it was the wrong owner: on a session whose hand
+    boundaries were missed it overwrote the next deal's real blind pot with the
+    old hand's pot 35 times in one merged mega-hand, erasing the very evidence
+    that a new deal had started. Real g0715 tail: the dealer-marked 1.0 state
+    is pruned; the debounce never invents a pot for it."""
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import (
+        _debounce_pot,
+        _segment,
+        _trim_trailing_next_deal,
+    )
 
-    hand = [{"pot": 240.9}, {"pot": 240.9}, {"pot": 1.0}]
-    _debounce_pot(hand)
-    assert [s["pot"] for s in hand] == [240.9, 240.9, 240.9]
-    # Counted as a REPAIR, not a discarded read: the pot still came out right, so
-    # it must not escalate to amount_scale_implausible.
-    assert hand[2]["pot_collapses_repaired"] == 1
-    assert "amounts_rejected" not in hand[2]
+    states = _g0715_settle_states()
+    (hand,) = _segment(states)          # teardown tail trails, no phantom hand
+    trimmed = _trim_trailing_next_deal(hand)
+    assert 1.0 not in [s["pot"] for s in trimmed]
+
+    # And the debounce itself is revert-only: it repairs an A -> B -> A blip
+    # but never carries the old pot over a reading with no revert evidence.
+    blip = [{"pot": 240.9}, {"pot": 1.0}, {"pot": 240.9}]
+    _debounce_pot(blip)
+    assert [s["pot"] for s in blip] == [240.9, 240.9, 240.9]
+    tail = [{"pot": 240.9}, {"pot": 240.9}, {"pot": 1.0}]
+    _debounce_pot(tail)
+    assert [s["pot"] for s in tail] == [240.9, 240.9, 1.0]
 
 
-def test_repaired_pot_collapses_do_not_escalate_to_a_warning():
-    """A hand whose pot misread transiently twice and was repaired both times
-    reconstructs the RIGHT pot; flagging it as an implausible-amount hand would
-    reject a good hand. Seen for real on 07-15 (240.9 misread as 2.0 and 24.0)."""
+def test_transient_pot_misreads_do_not_escalate_to_a_warning():
+    """A hand whose pot misread transiently mid-stream reconstructs the RIGHT
+    pot; flagging it as an implausible-amount hand would reject a good hand.
+    Seen for real on 07-15 (240.9 misread as 2.0 and 24.0). The old collapse
+    carry counted these as repairs; with it gone the revert-only debounce and
+    the settle logic absorb them, and nothing escalates."""
     from cv_lab.scripts.pipeline.build_yolo_hand_timeline import reconstruct
 
     states, _events = _states_from(_hand_fixture())
@@ -350,8 +492,10 @@ def test_repaired_pot_collapses_do_not_escalate_to_a_warning():
     for i in accepted[1:3]:
         states[i]["pot"] = 1.0            # transient pot misread, twice
     hand = reconstruct(states, 1)
-    assert hand["pot_collapses_repaired"] >= 2
+    assert hand["pot"] == 20.0            # the true final pot survives the dips
+    assert hand["pot_collapses_repaired"] == 0
     assert "amount_scale_implausible" not in hand["warnings"]
+    assert hand["warnings"] == []
 
 
 def test_debounce_pot_keeps_a_legitimate_small_pot_series():

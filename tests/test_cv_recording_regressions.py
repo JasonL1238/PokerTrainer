@@ -123,11 +123,15 @@ def test_ar1750_recording_reconstructs_the_lost_board_and_streets(ar1750_timelin
     folded = hands[2]
     assert folded["board"] == []
     assert [s["street"] for s in folded["streets"]] == ["preflop"]
-    # Round-2: seat 3's committed-at-start window carries DISAGREEING bet reads
-    # (0.5 then 6.0 against a never-moving 392.3 stack), so its starting stack
-    # is now refused instead of silently max-picked -- the board-related
-    # assertions above are what this test pins, and they hold.
-    assert folded["warnings"] == ["starting_stack_unknown"]
+    # The round-2 "disagreeing bet reads (0.5 then 6.0)" refusal is GONE, and
+    # it should be: at aspect 1.750 the frame-normalized seat map filed one
+    # player's card backs and 0.5 bet under seat 3 while their anchor-fitted
+    # stack read as seat 2 -- the "conflict" was two different players' bets
+    # merged onto one seat index. Attribution now runs in the anchored basis
+    # (measured on this recording: 231 bet_text and 227 card_back boxes move
+    # from seat 3 to seat 2, and 33 bet_text from seat 5 to 6), every class
+    # agrees per player, and the hand reads cleanly.
+    assert folded["warnings"] == []
 
 
 def test_ar1750_every_card_bearing_state_anchors(ar1750_timeline) -> None:
@@ -181,15 +185,15 @@ def test_ar1750_export_no_longer_ships_a_played_hand_with_an_empty_board(
     for _n, n_board, streets, _terminal in per_hand:
         past_preflop = [s for s in streets if s != "preflop"]
         assert bool(past_preflop) == bool(n_board), (streets, n_board)
-    # Hand 1 now exports (ledger inference closes its money holes; terminal is
-    # the observed showdown). Hands 2 and 3 stay held back for their remaining
-    # reconstruction faults, including round-2 committed-window refusals on
-    # disagreeing standing-bet reads.
-    assert [h["hand"]["hand_number"] for h in payload["hands"]] == [1]
+    # Hands 1 AND 3 export now (renumbered 1 and 2 on the way out). Hand 3 was
+    # held back by action_sequence_illegal + starting_stack_unknown -- both
+    # artifacts of the frame-normalized seat map splitting one player's HUD
+    # across seats 2 and 3 at this aspect ratio, and both gone in the anchored
+    # basis. Hand 2 stays held back for its genuine reconstruction faults
+    # (board_regression, street_order_issue), which are what the skip pins.
+    assert [h["hand"]["hand_number"] for h in payload["hands"]] == [1, 2]
     assert [sorted(s["codes"]) for s in payload["cv_import_summary"]["skipped"]] == [
-        ["amounts_unknown_in_ledger", "board_regression",
-         "starting_stack_unknown", "street_order_issue"],
-        ["action_sequence_illegal", "starting_stack_unknown"],
+        ["board_regression", "street_order_issue"],
     ]
 
 
@@ -235,6 +239,26 @@ def test_baseline_ar1397_zoning_is_unchanged() -> None:
     assert counts["hero"] == counts["legacy_hero"] == 674
     assert counts["legacy_board"] == 648
     assert counts["board"] == 645
+
+
+def test_the_development_table_straddles_and_the_spine_says_so(baseline_timeline) -> None:
+    """The development recording is itself a straddle game: every deal-open
+    state shows a third standing bet of 2.0 on the seat left of the BB, under a
+    green pill. The spine used to book that as an UTG *call* off the pill --
+    arithmetically coherent, but only while the pill was readable, and it left
+    positions and preflop order one seat wrong. The structure is now observed
+    per session and every hand carries one typed straddle post, position ST,
+    with preflop action opening left of it."""
+    assert baseline_timeline["metadata"]["forced_post_structure"] == [0.5, 1.0, 2.0]
+    for hand in baseline_timeline["hands"]:
+        straddles = [a for a in hand["actions"]
+                     if a.get("forced_bet_type") == "straddle"]
+        assert len(straddles) == 1, hand["hand_number"]
+        (post,) = straddles
+        assert post["action_type"] == "post_blind"
+        assert post["amount"] == 2.0
+        assert post["position"] == "ST"
+        assert post["is_live_post"] is True
 
 
 def test_baseline_ar1397_reconstructs_seven_hands(baseline_timeline) -> None:
@@ -492,20 +516,20 @@ def test_a_real_preflop_fold_is_not_rejected_for_its_empty_board(ar1750_timeline
     """False-positive guard on the same recording: hand 3's board really is empty,
     so NO board-related code may fire on it.
 
-    It is not warning-free overall -- its seat 3 checks facing a 6.0 raise, which
-    action_sequence_illegal reports and which is a genuine reconstruction fault in
-    that hand (the pill was read as a check where the pot arithmetic says a call).
-    The point of this guard is narrower and unchanged: an empty board is a legal
-    value and must not by itself cost the hand anything."""
+    The hand is now warning-free overall. Its old "seat 3 checks facing a 6.0
+    raise" (action_sequence_illegal) and "disagreeing 0.5/6.0 standing-bet
+    reads" (starting_stack_unknown) were one defect wearing two codes: at
+    aspect 1.750 the frame-normalized seat map filed seat 2's HUD under seat 3,
+    so one seat index appeared to both check and raise, and to hold two bets at
+    once. Anchored attribution reunites each player's boxes and both codes
+    dissolve. The property under test is narrower and unchanged: an empty board
+    is a legal value and must not by itself cost the hand anything."""
     folded = ar1750_timeline["hands"][2]
     assert folded["board"] == []
     report = validate_timeline({"hands": [folded], "states": []})
     codes = {w["code"] for w in report["hands"][0]["warnings"]}
     assert not {c for c in codes if "board" in c}
-    # starting_stack_unknown is the round-2 committed-window refusal (seat 3's
-    # disagreeing 0.5/6.0 reads); it is not a board code, which is the property
-    # under test.
-    assert codes == {"action_sequence_illegal", "starting_stack_unknown"}
+    assert codes == set()
 
 
 # --------------------------------------------------------------------------- #
@@ -530,9 +554,15 @@ def test_a_recording_truncated_hand_does_not_invent_a_winner(truncated_timeline)
     wins', confidence 1.0, tags=[], completion_status='complete', with
     terminal_event='showdown' on a ZERO-card board. The whole "Villain wins" rested
     on seat 3's stack reading 182.0 at t=195 and 182.5 at t=196 -- 0.5 BB of jitter,
-    0.03x the pot -- which the argmax over stack gains was free to call a sweep."""
+    0.03x the pot -- which the argmax over stack gains was free to call a sweep.
+
+    t_start is 184.0, not 185.0: segmentation cuts at the first state showing
+    the new DEAL (all eight card backs, blinds pot 7.5), one state before the
+    hero's own cards are read. That deal-open state carries the hand's true
+    opening roster and forced posts and belongs to this hand, not to the tail
+    of the previous one."""
     hand = truncated_timeline["hands"][-1]
-    assert (hand["t_start"], hand["t_end"]) == (185.0, 196.0)
+    assert (hand["t_start"], hand["t_end"]) == (184.0, 196.0)
     assert hand["hero"] == ["3d", "2s"]
     assert hand["board"] == []
     assert hand["pot"] == 17.5
@@ -547,7 +577,16 @@ def test_the_truncated_hand_exports_without_a_fabricated_result(
 ) -> None:
     """The published record, end to end. The hero's fold IS a complete record of
     the hero's decision, so the hand still exports -- but it must not claim a
-    villain won a pot nobody was seen to take."""
+    villain won a pot nobody was seen to take.
+
+    The recording opens mid-way through the PREVIOUS hand's river; that
+    fragment segments apart as its own truncated hand but does NOT export: its
+    teardown state stays attached (the interstitial's mid-animation dealer
+    marker is refused by the seat rejection radius, so the dealer-moved trim
+    arm has no reading to prune it on), the board it shows then empties inside
+    the fragment, and validation's street_order_issue blocks it. One state of
+    a hand nobody saw played is exactly the record the gate exists to hold
+    back."""
     payload = timeline_to_session_payload(
         truncated_timeline,
         timeline_path="t.json",
@@ -556,13 +595,16 @@ def test_the_truncated_hand_exports_without_a_fabricated_result(
     )
     exported = [h["hand"] for h in payload["hands"]]
     assert len(exported) == 1
-    last = exported[-1]
+    (last,) = exported
 
     assert last["board_cards"] == ""
     assert last["result"] == "Hero folds"
     assert last["hero_bb_won"] == 0.0
     assert last["completion_evidence"]["terminal_event"] == "hero_fold"
     assert not any(h["result"] == "Villain wins" for h in exported)
+    assert [sorted(s["codes"]) for s in payload["cv_import_summary"]["skipped"]] == [
+        ["street_order_issue"],
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -636,6 +678,53 @@ def test_green_colour_fallback_does_not_claim_call(monkeypatch) -> None:
 # --------------------------------------------------------------------------- #
 # Round 3: facts that used to be indistinguishable from "checked and clean".
 # --------------------------------------------------------------------------- #
+def test_seat_assignment_is_invariant_under_window_resize_and_chrome_offset() -> None:
+    """The generalization the anchored basis buys, pinned. One synthetic table
+    rendered three ways -- native, resized 0.8x and 1.3x, and shifted 180x120px
+    as if desktop chrome surrounded the client -- must produce IDENTICAL seat
+    attributions for every seated class. Under frame-normalized anchors the
+    shifted variant silently rotated reads onto neighbouring seats (the
+    2026-08-03 failure class); under the anchored basis the fitted transform
+    absorbs scale and offset entirely."""
+    def table(scale: float, dx: float = 0.0, dy: float = 0.0) -> rd.Frame:
+        w, h = round(2054 * scale + 2 * dx), round(1470 * scale + 2 * dy)
+        dets = []
+
+        def box(cls, nx, ny, attr=None, half=(40, 20)):
+            px, py = nx * 2054 * scale + dx, ny * 1470 * scale + dy
+            hx, hy = half[0] * scale, half[1] * scale
+            dets.append(rd.Detection(cls, 0.9, (px - hx, py - hy, px + hx, py + hy), attr))
+
+        for seat, (nx, ny) in rd.SEAT_ANCHORS_BY_CLASS["stack_text"].items():
+            box("stack_text", nx, ny, 100.0 + seat)
+        for seat in (1, 3, 6):
+            box("card_back", *rd.SEAT_ANCHORS_BY_CLASS["card_back"][seat])
+        box("dealer_button", *rd.SEAT_ANCHORS_BY_CLASS["dealer_button"][5])
+        box("active_turn_indicator", *rd.SEAT_ANCHORS_BY_CLASS["active_turn_indicator"][6])
+        box("bet_text", *rd.SEAT_ANCHORS_BY_CLASS["bet_text"][3], attr=2.0)
+        return rd.Frame("x", 0.0, w, h, dets)
+
+    views = [rd.assign_regions(table(1.0)),
+             rd.assign_regions(table(0.8)),
+             rd.assign_regions(table(1.3)),
+             rd.assign_regions(table(1.0, dx=180.0, dy=120.0))]
+    reference = views[0]
+    assert reference["dealer_seat"] == 5
+    assert reference["active_seat"] == 6
+    assert {s for s, info in reference["seats"].items() if info["card_back"]} == {1, 3, 6}
+    assert {s: info["stack"] for s, info in reference["seats"].items()
+            if info["stack"] is not None} == {s: 100.0 + s for s in range(8)}
+    for view in views[1:]:
+        assert view["dealer_seat"] == reference["dealer_seat"]
+        assert view["active_seat"] == reference["active_seat"]
+        assert {s: info["card_back"] for s, info in view["seats"].items()} \
+            == {s: info["card_back"] for s, info in reference["seats"].items()}
+        assert {s: info["stack"] for s, info in view["seats"].items()} \
+            == {s: info["stack"] for s, info in reference["seats"].items()}
+        assert view["seat_unassigned"] == 0
+        assert view["unanchored_seated"] == 0
+
+
 def test_a_short_handed_table_no_longer_has_an_unrunnable_check_to_record() -> None:
     """SUPERSEDES test_the_stack_outlier_net_records_when_it_could_not_run.
 
@@ -648,13 +737,17 @@ def test_a_short_handed_table_no_longer_has_an_unrunnable_check_to_record() -> N
     The net is deleted, so there is no check to skip and nothing to record. What
     replaces it is stronger and needs no siblings at all: a read is either PROVEN
     at the reader or it is UNKNOWN with a named reason, and a three-seat table
-    gets exactly the same treatment as an eight-seat one."""
+    gets exactly the same treatment as an eight-seat one -- given a table
+    transform. Three landmarks cannot fit a TRUSTED anchor by themselves
+    (ANCHOR_MIN_TRUSTED_POINTS), so the sparse frame reads through the session
+    anchor, exactly as the production spine's session-median fallback does."""
     import cv_lab.scripts.pipeline.build_yolo_hand_timeline as spine
 
     assert not hasattr(spine, "_reject_stack_outliers")
 
+    session = rd.anchor_for_frame(_stack_frame({s: 100.0 for s in range(8)}))
     three = {seat: v for seat, v in enumerate((10000.0, 100.0, 100.0))}
-    state = _frame_state(_stack_frame(three))
+    state = _frame_state(_stack_frame(three), session)
     assert "stack_outlier_check_skipped" not in state
     assert sorted(state["stacks"].values()) == [100.0, 100.0, 10000.0], (
         "a short-handed table is read exactly like a full one")
@@ -666,7 +759,7 @@ def test_a_short_handed_table_no_longer_has_an_unrunnable_check_to_record() -> N
                      None, attr_source="integer_over_decimal_band")
         for x, y in list(rd.SEAT_ANCHORS_BY_CLASS["stack_text"].values())[:3]
     ])
-    unknown = _frame_state(refused)["stacks_unknown"]
+    unknown = _frame_state(refused, session)["stacks_unknown"]
     assert set(unknown.values()) == {"integer_over_decimal_band"}
 
 
@@ -692,17 +785,23 @@ def test_two_disagreeing_stack_reads_for_one_seat_are_unknown_not_last_write() -
             for i, v in enumerate(values)
         ])
 
-    agreeing = rd.assign_regions(frame(142.6, 142.6))
+    # Two boxes cannot anchor a frame by themselves (seat attribution is
+    # anchored and fails closed without a transform), so supply the session
+    # anchor the production path would: a fit from a fully-landmarked frame.
+    session = rd.anchor_for_frame(_stack_frame({s: 100.0 for s in range(8)}))
+    assert session is not None
+
+    agreeing = rd.assign_regions(frame(142.6, 142.6), anchor=session)
     assert agreeing["seats"][4]["stack"] == 142.6
     assert agreeing["stack_conflicts"] == 0
 
-    disagreeing = rd.assign_regions(frame(142.6, 9.0))
+    disagreeing = rd.assign_regions(frame(142.6, 9.0), anchor=session)
     assert disagreeing["seats"][4]["stack"] is None
     assert disagreeing["stack_conflicts"] == 1
     assert disagreeing["amounts_unknown"] == 1
 
     # The destructive direction: a good read followed by an unreadable one.
-    destroyed = rd.assign_regions(frame(295.7, None))
+    destroyed = rd.assign_regions(frame(295.7, None), anchor=session)
     assert destroyed["seats"][4]["stack"] is None
     assert destroyed["stack_conflicts"] == 1
 
@@ -791,6 +890,18 @@ def test_hero_net_counts_chips_committed_before_the_first_sample(
         if not series:
             continue
         raw_delta = round(series[-1] - series[0], 2)
+        if hand["hand_number"] == 2:
+            # Hand 2's raw window overshoots its settlement: the tail keeps
+            # post-sweep interstitial states (their mid-animation dealer marker
+            # is refused by the seat rejection radius instead of snapping, so
+            # the dealer-moved trim arm has no reading to fire on), and in
+            # them the hero has ALREADY posted the next hand's 0.5 small
+            # blind. The spine's net is settlement-bounded by design -- that
+            # 0.5 belongs to hand 3 -- so the published net sits 0.5 above the
+            # naive whole-window formula: (settled delta 199.9) - (2.0
+            # straddle) = 197.9.
+            assert hand["hero_bb_won"] == round(raw_delta - blind + 0.5, 2)
+            continue
         assert hand["hero_bb_won"] == round(raw_delta - blind, 2), (
             f"hand {hand['hand_number']}: net {hand['hero_bb_won']} ignores the "
             f"{blind} already committed at the first observed state"

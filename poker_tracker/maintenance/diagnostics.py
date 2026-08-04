@@ -61,10 +61,10 @@ DOCUMENTED_ENV_VARS: tuple[tuple[str, str], ...] = (
     ("OPENAI_API_KEY", "Coaching credential. Never displayed by this product."),
 )
 
-# The calibrated floor the reconstruction spine stamps into every timeline's
-# layout_profile. Read from the pipeline rather than respelled, because a
-# duplicated constant that drifted would let Settings advertise support for a
-# geometry the reader is not calibrated for.
+# The supportedness statement the reconstruction spine stamps into every
+# timeline's layout_profile. Read from the pipeline rather than respelled,
+# because a duplicated statement that drifted would let Settings advertise
+# support for a geometry the reader is not calibrated for.
 _LAYOUT_FALLBACK = "Not resolvable in this build"
 
 
@@ -77,8 +77,7 @@ def supported_layout_profiles() -> dict[str, Any]:
     """
     try:
         from cv_lab.scripts.pipeline.build_yolo_hand_timeline import (
-            _MIN_CALIBRATED_HEIGHT,
-            _MIN_CALIBRATED_WIDTH,
+            layout_support_statement,
         )
     except Exception:  # a diagnostics readout must never take the page down
         return {
@@ -87,13 +86,12 @@ def supported_layout_profiles() -> dict[str, Any]:
             "statement": _LAYOUT_FALLBACK,
         }
     return {
-        "minimum_width": _MIN_CALIBRATED_WIDTH,
-        "minimum_height": _MIN_CALIBRATED_HEIGHT,
-        "statement": (
-            f"Client windows at least {_MIN_CALIBRATED_WIDTH}x{_MIN_CALIBRATED_HEIGHT}. "
-            "A recording below that is stamped '-unsupported' on the hand's layout "
-            "profile and the seat anchors and OCR templates are extrapolating."
-        ),
+        # Supportedness is anchor-health based, not a window-size floor, so
+        # there is no minimum W x H to advertise any more. The keys stay for
+        # response-shape stability; None is honest ("no such bound exists").
+        "minimum_width": None,
+        "minimum_height": None,
+        "statement": layout_support_statement(),
     }
 
 

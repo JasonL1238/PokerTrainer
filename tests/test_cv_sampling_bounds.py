@@ -20,6 +20,16 @@ taken, so on a recording that encodes nothing while the screen is still, the
 frame seek returned from 10s was filed at 4s. The spine reads coverage as the
 difference between consecutive state times, and the shift moves the hole onto a
 stretch that was in fact observed.
+
+The sampler answers each request with the frame IN EFFECT at that time (the
+last frame at or before it), not the next frame after it: on a change-driven
+recording the at-or-after answer skips the state that was actually on screen,
+and can skip it at every request. A request answered by the already-emitted
+frame is not re-emitted, but it is evidence -- the decoder proving no frame
+exists in between, i.e. the screen did not change through that time. That proof
+travels to the caller as a static-until time on the previous emission, so the
+spine can tell a provably-static stretch (watched, nothing moved) from an
+unobserved one (nobody watched).
 """
 
 from __future__ import annotations
@@ -140,8 +150,27 @@ def _sample(path: Path, *, start: float, end: float, interval: float):
         samples = list(
             _sample_times(container, stream, start, end, interval, stats=stats)
         )
-    digests = [hashlib.sha256(img.tobytes()).hexdigest() for _t, img in samples]
-    return [t for t, _img in samples], digests, stats
+    digests = [hashlib.sha256(img.tobytes()).hexdigest() for _t, _s, img in samples]
+    return [t for t, _s, _img in samples], digests, stats
+
+
+def _sample_with_statics(path: Path, *, start: float, end: float, interval: float):
+    """Like _sample, but also returns each emitted frame's static-until proof,
+    finalized the way a caller would: the value arriving with the NEXT emission
+    applies to the previous frame, and the tail comes from stats."""
+    stats: dict = {}
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        samples = list(
+            _sample_times(container, stream, start, end, interval, stats=stats)
+        )
+    statics: list[float | None] = [None] * len(samples)
+    for index, (_t, prev_static, _img) in enumerate(samples):
+        if index > 0:
+            statics[index - 1] = prev_static
+    if samples:
+        statics[-1] = stats.get("last_static_until_s")
+    return [t for t, _s, _img in samples], statics, stats
 
 
 # --------------------------------------------------------------------------- #
@@ -150,14 +179,20 @@ def _sample(path: Path, *, start: float, end: float, interval: float):
 def test_sampling_stops_at_the_end_of_the_stream_instead_of_repeating_it(clip_3s):
     """The measured defect: a 3-second clip asked for 10 seconds produced 11
     timestamped states from 4 distinct pictures, the last 8 of them the same
-    final frame emitted under 8 different times."""
+    final frame emitted under 8 different times.
+
+    The frame in effect at the 3.0s request is the picture taken at 2.9s -- a
+    real, distinct observation (the earlier at-or-after semantics skipped it
+    forever) -- so it is emitted once, at its own timestamp, and sampling then
+    stops: the decoder has proven no undecoded frame remains, so every later
+    request could only repeat it."""
     times, digests, stats = _sample(clip_3s, start=0.0, end=10.0, interval=1.0)
 
-    assert times == [0.0, 1.0, 2.0]
+    assert times == [0.0, 1.0, 2.0, pytest.approx(2.9)]
     assert len(set(digests)) == len(digests), "no picture may be emitted twice"
-    assert stats["ended_at"] == pytest.approx(3.0)
+    assert stats["ended_at"] == pytest.approx(4.0)
     assert stats["requested"] == 4
-    assert stats["emitted"] == 3
+    assert stats["emitted"] == 4
 
 
 def test_a_window_inside_the_stream_is_sampled_exactly_as_before(clip_3s):
@@ -216,22 +251,43 @@ def test_every_emitted_frame_carries_its_own_timestamp_not_the_requested_one(
     assert times == [0.0, 1.0, 2.0, 3.0, 10.0, 11.0, 12.0]
 
 
-def test_the_unobserved_stretch_survives_as_a_gap_between_consecutive_states(
+def test_a_frameless_stretch_is_returned_as_a_static_proof_not_a_hole(
     clip_with_a_hole,
 ):
-    """The spine reads coverage as the difference between consecutive state
-    times, so the gap has to fall between the right two states, not merely
-    exist. Nothing was recorded between 3s and 10s. Labelling by request time
-    still produced one 7-second gap, but between 4s and 11s -- a stretch that
-    was in fact observed -- while the states covering 3s to 10s, which nobody
-    watched, read as one ordinary interval apart."""
-    times, _digests, _stats = _sample(
+    """Nothing was recorded between 3s and 10s. On a change-driven screen
+    recording that is the encoder saying the screen did not change: the 3s
+    picture stayed up until the 10s one replaced it. The emitted series keeps
+    the frames' true spacing (the 3s and 10s states really are 7s apart), and
+    the decoder's answers to the requests in between come back as a
+    static-until proof on the 3s frame -- so the spine's unobserved window is
+    only the sub-interval sliver after the last proof, not the whole stretch."""
+    times, statics, _stats = _sample_with_statics(
         clip_with_a_hole, start=0.0, end=12.0, interval=1.0
     )
 
-    unobserved = [(a, b) for a, b in zip(times, times[1:], strict=False) if b - a > 1.0]
+    assert times == [0.0, 1.0, 2.0, 3.0, 10.0, 11.0, 12.0]
+    by_time = dict(zip(times, statics, strict=True))
+    # Requests 4..9 were all answered by the already-emitted 3s frame.
+    assert by_time[3.0] == pytest.approx(9.0)
+    # Frames followed within one interval carry no proof and need none.
+    assert by_time[0.0] is None
+    assert by_time[10.0] is None
+    assert by_time[11.0] is None
 
-    assert unobserved == [(3.0, 10.0)]
+
+def test_a_sparse_recording_proves_static_spans_between_its_frames(clip_sparse):
+    """Frames every 2s, sampled every 1s: each odd request resolves to the frame
+    already on screen, which is the decoder proving the screen sat still through
+    that second. The proof lands on the frame it extends. The final frame has no
+    proof: the request that would have provided one found the stream exhausted
+    instead, and sampling stopped."""
+    times, statics, stats = _sample_with_statics(
+        clip_sparse, start=0.0, end=9.0, interval=1.0
+    )
+
+    assert times == [0.0, 2.0, 4.0, 6.0, 8.0]
+    assert statics == [1.0, 3.0, 5.0, 7.0, None]
+    assert stats["duplicate_times"] == 4
 
 
 # --------------------------------------------------------------------------- #

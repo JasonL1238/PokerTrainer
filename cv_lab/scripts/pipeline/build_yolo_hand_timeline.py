@@ -39,7 +39,6 @@ from cv_lab.scripts.pipeline.landmark_anchor import ANCHOR_MIN_SESSION_FITS
 DEFAULT_OUT = "cv_lab/results/yolo_hand_timeline.json"
 
 _STREET_BY_COUNT = {0: "preflop", 3: "flop", 4: "turn", 5: "river"}
-_POSITION_NAMES = ["BTN", "SB", "BB", "UTG", "UTG+1", "LJ", "HJ", "CO"]
 _EPS = 1e-6
 
 # Run-length debounce thresholds are calibrated at this sampling interval. When
@@ -53,18 +52,22 @@ _EPS = 1e-6
 _CALIB_INTERVAL_S = 2.0
 _FOLD_MIN_RUN_CALIB = 3   # hero greyed-out fold: reject True-runs < 3 samples @2s
 
-# A pot that collapses to below this fraction of the running accepted pot, once
-# that pot is above _POT_COLLAPSE_FLOOR_BB, is the NEXT deal's blind pot showing
-# through, not this hand's. Calibrated once and used by both consumers
-# (_debounce_pot and _trim_trailing_next_deal) so there is one collapse rule.
-_POT_COLLAPSE_FLOOR_BB = 6.0
-_POT_COLLAPSE_RATIO = 0.3
-
-# Smallest client render the CV stack has been calibrated against: the 07-23
-# 3.33.54 PM development recording. Below this the seat anchors and the OCR
-# templates are both extrapolating -- see _layout_profile.
-_MIN_CALIBRATED_WIDTH = 1272
-_MIN_CALIBRATED_HEIGHT = 896
+# Layout supportedness facts -- anchor-health based, not window-size based.
+# The old W x H lower bound (1272x896) was anti-correlated with reality on the
+# first two sessions it judged: it stamped a 1052x732 recording that
+# reconstructed at a 4.5% operator-flagged error rate "-unsupported", and a
+# 2114x1414 recording that failed for game-structure reasons "supported".
+# What actually bounds the readers is the fitted table scale:
+#   * _REF_GLYPH_H_PX: HUD glyph height at reference scale. The corpus's
+#     native run heights span 12..31px at fitted scales ~0.62..1.34; both
+#     extremes divide back to ~19..23px, i.e. ~21px at s=1.
+#   * _MIN_RENORMALIZABLE_GLYPH_PX: the smallest native glyph the renormalized
+#     OCR re-read has been VALIDATED on. The pinned 1052x732 crops (s=0.512,
+#     glyphs 10-11px) read correctly; the adversarial sweep's confident-wrong
+#     upscales live at 7-9px. 9px is the boundary between "renormalizable"
+#     and "unvalidated".
+_REF_GLYPH_H_PX = 21.0
+_MIN_RENORMALIZABLE_GLYPH_PX = 9.0
 
 # Action types that MOVE MONEY. Only these can carry "an amount of unknown size";
 # a check or a fold legitimately has amount None and always did, which is exactly
@@ -456,8 +459,14 @@ def _frame_state(frame: rd.Frame, session_anchor: rd.TableAnchor | None = None) 
         # because a stack read was refused. Filled by _reconstruct_actions, which
         # is where transitions are walked; declared here so the key always exists.
         "unmeasured_transitions": [],
-        # Mid-hand coverage: seconds since the previous *table* state, and whether
-        # that gap hid a critical change. Filled in build_states / action walk.
+        # Decoder-proven static span: the table provably showed THIS state until
+        # here (a later sample resolved to the same decoded frame). Observation
+        # continuity for the gap math, not a distinct reading.
+        "observed_static_until_s": getattr(frame, "observed_static_until_s", None),
+        # Mid-hand coverage: seconds the table was UNOBSERVED before this state
+        # (since the last table observation, including same-signature frames
+        # and proven-static spans, not merely the last distinct state). Filled
+        # in build_states / action walk.
         "prior_gap_s": 0.0,
         "sampling_interval_s": 0.0,
         "coverage_gap": False,
@@ -632,7 +641,11 @@ def _debounce_bool_confirm(raw: list[dict[str, Any]], key: str, min_run: int = 3
         state[key] = accepted[i]
 
 
-def build_states(frames: list[rd.Frame]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def build_states(
+    frames: list[rd.Frame],
+    *,
+    sampling_interval_s: float | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return (distinct states, events). Raw per-frame states are debounced first
     (cards, pot, stacks, bets -- single-frame OCR/classifier blips are rejected
     unless the next reading confirms them), then collapsed to distinct states.
@@ -640,10 +653,21 @@ def build_states(frames: list[rd.Frame]) -> tuple[list[dict[str, Any]], list[dic
     Nontable frames (tab-in-front / lobby / modal) are omitted from inference
     state: their timestamps create a ``prior_gap_s`` on the next table state so
     action reconstruction can refuse to invent what happened underneath.
+
+    ``sampling_interval_s`` is the cadence the caller actually sampled at. Pass
+    it when known: on a variable-rate recording the duplicate-dropping sampler
+    emits frames at the recording's own change spacing, so measuring the
+    cadence from frame times over-estimates it and loosens every
+    interval-scaled debounce and gap threshold. When None it is measured from
+    the frame times, which is exact for dense fixtures.
     """
     table_frames = [f for f in frames if _is_table_frame(f)]
     session_anchor = _session_anchor(table_frames)
-    interval_s = _sampling_interval(table_frames if table_frames else frames)
+    interval_s = (
+        float(sampling_interval_s)
+        if sampling_interval_s and sampling_interval_s > _EPS
+        else _sampling_interval(table_frames if table_frames else frames)
+    )
     raw = [_frame_state(f, session_anchor) for f in table_frames]
     for state in raw:
         state["sampling_interval_s"] = interval_s
@@ -662,15 +686,31 @@ def build_states(frames: list[rd.Frame]) -> tuple[list[dict[str, Any]], list[dic
     events: list[dict[str, Any]] = []
     last_sig: tuple | None = None
     prev: dict[str, Any] | None = None
+    # The latest time the table was provably OBSERVED, advanced by every table
+    # frame -- including same-signature frames the collapse below skips, and
+    # decoder-proven static spans. ``prior_gap_s`` is the unobserved stretch
+    # before a state, so it must be measured from here, not from the previous
+    # DISTINCT state: a table that provably sat still for a minute and then
+    # changed was watched the whole time, and reading that minute as a coverage
+    # hole would refuse a perfectly observed hand.
+    observed_until: float | None = None
 
     for state in raw:
         sig = _signature(state)
+        static_until = state.get("observed_static_until_s")
+        cur_observed = state["time_s"] if static_until is None else max(
+            state["time_s"], static_until
+        )
         if sig == last_sig:
+            if observed_until is not None:
+                observed_until = max(observed_until, cur_observed)
             continue
         if prev is not None:
-            state["prior_gap_s"] = state["time_s"] - prev["time_s"]
+            since = prev["time_s"] if observed_until is None else observed_until
+            state["prior_gap_s"] = max(0.0, state["time_s"] - since)
         else:
             state["prior_gap_s"] = 0.0
+        observed_until = cur_observed
         state["state_index"] = len(states)
         states.append(state)
 
@@ -701,48 +741,211 @@ def build_states(frames: list[rd.Frame]) -> tuple[list[dict[str, Any]], list[dic
 
 
 # --------------------------------------------------------------------------- #
-# Pass 2: segment into hands (hero-cards change is the boundary)
+# Pass 2: segment into hands (button movement / board reset / fresh hero cards)
 # --------------------------------------------------------------------------- #
+def _board_continues(states: list[dict[str, Any]], i: int, ref_board: list[str]) -> bool:
+    """After an empty board at states[i], does the SAME deal's board come back?
+
+    True when the next non-empty board reading is the reference board or that
+    board grown by later streets -- a detection dropout mid-hand, not a
+    teardown. The card debounce deliberately never repairs empty readings (an
+    empty must reset the carry so one hand's cards cannot leak into the next),
+    so a one-state board dropout reaches segmentation and must be told apart
+    from a real reset here, by whether the board it interrupted resumes."""
+    ref = tuple(ref_board)
+    for nxt in states[i + 1:]:
+        cards = tuple(nxt["board_cards"])
+        if not cards:
+            continue
+        return cards == ref or (len(cards) > len(ref) and cards[: len(ref)] == ref)
+    return False
+
+
 def _segment(states: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    """A new hand starts when the hero's hole cards change AND there is table
-    evidence of a fresh deal: the board reset, the pot dropped (back to the
-    blinds+antes), the dealer button moved, or a long recording gap. A hero-card
-    change alone -- with a board still showing, or mid-preflop with the same pot
-    and button -- is read noise (suit misreads, showdown reveals landing in the
-    hero card zone), never a real boundary."""
+    """A new hand starts at the first state, no longer showing the old board,
+    with table evidence of a fresh deal. Three CO-EQUAL signals, any of which
+    cuts -- none depends on the hero being dealt in, so a session the hero sits
+    out entirely still segments:
+
+    - the dealer button MOVED (it moves exactly once per deal), confirmed by
+      the next dealer reading so a one-state marker misread cannot split a hand;
+    - the board RESET after showing cards, confirmed by the old board never
+      resuming (see _board_continues -- a mid-hand detection dropout resumes);
+    - the hero's hole cards changed to a NEW pair after passing through empty.
+      The empty passage is the teardown evidence: cards leave the hero zone
+      only at a fold or the sweep, so a "new pair" with no empty reading in
+      between is read noise (suit misreads, showdown reveals landing in the
+      hero zone), never a real boundary.
+
+    A signal only arms the boundary; the cut itself lands on the first state
+    that shows the NEW deal (hole-card backs at any seat, two hero cards, or a
+    fresh board). The client tears a hand down in stages -- sweep, pot reset,
+    button advance, cards cleared -- and those teardown states carry the old
+    hand's settlement, so they must trail it (where _trim_trailing_next_deal
+    prunes them), not head the next hand and pollute its opening roster and
+    starting stacks. Signals are additionally gated on the state not still
+    showing the old board, so a lingering board can never be cut into the next
+    hand's street logic."""
+    n = len(states)
+    # next_dealer[i]: the first dealer reading strictly after states[i].
+    next_dealer: list[int | None] = [None] * n
+    last_read: int | None = None
+    for j in range(n - 1, -1, -1):
+        next_dealer[j] = last_read
+        if states[j]["dealer_seat"] is not None:
+            last_read = states[j]["dealer_seat"]
+
     hands: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
     current_hero: list[str] = []
-    anchor: dict[str, Any] | None = None  # last state showing the current hero's cards
-    for state in states:
+    hero_swept = False        # hero zone read empty since current_hero appeared
+    ref_dealer: int | None = None   # this hand's confirmed button seat
+    ref_board: list[str] = []       # this hand's last non-empty (debounced) board
+    pending = False           # teardown seen; cut at the next deal evidence
+    for i, state in enumerate(states):
         hero = state["hero_cards"]
-        boundary = False
+        board = state["board_cards"]
         if current:
-            ref = anchor or current[-1]
-            hero_changed = len(hero) == 2 and bool(current_hero) and hero != current_hero
-            if hero_changed and not state["board_cards"]:
-                # Compare against the anchor, not the immediately preceding state:
-                # the table often passes through a swept interstitial state (no
-                # cards, pot cleared) that would otherwise hide the reset.
-                board_reset = bool(ref["board_cards"])
-                pot_dropped = (state["pot"] is not None and ref["pot"] is not None
-                               and state["pot"] < ref["pot"] - _EPS)
-                dealer_moved = (state["dealer_seat"] is not None
-                                and ref["dealer_seat"] is not None
-                                and state["dealer_seat"] != ref["dealer_seat"])
-                large_gap = state["time_s"] - ref["time_s"] > 30
-                boundary = board_reset or pot_dropped or dealer_moved or large_gap
-        if boundary:
-            hands.append(current)
-            current, current_hero, anchor = [], [], None
+            if not pending and not board:
+                d = state["dealer_seat"]
+                dealer_moved = (
+                    d is not None and ref_dealer is not None and d != ref_dealer
+                    and next_dealer[i] in (d, None)
+                )
+                board_reset = bool(ref_board) and not _board_continues(states, i, ref_board)
+                hero_fresh = (len(hero) == 2 and bool(current_hero)
+                              and hero != current_hero and hero_swept)
+                pending = dealer_moved or board_reset or hero_fresh
+            deal_here = bool(state["dealt_in"]) or len(hero) == 2 or bool(board)
+            stale_board = bool(board) and board == ref_board
+            if pending and deal_here and not stale_board:
+                hands.append(current)
+                current, current_hero = [], []
+                hero_swept, pending = False, False
+                ref_dealer, ref_board = None, []
         current.append(state)
+        d = state["dealer_seat"]
+        if ref_dealer is None and d is not None and next_dealer[i] in (d, None):
+            ref_dealer = d
+        if state["board_cards"]:
+            ref_board = state["board_cards"]
         if len(hero) == 2 and not current_hero:
             current_hero = hero
-        if hero == current_hero and current_hero:
-            anchor = state
+        if current_hero and not hero:
+            hero_swept = True
     if current:
         hands.append(current)
     return hands
+
+
+def _observed_forced_posts(
+    hand: list[dict[str, Any]],
+    players: list[int],
+    dealer_seat: int | None,
+) -> tuple[float, ...] | None:
+    """Read one hand's forced-post chain off its deal-open state, or None.
+
+    A forced post is a standing bet, present at the deal-open state BEFORE
+    anyone has acted, on a seat in the chain clockwise of the button. The chain
+    is read in ring order -- SB, BB, then straddles -- and must be
+    nondecreasing, with each straddle at least doubling the post before it
+    (that is what a straddle is; it is also what tells a 2.0 straddle from a
+    seat's ante or a stray read). Anything that shows action already happened
+    -- a board, a non-POST pill, standing money beyond the chain -- makes the
+    open unobservable and returns None: the session-level vote decides from
+    the hands whose opens WERE seen. Amounts are in BB display units, so the
+    result is effectively (0.5, 1.0) plus any straddles; nothing here assumes
+    that, it is simply what the client renders.
+    """
+    if not hand or dealer_seat is None:
+        return None
+    first = hand[0]
+    if first["board_cards"] or not first["dealt_in"]:
+        return None
+    ring = [s for s in rd.SEAT_RING if s in players]
+    if dealer_seat not in ring or len(ring) < 3:
+        # Heads-up posting is positional (the button IS the small blind) and
+        # has no straddle slot; nothing to learn beyond the default.
+        return None
+    start = ring.index(dealer_seat)
+    ring = ring[start:] + ring[:start]
+    chain = ring[1:]
+    bets = first.get("bets") or {}
+    unknown = first.get("bets_unknown") or {}
+    posts: list[float] = []
+    chain_seats: list[int] = []
+    for seat in chain:
+        if seat in unknown:
+            return None            # a refused read cannot certify the chain
+        amount = bets.get(seat)
+        if amount is None:
+            break
+        if posts and amount < posts[-1] - _EPS:
+            break
+        if len(posts) >= 2 and amount < 2 * posts[-1] - _EPS:
+            break
+        posts.append(amount)
+        chain_seats.append(seat)
+    if len(posts) < 2:
+        return None
+    for seat, pill in (first.get("pills") or {}).items():
+        # The only pills tolerated at a true open are the green POST pills on
+        # the posting seats themselves (the client paints POST on the same
+        # green as CALL/BET, so the word template often yields bet_or_call).
+        if seat in chain_seats and pill in {"post_blind", rd.PILL_BET_OR_CALL}:
+            continue
+        return None
+    if any(seat not in chain_seats for seat in bets):
+        return None                # standing money beyond the chain = action
+    return tuple(posts)
+
+
+def _session_forced_posts(
+    segments: list[list[dict[str, Any]]],
+    session_dealt_seats: set[int],
+) -> tuple[tuple[float, ...], list[bool]]:
+    """The table's forced-post structure, voted across every observable
+    deal-open in the session. The structure -- how many posts, of what size --
+    is a property of the TABLE, not of one hand, so the session mode decides
+    and individual unobservable opens simply don't vote. Falls back to plain
+    blinds (0.5, 1.0 in the client's BB display units) when no open was ever
+    observed; that fallback is a last resort, not a model of the game.
+
+    Also returns, per segment, whether that hand's OWN deal open was observed
+    -- the fact _player_seats needs to know card backs are authoritative for
+    that hand's roster.
+    """
+    observed: list[tuple[float, ...]] = []
+    open_seen: list[bool] = []
+    for segment in segments:
+        dealer_seat = _mode([s["dealer_seat"] for s in segment])
+        # The ring for the chain read comes from CARD BACKS alone (plus the
+        # button's own seat), never from the full roster heuristics: at a deal
+        # open the card backs are authoritative by definition, and a seat the
+        # stack recruitment would wrongly admit (a sitting-out player) lands
+        # inside the chain and severs it -- measured on the 2026-08-03
+        # session, where the waiting hero broke the chain between the small
+        # and big blinds on every hand it was recruited into.
+        players = sorted(
+            {seat for state in segment for seat in state["dealt_in"]}
+            | ({dealer_seat} if dealer_seat is not None else set())
+        )
+        posts = _observed_forced_posts(segment, players, dealer_seat)
+        open_seen.append(posts is not None)
+        if posts is not None:
+            observed.append(posts)
+    return (_mode(observed) or (0.5, 1.0)), open_seen
+
+
+def _has_deal_evidence(segment: list[dict[str, Any]]) -> bool:
+    """A segment is a HAND only if a deal was ever visible in it: hole-card
+    backs at any seat, a board, or two hero cards. Teardown interstitials and
+    idle stretches between deals segment off on the boundary signals above and
+    must not be reconstructed as hands of nothing."""
+    return any(
+        s["dealt_in"] or s["board_cards"] or len(s["hero_cards"]) == 2
+        for s in segment
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -777,32 +980,20 @@ def _debounce_series(hand: list[dict[str, Any]], key: str) -> None:
 
 
 def _debounce_pot(hand: list[dict[str, Any]]) -> None:
-    """Debounce ONE hand's pot series in place: revert-only blip rejection plus
-    a floor -- a mid-hand pot can never fall below the antes already in it."""
+    """Debounce ONE hand's pot series in place with revert-only blip rejection:
+    a reading B is repaired only in an A -> B -> A pattern (the next reading
+    reverts to the accepted value) -- the same rule every other numeric series
+    gets. There is deliberately NO collapse-repair arm any more: the old
+    "a pot far below the accepted pot is the next deal's blind pot showing
+    through" carry existed because segmentation used to leave next-deal states
+    inside the hand, and on a session it misjudged it erased the true hand
+    boundary 35 times in one merged mega-hand. Segmentation now cuts on the
+    button / board-reset evidence itself, so a persistent pot collapse inside
+    one hand is real by construction -- repairing it would be inventing money."""
     accepted: float | None = None
     for idx, state in enumerate(hand):
         pot = state["pot"]
         if pot is None:
-            continue
-        # Collapse floor. The strict "< 1.0" alone misses the exact case it was
-        # written for: after the sweep the next deal's blind pot reads EXACTLY
-        # 1.0 (one big blind) and slipped straight through. The proportional arm
-        # reuses the already-calibrated pair from _trim_trailing_next_deal, so
-        # there is one collapse rule with two consumers, and it is additive --
-        # everything the old floor caught, it still catches.
-        collapsed = accepted is not None and (
-            pot < 1.0 <= accepted
-            or (accepted > _POT_COLLAPSE_FLOOR_BB and pot < _POT_COLLAPSE_RATIO * accepted)
-        )
-        if collapsed:
-            state["pot"] = accepted
-            # Counted SEPARATELY from amounts_rejected. A collapse is repaired --
-            # the accepted pot is restored and the hand's output is right -- while
-            # a rejected stack is lost to unknown. Escalating the two together
-            # made a hand whose pot reconstructed correctly (two transient pot
-            # misreads on 07-15, both repaired) look like a hand whose reader was
-            # systematically broken, and would have rejected good hands.
-            state["pot_collapses_repaired"] = state.get("pot_collapses_repaired", 0) + 1
             continue
         if accepted is None or abs(pot - accepted) <= _EPS:
             accepted = pot
@@ -825,8 +1016,29 @@ def _street_for_count(count: int, last: str) -> str:
     return _STREET_BY_COUNT.get(count, last)
 
 
-def _positions(players: list[int], dealer_seat: int | None) -> dict[int, str]:
-    """Assign BTN/SB/BB/... walking the seat ring from the dealer over dealt-in seats."""
+def _position_names(n_straddles: int) -> list[str]:
+    """Position names for the button-anchored ring, straddle slots included.
+
+    Generated, not a fixed table: a straddle game inserts ST (then ST2, ST3...)
+    between the big blind and UTG, and every later name shifts one seat. The
+    old fixed 8-name list could not represent that, so a straddled table's
+    every position came out one seat wrong."""
+    return (["BTN", "SB", "BB"]
+            + [("ST" if k == 0 else f"ST{k + 1}") for k in range(n_straddles)]
+            + ["UTG", "UTG+1", "LJ", "HJ", "CO"])
+
+
+def _is_straddle_position(name: str) -> bool:
+    return name == "ST" or (name.startswith("ST") and name[2:].isdigit())
+
+
+def _positions(
+    players: list[int], dealer_seat: int | None, *, n_straddles: int = 0
+) -> dict[int, str]:
+    """Assign BTN/SB/BB/... walking the seat ring from the dealer over dealt-in
+    seats. ``n_straddles`` comes from the session's observed forced-post
+    structure; it is capped by the ring size (a 3-handed ring has no seat left
+    to straddle)."""
     if not players:
         return {}
     ring = [s for s in rd.SEAT_RING if s in players]
@@ -836,7 +1048,8 @@ def _positions(players: list[int], dealer_seat: int | None) -> dict[int, str]:
     if dealer_seat in ring:
         start = ring.index(dealer_seat)
     ordered = ring[start:] + ring[:start]
-    return {seat: (_POSITION_NAMES[k] if k < len(_POSITION_NAMES) else f"P{k}")
+    names = _position_names(min(max(0, n_straddles), max(0, len(ring) - 3)))
+    return {seat: (names[k] if k < len(names) else f"P{k}")
             for k, seat in enumerate(ordered)}
 
 
@@ -854,13 +1067,25 @@ def _street_seat_order(positions: dict[int, str], street: str) -> list[int]:
         return ring
     if street == "preflop":
         # Heads-up is the exception: the button is also the small blind and acts
-        # first preflop.  Multiway action begins with the seat left of the BB.
-        return ring if len(ring) == 2 else ring[3:] + ring[:3]
+        # first preflop.  Multiway action begins left of the LAST forced post --
+        # the big blind, or the last straddle when the table straddles (the
+        # position names already encode how many straddle slots exist).
+        if len(ring) == 2:
+            return ring
+        n_straddles = sum(
+            1 for name in positions.values() if _is_straddle_position(name)
+        )
+        k = (3 + n_straddles) % len(ring)
+        return ring[k:] + ring[:k]
     return ring[1:] + ring[:1]
 
 
 def _player_seats(
-    hand: list[dict[str, Any]], dealer_seat: int | None
+    hand: list[dict[str, Any]],
+    dealer_seat: int | None,
+    *,
+    session_dealt_seats: set[int] | None = None,
+    deal_open_observed: bool = False,
 ) -> list[int]:
     """Recover the hand roster, including players who folded before capture.
 
@@ -875,6 +1100,24 @@ def _player_seats(
     a stack seat must repeat.  This keeps a one-frame stack false positive from
     creating a player while allowing a recording that begins mid-action to retain
     the seats whose folds occurred before frame zero.
+
+    ``session_dealt_seats``, when provided, is the set of seats that were EVER
+    dealt cards anywhere in the session, and it caps the stack recruitment: a
+    stack HUD proves a seat is OCCUPIED, not that it is in this hand. A player
+    sitting out shows a stable stack all session and no cards ever, and
+    recruiting them shifts every blind and position by one seat -- measured on
+    the 2026-08-03 session, where a waiting hero was exported as the small
+    blind of every hand.
+
+    ``deal_open_observed`` disables stack recruitment entirely: when the
+    hand's own deal-open state was seen (its forced-post chain was readable),
+    every participant's card back was on screen, so the card backs are
+    authoritative and a stack HUD adds nothing. Without this, a straddled
+    table defeats the mid-hand-open test on EVERY hand -- the straddler's
+    green POST pill and above-blind standing bet at the deal open read as
+    "action already happened" -- and a seat that sat out THIS hand but played
+    elsewhere in the session (so the session cap admits it) is recruited into
+    a hand whose open plainly showed it holding no cards.
     """
     if not hand:
         return []
@@ -894,7 +1137,7 @@ def _player_seats(
     }
 
     first = hand[0]
-    mid_hand_open = bool(
+    mid_hand_open = not deal_open_observed and bool(
         first["board_cards"]
         or first.get("pills")
         or any(
@@ -909,6 +1152,7 @@ def _player_seats(
         players.update(
             seat for seat in first.get("stacks", {})
             if stack_counts[seat] >= 2
+            and (session_dealt_seats is None or seat in session_dealt_seats)
         )
 
     if dealer_seat is not None:
@@ -1286,17 +1530,17 @@ def _mode(values: list[Any]) -> Any:
 def _trim_trailing_next_deal(hand: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Drop trailing states that already belong to the NEXT deal.
 
-    Segmentation cuts a hand only when the hero's hole cards change to a new pair,
-    so an interstitial frame between hands -- button already advanced, pot reset to
-    the blinds, hero not yet re-dealt -- trails the current hand and corrupts its
-    final pot, hero net, and reconciliation (e.g. a 240 BB pot 'ending' at 1.5).
-    The button only moves between hands, so a trailing state whose dealer differs
-    from the hand's modal dealer, or whose pot has collapsed far below the hand's
-    peak, while the hero holds no cards, is next-deal noise."""
+    Segmentation arms its cut on the teardown signals but lands it on the first
+    state showing the new DEAL, so the teardown interstitial -- button already
+    advanced, pot reset, cards cleared -- deliberately trails the current hand
+    (it carries this hand's settlement) and is pruned here, exactly as before.
+    The pot-collapse arm this function used to carry is gone with the collapse
+    machinery (see _debounce_pot): a next-deal blind pot state either trails
+    here dealer-marked or heads the next segment, and in a segmented hand a
+    persistent pot collapse is real by construction."""
     if len(hand) <= 1:
         return hand
     modal_dealer = _mode([s["dealer_seat"] for s in hand])
-    max_pot = max((s["pot"] for s in hand if s["pot"] is not None), default=None)
     end = len(hand)
     while end > 1:
         s = hand[end - 1]
@@ -1313,10 +1557,7 @@ def _trim_trailing_next_deal(hand: list[dict[str, Any]]) -> list[dict[str, Any]]
                          and s["dealer_seat"] is None and not s["stacks"])
         dealer_moved = (modal_dealer is not None and s["dealer_seat"] is not None
                         and s["dealer_seat"] != modal_dealer)
-        pot_collapsed = (max_pot is not None and max_pot > _POT_COLLAPSE_FLOOR_BB
-                         and s["pot"] is not None
-                         and s["pot"] < _POT_COLLAPSE_RATIO * max_pot)
-        if uninformative or (no_hero and (dealer_moved or pot_collapsed)):
+        if uninformative or (no_hero and dealer_moved):
             end -= 1
         else:
             break
@@ -1402,7 +1643,10 @@ def _settle_index(hand: list[dict[str, Any]], players: set[int] | None = None) -
 
 
 def _reconstruct_actions(
-    hand: list[dict[str, Any]], positions: dict[int, str], player_name: dict[int, str]
+    hand: list[dict[str, Any]],
+    positions: dict[int, str],
+    player_name: dict[int, str],
+    forced_posts_bb: tuple[float, ...] = (0.5, 1.0),
 ) -> list[dict[str, Any]]:
     """Derive ordered actions from state-to-state deltas.
 
@@ -1439,6 +1683,7 @@ def _reconstruct_actions(
         source: dict[str, Any] | None,
         derivation: str,
         is_live_post: bool | None = None,
+        forced_bet_type: str | None = None,
     ):
         street_index[street] = street_index.get(street, 0) + 1
         if atype in {"bet", "raise", "all-in"}:
@@ -1462,6 +1707,7 @@ def _reconstruct_actions(
                 source=source,
                 derivation=derivation,
                 is_live_post=is_live_post,
+                forced_bet_type=forced_bet_type,
             )
         )
 
@@ -1517,6 +1763,30 @@ def _reconstruct_actions(
             source=first,
             derivation="hero_dim",
         )
+    # Forced straddle posts are structural, like the blinds: they are on the
+    # felt before anyone acts, their POST pill is frequently expired or
+    # unreadable by the time a state is sampled, and the session-observed
+    # forced-post structure -- not a pill -- is the evidence they happened.
+    # Booked first, so the ledger sees the money exactly where it entered.
+    # (On the development corpus the straddle used to be booked as an UTG
+    # "call 2.0" off its green pill, which kept the arithmetic right only
+    # while the pill was readable; on the 2026-08-03 session the pill was
+    # gone and the whole ledger came apart.)
+    posted_straddles: set[int] = set()
+    straddle_names = sorted(
+        (name, seat) for seat, name in positions.items()
+        if _is_straddle_position(name)
+    )
+    for k, (_name, seat) in enumerate(straddle_names):
+        amount = forced_posts_bb[2 + k] if 2 + k < len(forced_posts_bb) else None
+        emit(
+            "preflop", seat, "post_blind", amount, None,
+            hand[0]["stacks"].get(seat),
+            source=hand[0], derivation="forced_post_structure",
+            is_live_post=True, forced_bet_type="straddle",
+        )
+        posted_straddles.add(seat)
+
     # Book actions already standing in the first state, including mid-street
     # opens (operator: "missed where lj bet" when capture begins on the flop).
     opening_street = _street_for_count(
@@ -1535,6 +1805,22 @@ def _reconstruct_actions(
         for seat in ordered_first_seats:
             pill = first["pills"].get(seat)
             bet = first["bets"].get(seat)
+            if seat in posted_straddles:
+                # The post is already booked from the structure. The seat's
+                # green POST pill and its standing post-sized bet are that same
+                # post, not a second action -- but a bet ABOVE the post level
+                # (or an explicit raise/fold pill) is the straddler genuinely
+                # acting and falls through to the normal booking below.
+                expected = next(
+                    (forced_posts_bb[2 + k]
+                     for k, (_n, s) in enumerate(straddle_names) if s == seat),
+                    None,
+                )
+                post_shaped_pill = pill in {None, "post_blind", rd.PILL_BET_OR_CALL}
+                post_sized = (bet is None or expected is None
+                              or abs(bet - expected) <= _EPS)
+                if post_shaped_pill and post_sized:
+                    continue
             if pill == "fold":
                 folded.add(seat)
                 emit(
@@ -2097,6 +2383,7 @@ def _action(
     source: dict[str, Any] | None,
     derivation: str,
     is_live_post: bool | None = None,
+    forced_bet_type: str | None = None,
 ):
     payload = {
         "street": street,
@@ -2116,8 +2403,12 @@ def _action(
         "derivation": derivation,
     }
     if atype == "post_blind":
-        # Missed-blind POST on ClubWPT is a live big-blind post unless sized as SB.
-        if amount is not None and amount <= 0.5 + _EPS:
+        if forced_bet_type is not None:
+            # Structure-derived posts (straddles) name their own type; the
+            # amount heuristic below only ever knew about the two blinds.
+            payload["forced_bet_type"] = forced_bet_type
+        elif amount is not None and amount <= 0.5 + _EPS:
+            # Missed-blind POST on ClubWPT is a live big-blind post unless sized as SB.
             payload["forced_bet_type"] = "small_blind"
         else:
             payload["forced_bet_type"] = "big_blind"
@@ -2455,7 +2746,8 @@ def _clear_blind_only_unmeasured(
     for seat in first.get("unmeasured_transitions") or []:
         position = positions.get(seat, "")
         pill = (first.get("pills") or {}).get(seat)
-        if position in {"SB", "BB"} and pill in {None, "post_blind"}:
+        forced_poster = position in {"SB", "BB"} or _is_straddle_position(position)
+        if forced_poster and pill in {None, "post_blind"}:
             continue
         kept.append(seat)
     first["unmeasured_transitions"] = kept
@@ -2541,7 +2833,14 @@ def _lethal_coverage_gap_count(hand: list[dict[str, Any]]) -> int:
             lethal += 1
     return lethal
 
-def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
+def reconstruct(
+    hand: list[dict[str, Any]],
+    hand_number: int,
+    *,
+    session_dealt_seats: set[int] | None = None,
+    forced_posts_bb: tuple[float, ...] = (0.5, 1.0),
+    deal_open_observed: bool = False,
+) -> dict[str, Any]:
     # Shed any next-deal interstitial frames that segmentation left on the tail
     # before anything measures pot / stacks / winner from them.
     hand = _trim_trailing_next_deal(hand)
@@ -2558,8 +2857,11 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
     # The roster combines direct card/pill evidence with stable opening
     # occupancy when capture begins after early folds.  Positions are then
     # assigned exclusively from the dealer button and this physical seat ring.
-    players = _player_seats(hand, dealer_seat)
-    positions = _positions(players, dealer_seat)
+    players = _player_seats(hand, dealer_seat,
+                            session_dealt_seats=session_dealt_seats,
+                            deal_open_observed=deal_open_observed)
+    positions = _positions(players, dealer_seat,
+                           n_straddles=max(0, len(forced_posts_bb) - 2))
     player_name = {seat: ("Hero" if seat == 0 else f"Seat{seat}") for seat in players}
 
     # Villain showdown reveals: a non-hero seat's cards flip face-up only when
@@ -2595,7 +2897,7 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
             "shown_cards": shown_cards.get(seat),
         })
 
-    actions = _reconstruct_actions(hand, positions, player_name)
+    actions = _reconstruct_actions(hand, positions, player_name, forced_posts_bb)
     # Minimum-bar amount repair: calls are determined by the facing level,
     # blinds are structural, and unsized raises are back-solved only when later
     # sized calls uniquely pin the level. Runs before the unknown-ledger gate.
@@ -2938,7 +3240,10 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         terminal_event = "unobserved"
 
     warnings: list[str] = []
-    if len(hero) != 2:
+    if len(hero) != 2 and 0 in players:
+        # Only a defect when the hero IS a player in this hand. A hand the
+        # hero sat out has no hero cards by construction, and flagging that
+        # would mark every correctly-reconstructed sat-out hand defective.
         warnings.append("hero_cards_not_two")
     if board and len(board) not in {3, 4, 5}:
         warnings.append("invalid_board_count")
@@ -3098,6 +3403,10 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
         "hand_number": hand_number,
         "t_start": hand[0]["time_s"],
         "t_end": hand[-1]["time_s"],
+        # The forced-post structure this hand was reconstructed under (BB
+        # units, button-relative: sb, bb, then any straddles). Additive key;
+        # advisory evidence for the operator's blind attestation downstream.
+        "forced_posts_bb": list(forced_posts_bb),
         "n_states": len(hand),
         "hero": hero or None,
         "board": board,
@@ -3145,41 +3454,77 @@ def reconstruct(hand: list[dict[str, Any]], hand_number: int) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Top-level build
 # --------------------------------------------------------------------------- #
-def _layout_profile(frames: list[rd.Frame]) -> str:
+def layout_support_statement() -> str:
+    """One sentence for the Settings/diagnostics readout. Lives beside the
+    facts it describes so a drifted duplicate cannot advertise support the
+    readers don't have."""
+    return (
+        "Supported when the table anchor fits the frame (a similarity fit over "
+        "the seat landmarks) and HUD glyphs render at a normalizable size "
+        f"(fitted scale x {_REF_GLYPH_H_PX:.0f}px >= "
+        f"{_MIN_RENORMALIZABLE_GLYPH_PX:.0f}px). Window width x height alone "
+        "does not decide; a recording failing the anchor or glyph test is "
+        "stamped '-unsupported' on the hand's layout profile."
+    )
+
+
+def _layout_profile(frames: list[rd.Frame], session_anchor=None) -> str:
     """The render geometry this session was reconstructed from, as a fact on the
-    record: "<W>x<H>" of the modal frame, plus "-unsupported" when it is outside
-    the calibrated range.
+    record: "<W>x<H>" of the modal frame, plus "-unsupported" when the session
+    is outside what the calibrated readers can handle.
 
-    ``layout_profile`` reaches the app through completion evidence and was read at
-    export from timeline metadata that NOTHING in cv_lab ever set, so it was always
-    the empty string -- the pipeline had no representation at all of "this client
-    renders smaller than anything the readers were calibrated on". The seat anchors
-    and the OCR templates are both calibrated artefacts; a geometry outside their
-    range is a fact a reviewer is entitled to see, not something to infer from a
-    downstream symptom.
-
-    "Supported" is expressed in the SMALLER dimension because that is what scales
-    the HUD glyphs: the smallest calibrated client is 1272x896, and the OCR sweep
-    holds down to 0.75x of its glyph height (see ocr_readers._MIN_CALIBRATED_RUN_H).
+    "Unsupported" is decided by what actually bounds the readers -- can a table
+    anchor be fitted at all, and do HUD glyphs render at a size the OCR's
+    renormalized re-read is validated for -- not by the raw window dimensions.
+    The old W x H lower bound was one-sided and misleading (see the constants'
+    comment above): it flagged a small window that read fine and said nothing
+    about any other failure mode. The string format is unchanged; every
+    consumer parses only the "-unsupported" suffix.
     """
     sizes = [(f.width, f.height) for f in frames if f.width and f.height]
     if not sizes:
         return ""
     w, h = _mode(sizes)
-    supported = w >= _MIN_CALIBRATED_WIDTH and h >= _MIN_CALIBRATED_HEIGHT
+    supported = (
+        session_anchor is not None
+        and session_anchor.s * _REF_GLYPH_H_PX >= _MIN_RENORMALIZABLE_GLYPH_PX
+    )
     return f"{w}x{h}" if supported else f"{w}x{h}-unsupported"
 
 
-def build_hand_timeline(frames: list[rd.Frame]) -> dict[str, Any]:
-    states, events = build_states(frames)
-    hands = [reconstruct(hand, i) for i, hand in enumerate(_segment(states), start=1)]
+def build_hand_timeline(
+    frames: list[rd.Frame],
+    *,
+    sampling_interval_s: float | None = None,
+) -> dict[str, Any]:
+    states, events = build_states(frames, sampling_interval_s=sampling_interval_s)
+    table_frames_list = [f for f in frames if _is_table_frame(f)]
+    session_anchor = _session_anchor(table_frames_list)
+    segments = [seg for seg in _segment(states) if _has_deal_evidence(seg)]
+    # Seats ever dealt cards anywhere in the session. Caps the mid-hand-open
+    # stack recruitment in _player_seats: an occupied-but-sitting-out seat must
+    # never enter any hand's roster.
+    session_dealt_seats = {
+        seat for state in states for seat in state["dealt_in"]
+    }
+    forced_posts_bb, open_seen = _session_forced_posts(segments, session_dealt_seats)
+    hands = [
+        reconstruct(hand, i, session_dealt_seats=session_dealt_seats,
+                    forced_posts_bb=forced_posts_bb,
+                    deal_open_observed=observed)
+        for i, (hand, observed) in enumerate(
+            zip(segments, open_seen, strict=True), start=1
+        )
+    ]
     table_frames = sum(1 for frame in frames if _is_table_frame(frame))
     nontable_frames = len(frames) - table_frames
     return {
         "metadata": {
             "source": "yolo_region_detections",
             "classes": rd.CLASSES,
-            "layout_profile": _layout_profile(frames),
+            "layout_profile": _layout_profile(frames, session_anchor),
+            # Session-voted forced-post chain (BB units: sb, bb, straddles...).
+            "forced_post_structure": list(forced_posts_bb),
             "notes": [
                 "Offline completed-session reconstruction from 8-class region detections.",
                 "Seats assigned via per-class anchors learned from the labeled boxes.",

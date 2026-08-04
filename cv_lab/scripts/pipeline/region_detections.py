@@ -48,26 +48,16 @@ from cv_lab.scripts.pipeline.landmark_anchor import (
 
 CLASS_SET = set(CLASSES)
 
-# Coarse per-seat avatar centroids for the current 8-max ClubWPT view, in
-# normalized (cx, cy) coords. Seat 0 is the hero (bottom-center). Used as the
-# fallback for classes without a learned anchor table below.
-SEAT_CENTROIDS: dict[int, tuple[float, float]] = {
-    0: (0.50, 0.86),
-    1: (0.16, 0.80),
-    2: (0.05, 0.50),
-    3: (0.18, 0.20),
-    4: (0.50, 0.14),
-    5: (0.82, 0.20),
-    6: (0.95, 0.50),
-    7: (0.84, 0.80),
-}
-
 # Learned per-CLASS seat anchors (k-means over the human-labeled boxes in
-# labels.sqlite3, v00 frames, normalized by true image dims). Each HUD element
-# renders at its own per-seat position -- card backs sit above/inside of the
-# avatar, bet texts toward the table center -- so nearest-avatar assignment
-# flaps between adjacent seats; nearest-class-anchor does not. Regenerate by
-# re-running the k-means when the table layout changes.
+# labels.sqlite3, v00 frames). These are REFERENCE-normalized coordinates: the
+# v00 baseline recording IS the reference basis (REF_DET_W x REF_DET_H is that
+# recording's geometry), so its frame-normalized k-means output and the
+# anchored basis coincide -- which is what lets `_nearest_seat` consume them
+# through ``TableAnchor.to_ref`` on ANY geometry. Each HUD element renders at
+# its own per-seat position -- card backs sit above/inside of the avatar, bet
+# texts toward the table center -- so nearest-avatar assignment flaps between
+# adjacent seats; nearest-class-anchor does not. Regenerate by re-running the
+# k-means when the table layout changes.
 SEAT_ANCHORS_BY_CLASS: dict[str, dict[int, tuple[float, float]]] = {
     "card_back": {0: (0.500, 0.860), 1: (0.194, 0.623), 2: (0.117, 0.368), 3: (0.174, 0.164),
                   4: (0.480, 0.125), 5: (0.810, 0.164), 6: (0.868, 0.369), 7: (0.791, 0.618)},
@@ -168,6 +158,13 @@ class Frame:
     # modal / transition. Nontable frames are kept for coverage timing but are
     # not inferred into stack/board/action state.
     screen: str = "table"
+    # The latest sample time at which the decoder PROVED this frame was still
+    # the picture on screen (a later sample request resolved to this same
+    # frame, so no frame exists in between -- on a change-driven screen
+    # recording that is a static span, not an unobserved one). None when no
+    # such proof exists; the spine then treats observation as ending at
+    # ``time_s``.
+    observed_static_until_s: float | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -301,19 +298,59 @@ def read_pill_action(det: Detection, *, dealt_in: bool) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
-# Seat / zone assignment (coarse STUB geometry).
+# Seat / zone assignment (anchored reference basis).
 # --------------------------------------------------------------------------- #
-def _center(det: Detection, frame: Frame) -> tuple[float, float]:
-    x0, y0, x1, y1 = det.xyxy
-    return ((x0 + x1) / 2.0 / frame.width, (y0 + y1) / 2.0 / frame.height)
-
-
-def _nearest_seat(cx: float, cy: float, cls: str = "") -> int:
-    anchors = SEAT_ANCHORS_BY_CLASS.get(cls, SEAT_CENTROIDS)
+def _min_pairwise_distance(anchors: dict[int, tuple[float, float]]) -> float:
+    pts = list(anchors.values())
     return min(
-        anchors,
-        key=lambda s: (cx - anchors[s][0]) ** 2 + (cy - anchors[s][1]) ** 2,
+        ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+        for k, (ax, ay) in enumerate(pts)
+        for bx, by in pts[k + 1:]
     )
+
+
+# Per-class rejection radius: half the minimum spacing of that class's own
+# anchor table. Derived, not tuned -- the table defines how close two seats'
+# renders can be, so a box farther than half that from EVERY anchor cannot be
+# confidently any seat's. (Same refusal pattern as the legacy dealer-marker
+# radius in read_markers.py.)
+_SEAT_REJECT_RADIUS: dict[str, float] = {
+    cls: 0.5 * _min_pairwise_distance(anchors)
+    for cls, anchors in SEAT_ANCHORS_BY_CLASS.items()
+}
+
+
+def _nearest_seat(
+    rx: float, ry: float, cls: str, *, reject: bool = True
+) -> int | None:
+    """Nearest seat anchor for ``cls`` in REFERENCE-normalized coords, or None.
+
+    The coordinates must come through ``TableAnchor.to_ref`` -- never from raw
+    frame-normalized centers. Frame-normalized nearest-anchor silently assumed
+    the table fills every frame the way it fills the baseline recording's; any
+    window chrome, letterboxing, or aspect change shifted every seated read
+    onto a neighbouring seat with nothing downstream able to see it, because
+    with no rejection radius every box always landed on SOME seat. A box
+    farther than the class's rejection radius from every anchor now refuses
+    (None) instead of snapping.
+
+    ``reject=False`` is for RELATIVE comparisons only (the hero-seat votes ask
+    "which seat's card anchor is nearest", where hero hole cards legitimately
+    sit far from every card_back anchor); every real attribution keeps the
+    radius.
+    """
+    anchors = SEAT_ANCHORS_BY_CLASS.get(cls)
+    if not anchors:
+        return None
+    best = min(
+        anchors,
+        key=lambda s: (rx - anchors[s][0]) ** 2 + (ry - anchors[s][1]) ** 2,
+    )
+    if reject:
+        bx, by = anchors[best]
+        if ((rx - bx) ** 2 + (ry - by) ** 2) ** 0.5 > _SEAT_REJECT_RADIUS[cls]:
+            return None
+    return best
 
 
 def _center_px(det: Detection) -> tuple[float, float]:
@@ -530,17 +567,26 @@ def assign_regions(frame: Frame, *, anchor: TableAnchor | None = None) -> dict[s
           "dealer_seat": int | None, "active_seat": int | None,
           "anchor_ok": bool, "anchor_resid": float | None,
           "anchor_source": str | None, "unanchored_cards": int,
+          "unanchored_seated": int,  # seated boxes dropped for want of an anchor
+          "seat_unassigned": int,    # seated boxes the rejection radius refused
         }
 
-    ``anchor`` is the table transform to zone cards through. When omitted it is
-    fitted from this frame alone. When no anchor is available at all the frame
-    FAILS CLOSED: every face_card is dropped (counted in ``unanchored_cards``)
-    and hero/board/villain_cards come back empty. There is deliberately no
-    fallback to a fixed normalized window -- that fallback is the defect this
-    replaced, and it silently mis-zoned every board card at aspect ratio 1.750.
+    ``anchor`` is the table transform to zone cards AND attribute seats
+    through. When omitted it is fitted from this frame alone. When no anchor is
+    available at all the frame FAILS CLOSED: every face_card is dropped
+    (counted in ``unanchored_cards``) and every seated-class box is dropped
+    (counted in ``unanchored_seated``) -- hero/board/villain_cards and seats
+    come back empty. There is deliberately no fallback to a fixed normalized
+    window -- that fallback is the defect this replaced, and it silently
+    mis-zoned every board card at aspect ratio 1.750 and every seated read on
+    any window whose table sits differently in the frame than the baseline's.
     """
     anchor = anchor or anchor_for_frame(frame)
     unanchored_cards = 0
+    # Seated-class refusals, the two ways they happen: no table transform to
+    # attribute through, and a box the rejection radius refused to snap.
+    unanchored_seated = 0
+    seat_unassigned = 0
     amounts_unknown = 0
     # Per-refusal-code tally of every UNKNOWN amount on this frame. A bare count
     # cannot tell a systematic reader failure on one region from scattered
@@ -651,7 +697,6 @@ def assign_regions(frame: Frame, *, anchor: TableAnchor | None = None) -> dict[s
     for det in frame.detections:
         if det.cls not in CLASS_SET:
             continue
-        cx, cy = _center(det, frame)
 
         if det.cls == "face_card":
             if anchor is None:
@@ -662,17 +707,32 @@ def assign_regions(frame: Frame, *, anchor: TableAnchor | None = None) -> dict[s
             width_ref = (det.xyxy[2] - det.xyxy[0]) / anchor.s / REF_DET_W
             card_ref.append((rx, ry, zone, width_ref))
             if zone == "board":
-                board_dets.append((cx, det))
+                board_dets.append((rx, det))
             elif zone == "hero":
-                hero_dets.append((cx, det))
-                hero_zone_seat_votes.append(_nearest_seat(cx, cy, "card_back"))
+                hero_dets.append((rx, det))
+                vote = _nearest_seat(rx, ry, "card_back", reject=False)
+                if vote is not None:
+                    hero_zone_seat_votes.append(vote)
             else:
-                i = _nearest_seat(cx, cy, "card_back")
-                villain_dets.setdefault(i, []).append((cx, det))
+                i = _nearest_seat(rx, ry, "card_back")
+                if i is None:
+                    seat_unassigned += 1
+                else:
+                    villain_dets.setdefault(i, []).append((rx, det))
         elif det.cls == "pot_text":
             pot_candidates.append(det)
         elif det.cls in _SEATED_CLASSES:
-            i = _nearest_seat(cx, cy, det.cls)
+            if anchor is None:
+                # FAIL CLOSED, the same rule cards follow: attributing a seat
+                # without a table transform is guessing the layout, which is
+                # the exact defect the anchored basis replaced.
+                unanchored_seated += 1
+                continue
+            rx, ry = anchor.to_ref(*_center_px(det))
+            i = _nearest_seat(rx, ry, det.cls)
+            if i is None:
+                seat_unassigned += 1
+                continue
             if det.cls == "card_back":
                 seat(i)["card_back"] = True
             elif det.cls in ("stack_text", "bet_text"):
@@ -834,6 +894,8 @@ def assign_regions(frame: Frame, *, anchor: TableAnchor | None = None) -> dict[s
         "anchor_resid": None if anchor is None else round(anchor.resid, 5),
         "anchor_source": None if anchor is None else anchor.source,
         "unanchored_cards": unanchored_cards,
+        "unanchored_seated": unanchored_seated,
+        "seat_unassigned": seat_unassigned,
     }
 
 
@@ -863,6 +925,7 @@ def frames_from_fixture(data: Iterable[dict[str, Any]]) -> list[Frame]:
         screen = str(row.get("screen") or "table").strip().lower()
         if screen not in {"table", "nontable"}:
             screen = "table"
+        static_until = row.get("observed_static_until_s")
         frames.append(
             Frame(
                 image=str(row["image"]),
@@ -872,6 +935,11 @@ def frames_from_fixture(data: Iterable[dict[str, Any]]) -> list[Frame]:
                 detections=dets,
                 video_frame=int(row.get("video_frame", 0)),
                 screen=screen,
+                # Absent on every fixture written before the VFR static-span
+                # channel existed; those behave exactly as before.
+                observed_static_until_s=(
+                    None if static_until is None else float(static_until)
+                ),
             )
         )
     return frames
@@ -970,12 +1038,26 @@ def frame_from_models(
     width/height are taken from it.
     """
     h, w = (int(image.shape[0]), int(image.shape[1])) if image is not None else (0, 0)
+    rows = list(rows)
     ocr_readers = None
+    anchor_scale: float | None = None
     if ocr and image is not None:
         # Lazy import keeps the fixture path importable without cv2/numpy.
         from cv_lab.scripts.pipeline import ocr_readers as _ocr
 
         ocr_readers = _ocr
+        # Fit this frame's table anchor from the raw stack_text rows BEFORE the
+        # OCR loop -- geometry only, no attrs required. Its fitted scale is the
+        # fallback resize hint for renormalized re-reads of refusals whose
+        # native glyph run could not be measured (see ocr_readers).
+        stack_pts = [
+            ((float(r["x1"]) + float(r["x2"])) / 2.0,
+             (float(r["y1"]) + float(r["y2"])) / 2.0)
+            for r in rows if str(r.get("class", "")).strip() == "stack_text"
+        ]
+        fit = anchor_from_points(stack_pts, _REF_STACK_PTS)
+        if fit is not None and fit.resid <= ANCHOR_MAX_RESID:
+            anchor_scale = fit.s
     dets: list[Detection] = []
     for row in rows:
         cls = str(row.get("class", "")).strip()
@@ -1006,7 +1088,9 @@ def frame_from_models(
             # `detail is not None` branch, so a run with no calibrated template
             # bank produced attr=None / attr_source=None -- byte-identical to a
             # fixture detection carrying no amount at all.
-            detail = ocr_readers.read_amount_detail_from_image(image, xyxy)
+            detail = ocr_readers.read_amount_detail_from_image(
+                image, xyxy, anchor_scale=anchor_scale
+            )
             if detail is None:
                 attr_source = AMOUNT_READER_UNAVAILABLE
             else:

@@ -227,7 +227,14 @@ def anchor_from_points(det_pts, ref_pts, *, max_iter: int = 3) -> TableAnchor | 
         dists = [(((s * rp[0] + t[0] - dp[0]) ** 2 +
                    (s * rp[1] + t[1] - dp[1]) ** 2) ** 0.5) for rp, dp in pairs]
         med = _median(dists)
-        good = [pair for pair, d in zip(pairs, dists, strict=True) if d <= max(med * 3, 30)]
+        # The absolute arm of the inlier gate scales with the CURRENT fit
+        # estimate: 0.015 of the fitted table width is ~31px at reference
+        # scale (the old fixed 30px floor, preserved at s=1), but a fixed
+        # pixel floor on a half-scale client was a fifth of the seat spacing
+        # and admitted cross-seat pairings as inliers.
+        floor = 0.015 * s * REF_DET_W
+        good = [pair for pair, d in zip(pairs, dists, strict=True)
+                if d <= max(med * 3, floor)]
         if len(good) < ANCHOR_MIN_POINTS:
             break
         s, t = _similarity_fit([g[0] for g in good], [g[1] for g in good])

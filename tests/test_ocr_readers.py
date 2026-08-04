@@ -45,7 +45,6 @@ from cv_lab.scripts.pipeline.ocr_readers import (
     DECIMAL_EVIDENCE,
     DIGIT_SIZE,
     REFUSAL_CODES,
-    AmountRead,
     TemplateOCR,
     _norm,
     binarize_text,
@@ -1420,19 +1419,33 @@ def test_production_entrypoint_recovers_job4_stack_crops(
     production_bank, monkeypatch
 ) -> None:
     """Real 1052x732 ClubWPT stack crops from job 4: native bank refuses under
-    the calibrated floor, but the entrypoint must recover the on-screen BB value.
-    These are the exact failure mode that left session Hands empty (30/30
-    starting_stack_unknown)."""
-    expected = {
+    the calibrated floor; the renormalized re-read (at most two DERIVED
+    factors -- the table anchor's fitted scale and canvas/run_h -- full strict
+    contract at each, refusal on disagreement) recovers the on-screen BB
+    value. These are the exact failure mode that left session Hands empty
+    (30/30 starting_stack_unknown).
+
+    RECORDED SHORTFALL vs the deleted 18-factor consensus stack: the 204.50
+    and 212.20 crops stay UNKNOWN. This small render compressed their decimal
+    separators and suffix into shapes the strict contract refuses at BOTH
+    derived scales; the old stack read them only through the
+    skip_unexplained_ink waiver, B/8 suffix allowance and fraction-parsing
+    heuristics tuned to these six crops. Named refusals on two crops are the
+    accepted price for deleting the waiver machinery; a wrong value is not,
+    and the never-wrong sweep pins that this path never produces one."""
+    expected: dict[str, float | None] = {
         "stack_1458_90_at_1052x732.png": 1458.9,
         "stack_203_30_at_1052x732.png": 203.3,
-        "stack_212_20_at_1052x732.png": 212.2,
-        "stack_204_50_at_1052x732.png": 204.5,
+        "stack_212_20_at_1052x732.png": None,   # recorded shortfall
+        "stack_204_50_at_1052x732.png": None,   # recorded shortfall
         "stack_191_at_1052x732.png": 191.0,
         "stack_224_20_at_1052x732.png": 224.2,
     }
     monkeypatch.setattr(ocr_readers, "_bank", lambda: production_bank)
     job4 = FIXTURES / "job4_1052x732"
+    # The scale a 1052-wide capture of the reference client anchors at; the
+    # production path supplies this from the frame's own stack_text fit.
+    anchor_scale = 1052.0 / 2054.0
     for name, value in expected.items():
         img = cv2.imread(str(job4 / name))
         assert img is not None, name
@@ -1440,10 +1453,14 @@ def test_production_entrypoint_recovers_job4_stack_crops(
         assert native.value is None, name
         assert native.decimal_source == "below_calibrated_render_size", name
         recovered = ocr_readers.read_amount_detail_from_image(
-            img, (0, 0, img.shape[1], img.shape[0])
+            img, (0, 0, img.shape[1], img.shape[0]), anchor_scale=anchor_scale
         )
         assert recovered is not None, name
-        assert recovered.value == value, (name, recovered)
+        if value is None:
+            assert recovered.value is None, (name, recovered)
+            assert recovered.decimal_source in ocr_readers.REFUSAL_CODES
+        else:
+            assert recovered.value == value, (name, recovered)
 
 
 def test_production_entrypoint_does_not_rescue_sprite_fragment(
@@ -1516,70 +1533,6 @@ def test_adversary_truncated_native_does_not_ship_wrong_value(
             assert detail.value in (None, 60.0), (name, scale, detail.value)
             continue
         assert detail.value in (None, truth), (name, scale, detail.value)
-
-
-def test_digit_runs_compatible_trailing_fraction_zero() -> None:
-    """Native under-floor OCR often drops the trailing fractional zero
-    (2122 vs 212.20); recovery must treat that as compatible."""
-    recovered = AmountRead(212.2, "212.20", 0.9, "dot", 5)
-    assert ocr_readers._digit_runs_compatible("2122", recovered)
-    assert ocr_readers._digit_runs_compatible("21220", recovered)
-    assert not ocr_readers._digit_runs_compatible("9999", recovered)
-
-
-def test_soft_digit_related_rejects_shorter_fragments() -> None:
-    """Free-path gate: never promote 191→19 or left-mask 0.50→50."""
-    short = AmountRead(19.0, "19", 0.9, "no_dot", 2)
-    assert not ocr_readers._soft_digit_related("191", short)
-    assert not ocr_readers._soft_digit_related("050", AmountRead(50.0, "50", 0.9, "no_dot", 2))
-    # Hamming on short all-zero native must not invent 50 from 00.
-    assert not ocr_readers._soft_digit_related("00", AmountRead(50.0, "50", 0.9, "no_dot", 2))
-    assert ocr_readers._soft_digit_related("19", AmountRead(198.5, "198.50", 0.9, "dot", 5))
-    assert ocr_readers._soft_digit_related("191", AmountRead(191.0, "191", 0.9, "no_dot", 3))
-    # Integer +1 growth is allowed (21 -> 218); decimal +1/+2 is not.
-    assert ocr_readers._soft_digit_related("21", AmountRead(218.0, "218", 0.9, "integer", 3))
-    assert not ocr_readers._soft_digit_related("21", AmountRead(21.8, "21.8", 0.9, "dot", 3))
-    assert not ocr_readers._soft_digit_related("22", AmountRead(22.42, "22.42", 0.9, "dot", 4))
-    assert not ocr_readers._soft_digit_related("6", AmountRead(60.0, "60", 0.9, "integer", 2))
-    assert ocr_readers._soft_digit_related("50", AmountRead(50.0, "50", 0.9, "integer", 2))
-    assert ocr_readers._soft_digit_related("", AmountRead(191.0, "191", 0.9, "no_dot", 3))
-    assert not ocr_readers._soft_digit_related("", AmountRead(0.0, "0", 0.9, "no_dot", 1))
-    # Same-length hamming only for long runs (compat-aligned).
-    assert not ocr_readers._soft_digit_related(
-        "215", AmountRead(218.0, "218", 0.9, "no_dot", 3)
-    )
-    assert ocr_readers._soft_digit_related(
-        "21520", AmountRead(21820.0, "21820", 0.9, "no_dot", 5)
-    )
-    # Ambiguous 19|20 recovers as 192.20 (digits 19220, not a prefix of 1920).
-    assert ocr_readers._soft_digit_related(
-        "1920",
-        AmountRead(192.2, "192.20", 0.9, "dot", 5),
-        native_raw="19|20",
-    )
-    # Truncated under-floor 19 -> 198.50.
-    assert ocr_readers._soft_digit_related(
-        "19", AmountRead(198.5, "198.50", 0.9, "dot", 5)
-    )
-    # 1.30 must not digit-equal native 130.
-    assert not ocr_readers._soft_digit_related(
-        "130", AmountRead(1.3, "1.30", 0.9, "dot", 3)
-    )
-    # Weak single-digit ambiguous pieces: need a 3+ digit recovery (181), not 11.
-    assert not ocr_readers._soft_digit_related(
-        "11",
-        AmountRead(11.0, "11", 0.9, "no_dot", 2),
-        native_raw="1|1",
-    )
-    assert ocr_readers._soft_digit_related(
-        "11",
-        AmountRead(181.0, "181", 0.9, "no_dot", 3),
-        native_raw="1|1",
-    )
-    # Near-match: native 2057 vs recovered 208.70 (one digit confusion + frac zero).
-    assert ocr_readers._soft_digit_related(
-        "2057", AmountRead(208.7, "208.70", 0.9, "dot", 5)
-    )
 
 
 def test_production_entrypoint_never_reads_wrong_value_on_frozen_fixtures(

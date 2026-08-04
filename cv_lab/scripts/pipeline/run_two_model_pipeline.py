@@ -113,69 +113,95 @@ def _detect_regions(model, img, *, conf: float, imgsz: int, iou: float, device: 
 
 def _sample_times(container, stream, start: float, end: float, interval: float,
                   stats: dict | None = None):
-    """Yield (t_seconds, bgr_image) for frames sampled every `interval`s via seek.
+    """Yield (t_seconds, prev_static_until_s, bgr_image) for the frame IN EFFECT
+    at each sample time, every ``interval`` seconds via seek.
 
-    ``t_seconds`` is the emitted frame's own presentation timestamp, not the
-    time the sampler asked for. Seeking to t returns the first frame at or after
-    t, which on a variable-rate recording can be seconds later; stamping that
-    picture with t moves it backwards in time and closes the hole it came out
-    of. The spine measures ``prior_gap_s`` as the difference between consecutive
-    state times, so a series shifted this way reports the pair straddling a real
-    unobserved stretch as one ordinary interval apart. That silently disarms
-    every refusal keyed on coverage -- ``mid_hand_coverage_gap``, the
-    roster-shrink and continuous-presence refusals -- and a hand nobody watched
-    exports as complete. Reporting the true timestamp leaves the hole visible,
-    which is what the downstream refusals are there to read.
+    "In effect" means the last frame at or before the sample time -- the picture
+    the screen was actually showing at t -- not the first frame after it. The
+    distinction matters on variable-rate screen recordings, which encode a frame
+    only when the display changes: seeking forward from t skips over the state
+    that was on screen at t and can skip it at every sample time, so a table
+    state that persisted for many seconds was never observed at all. Sampling
+    the in-effect frame guarantees any state that persists at least one interval
+    is emitted.
 
-    Sampling stops at the end of the decodable stream, not at ``end``. Past the
-    last frame the decoder has nothing left to return, and the loop below used
-    to keep re-emitting the final image under every later timestamp: a 3-second
-    clip asked for ``--end 10 --interval 1`` produced 11 timestamped states from
-    4 distinct pictures. Those extra states are not a coverage limitation the
-    spine can see -- they carry a plausible table, so a timeline assembled from
-    them is wrong in a way nothing downstream rejects.
+    ``t_seconds`` is the emitted frame's own presentation timestamp, never the
+    requested time. Stamping a picture with the requested time moves it in time
+    and misplaces coverage holes; the true timestamp keeps them where they are.
 
-    A sample time that resolves to a frame already emitted is dropped for the
-    same reason. The test is decoder identity (same presentation timestamp), not
-    pixel identity: a table that genuinely does not change between two seconds
-    is two real observations, while one decoded frame answering two sample times
-    is one observation reported twice. Variable-rate screen recordings emit no
-    frame at all while the screen is static, so on those the gap between
-    consecutive frames can exceed the sampling interval.
+    A sample time answered by the frame already emitted is not re-emitted -- one
+    decoded frame is one observation, and emitting it twice would let it
+    debounce itself into a confirmed reading. But the answer itself is
+    evidence: on a change-driven recording, "the frame at t is still the
+    previous one" is the decoder proving no frame exists in between, i.e. the
+    screen did not change through t. That proof is returned as
+    ``prev_static_until_s`` on the NEXT emission (and left in
+    ``stats["last_static_until_s"]`` for the final frame): the latest sample
+    time the previous emitted frame was proven still on screen, or None when no
+    such request landed. Callers hang it on the previous frame so the spine can
+    tell a provably-static stretch from an unobserved one.
 
-    ``stats`` collects what the sampler did: how many times were requested, how
-    many frames were emitted, how many requested times were answered by an
-    already-emitted frame, and the time at which the stream ran out (``None``
-    when sampling reached ``end`` with frames still available).
+    Sampling stops once the decoder proves no undecoded frame remains, not at
+    ``end``: past the last frame there is nothing left that could ever answer a
+    later request. ``stats`` collects what the sampler did: times requested,
+    frames emitted, requests answered by an already-emitted frame, the pending
+    static-until proof for the last emitted frame, and the time sampling
+    stopped (``None`` when it reached ``end`` with frames still available).
     """
-    counts = {"requested": 0, "emitted": 0, "duplicate_times": 0, "ended_at": None}
+    counts = {"requested": 0, "emitted": 0, "duplicate_times": 0, "ended_at": None,
+              "last_static_until_s": None}
     if stats is not None:
         stats.clear()
         stats.update(counts)
         counts = stats
     t = start
     last_pts = None
+    static_until: float | None = None
+    stream_exhausted = False
     while t <= end:
-        counts["requested"] += 1
-        container.seek(int(t / stream.time_base), stream=stream)
-        frame = None
-        observed_t = None
-        for frame in container.decode(stream):
-            candidate = float(frame.pts * stream.time_base)
-            if candidate >= t:
-                observed_t = candidate
-                break
-        if frame is None or observed_t is None:
-            # No frame at or after t: the stream ends before this sample time.
+        if stream_exhausted:
+            # A previous request decoded to end of stream: no frame beyond the
+            # one already emitted exists, so every later request is the same
+            # answer. Stop rather than report one observation many times.
             counts["ended_at"] = t
             return
-        if frame.pts == last_pts:
+        counts["requested"] += 1
+        container.seek(int(t / stream.time_base), stream=stream)
+        best = None
+        eof = True
+        for frame in container.decode(stream):
+            if float(frame.pts * stream.time_base) <= t:
+                best = frame
+                continue
+            if best is None:
+                # The window starts before the stream's first frame; that first
+                # frame answers the request, as a request is a normal ask, not
+                # an exhausted stream.
+                best = frame
+            eof = False
+            break
+        if best is None:
+            # Nothing decodable at all at or around t.
+            counts["ended_at"] = t
+            return
+        if eof:
+            stream_exhausted = True
+        if best.pts == last_pts:
             counts["duplicate_times"] += 1
+            # The static proof holds only for a genuine in-effect answer. A
+            # bootstrap answer (the stream's first frame, still in the future
+            # of t) was not on screen at t and proves nothing about it.
+            if float(best.pts * stream.time_base) <= t:
+                static_until = t
+                counts["last_static_until_s"] = t
             t += interval
             continue
-        last_pts = frame.pts
+        prev_static = static_until
+        static_until = None
+        counts["last_static_until_s"] = None
+        last_pts = best.pts
         counts["emitted"] += 1
-        yield observed_t, frame.to_ndarray(format="bgr24")
+        yield float(best.pts * stream.time_base), prev_static, best.to_ndarray(format="bgr24")
         t += interval
 
 
@@ -275,11 +301,18 @@ def main() -> None:
     frames: list[rd.Frame] = []
     raw_dump: list[dict] = []
     sampling: dict = {}
+    nontable_reasons: dict = {}
     n_cards = 0
     n_nontable = 0
-    for i, (t, img) in enumerate(_sample_times(container, stream, args.start, args.end,
-                                               args.interval, stats=sampling)):
-        screen_label, _anchor = classify_screen(img)
+    for i, (t, prev_static, img) in enumerate(_sample_times(container, stream, args.start,
+                                                            args.end, args.interval,
+                                                            stats=sampling)):
+        if prev_static is not None and frames:
+            # The decoder proved the previous emitted frame was still on screen
+            # through prev_static (see _sample_times); the spine reads this to
+            # tell a provably-static stretch from an unobserved one.
+            frames[-1].observed_static_until_s = prev_static
+        screen_label, _anchor = classify_screen(img, reasons=nontable_reasons)
         image_name = f"t{t:09.2f}"
         h, w = int(img.shape[0]), int(img.shape[1])
         if screen_label != "table":
@@ -337,6 +370,9 @@ def main() -> None:
         if i % 10 == 0:
             print(f"  frame {i:>4} t={t:7.2f}s  regions={len(rows):>2}  named_cards={len(cards)}")
     container.close()
+    tail_static = sampling.get("last_static_until_s")
+    if tail_static is not None and frames:
+        frames[-1].observed_static_until_s = tail_static
 
     print(
         f"\nsampled {len(frames)} frames "
@@ -363,7 +399,13 @@ def main() -> None:
         total=total_samples,
         stage="timeline",
     )
-    timeline = build_hand_timeline(frames)
+    timeline = build_hand_timeline(frames, sampling_interval_s=args.interval)
+    if nontable_reasons:
+        # WHY frames were called nontable, so a whole-recording blackout reads
+        # as "capture scale outside the classifier band" instead of "recording
+        # of a lobby". Additive metadata key.
+        timeline["metadata"]["nontable_reasons"] = dict(sorted(nontable_reasons.items()))
+        print(f"nontable reasons: {json.dumps(timeline['metadata']['nontable_reasons'])}")
     if args.frame_dir:
         used_images = {
             str(Path(state["image"]).resolve())
@@ -388,6 +430,10 @@ def main() -> None:
             "image": f.image, "time_s": f.time_s, "width": f.width, "height": f.height,
             "video_frame": f.video_frame,
             "screen": getattr(f, "screen", "table"),
+            # Written only when the decoder proved a static span, so fixtures
+            # from dense recordings stay byte-identical to the pre-field era.
+            **({"observed_static_until_s": f.observed_static_until_s}
+               if f.observed_static_until_s is not None else {}),
             "detections": [{"cls": d.cls, "conf": round(d.conf, 4),
                             "xyxy": [round(v, 2) for v in d.xyxy], "attr": d.attr}
                            for d in f.detections],

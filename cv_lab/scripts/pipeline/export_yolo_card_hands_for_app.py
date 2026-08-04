@@ -366,6 +366,20 @@ def _split_source_codes(codes: set[str]) -> tuple[tuple[str, ...], tuple[str, ..
     return tuple(warnings), tuple(rejections)
 
 
+def _inferred_blinds(hand: dict[str, Any]) -> dict[str, Any] | None:
+    """Shape the timeline's forced_posts_bb for evidence, or None on timelines
+    built before the field existed (pass-through exporter posture: serialize
+    what the timeline carries, assert nothing about what it lacks)."""
+    posts = hand.get("forced_posts_bb")
+    if not isinstance(posts, (list, tuple)) or len(posts) < 2:
+        return None
+    return {
+        "small_blind": float(posts[0]),
+        "big_blind": float(posts[1]),
+        "straddles": [float(p) for p in posts[2:]],
+    }
+
+
 def _completion_evidence_for_hand(
     hand: dict[str, Any],
     *,
@@ -497,6 +511,13 @@ def _completion_evidence_for_hand(
             "cv_settle_scan_skipped": hand.get("settle_scan_skipped", 0),
             "cv_anchor_missing_states": hand.get("anchor_missing_states", 0),
             "cv_side_pot_detected": bool(hand.get("side_pot")),
+            # The session-voted forced-post structure this hand was
+            # reconstructed under (BB display units: sb, bb, then straddles).
+            # Advisory: the operator's blind attestation remains the authority;
+            # this says what the CV evidence showed so the attestation form can
+            # be pre-checked against it (a straddled table used to arrive with
+            # no trace of the straddle at all).
+            "cv_inferred_blinds": _inferred_blinds(hand),
         },
     )
 
