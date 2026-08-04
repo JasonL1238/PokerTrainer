@@ -6743,8 +6743,11 @@ def show_session_videos(db: PokerDatabase, session: Session) -> None:
             if hands_reconstructed_from_video(db, video.id, session_id=session.id):
                 st.caption(
                     "Hands in this session were reconstructed from this recording. "
-                    "Removing it keeps them, but importing more hands from it needs "
-                    "it linked to a session again."
+                    "Removing it keeps them — with their frames, verdicts and "
+                    "provenance, which are all keyed to the reconstruction job "
+                    "rather than to this link. What needs the recording attached "
+                    "again is Import: both importing further hands from it and "
+                    "reopening frame validation for the hands already here."
                 )
             render_video_danger_zone(db, video, key_prefix=f"session_{session.id}")
 

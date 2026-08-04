@@ -18,8 +18,11 @@ from poker_tracker.persistence.models import (
 from poker_tracker.services.validated_hand_import import (
     autonomous_import_blockers,
     ensure_hand_imported,
+    find_existing_imported_hand,
+    find_imported_hand_in_any_session,
     hand_frames_validated,
     hand_passes_autonomous_import_gate,
+    import_all_autonomous_eligible,
 )
 from poker_tracker.ui import reconstruction_review
 
@@ -753,5 +756,133 @@ def test_only_a_completed_job_can_have_its_timeline_imported(
     db.update_processing_job(job_id, status="completed")
     assert ensure_hand_imported(db, job_id, 2, mode="auto", data_dir=tmp_path).status == (
         "imported"
+    )
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Already-imported is not a per-session fact
+# ---------------------------------------------------------------------------
+
+
+def _move_video_to_new_session(db: PokerDatabase, job_id: int, name: str) -> int:
+    """Attach this job's recording to a fresh session, as the attach list does."""
+    job = db.fetch_processing_job(job_id)
+    assert job is not None
+    moved_to = db.create_session(Session(name=name, platform="ClubWPT Gold"))
+    assert moved_to.id is not None
+    db.update_video_session(job.video_id, moved_to.id)
+    return moved_to.id
+
+
+def test_moving_a_recording_to_another_session_does_not_reimport_its_hands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One real hand, played once, must not become two rows in two sessions.
+
+    The destination is read off ``video.session_id`` at import time, so attaching a
+    recording to a second session moves it. The de-duplication probe used to scan
+    that destination alone, which reported every hand already imported from the
+    recording as absent -- and the import then happily added a second copy of each.
+    Both copies count toward their session's results, so the two sessions disagree
+    about a hand that happened once and the portfolio totals count it twice.
+    """
+    db = _make_db(tmp_path)
+    job_id, first_session, _ = _seed_job(
+        db, tmp_path, _four_hand_timeline(), monkeypatch=monkeypatch
+    )
+    _mark_frames_correct(db, job_id, (2, "b"))
+    assert ensure_hand_imported(db, job_id, 2, mode="auto", data_dir=tmp_path).status == (
+        "imported"
+    )
+    original = db.fetch_hands_by_session(first_session)
+    assert len(original) == 1
+
+    second_session = _move_video_to_new_session(db, job_id, "Attached elsewhere")
+
+    result = ensure_hand_imported(db, job_id, 2, mode="auto", data_dir=tmp_path)
+
+    assert result.status == "already_present"
+    assert db.fetch_hands_by_session(second_session) == [], "the hand was imported twice"
+    assert [hand.id for hand in db.fetch_hands_by_session(first_session)] == [
+        original[0].id
+    ], "the original copy was disturbed"
+    # The result names where the hand actually is, not where the import aimed:
+    # ensure_draft_for_review treats already_present as success and renders this id.
+    assert result.session_id == first_session
+    assert result.hand_id == original[0].id
+    assert f"session #{first_session}" in result.message
+    db.close()
+
+
+def test_the_render_time_recovery_scan_does_not_duplicate_after_a_move(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The duplication path needed no button, which is what made it dangerous.
+
+    ``import_all_autonomous_eligible`` runs from the evidence-review page on render.
+    Frame verdicts are keyed by JOB, so they survive a recording being attached
+    elsewhere and every already-validated hand still passes the autonomous gate --
+    the scan therefore re-imported the whole timeline into the new session by itself.
+    """
+    db = _make_db(tmp_path)
+    job_id, first_session, _ = _seed_job(
+        db, tmp_path, _four_hand_timeline(), monkeypatch=monkeypatch
+    )
+    _mark_frames_correct(db, job_id, (1, "a"), (2, "b"), (3, "c"), (4, "d"))
+    first_scan = import_all_autonomous_eligible(db, job_id, data_dir=tmp_path)
+    imported_first = [item for item in first_scan if item.status == "imported"]
+    assert imported_first, "nothing was imported, so the test proves nothing"
+    landed = {hand.id for hand in db.fetch_hands_by_session(first_session)}
+    assert len(landed) == len(imported_first)
+
+    second_session = _move_video_to_new_session(db, job_id, "Moved mid-review")
+    second_scan = import_all_autonomous_eligible(db, job_id, data_dir=tmp_path)
+
+    # The timeline's first and last hands stay blocked in both scans (partial_start /
+    # partial_end), so the claim is about what the scan ADDS, not about every status.
+    assert "imported" not in [item.status for item in second_scan]
+    assert {item.status for item in second_scan} == {"already_present", "blocked"}
+    assert db.fetch_hands_by_session(second_session) == []
+    assert {hand.id for hand in db.fetch_hands_by_session(first_session)} == landed
+    db.close()
+
+
+def test_the_two_finders_answer_different_questions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scoped finder must stay scoped; only the dedupe question crosses sessions.
+
+    Four call sites ask "is this hand in the session on screen" to decide what to
+    draw -- an in-session badge, an onboarding step, the row beside the frames. If
+    the scoped finder started answering yes off another session's copy, each would
+    claim a hand this session does not hold. The bug was one question answered with
+    the other's scope, so the fix has to keep both available and distinct.
+    """
+    db = _make_db(tmp_path)
+    job_id, first_session, _ = _seed_job(
+        db, tmp_path, _four_hand_timeline(), monkeypatch=monkeypatch
+    )
+    _mark_frames_correct(db, job_id, (2, "b"))
+    assert ensure_hand_imported(db, job_id, 2, mode="auto", data_dir=tmp_path).status == (
+        "imported"
+    )
+    elsewhere = _move_video_to_new_session(db, job_id, "Somewhere else")
+
+    scoped = find_existing_imported_hand(
+        db, session_id=elsewhere, job_id=job_id, timeline_hand_number=2
+    )
+    assert scoped is None, "the scoped finder reached outside its session"
+
+    anywhere = find_imported_hand_in_any_session(
+        db, job_id=job_id, timeline_hand_number=2
+    )
+    assert anywhere is not None
+    assert anywhere.session_id == first_session
+
+    # A timeline hand that was never imported is absent under both questions.
+    assert (
+        find_imported_hand_in_any_session(db, job_id=job_id, timeline_hand_number=4)
+        is None
     )
     db.close()

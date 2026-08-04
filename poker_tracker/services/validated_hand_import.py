@@ -8,6 +8,7 @@ the hand is full / not mid-start, or ``draft`` when the operator explicitly asks
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -177,22 +178,24 @@ def hand_passes_autonomous_import_gate(
     ).ok
 
 
-def find_existing_imported_hand(
-    db: PokerDatabase,
+def _first_import_of(
+    candidates: Iterable[Hand],
     *,
-    session_id: int,
     job_id: int,
     timeline_hand_number: int,
-    related_job_ids: set[int] | None = None,
+    related_job_ids: set[int] | None,
 ) -> Hand | None:
-    """Return the session hand already imported from this job/timeline hand, if any.
+    """The first candidate row that is this timeline hand's import, or None.
 
-    ``related_job_ids`` lets a re-run of reconstruction on the same video recognize
-    hands already added from an earlier job for the same timeline hand number.
+    The identity test lives here and nowhere else, because TWO different questions
+    are asked with it -- "is this hand in the destination session" and "does it
+    exist in any session at all" -- and a rule copied into both drifts. Evidence
+    first, notes second: the notes fallback carries legacy CV drafts whose identity
+    was never stamped into completion evidence.
     """
     accepted_jobs = set(related_job_ids or ())
     accepted_jobs.add(job_id)
-    for hand in db.fetch_hands_by_session(session_id):
+    for hand in candidates:
         evidence = parse_completion_evidence(hand.completion_evidence)
         identity = evidence.extra.get(CV_TIMELINE_IDENTITY_KEY)
         if isinstance(identity, dict):
@@ -210,6 +213,65 @@ def find_existing_imported_hand(
         if timeline_hand_number_from_notes(hand.notes) == timeline_hand_number:
             return hand
     return None
+
+
+def find_existing_imported_hand(
+    db: PokerDatabase,
+    *,
+    session_id: int,
+    job_id: int,
+    timeline_hand_number: int,
+    related_job_ids: set[int] | None = None,
+) -> Hand | None:
+    """Return the hand already imported into THIS session from this timeline hand.
+
+    ``related_job_ids`` lets a re-run of reconstruction on the same video recognize
+    hands already added from an earlier job for the same timeline hand number.
+
+    Scoped deliberately. The UI asks this to decide what to draw for one session --
+    an "in session" badge, an onboarding step, the row to render beside the frames --
+    and every one of those answers is about the session on screen. The de-duplication
+    question is a different one; see ``find_imported_hand_in_any_session``.
+    """
+    return _first_import_of(
+        db.fetch_hands_by_session(session_id),
+        job_id=job_id,
+        timeline_hand_number=timeline_hand_number,
+        related_job_ids=related_job_ids,
+    )
+
+
+def find_imported_hand_in_any_session(
+    db: PokerDatabase,
+    *,
+    job_id: int,
+    timeline_hand_number: int,
+    related_job_ids: set[int] | None = None,
+) -> Hand | None:
+    """The same import, looked for across EVERY session. The de-duplication question.
+
+    A hand is a record of one real hand that was played once, so "already imported"
+    cannot be a per-session fact -- and asking it per session is how one real hand
+    came to exist twice. The import destination is read off ``video.session_id`` at
+    import time (see ``ensure_hand_imported``), so attaching a recording to a second
+    session moved the destination while leaving the earlier hands where they were.
+    A destination-scoped probe then reported every one of them absent, and the
+    evidence-review page's own recovery scan -- which runs on render, needs no
+    button, and passes the gate because frame verdicts are keyed by JOB and survive
+    the move -- re-imported the entire timeline into the new session. Both copies
+    counted toward session results and analytics.
+
+    Unindexed by necessity: a hand records its originating job inside its completion
+    evidence and no column indexes it, which is the same constraint
+    ``hands_reconstructed_from_video`` documents. That makes this a full scan, so it
+    belongs on an import action and must not be called from anything that renders.
+    """
+    return _first_import_of(
+        db.fetch_all_hands(),
+        job_id=job_id,
+        timeline_hand_number=timeline_hand_number,
+        related_job_ids=related_job_ids,
+    )
 
 
 def related_cv_job_ids(db: PokerDatabase, video_id: int) -> set[int]:
@@ -380,22 +442,39 @@ def ensure_hand_imported(
         )
     rollback_point = rollback.path.name
     with db.transaction(immediate=True):
-        existing = find_existing_imported_hand(
+        existing = find_imported_hand_in_any_session(
             db,
-            session_id=session_id,
             job_id=job_id,
             timeline_hand_number=timeline_hand_number,
             related_job_ids=related_jobs,
         )
         if existing is not None:
+            holder = existing.session_id
+            if holder == session_id:
+                message = f"Hand already in session #{session_id}."
+            else:
+                message = (
+                    f"Hand #{timeline_hand_number} from this recording was already "
+                    f"imported into session #{holder}, so nothing was added to "
+                    f"session #{session_id} — a second copy would be one real hand "
+                    "counted twice in both sessions' results. Move the existing "
+                    "hand between sessions instead of importing it again."
+                )
             return HandImportResult(
                 status="already_present",
                 hand_id=existing.id,
-                session_id=session_id,
-                message=f"Hand already in session #{session_id}.",
+                # The session that actually HOLDS the hand, not the one that asked.
+                # Reporting the destination is what let a caller believe the hand
+                # had landed where it requested: ensure_draft_for_review treats
+                # already_present as success and renders this id.
+                session_id=holder,
+                message=message,
                 rollback_point=rollback_point,
             )
         import_hands_into_session(db, one_hand_payload, session_id)
+        # Deliberately the session-scoped finder: this asks "did the row land HERE",
+        # which is a claim about the destination. The cross-session form would answer
+        # yes off a copy in another session and report an import that never happened.
         saved = find_existing_imported_hand(
             db,
             session_id=session_id,
