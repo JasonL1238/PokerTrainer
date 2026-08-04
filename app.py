@@ -2173,57 +2173,6 @@ def load_study_session_hands(
     return preferred_session or (sessions[0] if sessions else None), [], None
 
 
-def _batch_approve_candidates(ordered: list[Hand]) -> list[Hand]:
-    return [
-        hand
-        for hand in ordered
-        if hand.id is not None
-        and hand.study_inclusion != "skip"
-        and hand.review_status != "reviewed"
-        and hand.completion_status in {"complete", "not_applicable"}
-    ]
-
-
-def _session_hands_ready_to_approve(
-    db: PokerDatabase,
-    candidates: list[Hand],
-    cache: AccountingCache,
-) -> list[tuple[Hand, StudyReadiness]]:
-    """Evaluate batch candidates once; confirmation is implied by the approve action."""
-
-    ready: list[tuple[Hand, StudyReadiness]] = []
-    for hand in candidates:
-        if hand.id is None:
-            continue
-        accounting, accounting_error = _reconcile_cached(db, hand.id, cache)
-        readiness = hand_study_readiness(
-            db,
-            hand,
-            accounting,
-            accounting_error,
-            user_confirmed=True,
-        )
-        if readiness.is_ready:
-            ready.append((hand, readiness))
-    return ready
-
-
-def approve_ready_hands_in_session(
-    db: PokerDatabase,
-    candidates: list[Hand],
-    cache: AccountingCache,
-) -> tuple[int, int]:
-    """Approve session hands that are study-ready with confirmation implied."""
-
-    ready = _session_hands_ready_to_approve(db, candidates, cache)
-    approved = 0
-    for hand, readiness in ready:
-        if approve_hand_for_study(db, hand, readiness, announce=False):
-            approved += 1
-    skipped = len(candidates) - approved
-    return approved, skipped
-
-
 def show_study_workspace(db: PokerDatabase, session: Session | None) -> None:
     page_header(
         "Study",
@@ -5320,11 +5269,17 @@ def _render_unresolved_work(
     is a crisis over four hands and a rounding error over four hundred.
     """
     member_ids = {member.hand_id for member in snapshot.members if member.hand_id is not None}
-    open_issue_hand_ids = {
-        issue.hand_id
-        for issue in db.fetch_hand_issues(status="open")
-        if issue.hand_id in member_ids
-    }
+    # Kept grouped rather than reduced straight to ids, because the readiness scan
+    # below needs the rows themselves. This one query used to be spent on the id
+    # set alone and then re-run per hand inside `hand_study_readiness` -- two
+    # hundred scanned hands meant two hundred repeats of a query already answered
+    # here. `_issue_blockers` filters to open as its first act, so the open-only
+    # subset is exactly what it would have derived from the wider fetch.
+    open_issues_by_hand: dict[int, list[HandIssue]] = {}
+    for issue in db.fetch_hand_issues(status="open"):
+        if issue.hand_id in member_ids:
+            open_issues_by_hand.setdefault(issue.hand_id, []).append(issue)
+    open_issue_hand_ids = set(open_issues_by_hand)
     stale_hand_ids = db.fetch_stale_review_hand_ids() & member_ids
 
     scannable = [member for member in snapshot.members if member.hand_id is not None]
@@ -5337,6 +5292,7 @@ def _render_unresolved_work(
             member.hand,
             *_accounting_or_error(db, member.hand, accounting_cache),
             user_confirmed=True,
+            hand_issues=open_issues_by_hand.get(member.hand_id, []),
         ).is_ready
     ]
 
