@@ -6,6 +6,20 @@ backgroundColor = "#121418"
 secondaryBackgroundColor = "#1A1E24"
 textColor = "#F2EFE8"
 font = "sans serif"
+# This is a review console, so the root type scale is deliberately below the
+# 16px browser default: it shrinks Streamlit's own widgets and every `rem` in
+# ui_theme.py / poker_visuals.py from one number, which is why the density work
+# lives here and not as a pile of per-component font-size overrides.
+baseFontSize = 14
+# Streamlit's stock heading ramp tops out near 2.75rem, which on a review screen
+# spends a third of the fold on one `st.header`. These are the h1..h6 sizes the
+# product actually uses; the `pt-*` headers in ui_theme.py set their own.
+headingFontSizes = ["1.5rem", "1.2rem", "1.05rem", "0.95rem", "0.85rem", "0.8rem"]
+# Metric values and code blocks are the two surfaces that grow fastest with the
+# base size: a session dashboard is mostly metrics, a hand review is mostly the
+# history text block.
+metricValueFontSize = "1.35rem"
+codeFontSize = "0.72rem"
 
 [server]
 maxUploadSize = 2048

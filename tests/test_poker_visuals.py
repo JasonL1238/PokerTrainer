@@ -13,7 +13,20 @@ from poker_tracker.ui.poker_visuals import (
 
 def test_poker_visuals_include_narrow_phone_layout() -> None:
     assert "@media (max-width: 420px)" in _POKER_CSS
-    assert ".pt-table-shell { min-height: 232px" in _POKER_CSS
+    assert ".pt-table-shell { min-height: 196px" in _POKER_CSS
+
+
+def test_table_diagram_is_sized_in_px_and_scaled_with_the_compact_shell() -> None:
+    """The felt does not follow the root type scale, so it is scaled by hand.
+
+    ``baseFontSize`` in .streamlit/config.toml shrinks every ``rem`` in the
+    product, but the felt, the seat boxes and the cards are px. Left alone they
+    would keep their full size while the shell around them halved its padding,
+    which is how a "compact" build ends up with one oversized diagram on it.
+    """
+    assert ".pt-table-shell { position: relative; min-height: 258px" in _POKER_CSS
+    assert "width: min(100%, 490px)" in _POKER_CSS
+    assert ".pt-card { width: 26px; height: 36px" in _POKER_CSS
 
 
 def test_poker_table_responds_to_its_column_width() -> None:
@@ -122,7 +135,7 @@ def test_action_timeline_does_not_repeat_matching_position() -> None:
 def test_decision_history_uses_scoped_consistent_rows() -> None:
     assert ".stMarkdown ol.pt-decision-history" in _POKER_CSS
     assert "display: block !important" in _POKER_CSS
-    assert "min-height: 76px" in _POKER_CSS
+    assert "min-height: 54px" in _POKER_CSS
     assert ".pt-history-note { width: 100%; white-space: normal" in _POKER_CSS
 
 
@@ -230,7 +243,7 @@ def test_action_replay_reconstructs_the_selected_board_and_player_state() -> Non
 def test_cards_layer_behind_hero_position_and_pot_clears_board() -> None:
     assert ".pt-seat-hero { z-index: 5" in _POKER_CSS
     assert ".pt-table-center { position: absolute; z-index: 2" in _POKER_CSS
-    assert "bottom: calc(24px - 2%)" in _POKER_CSS
+    assert "bottom: calc(20px - 2%)" in _POKER_CSS
     assert ".pt-hero-cards { position: relative; z-index: 2" in _POKER_CSS
     assert ".pt-pot { position: relative; z-index: 3" in _POKER_CSS
     assert html_order(_table_markup()) == ["pt-board", "pt-pot", "pt-hero-cards"]

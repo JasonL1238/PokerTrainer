@@ -7,9 +7,10 @@
       "runtimeExecutable": "zsh",
       "runtimeArgs": [
         "-lic",
-        "exec streamlit run app.py --server.port 8501 --server.headless true --browser.gatherUsageStats false"
+        "exec streamlit run app.py --server.port ${PORT:-8501} --server.headless true --browser.gatherUsageStats false"
       ],
-      "port": 8501
+      "port": 8501,
+      "autoPort": true
     }
   ]
 }
