@@ -37,6 +37,14 @@ jobs:
       - name: Lint
         run: python -m ruff check .
 
+      # Cheap and first: an agent instruction file pointing at a doc that no
+      # longer exists sends every later agent back to reading the repository,
+      # which is the cost docs/ was written to remove. Stdlib only, runs in
+      # milliseconds, so it belongs ahead of mypy rather than buried in pytest
+      # (tests/test_agent_docs.py runs the same check for local runs).
+      - name: Agent docs
+        run: python scripts/check_agent_docs.py
+
       - name: Type check
         run: python -m mypy
 
