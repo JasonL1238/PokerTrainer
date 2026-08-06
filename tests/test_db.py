@@ -877,3 +877,110 @@ def test_accounting_evidence_update_demotes_a_complete_hand() -> None:
 
     assert db.fetch_hand(hand.id).completion_status == "uncertain"
     db.close()
+
+
+def _uploaded(session_id: int | None, name: str, digest: str) -> VideoRecord:
+    return VideoRecord(
+        session_id=session_id,
+        original_filename=name,
+        stored_path=f"/tmp/{name}",
+        file_size_bytes=10,
+        content_sha256=digest,
+    )
+
+
+def test_create_video_refuses_the_same_recording_twice_in_one_session() -> None:
+    """One recording, one row per session. Identity is the content digest.
+
+    An operator who uploaded the same capture three times got three rows, three
+    copies of a 568 MB file on disk, three reconstruction jobs, and -- had they
+    imported from more than one -- every hand counted as many times as the
+    recording was attached. Neither the filename nor the stored path can catch
+    this: the stored path carries a fresh uuid by construction, and the two
+    uploads have the same name.
+    """
+    db = make_db()
+    session = db.create_session(Session(name="Tuesday"))
+    first = db.create_video(_uploaded(session.id, "recording.mov", "d1"))
+
+    with pytest.raises(ValueError) as refused:
+        db.create_video(_uploaded(session.id, "recording (1).mov", "d1"))
+    assert "recording.mov" in str(refused.value), "name the copy already stored"
+    assert db.fetch_videos(session.id) == [first]
+
+    db.close()
+
+
+def test_create_video_allows_one_recording_in_two_different_sessions() -> None:
+    """The bound is per session, not global: one capture can legitimately cover
+    two sessions the operator files separately."""
+    db = make_db()
+    one = db.create_session(Session(name="Early"))
+    two = db.create_session(Session(name="Late"))
+
+    db.create_video(_uploaded(one.id, "recording.mov", "d1"))
+    db.create_video(_uploaded(two.id, "recording.mov", "d1"))
+
+    assert len(db.fetch_videos(one.id)) == 1
+    assert len(db.fetch_videos(two.id)) == 1
+
+    db.close()
+
+
+def test_create_video_treats_an_empty_digest_as_no_identity() -> None:
+    """Rows predating the content_sha256 column carry ''. Two of them are not
+    evidence of the same recording, and refusing them would wall off uploads
+    whose digest could not be taken."""
+    db = make_db()
+    session = db.create_session(Session(name="Legacy"))
+
+    db.create_video(_uploaded(session.id, "one.mov", ""))
+    db.create_video(_uploaded(session.id, "two.mov", ""))
+
+    assert len(db.fetch_videos(session.id)) == 2
+
+    db.close()
+
+
+def test_create_video_guards_the_unassigned_bucket_too() -> None:
+    db = make_db()
+    db.create_video(_uploaded(None, "loose.mov", "d1"))
+
+    with pytest.raises(ValueError):
+        db.create_video(_uploaded(None, "loose copy.mov", "d1"))
+
+    db.close()
+
+
+def test_update_video_session_refuses_a_move_onto_a_duplicate() -> None:
+    """Moving is the other way one session ends up holding a recording twice."""
+    db = make_db()
+    target = db.create_session(Session(name="Target"))
+    elsewhere = db.create_session(Session(name="Elsewhere"))
+    db.create_video(_uploaded(target.id, "recording.mov", "d1"))
+    roaming = db.create_video(_uploaded(elsewhere.id, "recording.mov", "d1"))
+
+    with pytest.raises(ValueError):
+        db.update_video_session(roaming.id, target.id)
+    assert db.fetch_video(roaming.id).session_id == elsewhere.id
+
+    # Re-saving a video into the session it is already in is not a duplicate.
+    assert db.update_video_session(roaming.id, elsewhere.id).session_id == elsewhere.id
+    # And a session that does not already hold it still accepts it.
+    assert db.update_video_session(roaming.id, None).session_id is None
+
+    db.close()
+
+
+def test_find_session_video_by_digest_answers_before_the_file_is_stored() -> None:
+    """The upload path pre-checks with this so a duplicate does not cost a copy."""
+    db = make_db()
+    session = db.create_session(Session(name="Tuesday"))
+    stored = db.create_video(_uploaded(session.id, "recording.mov", "d1"))
+
+    assert db.find_session_video_by_digest(session.id, "d1") == stored
+    assert db.find_session_video_by_digest(session.id, "other") is None
+    assert db.find_session_video_by_digest(None, "d1") is None
+    assert db.find_session_video_by_digest(session.id, "") is None
+
+    db.close()

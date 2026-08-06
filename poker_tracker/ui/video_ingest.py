@@ -301,6 +301,25 @@ def assert_regular_owned_file(path: Path) -> None:
         raise ValueError(f"Hard-linked videos are not allowed: {path}")
 
 
+def sha256_upload(source: BinaryIO, *, chunk_size: int = 1024 * 1024) -> str:
+    """Digest an upload without storing it, leaving the stream rewound.
+
+    Lets a caller answer "have I already got this recording?" before paying for
+    the copy. ``ingest_uploaded_video`` still digests what it actually wrote --
+    this is a pre-check, not a substitute: the bytes that reach disk are the ones
+    whose digest gets recorded.
+    """
+    digest = hashlib.sha256()
+    source.seek(0)
+    while True:
+        chunk = source.read(chunk_size)
+        if not chunk:
+            break
+        digest.update(chunk)
+    source.seek(0)
+    return digest.hexdigest()
+
+
 def sha256_file(path: Path, *, chunk_size: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -461,6 +480,7 @@ __all__ = [
     "require_playable_video",
     "resolve_stored_video_path",
     "sha256_file",
+    "sha256_upload",
     "sweep_stale_upload_partials",
     "validate_video_extension",
 ]

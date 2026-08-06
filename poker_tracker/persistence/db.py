@@ -4261,8 +4261,72 @@ class PokerDatabase:
         ).fetchall()
         return [_solver_run_from_row(row) for row in rows]
 
+    def find_session_video_by_digest(
+        self, session_id: int | None, content_sha256: str
+    ) -> VideoRecord | None:
+        """The recording already attached to ``session_id`` with this content, if any.
+
+        Identity is the content digest, not the filename or the stored path: two
+        uploads of one recording get different uuid-prefixed paths by
+        construction, and the operator's file manager gives them the same name.
+        An empty digest is not an identity -- rows predating the column carry
+        ``''`` -- so it never matches.
+        """
+        digest = (content_sha256 or "").strip()
+        if not digest:
+            return None
+        if session_id is None:
+            row = self._execute(
+                """
+                SELECT * FROM videos
+                WHERE session_id IS NULL AND content_sha256 = ?
+                ORDER BY id LIMIT 1
+                """,
+                (digest,),
+            ).fetchone()
+        else:
+            row = self._execute(
+                """
+                SELECT * FROM videos
+                WHERE session_id = ? AND content_sha256 = ?
+                ORDER BY id LIMIT 1
+                """,
+                (session_id, digest),
+            ).fetchone()
+        return None if row is None else _video_from_row(row)
+
+    def assert_session_video_not_duplicate(
+        self, session_id: int | None, content_sha256: str, *, moving: bool = False
+    ) -> None:
+        """Keep one recording from being attached to one session twice.
+
+        A session holding the same recording twice is not a harmless extra row.
+        Each copy costs its own full-size file on disk -- the case that prompted
+        this had three copies of one 568 MB capture -- each gets its own
+        reconstruction job, and every hand the second copy reconstructs is a real
+        hand that already exists under the first, so the session's counts, BB/100
+        and every aggregate built on them silently double-count.
+
+        Public because the upload path calls it BEFORE storing the file, to avoid
+        copying a gigabyte only to unlink it. ``create_video`` calls it again on
+        the way in, so this being skipped can never be how a duplicate lands.
+        """
+        existing = self.find_session_video_by_digest(session_id, content_sha256)
+        if existing is None:
+            return
+        where = "this session" if session_id is not None else "the unassigned videos"
+        verb = "is already attached to" if moving else "was already added to"
+        raise ValueError(
+            f"That recording {verb} {where} as "
+            f"{existing.original_filename!r}. Process the existing copy instead of "
+            "adding a second one."
+        )
+
     def create_video(self, video: VideoRecord) -> VideoRecord:
         payload = video.model_dump()
+        self.assert_session_video_not_duplicate(
+            payload["session_id"], payload.get("content_sha256") or ""
+        )
         cursor = self._execute(
             """
             INSERT INTO videos (
@@ -4313,10 +4377,17 @@ class PokerDatabase:
     def update_video_session(self, video_id: int, session_id: int | None) -> VideoRecord:
         """Attach a stored video to a session, move it, or leave it unassigned."""
 
-        if self.fetch_video(video_id) is None:
+        current = self.fetch_video(video_id)
+        if current is None:
             raise ValueError("Video not found.")
         if session_id is not None and self.fetch_session(session_id) is None:
             raise ValueError("Target session not found.")
+        if session_id != current.session_id:
+            # Moving is the second way one session ends up holding a recording
+            # twice, and guarding only the upload would leave it open.
+            self.assert_session_video_not_duplicate(
+                session_id, current.content_sha256, moving=True
+            )
         self._execute(
             "UPDATE videos SET session_id = ? WHERE id = ?",
             (session_id, video_id),

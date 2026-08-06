@@ -16,6 +16,7 @@ from poker_tracker.ui.video_ingest import (
     ingest_uploaded_video,
     require_playable_video,
     sha256_file,
+    sha256_upload,
 )
 
 
@@ -155,3 +156,20 @@ def test_ingest_rejects_symlink_storage_dir(tmp_path: Path) -> None:
     with source.open("rb") as handle:
         with pytest.raises(ValueError, match="symlink"):
             ingest_uploaded_video(handle, "session.avi", linked_dir)
+
+
+def test_sha256_upload_matches_the_stored_digest_and_rewinds(tmp_path: Path) -> None:
+    """The upload path asks "already got this?" before paying for the copy, so
+    the pre-check digest has to equal the one the stored file ends up carrying,
+    and it must leave the stream where ingest expects to find it."""
+    source = create_synthetic_video(tmp_path / "source.avi")
+    videos_dir = tmp_path / "videos"
+    videos_dir.mkdir()
+
+    with source.open("rb") as handle:
+        handle.read(64)                      # a caller may have already read some
+        pre_check = sha256_upload(handle)
+        assert handle.tell() == 0, "the stream must be usable by the copy that follows"
+        ingested = ingest_uploaded_video(handle, "source.avi", videos_dir)
+
+    assert pre_check == ingested.content_sha256 == sha256_file(ingested.path)

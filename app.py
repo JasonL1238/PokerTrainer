@@ -297,7 +297,7 @@ from poker_tracker.ui.session_library import (
     sessions_on_date,
 )
 from poker_tracker.ui.ui_theme import brand_header, inject_theme
-from poker_tracker.ui.video_ingest import ingest_uploaded_video
+from poker_tracker.ui.video_ingest import ingest_uploaded_video, sha256_upload
 from poker_tracker.ui.video_storage import (
     ensure_data_directories,
     validate_video_extension,
@@ -6662,6 +6662,13 @@ def _save_video_upload(
         try:
             validate_video_extension(uploaded.name)
             uploaded.seek(0)
+            # Ask before copying. create_video refuses the duplicate either way,
+            # but reaching it the long way round writes the whole recording to
+            # disk and then unlinks it -- 568 MB of I/O to say "you already have
+            # this" for the case that prompted the guard.
+            db.assert_session_video_not_duplicate(
+                session.id, sha256_upload(uploaded)
+            )
             ingested = ingest_uploaded_video(uploaded, uploaded.name)
             metadata = ingested.metadata
             try:
