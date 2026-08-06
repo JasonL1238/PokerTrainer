@@ -1,6 +1,37 @@
+import ast
+from pathlib import Path
+
 from streamlit.testing.v1 import AppTest
 
 from poker_tracker.ui.navigation import Page
+
+
+def test_shell_sets_a_compact_sidebar_width_in_pixels() -> None:
+    """``initial_sidebar_state`` is an int on purpose: it is the rail's width.
+
+    Streamlit reads that number as the *default* pixel width, so the rail matches
+    the compact type scale while a reader's own drag still wins over it. The
+    argument looks like a mistake next to the documented "auto"/"expanded"
+    strings, which is exactly why reverting it needs to fail a test.
+    """
+    tree = ast.parse(Path("app.py").read_text())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "set_page_config"
+    ]
+    assert len(calls) == 1, "the shell configures the page exactly once"
+    widths = [
+        kw.value.value
+        for kw in calls[0].keywords
+        if kw.arg == "initial_sidebar_state" and isinstance(kw.value, ast.Constant)
+    ]
+    assert widths, "initial_sidebar_state must stay set"
+    assert isinstance(widths[0], int) and not isinstance(widths[0], bool)
+    # Streamlit clamps to 200-600; outside that the number is silently ignored.
+    assert 200 <= widths[0] <= 600
 
 
 def test_product_shell_navigation_smoke(monkeypatch) -> None:

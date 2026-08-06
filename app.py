@@ -1026,7 +1026,13 @@ def _open_database_or_refuse() -> PokerDatabase | None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="PokerTrainer", layout="wide")
+    # An integer sidebar state is a pixel width (Streamlit clamps it to 200-600).
+    # 240 is sized to the widest thing the rail has to hold -- a full session
+    # label like "Jul 30 - Thursday, July 30, 2026" -- rather than left at the
+    # stock 300, which reads as dead space next to the compact type scale. This
+    # only sets the *default*: dragging the edge still works and is remembered,
+    # and double-clicking the handle returns to this width.
+    st.set_page_config(page_title="PokerTrainer", layout="wide", initial_sidebar_state=240)
     inject_theme()
     inject_poker_visual_styles()
     if not check_password():
