@@ -280,9 +280,37 @@ def _coin_detection_scale(width: int, height: int) -> float:
     return min(float(width) / float(REF_W), float(height) / float(REF_H))
 
 
-def _odd_kernel(size: int) -> int:
-    size = max(1, int(size))
-    return size if size % 2 == 1 else size + 1
+def _scaled_odd_kernel(calibrated: int, scale: float) -> int:
+    """The calibrated square kernel shrunk to ``scale``, as the NEAREST odd size.
+
+    An OpenCV structuring element has to be odd, so a proportional size has to
+    land on one of the two odd integers bracketing it, and which one you pick is
+    the whole story. This used to round the proportional size to an integer and
+    then push an even result UP, which broke the rule its own caller states
+    ("shrink those gates with scale") over exactly the band where shrinking
+    matters. For scale in [0.5, 0.833] the proportional open is under 2.5, and
+    rounding up handed back the full calibrated 3 -- so the open did not shrink
+    at all until scale fell below 0.5.
+
+    That cost a healthy recording entirely. The seat coin is a ~2px-stroke green
+    RING, not a filled disc, and a 3x3 open erases a 2px stroke. On a 1344x836
+    client (scale 0.596) the eight seat coins came back as 6x4 fragments or not
+    at all; the fit collapsed onto the surviving bet chips at s~=0.32; every one
+    of 1021 sampled frames failed the classifier's scale band, and the operator
+    was told to re-record a recording that was fine.
+
+    Nearest-odd instead of round-then-bump-up. Both reference geometries are
+    untouched -- 2114x1414 (scale 0.989) still gets 3 / 7 and 1052x732 (scale
+    0.492) still gets 1 / 3 -- because their proportional sizes already sit
+    nearest the odd value they were getting. 1344x836 now gets 1 / 5: the open
+    is off, as it already is on the smaller validated geometry, and the close
+    stays wide enough to merge the ring fragments the mask breaks a coin into
+    (a 3 there under-merges and costs a fifth of the table frames).
+    """
+    proportional = max(1.0, float(calibrated) * float(scale))
+    # Nearest odd integer to `proportional`, then never above the calibrated size.
+    nearest_odd = int(round((proportional - 1.0) / 2.0)) * 2 + 1
+    return max(1, min(int(calibrated) | 1, nearest_odd))
 
 
 def detect_coins(img_bgr):
@@ -291,9 +319,8 @@ def detect_coins(img_bgr):
 
     height, width = img_bgr.shape[:2]
     scale = _coin_detection_scale(width, height)
-    # Cap at the calibrated kernels so larger recordings keep the measured gates.
-    open_k = _odd_kernel(max(1, min(3, round(3 * scale))))
-    close_k = _odd_kernel(max(1, min(7, round(7 * scale))))
+    open_k = _scaled_odd_kernel(3, scale)
+    close_k = _scaled_odd_kernel(7, scale)
     min_area = max(8.0, 40.0 * (scale ** 2))
 
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
@@ -316,11 +343,38 @@ def detect_coins(img_bgr):
     return out
 
 
+# How far the pot coin may sit from its PROJECTED reference slot, as a fraction
+# of the fitted table width, before it stops counting as the pot coin.
+#
+# ``_classify`` finds the pot coin by relative area (~1.6x a seat coin), which
+# holds on the reference render and does NOT hold on every client size: on a
+# 1344x836 window the client draws the pot coin at the same size as a seat coin,
+# so the area rule found no pot at all and the classifier rejected good table
+# frames on ``no_pot_coin``. Position is the scale-free property, so where the
+# area rule comes back empty ``anchor`` falls back to asking whether any coin
+# lands where the pot coin belongs.
+#
+# Measured over 442 credible seats-only fits across the 3 real geometries
+# (1344x836, 1052x732, 2114x1414), as distance from the projected slot to the
+# nearest detected coin: every frame that has a pot lands at <= 0.0156, and the
+# next observation up is 0.0913 -- frames with no pot on the table at all, where
+# the nearest coin is a seat coin most of a table away. 0.04 is the geometric
+# midpoint of that gap (2.6x the largest real pot, 2.3x under the nearest
+# confuser). This is STRICTER evidence than the area rule it backs up, not
+# looser: it demands a coin at the right place rather than any coin of roughly
+# the right size.
+POT_SLOT_MAX_OFFSET = 0.04
+
+
 def _classify(coins):
     """Split blobs into seat coins vs pot coin vs bet-chip (by area). Areas at
     reference scale: seat ~340, pot ~555, bet-chips >800. Scale-invariant ratios
     are recovered later, so here we use scale-robust *relative* areas: the median
-    round-coin area defines the seat size."""
+    round-coin area defines the seat size.
+
+    The pot coin's area ratio is render-dependent (see POT_SLOT_MAX_OFFSET), so a
+    None pot here means "no pot coin BY AREA", not "no pot coin".
+    """
     if not coins:
         return [], None
     areas = np.array([c["area"] for c in coins])
@@ -361,6 +415,35 @@ def _similarity_fit(ref_pts, det_pts):
     return s, (dc[0] - s * rc[0], dc[1] - s * rc[1])
 
 
+def _pot_coin_at_slot(coins, seats, ref_seat_px, ref_pot_px, *, max_iter=3):
+    """The coin sitting where the pot coin belongs, or None.
+
+    Backs up ``_classify``'s area rule with the scale-free property: fit the seat
+    constellation ALONE, project the reference pot slot through that fit, and
+    accept the nearest coin if it lands inside POT_SLOT_MAX_OFFSET of the fitted
+    table width.
+
+    Every coin is a candidate, INCLUDING one the area rule filed as a seat -- on
+    the render that motivated this the pot coin is seat-sized, so it lands in
+    ``seats`` and excluding seats found nothing. The caller therefore has to drop
+    the returned coin from its seat list: a single detection matched to two
+    reference slots at once would corrupt the fit it is supposed to improve.
+    """
+    if not coins or len(seats) < ANCHOR_MIN_POINTS:
+        return None
+    seats_only = anchor_from_points([(c["cx"], c["cy"]) for c in seats],
+                                   ref_seat_px, max_iter=max_iter)
+    if seats_only is None:
+        return None
+    slot_x = seats_only.s * ref_pot_px[0] + seats_only.tx
+    slot_y = seats_only.s * ref_pot_px[1] + seats_only.ty
+    tolerance = POT_SLOT_MAX_OFFSET * seats_only.s * REF_W
+    nearest = min(coins,
+                  key=lambda c: (c["cx"] - slot_x) ** 2 + (c["cy"] - slot_y) ** 2)
+    offset = ((nearest["cx"] - slot_x) ** 2 + (nearest["cy"] - slot_y) ** 2) ** 0.5
+    return nearest if offset <= tolerance else None
+
+
 def anchor(img_bgr, max_iter=3):
     """Locate the table. Returns dict with similarity (s, tx, ty), the number of
     matched coins, and a map() closure turning canonical ROIs into pixel boxes.
@@ -370,12 +453,18 @@ def anchor(img_bgr, max_iter=3):
     ref_seat_px = [(u * REF_W, v * REF_H) for (u, v) in REF_SEAT_COINS]
     ref_pot_px = (REF_POT_COIN[0] * REF_W, REF_POT_COIN[1] * REF_H)
 
+    if len(seats) < ANCHOR_MIN_POINTS:
+        return None
+    if pot is None:
+        # Seat-sized pot coin: recovered by position, and taken OUT of the seat
+        # list so the one detection carries one reference slot (_pot_coin_at_slot).
+        pot = _pot_coin_at_slot(coins, seats, ref_seat_px, ref_pot_px,
+                                max_iter=max_iter)
+        if pot is not None:
+            seats = [c for c in seats if c is not pot]
     det = [(c["cx"], c["cy"]) for c in seats]
-    if pot is not None:
-        det_pot = (pot["cx"], pot["cy"])
-    else:
-        det_pot = None
-    if len(det) < 3:
+    det_pot = (pot["cx"], pot["cy"]) if pot is not None else None
+    if len(det) < ANCHOR_MIN_POINTS:
         return None
 
     # ONE ICP implementation, shared with the detector-side path. The coin

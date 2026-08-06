@@ -359,3 +359,104 @@ def test_detect_coins_reference_scale_still_finds_constellation() -> None:
     img[:] = (40, 40, 40)
     _paint_reference_coins(img, radius=11, pot_radius=14)
     assert len(la.detect_coins(img)) >= 8
+
+
+# The ClubWPT coin is a thin green RING, and the client antialiases it, so the
+# only pixels that clear the saturation gate are the stroke's core: measured on
+# real captures that core is ~1px on a 1344x836 client and ~2px at reference
+# size. _paint_reference_coins paints FILLED discs instead, which is why the
+# whole existing coin suite passed while a real 1344x836 recording had every one
+# of its 1021 frames rejected -- a 3x3 open leaves a filled disc alone and
+# erases a 1-2px stroke.
+_COIN_CORE_STROKE_PX = 2.0
+
+
+def _ring_table_frame(scale: float, *, with_pot: bool = True):
+    """A table frame whose coins are drawn the way the client draws them."""
+    np = pytest.importorskip("numpy")
+    cv2 = pytest.importorskip("cv2")
+    width, height = int(la.REF_W * scale), int(la.REF_H * scale)
+    img = np.zeros((height, width, 3), dtype=np.uint8)
+    img[:] = (40, 40, 40)
+    radius = max(3, round(11 * scale))
+    stroke = max(1, round(_COIN_CORE_STROKE_PX * scale))
+    slots = list(la.REF_SEAT_COINS)
+    if with_pot:
+        # Seat-sized on purpose: the client does not draw the pot coin 1.6x a
+        # seat coin at every window size (see POT_SLOT_MAX_OFFSET).
+        slots.append(la.REF_POT_COIN)
+    for nx, ny in slots:
+        cv2.circle(img, (int(nx * width), int(ny * height)), radius,
+                   (0, 220, 0), stroke)
+    return img
+
+
+def test_scaled_odd_kernel_shrinks_instead_of_rounding_back_up() -> None:
+    """The morphology gate must fall with scale over the WHOLE range.
+
+    Rounding an even proportional size up to the next odd handed a 0.5-0.833
+    scale client the full calibrated 3x3 open, which erases the 2px ring stroke
+    the seat coin is drawn with. Both reference geometries keep the kernels they
+    were measured with; only the band in between changes.
+    """
+    reference = la._coin_detection_scale(2114, 1414)     # the 2114x1414 recording
+    half = la._coin_detection_scale(1052, 732)           # the 1052x732 recording
+    middle = la._coin_detection_scale(1344, 836)         # the recording that broke
+
+    assert (la._scaled_odd_kernel(3, 1.0), la._scaled_odd_kernel(7, 1.0)) == (3, 7)
+    assert (la._scaled_odd_kernel(3, reference), la._scaled_odd_kernel(7, reference)) == (3, 7)
+    assert (la._scaled_odd_kernel(3, half), la._scaled_odd_kernel(7, half)) == (1, 3)
+    assert (la._scaled_odd_kernel(3, middle), la._scaled_odd_kernel(7, middle)) == (1, 5)
+    # Never larger than the calibrated kernel, however big the capture.
+    assert (la._scaled_odd_kernel(3, 2.5), la._scaled_odd_kernel(7, 2.5)) == (3, 7)
+    # Always an odd, usable structuring element.
+    for scale in (0.05, 0.3, 0.45, 0.6, 0.75, 0.9, 1.0, 2.0):
+        for calibrated in (3, 7):
+            size = la._scaled_odd_kernel(calibrated, scale)
+            assert size >= 1 and size % 2 == 1
+
+
+def test_detect_coins_keeps_ring_drawn_coins_at_intermediate_scale() -> None:
+    """1344x836: the geometry whose every frame read as non-table."""
+    coins = la.detect_coins(_ring_table_frame(la._coin_detection_scale(1344, 836)))
+    assert len(coins) >= 8, (
+        f"ring-drawn coins must survive the scaled open, got {len(coins)}")
+
+
+def test_anchor_fits_ring_drawn_intermediate_scale_table() -> None:
+    scale = la._coin_detection_scale(1344, 836)
+    fitted = la.anchor(_ring_table_frame(scale))
+    assert fitted is not None
+    # The fit recovers the true scale rather than collapsing onto the few blobs
+    # that survived: the broken build reported s ~= 0.32 for this frame.
+    assert abs(fitted["s"] - scale) / scale < 0.05
+    assert fitted["resid"] <= la.ANCHOR_MAX_RESID
+
+
+def test_anchor_finds_a_seat_sized_pot_coin_by_position() -> None:
+    """The pot coin is not 1.6x a seat coin on every client size.
+
+    On 1344x836 the client draws it seat-sized, so the area rule filed it as a
+    seat and ``has_pot_coin`` came back False on frames with a pot plainly on
+    the table. Position is the scale-free property.
+    """
+    scale = la._coin_detection_scale(1344, 836)
+    img = _ring_table_frame(scale)          # pot coin painted at seat radius
+    coins = la.detect_coins(img)
+    _seats, by_area = la._classify(coins)
+    assert by_area is None, "this frame is the case the area rule cannot see"
+
+    fitted = la.anchor(img)
+    assert fitted is not None
+    assert fitted["has_pot_coin"], "a coin sits exactly on the projected pot slot"
+    # Recovered by REclassification, not by counting the same blob twice.
+    assert fitted["n_seats"] == len(la.REF_SEAT_COINS)
+
+
+def test_anchor_reports_no_pot_coin_when_the_table_has_none() -> None:
+    """The positional fallback must not borrow a seat coin as the pot."""
+    fitted = la.anchor(_ring_table_frame(la._coin_detection_scale(1344, 836),
+                                         with_pot=False))
+    assert fitted is not None
+    assert not fitted["has_pot_coin"]
+    assert fitted["n_seats"] == len(la.REF_SEAT_COINS)
