@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -210,6 +211,54 @@ def load_timeline_for_job(
     return payload
 
 
+# What each screen-classifier rejection means, in the operator's terms. The
+# classifier tallies these per frame into metadata["nontable_reasons"]
+# (cv_lab/scripts/pipeline/classify_screen.py); until now the tally was written
+# and never read, so "all frames were non-table" reached the operator with no
+# way to tell a recording of the lobby from a table the reader could not fit.
+#
+# The advice this replaces asserted the recording was "below the calibrated
+# ClubWPT window size" and told the operator to re-record at 1272x896 or larger.
+# That was wrong twice over: supportedness stopped being a window-size floor
+# (layout_support_statement), and the recording it was shown for was 1344x836 --
+# WIDER than the size it was being told to reach. The frames were fine; the coin
+# morphology was erasing the seat coins. Say what was measured, not a guess.
+_NONTABLE_REASON_TEXT = {
+    "no_coin_constellation": (
+        "no chip-coin constellation was found at all — these frames are a lobby, "
+        "a menu, or a table hidden behind another window"
+    ),
+    "seat_count_out_of_range": (
+        "chip coins were found but not a table's worth of seats"
+    ),
+    "scale_outside_band": (
+        "the table rendered outside the size band the readers fit"
+    ),
+    "residual_too_high": (
+        "the chip coins found did not sit in a table's seat constellation"
+    ),
+    "no_pot_coin": "no pot coin was on the table in these frames",
+}
+
+
+def _dominant_nontable_reason(metadata: Mapping[str, Any]) -> str:
+    """The classifier's own most-frequent rejection, phrased for the operator."""
+    reasons = metadata.get("nontable_reasons")
+    if not isinstance(reasons, Mapping) or not reasons:
+        return ""
+    counted = [
+        (str(name), int(count))
+        for name, count in reasons.items()
+        if isinstance(count, int) and count > 0
+    ]
+    if not counted:
+        return ""
+    # Ties broken by name so the same timeline always reads the same way.
+    name, count = max(counted, key=lambda item: (item[1], item[0]))
+    text = _NONTABLE_REASON_TEXT.get(name, f"the screen check recorded {name}")
+    return f" The most common reason, on {count} of them, was that {text}."
+
+
 def empty_hands_review_message(timeline: dict[str, Any]) -> str:
     """Explain a completed job whose timeline has nothing to validate."""
     summary = timeline.get("summary") or {}
@@ -230,10 +279,11 @@ def empty_hands_review_message(timeline: dict[str, Any]) -> str:
             f"All {frames} sampled frames were classified as non-table "
             "(lobby, modal, transition, or unrecognized layout), so detection never ran."
         )
+        detail += _dominant_nontable_reason(metadata)
         if unsupported:
             detail += (
-                f" Layout {layout} is below the calibrated ClubWPT window size — "
-                "record the full client closer to 1272×896 or larger."
+                f" The run was reconstructed at layout {layout}, which the readers "
+                "are not calibrated for."
             )
         return detail
 
@@ -868,9 +918,15 @@ def cv_issues_for_timeline_action(
                 "the seat's running total for the street, not the increment."
             )
             if code == "below_calibrated_render_size":
+                # What the reader measured is a GLYPH height, and the window
+                # size that produces a readable glyph is not a fixed number: a
+                # 1344x836 capture clears the band that a taller 1272x896 one
+                # was named after. Saying "1272x896 or larger" turned a true
+                # statement about text size into a false one about window size.
                 detail += (
-                    " (For future recordings, capture the client at 1272×896 "
-                    "or larger.)"
+                    " (For future recordings, enlarge the client until the "
+                    "stack and bet numbers render larger; this one was below "
+                    "the size the reader is calibrated on.)"
                 )
         elif readable_bet is not None:
             detail = (

@@ -519,7 +519,12 @@ def test_cv_issues_report_refused_amount_with_code_and_remedy() -> None:
     amount_issue = next(issue for issue in issues if issue.kind == "Amount unknown")
     assert "refused to guess" in amount_issue.detail
     assert "enter the chips this seat added" in amount_issue.detail
-    assert "1272×896" in amount_issue.detail
+    # The remedy names the thing the reader measured -- how large the NUMBERS
+    # render -- not a window size. It used to say "capture at 1272×896 or
+    # larger", which a 1344x836 recording both exceeds in width and beats on
+    # every amount read, so the number was advice the reader never checked.
+    assert "render larger" in amount_issue.detail
+    assert "1272" not in amount_issue.detail
     assert amount_issue.frame_index == 0
     # Seat 1 committed before the recording started (t_start == 0):
     # its starting stack is unknown.

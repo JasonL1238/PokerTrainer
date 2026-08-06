@@ -103,7 +103,61 @@ def test_empty_hands_review_message_explains_all_nontable_frames() -> None:
     )
     assert "non-table" in message
     assert "1052x732-unsupported" in message
-    assert "1272" in message
+
+
+def test_empty_hands_review_message_names_the_measured_rejection() -> None:
+    """The screen classifier's own tally, not a guess about the window size.
+
+    This message used to tell the operator their client was "below the
+    calibrated ClubWPT window size" and to re-record at 1272x896 or larger. It
+    said that to a 1344x836 recording -- wider than the size it demanded -- whose
+    frames were fine, and it said it purely because the layout carried an
+    "-unsupported" suffix. No recommendation the run did not measure belongs here.
+    """
+    message = empty_hands_review_message(
+        {
+            "metadata": {
+                "layout_profile": "1344x836-unsupported",
+                "nontable_reasons": {
+                    "no_coin_constellation": 523,
+                    "scale_outside_band": 498,
+                    "seat_count_out_of_range": 245,
+                },
+            },
+            "summary": {
+                "frames": 1021,
+                "table_frames": 0,
+                "nontable_frames": 1021,
+                "hands": 0,
+            },
+            "hands": [],
+            "states": [],
+        }
+    )
+    assert "523" in message, "name the count the classifier actually recorded"
+    assert "chip-coin constellation" in message
+    assert "1272" not in message and "896" not in message, (
+        "a window-size recommendation this run never measured"
+    )
+
+
+def test_empty_hands_review_message_survives_an_unknown_rejection_code() -> None:
+    """A code the UI has no phrasing for is still reported, not swallowed."""
+    message = empty_hands_review_message(
+        {
+            "metadata": {"nontable_reasons": {"some_future_check": 7}},
+            "summary": {
+                "frames": 7,
+                "table_frames": 0,
+                "nontable_frames": 7,
+                "hands": 0,
+            },
+            "hands": [],
+            "states": [],
+        }
+    )
+    assert "some_future_check" in message
+    assert "7 of them" in message
 
 
 def test_empty_hands_review_message_mentions_unsupported_layout() -> None:
