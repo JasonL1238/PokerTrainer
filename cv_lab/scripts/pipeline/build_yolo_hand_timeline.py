@@ -592,6 +592,66 @@ def _debounce_cards(raw: list[dict[str, Any]], key: str) -> None:
             state[key] = list(accepted) if accepted is not None else []
 
 
+def _resolve_identity_by_majority(hand: list[dict[str, Any]]) -> None:
+    """Give each card slot ONE identity per hand: the reading most states saw.
+
+    ``_debounce_cards`` is sequential -- it accepts a change the NEXT reading
+    confirms, and reverts an excursion only if the accepted value comes back
+    before the table is swept. That leaves one shape unhandled: a misread that
+    starts partway through a hand and never reverts because the hand ENDS first.
+    Measured on a 1344x836 recording, hero held Kd Tc for 31 consecutive states
+    and Ts for the last 8 before the sweep. Nothing reverted, so the tail was
+    confirmed and published, and one hand carried two different hole-card pairs.
+    Hole cards are dealt once and do not change, so that is not low confidence,
+    it is incoherent -- and no consumer of the hand can tell which half to trust.
+
+    Runs per SEGMENT, on the boundaries ``_segment`` already found, and never on
+    a raw span of its own devising. An earlier revision segmented on "a maximal
+    run of non-empty readings", reasoning that cards leaving the table end the
+    hand. They do not always: the sweep can fall between samples or be collapsed
+    away, so that rule glued several deals together and gave one hand the hole
+    cards of a hand two earlier -- which then duplicated a board card, a strictly
+    worse defect than the one being fixed. A deal boundary has exactly one
+    definition in this module and this is not the place to add a second.
+
+    Board growth survives untouched because each state keeps its own LENGTH; only
+    the identity at a slot is rewritten, and slot 0 of a flop is the same card on
+    the river. Ties go to the reading seen first, so the result never depends on
+    dict ordering.
+
+    Deliberately does NOT silence _flag_identity_splits: the majority is what to
+    publish, not proof it is right. The 07-23 turn card read 8d eight times and
+    8h twice with the eight of hearts on screen, so a hand whose slots were
+    contested still exports contested, at reduced confidence, for review.
+    """
+    for key in ("hero_cards", "board_cards"):
+        readings = [state for state in hand if state[key]]
+        if not readings:
+            continue
+        winners: dict[int, str] = {}
+        for slot in range(max(len(state[key]) for state in readings)):
+            counts: dict[str, int] = {}
+            first_seen: dict[str, int] = {}
+            for index, state in enumerate(readings):
+                if slot >= len(state[key]):
+                    continue
+                card = state[key][slot]
+                counts[card] = counts.get(card, 0) + 1
+                first_seen.setdefault(card, index)
+            if counts:
+                winners[slot] = max(counts, key=lambda c: (counts[c], -first_seen[c]))
+        for state in readings:
+            resolved = [winners[slot] for slot in range(len(state[key]))]
+            # Never MANUFACTURE a duplicate. Two slots whose majorities collide
+            # would publish one card twice -- and across hero and board it would
+            # deal a card that is already on the table. Both are worse claims
+            # than the disagreement they came from, so such a state is left as
+            # the debounce left it.
+            others = set(state["board_cards" if key == "hero_cards" else "hero_cards"])
+            if len(set(resolved)) == len(resolved) and not (set(resolved) & others):
+                state[key] = resolved
+
+
 def _debounce_bool_confirm(raw: list[dict[str, Any]], key: str, min_run: int = 3,
                             reset_key: str | None = None) -> None:
     """Only accept a True reading that's part of a run of >= min_run
@@ -3501,6 +3561,11 @@ def build_hand_timeline(
     table_frames_list = [f for f in frames if _is_table_frame(f)]
     session_anchor = _session_anchor(table_frames_list)
     segments = [seg for seg in _segment(states) if _has_deal_evidence(seg)]
+    # A card slot holds one identity for the whole deal. Settling it on the
+    # reading most states saw is only safe once the deal's boundaries are known,
+    # which is here and not in build_states.
+    for segment in segments:
+        _resolve_identity_by_majority(segment)
     # Seats ever dealt cards anywhere in the session. Caps the mid-hand-open
     # stack recruitment in _player_seats: an occupied-but-sitting-out seat must
     # never enter any hand's roster.

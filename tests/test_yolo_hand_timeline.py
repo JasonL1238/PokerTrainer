@@ -2492,3 +2492,110 @@ def test_explicit_post_pill_alias_maps_to_post_blind():
         assert rd.read_pill_action(
             type("D", (), {"attr": attr})(), dealt_in=True
         ) == "post_blind"
+
+
+def _flip_hero_suit(fixture, *, at_or_after, frm="Kd", to="Ks"):
+    """Misread ONE hero hole card from ``at_or_after`` to the end of the hand."""
+    for row in fixture:
+        if row["time_s"] < at_or_after:
+            continue
+        for det in row["detections"]:
+            if det["cls"] == "face_card" and det["attr"] == frm:
+                det["attr"] = to
+    return fixture
+
+
+def test_a_hero_slot_that_never_reverts_still_settles_on_the_majority():
+    """The shape the sequential debounce cannot reach.
+
+    ``_debounce_cards`` accepts a change its NEXT reading confirms, and undoes an
+    excursion only when the accepted value comes back before the sweep. A misread
+    that starts partway through a hand and runs to the SHOWDOWN never comes back,
+    so it was confirmed and published: measured on a 1344x836 recording, hero
+    read Kd Tc for 31 states and Ts for the last 8, and the hand carried two
+    different hole-card pairs. Hole cards are dealt once; that is incoherent, not
+    merely uncertain.
+    """
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import build_hand_timeline
+
+    # Right from state one the reading is unanimous.
+    clean = build_hand_timeline(rd.frames_from_fixture(_hand_fixture()))
+    assert clean["hands"][0]["hero"] == ["As", "Kd"]
+
+    # Now flip the second hole card for the LAST THREE frames and never back.
+    timeline = build_hand_timeline(
+        rd.frames_from_fixture(_flip_hero_suit(_hand_fixture(), at_or_after=6.0))
+    )
+    hand = timeline["hands"][0]
+    assert hand["hero"] == ["As", "Kd"], "six states read Kd, three read Ks"
+    heroes = {tuple(s["hero_cards"]) for s in timeline["states"] if s["hero_cards"]}
+    assert heroes == {("As", "Kd")}, f"one hand, one pair of hole cards: {heroes}"
+
+
+def test_the_majority_is_published_but_still_reported_as_contested():
+    """Taking the majority is not a claim the majority is right.
+
+    Measured on the 07-23 recording the majority was WRONG -- a turn card read 8d
+    eight times and 8h twice with the eight of hearts unmistakably on screen --
+    so a hand whose slots were contested keeps its warning and its reduced
+    confidence, and the operator still gets it in the review console.
+    """
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import build_hand_timeline
+
+    timeline = build_hand_timeline(
+        rd.frames_from_fixture(_flip_hero_suit(_hand_fixture(), at_or_after=6.0))
+    )
+    assert "hero_card_identity_split" in timeline["hands"][0]["warnings"]
+
+
+def test_majority_resolution_leaves_board_growth_alone():
+    """Only the identity AT a slot is rewritten; each state keeps its own length,
+    so a flop does not become a river."""
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import build_hand_timeline
+
+    timeline = build_hand_timeline(rd.frames_from_fixture(_hand_fixture()))
+    lengths = [len(s["board_cards"]) for s in timeline["states"]]
+    assert lengths == sorted(lengths), "the board only ever grows"
+    assert {tuple(s["board_cards"]) for s in timeline["states"]} == {
+        (), tuple(FLOP), tuple(TURN), tuple(RIVER)
+    }
+    assert timeline["hands"][0]["board"] == RIVER
+
+
+def test_majority_resolution_never_takes_cards_across_a_hand_boundary():
+    """One hand's majority must never reach another hand's states.
+
+    The first attempt at this segmented on "a maximal run of non-empty card
+    readings", reasoning that cards leaving the table end the hand. They do not
+    always -- the sweep can fall between samples or be collapsed away -- so three
+    deals were treated as one, a hand inherited the hole cards of a hand two
+    earlier, and that pair then duplicated a card already on its board. A deal
+    boundary has exactly one definition in the spine (``_segment``), and this
+    resolution rides on it rather than inventing a second.
+    """
+    from cv_lab.scripts.pipeline.build_yolo_hand_timeline import build_hand_timeline
+
+    first = _hand_fixture()
+    # A second deal, with different hole cards, and NO all-empty-board gap in
+    # between beyond the one the fixture already carries.
+    second = []
+    for row in _hand_fixture():
+        row = json.loads(json.dumps(row))
+        row["time_s"] += 20.0
+        row["image"] = f"f{row['time_s']}.jpg"
+        for det in row["detections"]:
+            if det["cls"] == "face_card" and det["attr"] == "As":
+                det["attr"] = "Qh"
+            elif det["cls"] == "face_card" and det["attr"] == "Kd":
+                det["attr"] = "Qs"
+        second.append(row)
+
+    timeline = build_hand_timeline(rd.frames_from_fixture(first + second))
+    assert timeline["summary"]["hands"] == 2
+    assert timeline["hands"][0]["hero"] == ["As", "Kd"]
+    assert timeline["hands"][1]["hero"] == ["Qh", "Qs"], (
+        "the longer hand's majority must not leak into the shorter one"
+    )
+    for state in timeline["states"]:
+        shared = set(state["hero_cards"]) & set(state["board_cards"])
+        assert not shared, f"resolution dealt a card already on the board: {shared}"
